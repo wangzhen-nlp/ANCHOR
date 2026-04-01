@@ -58,6 +58,27 @@
             color: #475467;
             font-size: 14px;
         }
+        .filters {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+        .filter-chip {
+            border: 1px solid #d0d5dd;
+            background: #fff;
+            color: #344054;
+            border-radius: 999px;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .filter-chip.active {
+            background: #111827;
+            border-color: #111827;
+            color: #fff;
+        }
         .list {
             margin-top: 22px;
             display: grid;
@@ -119,6 +140,24 @@
             line-height: 1.5;
             word-break: break-word;
         }
+        .inline-links {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .inline-link {
+            border: none;
+            background: rgba(9, 105, 218, 0.08);
+            color: #0969da;
+            border-radius: 999px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .inline-link:hover {
+            background: rgba(9, 105, 218, 0.16);
+        }
         .empty {
             margin-top: 24px;
             text-align: center;
@@ -141,6 +180,14 @@
                 <button class="btn" onclick="document.getElementById('fileInput').click()">选择 JSONL 文件</button>
                 <div class="hint">每行一个故障组对象</div>
             </div>
+            <div class="filters" id="filters">
+                <button class="filter-chip active" data-filter="all">全部</button>
+                <button class="filter-chip" data-filter="with-related">有关联故障组</button>
+                <button class="filter-chip" data-filter="without-related">无关联故障组</button>
+                <button class="filter-chip" data-filter="multi-site">站点数大于 1</button>
+                <button class="filter-chip" data-filter="rule:transmission_rule">规则: transmission_rule</button>
+                <button class="filter-chip" data-filter="rule:power_rule">规则: power_rule</button>
+            </div>
             <div class="status" id="status">尚未加载文件</div>
         </div>
 
@@ -150,6 +197,7 @@
 
     <script>
         let faultGroups = [];
+        let activeFilter = 'all';
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -160,8 +208,24 @@
                 .replace(/'/g, '&#39;');
         }
 
-        function getGroupTime(group) {
-            return group.group_anchor_time || group.match_info?.group_anchor_time || '-';
+        function getGroupTimeRange(group) {
+            const symptoms = group.symptoms || [];
+            const timestamps = symptoms
+                .map(symptom => symptom && symptom.ts)
+                .filter(ts => ts !== null && ts !== undefined)
+                .sort((a, b) => a - b);
+
+            if (timestamps.length === 0) {
+                return group.group_anchor_time || group.match_info?.group_anchor_time || '-';
+            }
+
+            const formatTs = (ts) => {
+                const date = new Date(ts * 1000);
+                const pad = (value) => String(value).padStart(2, '0');
+                return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+            };
+
+            return `${formatTs(timestamps[0])} ~ ${formatTs(timestamps[timestamps.length - 1])}`;
         }
 
         function getGroupRuleText(group) {
@@ -175,6 +239,10 @@
         function getRelatedGroupText(group) {
             const related = group.related_group_uuids || group.match_info?.related_group_uuids || [];
             return related.length > 0 ? related.join(', ') : '无';
+        }
+
+        function getRelatedGroups(group) {
+            return group.related_group_uuids || group.match_info?.related_group_uuids || [];
         }
 
         function getSiteCount(group) {
@@ -196,27 +264,71 @@
         function openGroupDetail(index) {
             const group = faultGroups[index];
             const sessionKey = `fault-group-${Date.now()}-${index}`;
-            sessionStorage.setItem(sessionKey, JSON.stringify(group));
+            localStorage.setItem(sessionKey, JSON.stringify(group));
             window.open(`fault_group_detail.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+        }
+
+        function openGroupDetailByUuid(uuid) {
+            const index = faultGroups.findIndex(group => (group.uuid || group.match_info?.uuid) === uuid);
+            if (index >= 0) {
+                openGroupDetail(index);
+            }
+        }
+
+        function filterGroups(groups) {
+            if (activeFilter === 'all') {
+                return groups;
+            }
+            if (activeFilter === 'with-related') {
+                return groups.filter(group => getRelatedGroups(group).length > 0);
+            }
+            if (activeFilter === 'without-related') {
+                return groups.filter(group => getRelatedGroups(group).length === 0);
+            }
+            if (activeFilter === 'multi-site') {
+                return groups.filter(group => getSiteCount(group) > 1);
+            }
+            if (activeFilter.startsWith('rule:')) {
+                const ruleName = activeFilter.slice(5);
+                return groups.filter(group => {
+                    const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
+                    return mergedRules.includes(ruleName) || group.rule === ruleName || group.match_info?.rule === ruleName;
+                });
+            }
+            return groups;
+        }
+
+        function renderRelatedGroupLinks(group) {
+            const relatedGroups = getRelatedGroups(group);
+            if (relatedGroups.length === 0) {
+                return '无';
+            }
+            return `<div class="inline-links">${
+                relatedGroups.map(uuid => `<button class="inline-link" onclick='openGroupDetailByUuid(${JSON.stringify(uuid)})'>${escapeHtml(uuid)}</button>`).join('')
+            }</div>`;
         }
 
         function renderGroups() {
             const list = document.getElementById('groupList');
             const emptyState = document.getElementById('emptyState');
+            const visibleGroups = filterGroups(faultGroups);
 
-            if (faultGroups.length === 0) {
+            if (visibleGroups.length === 0) {
                 list.innerHTML = '';
+                emptyState.textContent = faultGroups.length === 0 ? '请选择一个 `jsonl` 文件' : '当前筛选条件下没有故障组';
                 emptyState.style.display = 'block';
                 return;
             }
 
             emptyState.style.display = 'none';
-            list.innerHTML = faultGroups.map((group, index) => `
+            list.innerHTML = visibleGroups.map((group) => {
+                const index = faultGroups.indexOf(group);
+                return `
                 <div class="card">
                     <div class="card-head">
                         <div>
                             <div class="title">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}</div>
-                            <div class="time">故障组时间：${escapeHtml(getGroupTime(group))}</div>
+                            <div class="time">故障组时间范围：${escapeHtml(getGroupTimeRange(group))}</div>
                         </div>
                         <button class="open-btn" onclick="openGroupDetail(${index})">查看详情</button>
                     </div>
@@ -227,7 +339,7 @@
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">关联故障组</div>
-                            <div class="meta-value">${escapeHtml(getRelatedGroupText(group))}</div>
+                            <div class="meta-value">${renderRelatedGroupLinks(group)}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">站点数 / 设备数 / 告警数</div>
@@ -235,7 +347,8 @@
                         </div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
         }
 
         function parseJsonl(text) {
@@ -269,6 +382,14 @@
                 }
             };
             reader.readAsText(file, 'utf-8');
+        });
+
+        document.getElementById('filters').addEventListener('click', function(event) {
+            const btn = event.target.closest('.filter-chip');
+            if (!btn) return;
+            activeFilter = btn.dataset.filter || 'all';
+            document.querySelectorAll('.filter-chip').forEach(chip => chip.classList.toggle('active', chip === btn));
+            renderGroups();
         });
     </script>
 </body>

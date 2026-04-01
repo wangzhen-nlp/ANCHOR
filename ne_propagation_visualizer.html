@@ -3570,7 +3570,7 @@
             if (sessionKey) {
                 showLoading(true);
                 try {
-                    const rawData = sessionStorage.getItem(sessionKey);
+                    const rawData = localStorage.getItem(sessionKey);
                     if (!rawData) {
                         throw new Error('未找到对应的故障组数据');
                     }
@@ -3583,6 +3583,7 @@
                     } else {
                         throw new Error('未知数据格式');
                     }
+                    localStorage.removeItem(sessionKey);
                     document.getElementById('fileStatus').textContent = '已加载单个故障组详情';
                 } catch (error) {
                     showError('加载故障组详情失败: ' + error.message);
@@ -3703,6 +3704,9 @@
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info).length + ' 个 Group, ' + allNodes.length + ' 个节点';
             
             updateStats();
+            if (graphData.group_info && Object.keys(graphData.group_info).length > 0) {
+                showAllGroups();
+            }
             showLoading(false);
         }
 
@@ -3726,6 +3730,9 @@
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info || {}).length + ' 个 Group, ' + allNodes.length + ' 个节点';
             
             updateStats();
+            if (graphData.group_info && Object.keys(graphData.group_info).length > 0) {
+                showAllGroups();
+            }
             showLoading(false);
         }
 
