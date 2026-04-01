@@ -197,7 +197,7 @@
 
     <script>
         let faultGroups = [];
-        let activeFilter = 'all';
+        let activeFilters = new Set(['all']);
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -275,27 +275,33 @@
             }
         }
 
+        function matchesRuleFilter(group, ruleName) {
+            const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
+            return mergedRules.includes(ruleName) || group.rule === ruleName || group.match_info?.rule === ruleName;
+        }
+
         function filterGroups(groups) {
-            if (activeFilter === 'all') {
+            if (activeFilters.has('all') || activeFilters.size === 0) {
                 return groups;
             }
-            if (activeFilter === 'with-related') {
-                return groups.filter(group => getRelatedGroups(group).length > 0);
-            }
-            if (activeFilter === 'without-related') {
-                return groups.filter(group => getRelatedGroups(group).length === 0);
-            }
-            if (activeFilter === 'multi-site') {
-                return groups.filter(group => getSiteCount(group) > 1);
-            }
-            if (activeFilter.startsWith('rule:')) {
-                const ruleName = activeFilter.slice(5);
-                return groups.filter(group => {
-                    const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
-                    return mergedRules.includes(ruleName) || group.rule === ruleName || group.match_info?.rule === ruleName;
-                });
-            }
-            return groups;
+
+            return groups.filter(group => {
+                for (const filter of activeFilters) {
+                    if (filter === 'with-related' && getRelatedGroups(group).length === 0) {
+                        return false;
+                    }
+                    if (filter === 'without-related' && getRelatedGroups(group).length > 0) {
+                        return false;
+                    }
+                    if (filter === 'multi-site' && getSiteCount(group) <= 1) {
+                        return false;
+                    }
+                    if (filter.startsWith('rule:') && !matchesRuleFilter(group, filter.slice(5))) {
+                        return false;
+                    }
+                }
+                return true;
+            });
         }
 
         function renderRelatedGroupLinks(group) {
@@ -387,8 +393,26 @@
         document.getElementById('filters').addEventListener('click', function(event) {
             const btn = event.target.closest('.filter-chip');
             if (!btn) return;
-            activeFilter = btn.dataset.filter || 'all';
-            document.querySelectorAll('.filter-chip').forEach(chip => chip.classList.toggle('active', chip === btn));
+
+            const filter = btn.dataset.filter || 'all';
+            if (filter === 'all') {
+                activeFilters = new Set(['all']);
+            } else {
+                activeFilters.delete('all');
+                if (activeFilters.has(filter)) {
+                    activeFilters.delete(filter);
+                } else {
+                    activeFilters.add(filter);
+                }
+                if (activeFilters.size === 0) {
+                    activeFilters.add('all');
+                }
+            }
+
+            document.querySelectorAll('.filter-chip').forEach(chip => {
+                const chipFilter = chip.dataset.filter || 'all';
+                chip.classList.toggle('active', activeFilters.has(chipFilter));
+            });
             renderGroups();
         });
     </script>
