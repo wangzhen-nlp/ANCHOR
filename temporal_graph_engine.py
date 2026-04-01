@@ -52,6 +52,8 @@ class TemporalGraphEngine:
 
         # 流式时间水印
         self.current_watermark = 0.0
+        # 已到达事件时间上界：TTL 清理只跟真实已进入引擎的事件时间走，不跟 live 模式下的模拟水印走
+        self.latest_arrived_event_ts = 0.0
 
         # 延迟触发队列：记录“当前仍在等待聚合”的 trigger 起点锚点，结构为 (ts, seq)
         self.pending_triggers = {}
@@ -111,6 +113,7 @@ class TemporalGraphEngine:
         with self._lock:
             # 1. 当前仍保留事件时间水印，便于离线按事件时间回放。
             self.current_watermark = max(self.current_watermark, ts)
+            self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
             # 2. 先清理过期缓存，再按上报/清除事件更新状态。
             q = self.event_cache[node]
@@ -300,7 +303,7 @@ class TemporalGraphEngine:
         merged_matches = merge_match_batch(raw_matches)
         expanded_matches = self._expand_matches_with_pending_context(merged_matches, helper)
         with self._lock:
-            self._prune_expired_state_locked(self.current_watermark)
+            self._prune_expired_state_locked(self.latest_arrived_event_ts)
             current_watermark = self.current_watermark
             finalized_matches = self._finalize_matches_with_history(expanded_matches)
 
@@ -588,7 +591,9 @@ class TemporalGraphEngine:
     def _finalize_matches_with_history(self, matches):
         """把当前批次结果与历史组做最终合并并落库。"""
         finalized = []
-        current_time = self.current_watermark if hasattr(self, 'current_watermark') else time.time()
+        current_time = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else (
+            self.current_watermark if hasattr(self, 'current_watermark') else time.time()
+        )
         self.emitted_group_store.prune_expired(current_time)
 
         for match_result in matches:
