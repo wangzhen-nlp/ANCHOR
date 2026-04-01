@@ -1979,21 +1979,6 @@
             if (!groupId) return;
 
             if (!graphData.group_info || !graphData.group_info[groupId]) {
-                const numericId = parseInt(groupId).toString();
-                if (graphData.group_info && graphData.group_info[numericId]) {
-                    if (activeGroups.has(numericId)) {
-                        showAddFeedback('该 Group 已添加', 'warning');
-                        input.value = '';
-                        return;
-                    }
-                    activeGroups.add(numericId);
-                    input.value = '';
-                    updateActiveGroupsUI();
-                    renderCurrentGroups();
-                    showAddFeedback('已添加 Group ' + numericId, 'success');
-                    return;
-                }
-                
                 showAddFeedback('未找到 Group ' + groupId, 'error');
                 return;
             }
@@ -2067,7 +2052,9 @@
             if (activeGroups.size === 0) {
                 container.innerHTML = '<span class="group-tag empty">暂无 Group，请先添加</span>';
             } else {
-                const sortedGroups = Array.from(activeGroups).sort(function(a, b) { return parseInt(a) - parseInt(b); });
+                const sortedGroups = Array.from(activeGroups).sort(function(a, b) {
+                    return a.localeCompare(b, 'zh-CN', { numeric: true, sensitivity: 'base' });
+                });
                 container.innerHTML = sortedGroups.map(function(gid) {
                     const ginfo = graphData.group_info[gid];
                     const neCount = ginfo ? (ginfo.ne_list ? ginfo.ne_list.length : 0) : 0;
