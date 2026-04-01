@@ -351,15 +351,34 @@ def _format_debug_trigger_index(engine, site_id):
     return json.dumps(entries, ensure_ascii=False)
 
 
+def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
+    trigger_ts, trigger_seq = trigger_anchor
+    for event_ts, event_id, event_seq, alarm_type in engine.trigger_event_index.get((site_id, rule_name), ()):
+        if event_ts == trigger_ts and event_seq == trigger_seq:
+            return {
+                "alarm": alarm_type,
+                "eid": event_id,
+                "seq": event_seq,
+            }
+    return {
+        "alarm": "",
+        "eid": "",
+        "seq": trigger_seq,
+    }
+
+
 def _format_debug_pending(engine, site_id):
     pending = {}
     for (node, rule_name), trigger_anchor in engine.pending_triggers.items():
         if node != site_id:
             continue
         trigger_ts, trigger_seq = trigger_anchor
+        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor)
         pending[rule_name] = {
+            "alarm": trigger_detail["alarm"],
+            "eid": trigger_detail["eid"],
             "trigger_time": datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S"),
-            "trigger_seq": trigger_seq,
+            "trigger_seq": trigger_detail["seq"],
             "ready_time": datetime.fromtimestamp(trigger_ts + engine.aggregation_wait_sec).strftime("%Y-%m-%d %H:%M:%S"),
         }
     return json.dumps(pending, ensure_ascii=False)
