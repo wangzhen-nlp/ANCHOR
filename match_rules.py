@@ -500,6 +500,34 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
             _print_debug_match_details(match)
 
 
+def _print_debug_event_removal(payload, debug_sites):
+    node = payload.get("node")
+    if node not in debug_sites:
+        return
+
+    removed_time = payload.get("ts")
+    removed_time_str = (
+        datetime.fromtimestamp(removed_time).strftime("%Y-%m-%d %H:%M:%S")
+        if removed_time is not None else "-"
+    )
+    if payload.get("reason") == "ttl":
+        current_ts = payload.get("current_ts")
+        current_time_str = (
+            datetime.fromtimestamp(current_ts).strftime("%Y-%m-%d %H:%M:%S")
+            if current_ts is not None else "-"
+        )
+        print(
+            f"🗑️ 事件移出缓存(TTL): site={node}, alarm={payload.get('alarm_type', '')}, "
+            f"time={removed_time_str}, eid={payload.get('event_id', '')}, current_time={current_time_str}"
+        )
+    elif payload.get("reason") == "clear":
+        print(
+            f"🗑️ 事件移出缓存(清除): site={node}, alarm={payload.get('alarm_type', '')}, "
+            f"time={removed_time_str}, eid={payload.get('event_id', '')}, "
+            f"cleared_event_id={payload.get('cleared_event_id', '')}"
+        )
+
+
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
     """按 ts 差值模拟实时告警流，并由后台定时线程异步收割成熟故障组。"""
     print(
@@ -553,10 +581,11 @@ def _run_debug_mode(
         f"🔎 Debug 模式({mode}): 观察 {debug_target_text}，"
         "所有 trigger 仍按原始逻辑正常运行"
     )
+    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
     engine.debug_observer = lambda snapshot: _print_debug_collection_snapshot(
         snapshot, debug_targets, rules_config
     )
-    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
+    engine.debug_event_logger = lambda payload: _print_debug_event_removal(payload, debug_sites)
 
     def on_debug_matches(matches, source="收割"):
         debug_matches = [
@@ -630,6 +659,7 @@ def _run_debug_mode(
         finally:
             process_progress.close()
             engine.stop_periodic_harvest()
+            engine.debug_event_logger = None
         return
 
     try:
@@ -688,6 +718,7 @@ def _run_debug_mode(
             process_progress.update()
     finally:
         process_progress.close()
+        engine.debug_event_logger = None
 
 
 def main():

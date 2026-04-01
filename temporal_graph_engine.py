@@ -88,6 +88,8 @@ class TemporalGraphEngine:
         self._harvest_now_ts_getter = None
         # Debug 观察回调：仅在调试模式下接收一次收割过程中的中间阶段结果
         self.debug_observer = None
+        # Debug 事件回调：仅在调试模式下记录 event_cache 中事件被移除的原因
+        self.debug_event_logger = None
         
         # 引擎主锁：保护 event_cache、pending、watermark 和历史组状态的一致性
         self._lock = threading.RLock()
@@ -113,7 +115,8 @@ class TemporalGraphEngine:
             # 2. 先清理过期缓存，再按上报/清除事件更新状态。
             q = self.event_cache[node]
             while q and (ts - q[0][0]) > self._get_event_ttl(q[0][2]):
-                q.popleft()
+                expired_event = q.popleft()
+                self._log_debug_event_removal(node, expired_event, "ttl", current_ts=ts)
             self._prune_expired_trigger_index(node, ts)
 
             if is_clear:
@@ -144,6 +147,23 @@ class TemporalGraphEngine:
 
     def _get_event_ttl(self, alarm_type):
         return self.power_alarm_ttl if alarm_type in POWER_ALARMS else self.global_ttl
+
+    def _log_debug_event_removal(self, node, event, reason, **extra):
+        if not self.debug_event_logger:
+            return
+
+        ts, event_id, alarm_type, alarm_source, consumed_as_trigger = event
+        payload = {
+            "node": node,
+            "ts": ts,
+            "event_id": event_id,
+            "alarm_type": alarm_type,
+            "alarm_source": alarm_source,
+            "consumed_as_trigger": consumed_as_trigger,
+            "reason": reason,
+        }
+        payload.update(extra)
+        self.debug_event_logger(payload)
 
     def _set_pending_trigger(self, trigger_key, first_trigger_ts, trigger_seq):
         trigger_anchor = (first_trigger_ts, trigger_seq)
@@ -380,6 +400,12 @@ class TemporalGraphEngine:
 
         for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger in q:
             if event_id and cached_eid == event_id:
+                self._log_debug_event_removal(
+                    node,
+                    (cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger),
+                    "clear",
+                    cleared_event_id=event_id,
+                )
                 continue
             kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger))
 
@@ -549,7 +575,8 @@ class TemporalGraphEngine:
                 continue
 
             while q and (current_ts - q[0][0]) > self._get_event_ttl(q[0][2]):
-                q.popleft()
+                expired_event = q.popleft()
+                self._log_debug_event_removal(node, expired_event, "ttl", current_ts=current_ts)
 
             if not q:
                 self.event_cache.pop(node, None)
