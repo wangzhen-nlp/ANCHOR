@@ -1906,7 +1906,11 @@
             // 点击地图或节点列表时关闭告警弹窗
             document.addEventListener('click', function(e) {
                 // 如果点击的不是告警弹窗内部，则关闭弹窗
-                if (!e.target.closest('.alarm-popup') && !e.target.closest('.leaflet-popup-content')) {
+                if (!e.target.closest('.alarm-popup') &&
+                    !e.target.closest('.leaflet-popup-content') &&
+                    !e.target.closest('.custom-marker') &&
+                    !e.target.closest('.leaflet-marker-icon') &&
+                    !e.target.closest('.node-item')) {
                     closeAlarmPopup();
                 }
             });
