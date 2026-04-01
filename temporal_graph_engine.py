@@ -86,6 +86,8 @@ class TemporalGraphEngine:
         self._harvest_callback = None
         # 后台收割线程使用的当前时间函数；默认为真实时间，可由调用方注入模拟时钟
         self._harvest_now_ts_getter = None
+        # Debug 观察回调：仅在调试模式下接收一次收割过程中的中间阶段结果
+        self.debug_observer = None
         
         # 引擎主锁：保护 event_cache、pending、watermark 和历史组状态的一致性
         self._lock = threading.RLock()
@@ -278,7 +280,28 @@ class TemporalGraphEngine:
         merged_matches = merge_match_batch(raw_matches)
         with self._lock:
             self._prune_expired_state_locked(self.current_watermark)
-            return self._finalize_matches_with_history(merged_matches)
+            current_watermark = self.current_watermark
+            finalized_matches = self._finalize_matches_with_history(merged_matches)
+
+        if self.debug_observer:
+            self.debug_observer({
+                "force": force,
+                "watermark": current_watermark,
+                "mature_items": [
+                    {
+                        "node": trigger_key[0],
+                        "rule": trigger_key[1],
+                        "trigger_ts": trigger_anchor[0],
+                        "trigger_seq": trigger_anchor[1],
+                    }
+                    for trigger_key, trigger_anchor in mature_items
+                ],
+                "raw_matches": raw_matches,
+                "batch_merged_matches": merged_matches,
+                "finalized_matches": finalized_matches,
+            })
+
+        return finalized_matches
 
     def advance_watermark(self, now_ts=None):
         """通过定时任务推进水印，并收割已成熟的故障组。"""

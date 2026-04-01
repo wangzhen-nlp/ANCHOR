@@ -390,6 +390,61 @@ def _print_debug_match_details(match):
     print(f"      symptoms={json.dumps(symptom_preview, ensure_ascii=False)}")
 
 
+def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
+    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
+    raw_debug_matches = [
+        match for match in snapshot.get("raw_matches", [])
+        if _match_debug_trigger(match, debug_targets, rules_config)
+    ]
+    batch_debug_matches = [
+        match for match in snapshot.get("batch_merged_matches", [])
+        if _match_debug_trigger(match, debug_targets, rules_config)
+    ]
+    finalized_debug_matches = [
+        match for match in snapshot.get("finalized_matches", [])
+        if _match_debug_trigger(match, debug_targets, rules_config)
+    ]
+    mature_triggers = [
+        item for item in snapshot.get("mature_items", [])
+        if item.get("node") in debug_sites
+    ]
+
+    if not mature_triggers and not raw_debug_matches and not batch_debug_matches and not finalized_debug_matches:
+        return
+
+    watermark = snapshot.get("watermark")
+    watermark_str = (
+        datetime.fromtimestamp(watermark).strftime("%Y-%m-%d %H:%M:%S")
+        if watermark is not None else "-"
+    )
+    print(
+        f"🔎 收割阶段快照: watermark={watermark_str}, "
+        f"force={snapshot.get('force', False)}"
+    )
+    if mature_triggers:
+        mature_preview = [
+            {
+                "node": item.get("node", ""),
+                "rule": item.get("rule", ""),
+                "trigger_time": datetime.fromtimestamp(item["trigger_ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                if item.get("trigger_ts") is not None else "-",
+                "trigger_seq": item.get("trigger_seq", ""),
+            }
+            for item in mature_triggers
+        ]
+        print(f"   ↳ 本轮成熟 trigger: {json.dumps(mature_preview, ensure_ascii=False)}")
+
+    stage_mapping = (
+        ("原始候选组", raw_debug_matches),
+        ("当前批次合并后", batch_debug_matches),
+        ("历史组合并后", finalized_debug_matches),
+    )
+    for stage_name, stage_matches in stage_mapping:
+        print(f"   ↳ {stage_name}: {len(stage_matches)} 个相关故障组")
+        for match in stage_matches:
+            _print_debug_match_details(match)
+
+
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
     """按 ts 差值模拟实时告警流，并由后台定时线程异步收割成熟故障组。"""
     print(
@@ -442,6 +497,9 @@ def _run_debug_mode(
     print(
         f"🔎 Debug 模式({mode}): 观察 {debug_target_text}，"
         "所有 trigger 仍按原始逻辑正常运行"
+    )
+    engine.debug_observer = lambda snapshot: _print_debug_collection_snapshot(
+        snapshot, debug_targets, rules_config
     )
 
     def on_debug_matches(matches, source="收割"):
@@ -637,6 +695,9 @@ def main():
                 on_matches(debug_final_matches)
         else:
             on_matches(final_matches)
+
+    if debug_enabled:
+        engine.debug_observer = None
 
     elapsed = time.time() - start_time
     print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")
