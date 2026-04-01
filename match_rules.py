@@ -11,7 +11,7 @@ from alarm_inputs import (
     load_site_graph,
     stream_alarm_inputs,
 )
-from alarm_types import CRITICAL_ALARMS
+from alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from progress_utils import ProgressBar
 from reports import generate_incident_report
 from rule_config import transmission_rule, power_rule
@@ -580,6 +580,11 @@ def _run_debug_mode(
         try:
             for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
                 is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+                is_debug_site_power_alarm = (
+                    item.get("site_id") in debug_sites
+                    and item.get("alarm_title") in POWER_ALARMS
+                    and not _is_clear_alarm(item.get("alarm", {}))
+                )
                 is_debug_site_clear = (
                     item.get("site_id") in debug_sites
                     and _is_clear_alarm(item.get("alarm", {}))
@@ -601,6 +606,15 @@ def _run_debug_mode(
                     print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                     print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
                     print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                elif is_debug_site_power_alarm:
+                    debug_site = item.get("site_id", "")
+                    power_alarm = item.get("alarm_title", "")
+                    power_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"⚡ 电告警进入缓存: site={debug_site}, alarm={power_alarm}, "
+                        f"time={power_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                    )
+                    print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                 elif is_debug_site_clear:
                     debug_site = item.get("site_id", "")
                     clear_alarm = item.get("alarm_title", "")
@@ -621,6 +635,11 @@ def _run_debug_mode(
     try:
         for item in valid_alarms:
             is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+            is_debug_site_power_alarm = (
+                item.get("site_id") in debug_sites
+                and item.get("alarm_title") in POWER_ALARMS
+                and not _is_clear_alarm(item.get("alarm", {}))
+            )
             is_debug_site_clear = (
                 item.get("site_id") in debug_sites
                 and _is_clear_alarm(item.get("alarm", {}))
@@ -644,6 +663,15 @@ def _run_debug_mode(
                 print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
                 if not matches:
                     print("   ↳ 当前触发点暂未产出故障组")
+            elif is_debug_site_power_alarm:
+                debug_site = item.get("site_id", "")
+                power_alarm = item.get("alarm_title", "")
+                power_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"⚡ 电告警进入缓存: site={debug_site}, alarm={power_alarm}, "
+                    f"time={power_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                )
+                print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
             elif is_debug_site_clear:
                 debug_site = item.get("site_id", "")
                 clear_alarm = item.get("alarm_title", "")
