@@ -10,12 +10,24 @@ class NodeRuleHelper:
         self.critical_alarms = critical_alarms
         self.event_getter = event_getter
 
+    @staticmethod
+    def normalize_edge_window(edge_window):
+        """把边时间窗规范化成 before/after 形式，支持对称和非对称窗口。"""
+        if isinstance(edge_window, dict):
+            before_sec = float(edge_window.get("before_sec", edge_window.get("backward_sec", 0)))
+            after_sec = float(edge_window.get("after_sec", edge_window.get("forward_sec", 0)))
+            return before_sec, after_sec
+
+        win = float(edge_window)
+        return win, win
+
     def events_in_window(self, physical_node, reference_ts, edge_window):
         """获取某个节点在指定时间窗口内的缓存事件。"""
+        before_sec, after_sec = self.normalize_edge_window(edge_window)
         return [
             {"node": physical_node, "ts": ts, "eid": eid, "alarm": alarm, "alarm_source": alarm_source}
             for ts, eid, alarm, alarm_source in self.event_getter(physical_node)
-            if abs(reference_ts - ts) <= edge_window
+            if (reference_ts - before_sec) <= ts <= (reference_ts + after_sec)
         ]
 
     @staticmethod
@@ -29,8 +41,9 @@ class NodeRuleHelper:
     @staticmethod
     def format_window_for_reason(reference_ts, edge_window):
         """把参考时间和窗口宽度格式化成可读区间。"""
-        start_ts = reference_ts - edge_window
-        end_ts = reference_ts + edge_window
+        before_sec, after_sec = NodeRuleHelper.normalize_edge_window(edge_window)
+        start_ts = reference_ts - before_sec
+        end_ts = reference_ts + after_sec
         start_str = datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M:%S')
         end_str = datetime.fromtimestamp(end_ts).strftime('%Y-%m-%d %H:%M:%S')
         return f"[{start_str}, {end_str}]"

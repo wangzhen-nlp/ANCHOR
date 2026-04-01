@@ -14,7 +14,7 @@ from alarm_inputs import (
 from alarm_types import CRITICAL_ALARMS
 from progress_utils import ProgressBar
 from reports import generate_incident_report
-from rule_config import transmission_rule
+from rule_config import transmission_rule, power_rule
 from temporal_graph_engine import TemporalGraphEngine
 
 
@@ -238,34 +238,19 @@ def _build_group_output(match, ne_graph_data):
     }
 
 
-def _merge_group_output(aggregated_output, group_output):
-    group_info = next(iter(group_output.get("group_info", {}).values()), {})
-    group_ne_ids = set(group_info.get("ne_list", []))
-    match_info = group_output.get("match_info", {})
-    group_id = match_info.get("uuid", "")
-    aggregated_group_ne_ids = []
+def _build_jsonl_match_output(match, ne_graph_data):
+    group_output = _build_group_output(match, ne_graph_data)
+    timestamps = [symptom["ts"] for symptom in match.get("symptoms", []) if symptom.get("ts") is not None]
+    group_anchor_ts = min(timestamps) if timestamps else None
 
-    for ne_id, ne_data in group_output.get("ne_info", {}).items():
-        aggregated_ne_id = f"{group_id}::{ne_id}" if group_id else ne_id
-        aggregated_ne_data = dict(ne_data)
-        aggregated_ne_data["group"] = group_id
-        aggregated_group_ne_ids.append(aggregated_ne_id)
-
-        link_info = {}
-        for neighbor_id, link_data in ne_data.get("link", {}).items():
-            if neighbor_id not in group_ne_ids:
-                continue
-            aggregated_neighbor_id = f"{group_id}::{neighbor_id}" if group_id else neighbor_id
-            link_info[aggregated_neighbor_id] = link_data
-        aggregated_ne_data["link"] = link_info
-
-        aggregated_output["ne_info"][aggregated_ne_id] = aggregated_ne_data
-
-    aggregated_output["group_info"][group_id] = {
-        "ne_list": sorted(aggregated_group_ne_ids),
-        "site_list": group_info.get("site_list", []),
-    }
-    aggregated_output["match_info"][group_id] = match_info
+    enriched_match = dict(match)
+    enriched_match["group_anchor_ts"] = group_anchor_ts
+    enriched_match["group_anchor_time"] = (
+        datetime.fromtimestamp(group_anchor_ts).strftime("%Y-%m-%d %H:%M:%S")
+        if group_anchor_ts is not None else ""
+    )
+    enriched_match.update(group_output)
+    return enriched_match
 
 
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
@@ -308,8 +293,6 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
-    parser.add_argument('--output-format', type=str, choices=('jsonl', 'json'), default='jsonl',
-                        help='jsonl: 每行一个原始故障组; json: 输出单个传播图 JSON 文件')
     parser.add_argument('--topo', type=str, default='site_graph_by_ne.json')
     parser.add_argument('--site-domain', type=str, default='site_device_counts.json')
     parser.add_argument('--ne-graph', type=str, default='ne_graph.json', help='ne_graph.json 文件')
@@ -334,7 +317,8 @@ def main():
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
 
     rules_config = {
-        "transmission_rule": transmission_rule
+        "transmission_rule": transmission_rule,
+        "power_rule": power_rule
     }
 
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
@@ -364,27 +348,17 @@ def main():
 
     match_count = 0
     output_lock = threading.Lock()
-    aggregated_output = {"ne_info": {}, "group_info": {}, "match_info": {}}
-
-    if args.output_format == 'jsonl':
-        # 默认输出为 jsonl，避免把全部故障组长期堆在内存里。
-        with open(args.output, 'w', encoding='utf-8'):
-            pass
+    with open(args.output, 'w', encoding='utf-8'):
+        pass
 
     def on_matches(matches):
-        # 统一处理一批新产出的故障组：边输出报告，边按指定格式落盘。
+        # 统一处理一批新产出的故障组：边输出报告，边按 jsonl 落盘。
         nonlocal match_count
         with output_lock:
-            if args.output_format == 'jsonl':
-                with open(args.output, 'a', encoding='utf-8') as fw:
-                    for match in matches:
-                        generate_incident_report(match)
-                        fw.write(json.dumps(match, ensure_ascii=False) + '\n')
-            else:
+            with open(args.output, 'a', encoding='utf-8') as fw:
                 for match in matches:
                     generate_incident_report(match)
-                    group_output = _build_group_output(match, ne_graph_data)
-                    _merge_group_output(aggregated_output, group_output)
+                    fw.write(json.dumps(_build_jsonl_match_output(match, ne_graph_data), ensure_ascii=False) + '\n')
             match_count += len(matches)
 
     process_progress = ProgressBar(filtered_count, "处理有效告警")
@@ -407,10 +381,6 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")
-
-    if args.output_format == 'json':
-        with open(args.output, 'w', encoding='utf-8') as fw:
-            json.dump(aggregated_output, fw, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

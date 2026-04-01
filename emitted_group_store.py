@@ -52,6 +52,8 @@ class EmittedGroupStore:
             "role_mapping": copy.deepcopy(match_result.get("role_mapping", {})),
             "symptoms": list(match_result.get("symptoms", []))
         }
+        if "_expire_ts_hint" in match_result:
+            merged["_expire_ts_hint"] = match_result["_expire_ts_hint"]
 
         merged_group_indexes = set()
         related_group_uuids = set()
@@ -88,8 +90,16 @@ class EmittedGroupStore:
 
         return merged, merged_group_indexes, related_group_uuids, True
 
-    def replace_and_store(self, merged_group_indexes, rule_name, anchor_ts, match_result):
+    def replace_and_store(self, merged_group_indexes, anchor_ts, match_result):
         """删除被吸收的历史组，并把当前组作为新的历史版本落库。"""
+        current_expire_ts = match_result.pop("_expire_ts_hint", None)
+        if current_expire_ts is None:
+            current_expire_ts = anchor_ts + self.get_rule_max_stay_time(match_result.get("rule"))
+        merged_expire_ts = max(
+            (self.groups[idx]["expire_ts"] for idx in merged_group_indexes),
+            default=current_expire_ts
+        )
+
         if merged_group_indexes:
             self.groups = [
                 item for idx, item in enumerate(self.groups)
@@ -98,9 +108,22 @@ class EmittedGroupStore:
 
         self.groups.append({
             "anchor_ts": anchor_ts,
-            "expire_ts": anchor_ts + self.get_rule_max_stay_time(rule_name),
+            "expire_ts": max(current_expire_ts, merged_expire_ts),
             "match": copy.deepcopy(match_result)
         })
+
+    def extend_related_expire_ts(self, merged_group_indexes, match_result, anchor_ts):
+        """当当前结果不需要再次输出时，延长相关历史组的过期时间。"""
+        if not merged_group_indexes:
+            return
+
+        current_expire_ts = match_result.get("_expire_ts_hint")
+        if current_expire_ts is None:
+            current_expire_ts = anchor_ts + self.get_rule_max_stay_time(match_result.get("rule"))
+
+        for idx in merged_group_indexes:
+            if 0 <= idx < len(self.groups):
+                self.groups[idx]["expire_ts"] = max(self.groups[idx]["expire_ts"], current_expire_ts)
 
     def _get_alarm_keys(self, symptoms):
         """提取一组症状中的有效 eid 集合。"""

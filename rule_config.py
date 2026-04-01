@@ -1,4 +1,4 @@
-from alarm_types import OFFLINE_ALARMS
+from alarm_types import OFFLINE_ALARMS, POWER_ALARMS
 
 TRANSMISSION_SITE_RULES = [
   {
@@ -14,7 +14,7 @@ TRANSMISSION_SITE_RULES = [
 
 transmission_rule = {
   "pattern_name": "bounded_silent_cross_domain_storm",
-  "description": "无告警 -> 断站? -> 断站",
+  "description": "无告警 -> 断站? -> 断站?",
   "max_stay_time_sec": 3600,
   "trigger_role": "downstream_compound_node",
   "nodes": {
@@ -69,11 +69,49 @@ transmission_rule = {
       "source": "parent_microwave_node",
       "target": "downstream_compound_node",
       "direction": "downstream",
-      "time_window_sec": 300,
+      "time_window_sec": 600,
       "constraints": {
         "path_node_requirements": {
           "site_rules": TRANSMISSION_SITE_RULES
         }
+      }
+    }
+  ]
+}
+
+power_rule = {
+  "pattern_name": "local_power_to_offline",
+  "description": "同站点离线告警 -> 同站点电源根因",
+  "max_stay_time_sec": 10800,
+  "trigger_role": "offline_node",
+  "nodes": {
+    "offline_node": {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Transmission"],
+          "expected_alarms": OFFLINE_ALARMS
+        }
+      ]
+    },
+    "power_node": {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Transmission"],
+          "expected_alarms": POWER_ALARMS
+        }
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "power_node",
+      "target": "offline_node",
+      "direction": "self",
+      "time_window_sec": {
+        "before_sec": 600,
+        "after_sec": 10800
       }
     }
   ]

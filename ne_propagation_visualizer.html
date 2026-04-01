@@ -2757,7 +2757,7 @@
                 // Popup 内容
                 let popupContent = '<div class="popup-title">' + getRawNodeId(node) + '</div>' +
                     '<div class="popup-row">站点: ' + getNodeSiteTitle(node) + '</div>' +
-                    '<div class="popup-row">NE: ' + getRawNodeId(node) + '</div>' +
+                    '<div class="popup-row">名称: ' + (node.site_name || node.site_id || '-') + '</div>' +
                     '<div class="popup-row">Group: ' + (node.group || '-') + '</div>' +
                     '<div class="popup-row">类型: ' + (node.network_type || node.type || '-') + '</div>' +
                     '<div class="popup-row">Domain: <span style="color:' + style.color + '; font-weight:bold;">' + style.label + '</span></div>' +
@@ -3565,6 +3565,31 @@
         function loadData() {
             const urlParams = new URLSearchParams(window.location.search);
             const dataFile = urlParams.get('file');
+            const sessionKey = urlParams.get('session_key');
+
+            if (sessionKey) {
+                showLoading(true);
+                try {
+                    const rawData = sessionStorage.getItem(sessionKey);
+                    if (!rawData) {
+                        throw new Error('未找到对应的故障组数据');
+                    }
+                    const data = JSON.parse(rawData);
+                    graphData = data;
+                    if (graphData.ne_info) {
+                        loadOriginalFormat(graphData);
+                    } else if (graphData.nodes) {
+                        loadVizFormat(graphData);
+                    } else {
+                        throw new Error('未知数据格式');
+                    }
+                    document.getElementById('fileStatus').textContent = '已加载单个故障组详情';
+                } catch (error) {
+                    showError('加载故障组详情失败: ' + error.message);
+                    showLoading(false);
+                }
+                return;
+            }
 
             if (dataFile) {
                 showLoading(true);

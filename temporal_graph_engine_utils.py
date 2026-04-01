@@ -11,9 +11,17 @@ def build_pattern_adj(edges_cfg):
         source, target = edge["source"], edge["target"]
         fwd_dir = edge.get("direction", "downstream")
         rev_dir = "upstream" if fwd_dir == "downstream" else (
-            "downstream" if fwd_dir == "upstream" else "bidirectional")
+            "downstream" if fwd_dir == "upstream" else (
+                "self" if fwd_dir == "self" else "bidirectional"
+            ))
         hops = edge.get("max_hops")
         win = edge.get("time_window_sec", 300)
+        rev_win = win
+        if isinstance(win, dict):
+            rev_win = {
+                "before_sec": win.get("after_sec", win.get("forward_sec", 0)),
+                "after_sec": win.get("before_sec", win.get("backward_sec", 0))
+            }
         constraints = edge.get("constraints", {})
         path_requirements = constraints.get("path_node_requirements")
         source_candidate_selector = constraints.get("source_candidate_selector")
@@ -31,7 +39,7 @@ def build_pattern_adj(edges_cfg):
             "role": source,
             "traverse_dir": rev_dir,
             "hops": hops,
-            "win": win,
+            "win": rev_win,
             "path_requirements": path_requirements,
             "candidate_selector": source_candidate_selector
         })
@@ -76,8 +84,13 @@ def merge_match_component(component_matches):
 
     symptom_map = {}
     related_group_uuids = set()
+    expire_ts_hint = None
 
     for source in component_matches:
+        source_expire_ts_hint = source.get("_expire_ts_hint")
+        if source_expire_ts_hint is not None:
+            expire_ts_hint = source_expire_ts_hint if expire_ts_hint is None else max(expire_ts_hint, source_expire_ts_hint)
+
         for role, nodes in source.get("inferred_roots", {}).items():
             merged["inferred_roots"].setdefault(role, [])
             merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
@@ -97,6 +110,8 @@ def merge_match_component(component_matches):
     merged["symptoms"] = list(symptom_map.values())
     if related_group_uuids:
         merged["related_group_uuids"] = sorted(related_group_uuids)
+    if expire_ts_hint is not None:
+        merged["_expire_ts_hint"] = expire_ts_hint
 
     return merged
 

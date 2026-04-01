@@ -9,7 +9,7 @@ from datetime import datetime
 
 from emitted_group_store import EmittedGroupStore
 from node_rule_helper import NodeRuleHelper
-from alarm_types import CRITICAL_ALARMS
+from alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from temporal_graph_engine_utils import (
     build_pattern_adj,
     clone_instance_with_updates,
@@ -35,7 +35,10 @@ class TemporalGraphEngine:
 
         # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source)]) }
         self.event_cache = collections.defaultdict(collections.deque)
+        # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
+        # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
+        self.power_alarm_ttl = 10800
 
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
@@ -54,7 +57,7 @@ class TemporalGraphEngine:
         self.pending_triggers = {}
         # 延迟触发最小堆：按 ready_ts 排序，快速摘取已成熟的 pending trigger
         self.pending_trigger_heap = []
-        # 保存某个 (node, rule) 下所有还能作为 trigger 候选的事件，结构为 (ts, event_id, seq)
+        # 保存某个 (node, rule) 下所有还能作为 trigger 候选的事件，结构为 (ts, event_id, seq, alarm_type)
         self.trigger_event_index = collections.defaultdict(collections.deque)
         # trigger 候选事件的全局递增序号，用于精确定位“下一条”事件。
         self._trigger_seq = 0
@@ -107,7 +110,7 @@ class TemporalGraphEngine:
 
             # 2. 先清理过期缓存，再按上报/清除事件更新状态。
             q = self.event_cache[node]
-            while q and (ts - q[0][0]) > self.global_ttl:
+            while q and (ts - q[0][0]) > self._get_event_ttl(q[0][2]):
                 q.popleft()
             self._prune_expired_trigger_index(node, ts)
 
@@ -126,7 +129,7 @@ class TemporalGraphEngine:
                         trigger_key = (node, rule_name)
                         self._trigger_seq += 1
                         trigger_seq = self._trigger_seq
-                        self.trigger_event_index[trigger_key].append((ts, event_id, trigger_seq))
+                        self.trigger_event_index[trigger_key].append((ts, event_id, trigger_seq, alarm_type))
                         # 如果这段时间内已经触发过，就不更新时间，以“第一声警报”为准
                         if trigger_key not in self.pending_triggers:
                             self._set_pending_trigger(trigger_key, ts, trigger_seq)
@@ -136,6 +139,9 @@ class TemporalGraphEngine:
             return self._collect_pending_matches(force=False)
 
         return []
+
+    def _get_event_ttl(self, alarm_type):
+        return self.power_alarm_ttl if alarm_type in POWER_ALARMS else self.global_ttl
 
     def _set_pending_trigger(self, trigger_key, first_trigger_ts, trigger_seq):
         trigger_anchor = (first_trigger_ts, trigger_seq)
@@ -380,10 +386,10 @@ class TemporalGraphEngine:
                 continue
 
             kept_trigger_events = collections.deque()
-            for event_ts, indexed_event_id, indexed_seq in trigger_events:
+            for event_ts, indexed_event_id, indexed_seq, indexed_alarm_type in trigger_events:
                 if indexed_event_id in removed_event_ids:
                     continue
-                kept_trigger_events.append((event_ts, indexed_event_id, indexed_seq))
+                kept_trigger_events.append((event_ts, indexed_event_id, indexed_seq, indexed_alarm_type))
 
             if kept_trigger_events:
                 self.trigger_event_index[trigger_key] = kept_trigger_events
@@ -425,7 +431,7 @@ class TemporalGraphEngine:
             if not trigger_events:
                 continue
 
-            while trigger_events and (current_ts - trigger_events[0][0]) > self.global_ttl:
+            while trigger_events and (current_ts - trigger_events[0][0]) > self._get_event_ttl(trigger_events[0][3]):
                 trigger_events.popleft()
 
             if not trigger_events:
@@ -457,10 +463,10 @@ class TemporalGraphEngine:
                 continue
 
             kept = collections.deque()
-            for event_ts, indexed_event_id, indexed_seq in trigger_events:
+            for event_ts, indexed_event_id, indexed_seq, indexed_alarm_type in trigger_events:
                 if indexed_event_id == event_id:
                     continue
-                kept.append((event_ts, indexed_event_id, indexed_seq))
+                kept.append((event_ts, indexed_event_id, indexed_seq, indexed_alarm_type))
 
             if kept:
                 self.trigger_event_index[trigger_key] = kept
@@ -491,7 +497,7 @@ class TemporalGraphEngine:
             return None
 
         _lower_bound_ts, lower_bound_seq = lower_bound_anchor
-        for event_ts, _event_id, event_seq in trigger_events:
+        for event_ts, _event_id, event_seq, _alarm_type in trigger_events:
             if event_seq > lower_bound_seq:
                 return event_ts, event_seq
         return None
@@ -516,7 +522,7 @@ class TemporalGraphEngine:
             if not q:
                 continue
 
-            while q and (current_ts - q[0][0]) > self.global_ttl:
+            while q and (current_ts - q[0][0]) > self._get_event_ttl(q[0][2]):
                 q.popleft()
 
             if not q:
@@ -536,13 +542,17 @@ class TemporalGraphEngine:
             group_anchor_ts = self.emitted_group_store.get_group_anchor_ts(match_result, current_time)
             match_result, merged_group_indexes, related_group_uuids, should_emit = self.emitted_group_store.merge_with_related(match_result)
             if not should_emit:
+                self.emitted_group_store.extend_related_expire_ts(
+                    merged_group_indexes,
+                    match_result,
+                    group_anchor_ts
+                )
                 continue
             if related_group_uuids:
                 existing_uuids = set(match_result.get("related_group_uuids", []))
                 match_result["related_group_uuids"] = sorted(existing_uuids | set(related_group_uuids))
             self.emitted_group_store.replace_and_store(
                 merged_group_indexes,
-                match_result.get("rule"),
                 group_anchor_ts,
                 match_result
             )
@@ -633,11 +643,16 @@ class TemporalGraphEngine:
 
                     curr_valid_targets = {}
                     all_passed = True
+                    window_cache_key = (
+                        tuple(sorted(edge["win"].items()))
+                        if isinstance(edge["win"], dict)
+                        else edge["win"]
+                    )
 
                     # 如果 candidates 为空，天然跳过内层循环，该源节点被淘汰
                     for cand_phys in candidates:
                         # 校验结果依赖候选节点、目标角色以及参考时间窗口
-                        cache_key = (cand_phys, tgt_role, ref_ts, edge["win"])
+                        cache_key = (cand_phys, tgt_role, ref_ts, window_cache_key)
                         if cache_key in validation_cache:
                             is_valid, evts = validation_cache[cache_key]
                         else:
@@ -733,7 +748,11 @@ class TemporalGraphEngine:
                 "merged_rules": [rule_name],
                 "inferred_roots": inferred_roots,
                 "role_mapping": role_mapping,
-                "symptoms": list(symp_dict.values())
+                "symptoms": list(symp_dict.values()),
+                "_expire_ts_hint": (
+                    min((symptom["ts"] for symptom in symp_dict.values() if "ts" in symptom), default=trigger_ts)
+                    + rule.get("max_stay_time_sec", self.global_ttl)
+                )
             }
             results.append(match_result)
 
@@ -744,6 +763,9 @@ class TemporalGraphEngine:
                         path_requirements=None, node_rule_helper=None):
         """通用的广度优先搜索，支持路径节点约束"""
         helper = node_rule_helper or self.node_rule_helper
+
+        if direction == "self":
+            return {start_node: 0}
 
         cache_key = (start_node, direction, max_hops)
 

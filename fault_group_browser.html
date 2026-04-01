@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>故障组总览</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background: #f5f7fb;
+            color: #1f2937;
+        }
+        .page {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .hero {
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            border: 1px solid #dbe4f0;
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        }
+        h1 {
+            margin: 0 0 10px;
+            font-size: 28px;
+        }
+        .sub {
+            color: #5b6472;
+            margin-bottom: 18px;
+        }
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            border: none;
+            border-radius: 10px;
+            padding: 10px 16px;
+            background: #0969da;
+            color: #fff;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .btn:hover { background: #0858b8; }
+        .hint {
+            color: #667085;
+            font-size: 13px;
+        }
+        .status {
+            margin-top: 14px;
+            color: #475467;
+            font-size: 14px;
+        }
+        .list {
+            margin-top: 22px;
+            display: grid;
+            gap: 14px;
+        }
+        .card {
+            background: #fff;
+            border: 1px solid #e4e7ec;
+            border-radius: 16px;
+            padding: 18px;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
+        }
+        .card-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 12px;
+        }
+        .title {
+            font-size: 18px;
+            font-weight: 700;
+            word-break: break-word;
+        }
+        .time {
+            color: #475467;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+        .open-btn {
+            flex-shrink: 0;
+            border: none;
+            border-radius: 10px;
+            padding: 10px 14px;
+            background: #111827;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .open-btn:hover { background: #0b1220; }
+        .meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 10px 18px;
+        }
+        .meta-item {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 10px 12px;
+            min-height: 64px;
+        }
+        .meta-label {
+            font-size: 12px;
+            color: #667085;
+            margin-bottom: 6px;
+        }
+        .meta-value {
+            font-size: 14px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .empty {
+            margin-top: 24px;
+            text-align: center;
+            padding: 40px 24px;
+            color: #667085;
+            background: #fff;
+            border: 1px dashed #d0d5dd;
+            border-radius: 18px;
+        }
+        input[type="file"] { display: none; }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="hero">
+            <h1>故障组总览</h1>
+            <div class="sub">加载 `jsonl` 文件后，页面会展示所有故障组摘要；点击任意故障组可打开单组传播图详情。</div>
+            <div class="toolbar">
+                <input id="fileInput" type="file" accept=".jsonl,.txt,.json">
+                <button class="btn" onclick="document.getElementById('fileInput').click()">选择 JSONL 文件</button>
+                <div class="hint">每行一个故障组对象</div>
+            </div>
+            <div class="status" id="status">尚未加载文件</div>
+        </div>
+
+        <div class="list" id="groupList"></div>
+        <div class="empty" id="emptyState">请选择一个 `jsonl` 文件</div>
+    </div>
+
+    <script>
+        let faultGroups = [];
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function getGroupTime(group) {
+            return group.group_anchor_time || group.match_info?.group_anchor_time || '-';
+        }
+
+        function getGroupRuleText(group) {
+            const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
+            if (mergedRules.length > 0) {
+                return mergedRules.join(' + ');
+            }
+            return group.rule || group.match_info?.rule || '-';
+        }
+
+        function getRelatedGroupText(group) {
+            const related = group.related_group_uuids || group.match_info?.related_group_uuids || [];
+            return related.length > 0 ? related.join(', ') : '无';
+        }
+
+        function getSiteCount(group) {
+            const groupInfo = group.group_info || {};
+            const firstGroup = Object.values(groupInfo)[0] || {};
+            return (firstGroup.site_list || []).length;
+        }
+
+        function getNodeCount(group) {
+            const groupInfo = group.group_info || {};
+            const firstGroup = Object.values(groupInfo)[0] || {};
+            return (firstGroup.ne_list || []).length;
+        }
+
+        function getSymptomCount(group) {
+            return (group.symptoms || []).length;
+        }
+
+        function openGroupDetail(index) {
+            const group = faultGroups[index];
+            const sessionKey = `fault-group-${Date.now()}-${index}`;
+            sessionStorage.setItem(sessionKey, JSON.stringify(group));
+            window.open(`fault_group_detail.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+        }
+
+        function renderGroups() {
+            const list = document.getElementById('groupList');
+            const emptyState = document.getElementById('emptyState');
+
+            if (faultGroups.length === 0) {
+                list.innerHTML = '';
+                emptyState.style.display = 'block';
+                return;
+            }
+
+            emptyState.style.display = 'none';
+            list.innerHTML = faultGroups.map((group, index) => `
+                <div class="card">
+                    <div class="card-head">
+                        <div>
+                            <div class="title">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}</div>
+                            <div class="time">故障组时间：${escapeHtml(getGroupTime(group))}</div>
+                        </div>
+                        <button class="open-btn" onclick="openGroupDetail(${index})">查看详情</button>
+                    </div>
+                    <div class="meta">
+                        <div class="meta-item">
+                            <div class="meta-label">关联规则</div>
+                            <div class="meta-value">${escapeHtml(getGroupRuleText(group))}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">关联故障组</div>
+                            <div class="meta-value">${escapeHtml(getRelatedGroupText(group))}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">站点数 / 设备数 / 告警数</div>
+                            <div class="meta-value">${getSiteCount(group)} / ${getNodeCount(group)} / ${getSymptomCount(group)}</div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function parseJsonl(text) {
+            return text
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean)
+                .map((line, index) => {
+                    try {
+                        return JSON.parse(line);
+                    } catch (error) {
+                        throw new Error(`第 ${index + 1} 行解析失败: ${error.message}`);
+                    }
+                });
+        }
+
+        document.getElementById('fileInput').addEventListener('change', function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    faultGroups = parseJsonl(e.target.result);
+                    document.getElementById('status').textContent = `已加载 ${faultGroups.length} 个故障组`;
+                    renderGroups();
+                } catch (error) {
+                    faultGroups = [];
+                    document.getElementById('status').textContent = error.message;
+                    renderGroups();
+                }
+            };
+            reader.readAsText(file, 'utf-8');
+        });
+    </script>
+</body>
+</html>
