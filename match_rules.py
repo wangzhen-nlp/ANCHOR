@@ -556,6 +556,7 @@ def _run_debug_mode(
     engine.debug_observer = lambda snapshot: _print_debug_collection_snapshot(
         snapshot, debug_targets, rules_config
     )
+    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
 
     def on_debug_matches(matches, source="收割"):
         debug_matches = [
@@ -579,6 +580,10 @@ def _run_debug_mode(
         try:
             for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
                 is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+                is_debug_site_clear = (
+                    item.get("site_id") in debug_sites
+                    and _is_clear_alarm(item.get("alarm", {}))
+                )
                 _process_alarm(
                     engine,
                     item,
@@ -596,6 +601,17 @@ def _run_debug_mode(
                     print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                     print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
                     print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                elif is_debug_site_clear:
+                    debug_site = item.get("site_id", "")
+                    clear_alarm = item.get("alarm_title", "")
+                    clear_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"🧹 清除告警输入: site={debug_site}, alarm={clear_alarm}, "
+                        f"time={clear_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                    )
+                    print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+                    print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+                    print(f"   ↳ 清除后 pending: {_format_debug_pending(engine, debug_site)}")
                 process_progress.update()
         finally:
             process_progress.close()
@@ -605,6 +621,10 @@ def _run_debug_mode(
     try:
         for item in valid_alarms:
             is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+            is_debug_site_clear = (
+                item.get("site_id") in debug_sites
+                and _is_clear_alarm(item.get("alarm", {}))
+            )
             matches = _process_alarm(
                 engine,
                 item,
@@ -624,6 +644,17 @@ def _run_debug_mode(
                 print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
                 if not matches:
                     print("   ↳ 当前触发点暂未产出故障组")
+            elif is_debug_site_clear:
+                debug_site = item.get("site_id", "")
+                clear_alarm = item.get("alarm_title", "")
+                clear_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"🧹 清除告警输入: site={debug_site}, alarm={clear_alarm}, "
+                    f"time={clear_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                )
+                print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+                print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+                print(f"   ↳ 清除后 pending: {_format_debug_pending(engine, debug_site)}")
             if matches:
                 on_debug_matches(matches, "同步检查")
             process_progress.update()
