@@ -1684,22 +1684,42 @@
             'DEFAULT': { color: '#808080', shape: 'circle', label: 'Unknown', symbol: '●' }
         };
 
+        const EDGE_DOMAIN_PRIORITY = ['IP', 'Transmission', 'RAN', 'MICROWAVE', 'DEFAULT'];
+
+        function getDomainKey(domainStr) {
+            if (!domainStr) return 'DEFAULT';
+            const d = String(domainStr).toUpperCase();
+
+            if (d.includes('IP') || d.includes('ROUTER') || d.includes('DATA') || d.includes('METRO')) {
+                return 'IP';
+            } else if (d.includes('TRANSMISSION') || d.includes('DWDM') || d.includes('OTN') || d.includes('OPTICAL') || d.includes('RTN') || d.includes('WDM')) {
+                return 'Transmission';
+            } else if (d.includes('RAN') || d.includes('WIRELESS') || d.includes('NODEB') || d.includes('BTS') || d.includes('LTE')) {
+                return 'RAN';
+            } else if (d.includes('MICROWAVE') || d.includes('MW')) {
+                return 'MICROWAVE';
+            } else {
+                return 'DEFAULT';
+            }
+        }
+
         // 根据 domain 字符串获取样式
         function getDomainStyle(domainStr) {
-            if (!domainStr) return DOMAIN_STYLE['DEFAULT'];
-            const d = String(domainStr).toUpperCase();
-            
-            if (d.includes('IP') || d.includes('ROUTER') || d.includes('DATA') || d.includes('METRO')) {
-                return DOMAIN_STYLE['IP'];
-            } else if (d.includes('TRANSMISSION') || d.includes('DWDM') || d.includes('OTN') || d.includes('OPTICAL') || d.includes('RTN') || d.includes('WDM')) {
-                return DOMAIN_STYLE['Transmission'];
-            } else if (d.includes('RAN') || d.includes('WIRELESS') || d.includes('NODEB') || d.includes('BTS') || d.includes('LTE')) {
-                return DOMAIN_STYLE['RAN'];
-            } else if (d.includes('MICROWAVE') || d.includes('MW')) {
-                return DOMAIN_STYLE['MICROWAVE'];
-            } else {
-                return DOMAIN_STYLE['DEFAULT'];
+            return DOMAIN_STYLE[getDomainKey(domainStr)] || DOMAIN_STYLE['DEFAULT'];
+        }
+
+        function getEdgeColorByNodes(sourceNode, targetNode) {
+            const sourceKey = getDomainKey(sourceNode ? sourceNode.domain : '');
+            const targetKey = getDomainKey(targetNode ? targetNode.domain : '');
+
+            for (let i = 0; i < EDGE_DOMAIN_PRIORITY.length; i++) {
+                const domainKey = EDGE_DOMAIN_PRIORITY[i];
+                if (sourceKey === domainKey || targetKey === domainKey) {
+                    return DOMAIN_STYLE[domainKey].color;
+                }
             }
+
+            return DOMAIN_STYLE['DEFAULT'].color;
         }
 
         // ==========================================
@@ -2488,10 +2508,6 @@
                    !isNaN(parseFloat(node.longitude));
         }
 
-        function getSiteDisplayName(node) {
-            return node.site_name || node.site_id || node.name || node.id || '未知站点';
-        }
-
         function getCurrentSiteLocations() {
             const siteMap = new Map();
 
@@ -2514,7 +2530,7 @@
                 } else {
                     siteMap.set(siteKey, {
                         siteId: siteId,
-                        siteName: siteName || getSiteDisplayName(node),
+                        siteName: siteName || '',
                         latSum: lat,
                         lngSum: lng,
                         count: 1
@@ -2531,6 +2547,17 @@
                     deviceCount: site.count
                 };
             });
+        }
+
+        function getNodeSiteTitle(node) {
+            return node.site_id || node.site_name || '未知站点';
+        }
+
+        function getRawNodeId(nodeOrId) {
+            const fullId = typeof nodeOrId === 'string' ? nodeOrId : ((nodeOrId && nodeOrId.id) || '');
+            if (!fullId) return '-';
+            const parts = String(fullId).split('::');
+            return parts[parts.length - 1] || fullId;
         }
 
         function renderSiteOverlays() {
@@ -2572,7 +2599,7 @@
                     zIndexOffset: -1000,
                     icon: L.divIcon({
                         className: 'site-label-container',
-                        html: '<div class="site-label-map">' + (site.siteName || site.siteId || '未知站点') + '</div>',
+                        html: '<div class="site-label-map">' + (site.siteId || site.siteName || '未知站点') + '</div>',
                         iconSize: null,
                         iconAnchor: [-8, 14]
                     })
@@ -2697,8 +2724,10 @@
                 const marker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
 
                 // Popup 内容
-                let popupContent = '<div class="popup-title">' + node.id + '</div>' +
-                    '<div class="popup-row">站点: ' + (node.site_id || node.site_name || '-') + '</div>' +
+                let popupContent = '<div class="popup-title">' + getRawNodeId(node) + '</div>' +
+                    '<div class="popup-row">站点: ' + getNodeSiteTitle(node) + '</div>' +
+                    '<div class="popup-row">NE: ' + getRawNodeId(node) + '</div>' +
+                    '<div class="popup-row">Group: ' + (node.group || '-') + '</div>' +
                     '<div class="popup-row">类型: ' + (node.network_type || node.type || '-') + '</div>' +
                     '<div class="popup-row">Domain: <span style="color:' + style.color + '; font-weight:bold;">' + style.label + '</span></div>' +
                     '<div class="popup-row">厂商: ' + (node.manufacturer || '-') + '</div>' +
@@ -2849,9 +2878,9 @@
             mapPolylines.forEach(function(polyline) {
                 const isDistance = isDistanceLink(polyline.linkData);
                 const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
-                const style = getDomainStyle(sourceNode ? sourceNode.domain : '');
+                const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                 polyline.setStyle({ 
-                    color: style.color, 
+                    color: getEdgeColorByNodes(sourceNode, targetNode), 
                     weight: 2.5, 
                     opacity: 0.8,
                     dashArray: isDistance ? '10, 6' : null
@@ -2924,8 +2953,10 @@
             const style = getDomainStyle(domain);
             
             let alarmHtml = '<div style="margin-bottom: 15px; padding: 10px; background: #f6f8fa; border-radius: 6px;">' +
-                '<div style="font-weight: bold; color: #0969da; margin-bottom: 5px;">' + node.id + '</div>' +
-                '<div style="font-size: 12px; color: #57606a;">站点: ' + (node.site_id || '-') + ' | Domain: <span style="color:' + style.color + '">' + style.label + '</span></div>' +
+                '<div style="font-weight: bold; color: #0969da; margin-bottom: 5px;">' + getRawNodeId(node) + '</div>' +
+                '<div style="font-size: 12px; color: #57606a;">站点: ' + getNodeSiteTitle(node) + '</div>' +
+                '<div style="font-size: 12px; color: #57606a; margin-top: 4px;">NE: ' + getRawNodeId(node) + ' | Domain: <span style="color:' + style.color + '">' + style.label + '</span></div>' +
+                '<div style="font-size: 12px; color: #57606a; margin-top: 4px;">Group: ' + (node.group || '-') + '</div>' +
                 '</div>' +
                 '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + node.alarm.length + ' 个):</div>' +
                 '<div class="alarm-list">';
@@ -3075,9 +3106,8 @@
 
                 const sourceNode = currentNodes.find(function(n) { return n.id === sourceId; });
                 
-                // 边的颜色跟随源节点的 domain
-                const domain = sourceNode ? (sourceNode.domain || '') : '';
-                const style = getDomainStyle(domain);
+                const targetNode = currentNodes.find(function(n) { return n.id === targetId; });
+                const edgeColor = getEdgeColorByNodes(sourceNode, targetNode);
                 
                 const latlngs = [
                     [sourcePos[0], sourcePos[1]],
@@ -3088,7 +3118,7 @@
                 const isDistance = isDistanceLink(link);
                 
                 const polyline = L.polyline(latlngs, {
-                    color: style.color,
+                    color: edgeColor,
                     weight: 2.5,
                     opacity: 0.8,
                     dashArray: isDistance ? '10, 6' : null // distance类型使用虚线
@@ -3123,7 +3153,7 @@
                     this.setStyle({ 
                         weight: isDistance ? 2.5 : 2.5, 
                         opacity: isSelected ? 1 : 0.8,
-                        color: isSelected ? '#cf222e' : style.color
+                        color: isSelected ? '#cf222e' : edgeColor
                     });
                 });
 
@@ -3169,9 +3199,9 @@
                 } else {
                     const isDistance = isDistanceLink(polyline.linkData);
                     const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
-                    const style = getDomainStyle(sourceNode ? sourceNode.domain : '');
+                    const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                     polyline.setStyle({ 
-                        color: style.color, 
+                        color: getEdgeColorByNodes(sourceNode, targetNode), 
                         weight: 2.5, 
                         opacity: 0.8,
                         dashArray: isDistance ? '10, 6' : null
@@ -3767,7 +3797,7 @@
                 }
             }
 
-            content.innerHTML = '<div class="detail-row"><span class="key">NE ID:</span><span class="value">' + node.id + '</span></div>' +
+            content.innerHTML = '<div class="detail-row"><span class="key">NE ID:</span><span class="value">' + getRawNodeId(node) + '</span></div>' +
                 '<div class="detail-row"><span class="key">名称:</span><span class="value">' + (node.name || '-') + '</span></div>' +
                 '<div class="detail-row"><span class="key">站点:</span><span class="value">' + (node.site_id || '-') + '</span></div>' +
                 '<div class="detail-row"><span class="key">Domain:</span><span class="value" style="color: ' + style.color + '; font-weight: bold;">' + style.symbol + ' ' + style.label + '</span></div>' +
