@@ -437,11 +437,11 @@ def _run_debug_mode(
     speedup,
     real_harvest_interval_sec,
 ):
-    """仅把指定站点+告警注册为 trigger，其它告警只作为上下文进入缓存。"""
+    """不改变原始 trigger 行为，只额外观察指定站点+告警相关的中间过程。"""
     debug_target_text = ", ".join(f"{site} / {alarm}" for site, alarm in sorted(debug_targets))
     print(
-        f"🔎 Debug 模式({mode}): 仅 {debug_target_text} 作为 trigger 运行，"
-        "其它告警仅作为上下文参与匹配"
+        f"🔎 Debug 模式({mode}): 观察 {debug_target_text}，"
+        "所有 trigger 仍按原始逻辑正常运行"
     )
 
     def on_debug_matches(matches, source="收割"):
@@ -470,7 +470,7 @@ def _run_debug_mode(
                     engine,
                     item,
                     collect_matches=False,
-                    register_trigger=is_debug_trigger
+                    register_trigger=True
                 )
                 if is_debug_trigger:
                     debug_site = item.get("site_id", "")
@@ -496,7 +496,7 @@ def _run_debug_mode(
                 engine,
                 item,
                 collect_matches=True,
-                register_trigger=is_debug_trigger
+                register_trigger=True
             )
             if is_debug_trigger:
                 debug_site = item.get("site_id", "")
