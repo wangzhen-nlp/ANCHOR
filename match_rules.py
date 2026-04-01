@@ -103,7 +103,7 @@ def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_s
     return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
 
 
-def _process_alarm(engine, item, collect_matches=False):
+def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
     alarm = item["alarm"]
     return engine.process_event(
         node=item["site_id"],
@@ -112,7 +112,8 @@ def _process_alarm(engine, item, collect_matches=False):
         ts=item["ts"],
         event_id=alarm["告警编码ID"],
         is_clear=_is_clear_alarm(alarm),
-        collect_matches=collect_matches
+        collect_matches=collect_matches,
+        register_trigger=register_trigger
     )
 
 
@@ -202,8 +203,13 @@ def _build_group_output(match, ne_graph_data):
         if site_id:
             group_site_ids.add(site_id)
 
+        alarms = sorted(
+            ne_alarms.get(ne_id, []),
+            key=lambda alarm: (alarm.get("alarm_time", ""), alarm.get("alarm_id", ""))
+        )
+
         ne_info[ne_id] = {
-            "alarm": ne_alarms.get(ne_id, []),
+            "alarm": alarms,
             "link": _build_group_link_info(ne_id, set(group_ne_ids), ne_graph_data),
             "group": group_id,
             "name": ne_graph_entry.get("name", ne_id),
@@ -253,6 +259,137 @@ def _build_jsonl_match_output(match, ne_graph_data):
     return enriched_match
 
 
+def _match_debug_trigger(match, debug_targets, rules_config):
+    merged_rules = match.get("merged_rules", [match.get("rule")])
+    trigger_roles = {
+        rules_config[rule_name]["trigger_role"]
+        for rule_name in merged_rules
+        if rule_name in rules_config and rules_config[rule_name].get("trigger_role")
+    }
+    for symptom in match.get("symptoms", []):
+        target = (symptom.get("node"), symptom.get("alarm"))
+        if target not in debug_targets:
+            continue
+        if symptom.get("matched_role") in trigger_roles:
+            return True
+    return False
+
+
+def _build_match_time_range(match):
+    timestamps = sorted(
+        symptom["ts"]
+        for symptom in match.get("symptoms", [])
+        if symptom.get("ts") is not None
+    )
+    if not timestamps:
+        return "-"
+
+    def format_ts(ts):
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    return f"{format_ts(timestamps[0])} ~ {format_ts(timestamps[-1])}"
+
+
+def _is_debug_trigger_item(item, debug_targets):
+    return (
+        (item.get("site_id"), item.get("alarm_title")) in debug_targets
+        and not _is_clear_alarm(item.get("alarm", {}))
+    )
+
+
+def _parse_debug_targets(args):
+    debug_targets = set()
+
+    for raw_value in args.debug_trigger or []:
+        if "::" not in raw_value:
+            raise ValueError(f"无效的 --debug-trigger 参数: {raw_value}，应为 站点ID::告警名")
+        site_id, alarm_name = raw_value.split("::", 1)
+        site_id = site_id.strip()
+        alarm_name = alarm_name.strip()
+        if not site_id or not alarm_name:
+            raise ValueError(f"无效的 --debug-trigger 参数: {raw_value}，站点ID和告警名都不能为空")
+        debug_targets.add((site_id, alarm_name))
+
+    return debug_targets
+
+
+def _format_debug_site_events(engine, site_id, limit=12):
+    events = list(engine.event_cache.get(site_id, []))[-limit:]
+    if not events:
+        return "[]"
+
+    formatted = []
+    for ts, eid, alarm_type, alarm_source, consumed_as_trigger in events:
+        formatted.append(
+            {
+                "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                "eid": eid,
+                "alarm": alarm_type,
+                "source": alarm_source,
+                "consumed_as_trigger": consumed_as_trigger,
+            }
+        )
+    return json.dumps(formatted, ensure_ascii=False)
+
+
+def _format_debug_trigger_index(engine, site_id):
+    entries = {}
+    for rule_name, _ in engine.trigger_specs_by_node.get(site_id, ()):
+        trigger_key = (site_id, rule_name)
+        trigger_events = list(engine.trigger_event_index.get(trigger_key, ()))
+        if not trigger_events:
+            continue
+        entries[rule_name] = [
+            {
+                "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                "eid": eid,
+                "seq": seq,
+                "alarm": alarm_type,
+            }
+            for ts, eid, seq, alarm_type in trigger_events
+        ]
+    return json.dumps(entries, ensure_ascii=False)
+
+
+def _format_debug_pending(engine, site_id):
+    pending = {}
+    for (node, rule_name), trigger_anchor in engine.pending_triggers.items():
+        if node != site_id:
+            continue
+        trigger_ts, trigger_seq = trigger_anchor
+        pending[rule_name] = {
+            "trigger_time": datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger_seq": trigger_seq,
+            "ready_time": datetime.fromtimestamp(trigger_ts + engine.aggregation_wait_sec).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    return json.dumps(pending, ensure_ascii=False)
+
+
+def _print_debug_match_details(match):
+    print(
+        "   ↳ 命中故障组: "
+        f"uuid={match.get('uuid', '')}, "
+        f"rules={'+'.join(match.get('merged_rules', [match.get('rule', '')]))}, "
+        f"time_range={_build_match_time_range(match)}"
+    )
+    print(f"      inferred_roots={json.dumps(match.get('inferred_roots', {}), ensure_ascii=False)}")
+    print(f"      role_mapping={json.dumps(match.get('role_mapping', {}), ensure_ascii=False)}")
+    symptom_preview = [
+        {
+            "time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "-",
+            "node": symptom.get("node", ""),
+            "alarm": symptom.get("alarm", ""),
+            "matched_role": symptom.get("matched_role", ""),
+            "eid": symptom.get("eid", ""),
+        }
+        for symptom in sorted(
+            match.get("symptoms", []),
+            key=lambda symptom: (symptom.get("ts", float("inf")), symptom.get("eid", ""))
+        )
+    ]
+    print(f"      symptoms={json.dumps(symptom_preview, ensure_ascii=False)}")
+
+
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
     """按 ts 差值模拟实时告警流，并由后台定时线程异步收割成熟故障组。"""
     print(
@@ -289,6 +426,98 @@ def _run_offline_mode(engine, valid_alarms, on_matches, process_progress):
         process_progress.close()
 
 
+def _run_debug_mode(
+    engine,
+    valid_alarms,
+    on_matches,
+    process_progress,
+    debug_targets,
+    rules_config,
+    mode,
+    speedup,
+    real_harvest_interval_sec,
+):
+    """仅把指定站点+告警注册为 trigger，其它告警只作为上下文进入缓存。"""
+    debug_target_text = ", ".join(f"{site} / {alarm}" for site, alarm in sorted(debug_targets))
+    print(
+        f"🔎 Debug 模式({mode}): 仅 {debug_target_text} 作为 trigger 运行，"
+        "其它告警仅作为上下文参与匹配"
+    )
+
+    def on_debug_matches(matches, source="收割"):
+        debug_matches = [
+            match for match in matches
+            if _match_debug_trigger(match, debug_targets, rules_config)
+        ]
+        if not debug_matches:
+            return
+        print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
+        for match in debug_matches:
+            _print_debug_match_details(match)
+        on_matches(debug_matches)
+
+    if mode == 'live':
+        now_ts_getter = _build_simulated_now_ts_getter(valid_alarms, speedup)
+        engine.start_periodic_harvest(
+            interval_sec=real_harvest_interval_sec,
+            on_matches=lambda matches: on_debug_matches(matches, "定时收割"),
+            now_ts_getter=now_ts_getter
+        )
+        try:
+            for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
+                is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+                _process_alarm(
+                    engine,
+                    item,
+                    collect_matches=False,
+                    register_trigger=is_debug_trigger
+                )
+                if is_debug_trigger:
+                    debug_site = item.get("site_id", "")
+                    debug_alarm = item.get("alarm_title", "")
+                    trigger_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
+                        f"time={trigger_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                    )
+                    print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+                    print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+                    print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                process_progress.update()
+        finally:
+            process_progress.close()
+            engine.stop_periodic_harvest()
+        return
+
+    try:
+        for item in valid_alarms:
+            is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
+            matches = _process_alarm(
+                engine,
+                item,
+                collect_matches=True,
+                register_trigger=is_debug_trigger
+            )
+            if is_debug_trigger:
+                debug_site = item.get("site_id", "")
+                debug_alarm = item.get("alarm_title", "")
+                trigger_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
+                    f"time={trigger_time}, eid={item['alarm'].get('告警编码ID', '')}"
+                )
+                print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+                print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+                print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                if not matches:
+                    print("   ↳ 当前触发点暂未产出故障组")
+            if matches:
+                on_debug_matches(matches, "同步检查")
+            process_progress.update()
+    finally:
+        process_progress.close()
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
@@ -299,6 +528,7 @@ def main():
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='live', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
+    parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
     args = parser.parse_args()
 
     topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
@@ -343,6 +573,13 @@ def main():
     print(f"有效告警数: {filtered_count}，排序耗时: {sort_elapsed:.4f} 秒")
     print(f"正常告警数: {normal_alarm_count}，清除告警数: {clear_alarm_count}")
 
+    debug_targets = _parse_debug_targets(args)
+    debug_enabled = bool(debug_targets)
+    if debug_enabled:
+        print("🔎 Debug 模式已开启:")
+        for site_id, alarm_name in sorted(debug_targets):
+            print(f"   - {site_id} / {alarm_name}")
+
     speedup = max(float(args.speedup), 1e-9)
     real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
 
@@ -358,11 +595,24 @@ def main():
             with open(args.output, 'a', encoding='utf-8') as fw:
                 for match in matches:
                     generate_incident_report(match)
-                    fw.write(json.dumps(_build_jsonl_match_output(match, ne_graph_data), ensure_ascii=False) + '\n')
+                    enriched_match = _build_jsonl_match_output(match, ne_graph_data)
+                    fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)
 
     process_progress = ProgressBar(filtered_count, "处理有效告警")
-    if args.mode == 'live':
+    if debug_enabled:
+        _run_debug_mode(
+            engine,
+            valid_alarms,
+            on_matches,
+            process_progress,
+            debug_targets,
+            rules_config,
+            args.mode,
+            speedup,
+            real_harvest_interval_sec,
+        )
+    elif args.mode == 'live':
         _run_live_mode(
             engine,
             valid_alarms,
@@ -377,7 +627,16 @@ def main():
     print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
     final_matches = engine.flush_pending()
     if final_matches:
-        on_matches(final_matches)
+        if debug_enabled:
+            debug_final_matches = [
+                match for match in final_matches
+                if _match_debug_trigger(match, debug_targets, rules_config)
+            ]
+            if debug_final_matches:
+                print(f"🔎 Flush 阶段额外产出 {len(debug_final_matches)} 个故障组")
+                on_matches(debug_final_matches)
+        else:
+            on_matches(final_matches)
 
     elapsed = time.time() - start_time
     print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")

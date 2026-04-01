@@ -101,7 +101,7 @@ class TemporalGraphEngine:
         # 当 heap 脏条目过多时触发重建的倍率阈值
         self._pending_heap_rebuild_factor = 3
 
-    def process_event(self, node, alarm_type, ts, event_id, alarm_source="", is_clear=False, collect_matches=False):
+    def process_event(self, node, alarm_type, ts, event_id, alarm_source="", is_clear=False, collect_matches=False, register_trigger=True):
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
         with self._lock:
@@ -123,7 +123,7 @@ class TemporalGraphEngine:
                 q.append((ts, event_id, alarm_type, alarm_source, False))
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
-            if not is_clear:
+            if not is_clear and register_trigger:
                 for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
                     if any(matches_expected_alarm(alarm_type, expected) for expected in expected_list):
                         trigger_key = (node, rule_name)
