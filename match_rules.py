@@ -326,10 +326,13 @@ def _parse_debug_targets(args):
     return debug_targets
 
 
-def _format_debug_site_events(engine, site_id, limit=12):
-    events = list(engine.event_cache.get(site_id, []))[-limit:]
+def _format_debug_site_events(engine, site_id, limit=50):
+    with engine._lock:
+        site_events = list(engine.event_cache.get(site_id, []))
+
+    events = site_events[-limit:]
     if not events:
-        return "[]"
+        return json.dumps({"total": 0, "events": []}, ensure_ascii=False)
 
     formatted = []
     for ts, eid, alarm_type, alarm_source, consumed_as_trigger in events:
@@ -342,14 +345,20 @@ def _format_debug_site_events(engine, site_id, limit=12):
                 "consumed_as_trigger": consumed_as_trigger,
             }
         )
-    return json.dumps(formatted, ensure_ascii=False)
+    return json.dumps({"total": len(site_events), "events": formatted}, ensure_ascii=False)
 
 
 def _format_debug_trigger_index(engine, site_id):
+    with engine._lock:
+        trigger_specs = tuple(engine.trigger_specs_by_node.get(site_id, ()))
+        trigger_index_snapshot = {
+            rule_name: list(engine.trigger_event_index.get((site_id, rule_name), ()))
+            for rule_name, _ in trigger_specs
+        }
+
     entries = {}
-    for rule_name, _ in engine.trigger_specs_by_node.get(site_id, ()):
-        trigger_key = (site_id, rule_name)
-        trigger_events = list(engine.trigger_event_index.get(trigger_key, ()))
+    for rule_name, _ in trigger_specs:
+        trigger_events = trigger_index_snapshot.get(rule_name, [])
         if not trigger_events:
             continue
         entries[rule_name] = [
@@ -366,7 +375,10 @@ def _format_debug_trigger_index(engine, site_id):
 
 def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
     trigger_ts, trigger_seq = trigger_anchor
-    for event_ts, event_id, event_seq, alarm_type in engine.trigger_event_index.get((site_id, rule_name), ()):
+    with engine._lock:
+        trigger_events = list(engine.trigger_event_index.get((site_id, rule_name), ()))
+
+    for event_ts, event_id, event_seq, alarm_type in trigger_events:
         if event_ts == trigger_ts and event_seq == trigger_seq:
             return {
                 "alarm": alarm_type,
@@ -381,13 +393,19 @@ def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
 
 
 def _format_debug_pending(engine, site_id):
+    with engine._lock:
+        pending_items = [
+            ((node, rule_name), trigger_anchor)
+            for (node, rule_name), trigger_anchor in engine.pending_triggers.items()
+            if node == site_id
+        ]
+
     pending = {}
-    for (node, rule_name), trigger_anchor in engine.pending_triggers.items():
-        if node != site_id:
-            continue
+    for (_node, rule_name), trigger_anchor in pending_items:
         trigger_ts, trigger_seq = trigger_anchor
         trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor)
         pending[rule_name] = {
+            "site": site_id,
             "alarm": trigger_detail["alarm"],
             "eid": trigger_detail["eid"],
             "trigger_time": datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S"),
