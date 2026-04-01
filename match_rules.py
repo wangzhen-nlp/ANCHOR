@@ -423,12 +423,16 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
         match for match in snapshot.get("finalized_matches", [])
         if _match_debug_trigger(match, debug_targets, rules_config)
     ]
+    expanded_debug_matches = [
+        match for match in snapshot.get("expanded_matches", [])
+        if _match_debug_trigger(match, debug_targets, rules_config)
+    ]
     mature_triggers = [
         item for item in snapshot.get("mature_items", [])
         if item.get("node") in debug_sites
     ]
 
-    if not mature_triggers and not raw_debug_matches and not batch_debug_matches and not finalized_debug_matches:
+    if not mature_triggers and not raw_debug_matches and not batch_debug_matches and not finalized_debug_matches and not expanded_debug_matches:
         return
 
     watermark = snapshot.get("watermark")
@@ -457,6 +461,7 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
         ("原始候选组", raw_debug_matches),
         ("当前批次合并后", batch_debug_matches),
         ("历史组合并后", finalized_debug_matches),
+        ("pending 扩充后", expanded_debug_matches),
     )
     for stage_name, stage_matches in stage_mapping:
         print(f"   ↳ {stage_name}: {len(stage_matches)} 个相关故障组")

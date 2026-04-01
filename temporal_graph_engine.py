@@ -278,10 +278,11 @@ class TemporalGraphEngine:
                 raw_matches.extend(results)
 
         merged_matches = merge_match_batch(raw_matches)
+        expanded_matches = self._expand_matches_with_pending_context(merged_matches, helper)
         with self._lock:
             self._prune_expired_state_locked(self.current_watermark)
             current_watermark = self.current_watermark
-            finalized_matches = self._finalize_matches_with_history(merged_matches)
+            finalized_matches = self._finalize_matches_with_history(expanded_matches)
 
         if self.debug_observer:
             self.debug_observer({
@@ -298,6 +299,7 @@ class TemporalGraphEngine:
                 ],
                 "raw_matches": raw_matches,
                 "batch_merged_matches": merged_matches,
+                "expanded_matches": expanded_matches,
                 "finalized_matches": finalized_matches,
             })
 
@@ -584,6 +586,70 @@ class TemporalGraphEngine:
 
         self._prune_consumed_alarm_history(finalized)
         return finalized
+
+    def _get_trigger_roles_for_match(self, match_result):
+        merged_rules = match_result.get("merged_rules", [match_result.get("rule")])
+        return {
+            self.rules[rule_name]["trigger_role"]
+            for rule_name in merged_rules
+            if rule_name in self.rules and self.rules[rule_name].get("trigger_role")
+        }
+
+    def _get_non_trigger_nodes_for_match(self, match_result):
+        trigger_roles = self._get_trigger_roles_for_match(match_result)
+        non_trigger_nodes = set()
+
+        for role, nodes in match_result.get("role_mapping", {}).items():
+            if role in trigger_roles:
+                continue
+            for node in nodes:
+                if node not in (None, ""):
+                    non_trigger_nodes.add(node)
+
+        return non_trigger_nodes
+
+    def _expand_matches_with_pending_context(self, matches, node_rule_helper):
+        """只读扩充当前批次：汇总整批非 trigger 节点上的 pending，再和当前批统一做一次批内合并。"""
+        if not matches:
+            return matches
+
+        non_trigger_nodes = set()
+        for match_result in matches:
+            non_trigger_nodes.update(self._get_non_trigger_nodes_for_match(match_result))
+
+        if not non_trigger_nodes:
+            return matches
+
+        with self._lock:
+            pending_candidates = [
+                ((node, rule_name), trigger_anchor)
+                for (node, rule_name), trigger_anchor in self.pending_triggers.items()
+                if node in non_trigger_nodes
+            ]
+
+        if not pending_candidates:
+            return matches
+
+        extra_matches = []
+        for (node, rule_name), trigger_anchor in pending_candidates:
+            rule = self.rules.get(rule_name)
+            if not rule:
+                continue
+            trigger_ts, _trigger_seq = trigger_anchor
+            results = self._evaluate_rule(
+                rule_name,
+                rule,
+                node,
+                trigger_ts,
+                node_rule_helper=node_rule_helper
+            )
+            if results:
+                extra_matches.extend(results)
+
+        if not extra_matches:
+            return matches
+
+        return merge_match_batch(list(matches) + extra_matches)
 
     def _evaluate_rule(self, rule_name, rule, trigger_node, trigger_ts, node_rule_helper=None):
         """
