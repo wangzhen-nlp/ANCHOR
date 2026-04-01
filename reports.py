@@ -53,7 +53,9 @@ def generate_incident_report(match_result):
     for sym in symptoms_sorted:
         ts_str = datetime.fromtimestamp(sym["ts"]).strftime('%H:%M:%S')
         role_tag = f"[{sym.get('matched_role', 'UNKNOWN')}]"
-        print(f"   [{ts_str}] {role_tag:<28} | 节点: {sym['node']:<15} | 告警: {sym['alarm']}")
+        alarm_source = sym.get("alarm_source", "")
+        device_str = alarm_source if alarm_source else "-"
+        print(f"   [{ts_str}] {role_tag:<28} | 节点: {sym['node']:<15} | 设备: {device_str:<20} | 告警: {sym['alarm']}")
 
     print("=" * 60 + "\n")
 

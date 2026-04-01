@@ -4,6 +4,7 @@ import threading
 
 from datetime import datetime
 from argparse import ArgumentParser
+from collections import defaultdict
 
 from alarm_inputs import (
     build_ne_to_site_map,
@@ -40,9 +41,27 @@ def _stream_alarms_by_ts(valid_alarms, speedup=1.0):
         previous_ts = current_ts
 
 
+def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_str, is_clear=False):
+    dt_obj = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S")
+    event_alarm = dict(alarm)
+    event_alarm["告警首次发生时间"] = event_time_str
+    if is_clear:
+        event_alarm["清除告警"] = "是"
+
+    valid_alarms.append({
+        "alarm": event_alarm,
+        "site_id": site_id,
+        "alarm_source": alarm.get("告警源", ""),
+        "alarm_title": alarm_title,
+        "ts": dt_obj.timestamp()
+    })
+
+
 def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_site):
     processed_count = 0
     valid_alarms = []
+    normal_alarm_count = 0
+    clear_alarm_count = 0
 
     for alarm in stream_alarm_inputs(alarm_file_path, show_progress=True):
         processed_count += 1
@@ -59,21 +78,36 @@ def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_s
         if not site_id or site_id not in valid_sites:
             continue
 
-        dt_obj = datetime.strptime(alarm["告警首次发生时间"], "%Y-%m-%d %H:%M:%S")
-        valid_alarms.append({
-            "alarm": alarm,
-            "site_id": site_id,
-            "alarm_title": alarm_title,
-            "ts": dt_obj.timestamp()
-        })
+        _append_alarm_event(
+            valid_alarms,
+            alarm,
+            site_id,
+            alarm_title,
+            alarm["告警首次发生时间"],
+            is_clear=False
+        )
+        normal_alarm_count += 1
 
-    return processed_count, valid_alarms
+        clear_time_str = str(alarm.get("告警清除时间", "")).strip()
+        if clear_time_str:
+            _append_alarm_event(
+                valid_alarms,
+                alarm,
+                site_id,
+                alarm_title,
+                clear_time_str,
+                is_clear=True
+            )
+            clear_alarm_count += 1
+
+    return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
 
 
 def _process_alarm(engine, item, collect_matches=False):
     alarm = item["alarm"]
     return engine.process_event(
         node=item["site_id"],
+        alarm_source=item.get("alarm_source", ""),
         alarm_type=item["alarm_title"],
         ts=item["ts"],
         event_id=alarm["告警编码ID"],
@@ -95,6 +129,139 @@ def _build_simulated_now_ts_getter(valid_alarms, speedup):
         return simulated_start_ts + elapsed_real_sec * speedup
 
     return get_now_ts
+
+
+def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data):
+    ne_graph_entry = ne_graph_data.get(ne_id, {})
+    raw_links = ne_graph_entry.get("link", {}) if isinstance(ne_graph_entry, dict) else {}
+    link_info = {}
+
+    for neighbor_id, link_meta in raw_links.items():
+        if neighbor_id not in group_ne_ids:
+            continue
+
+        if isinstance(link_meta, dict):
+            connection_types = sorted(str(link_type) for link_type in link_meta.keys())
+            topologies = sorted({str(direction) for direction in link_meta.values() if direction})
+        else:
+            connection_types = [str(link_meta)]
+            topologies = []
+
+        link_info[neighbor_id] = {
+            "connection_type": ",".join(connection_types),
+            "distance": "",
+            "topology": ",".join(topologies),
+            "time_window": "",
+            "left_alarm": {},
+            "right_alarm": {},
+        }
+
+    return link_info
+
+
+def _build_group_output(match, ne_graph_data):
+    group_id = match.get("uuid", "")
+    ne_info = {}
+    ne_alarms = defaultdict(list)
+    group_site_ids = set()
+
+    for nodes in match.get("role_mapping", {}).values():
+        for site_id in nodes:
+            if site_id:
+                group_site_ids.add(site_id)
+
+    for symptom in match.get("symptoms", []):
+        site_id = symptom.get("node", "")
+        ne_id = symptom.get("alarm_source")
+        if not ne_id:
+            continue
+
+        ne_graph_entry = ne_graph_data.get(ne_id, {})
+        if site_id:
+            group_site_ids.add(site_id)
+
+        ne_alarms[ne_id].append({
+            "alarm_id": symptom.get("eid", ""),
+            "alarm_type": symptom.get("alarm", ""),
+            "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
+            "domain": ne_graph_entry.get("domain", ""),
+            "site_id": site_id,
+            "site_name": ne_graph_entry.get("site_name", ""),
+            "matched_role": symptom.get("matched_role", ""),
+        })
+
+    group_ne_ids = sorted({
+        ne_id
+        for ne_id, ne_graph_entry in ne_graph_data.items()
+        if ne_graph_entry.get("site_id", "") in group_site_ids
+    } | set(ne_alarms.keys()))
+
+    for ne_id in group_ne_ids:
+        ne_graph_entry = ne_graph_data.get(ne_id, {})
+        site_id = ne_graph_entry.get("site_id", "")
+        if site_id:
+            group_site_ids.add(site_id)
+
+        ne_info[ne_id] = {
+            "alarm": ne_alarms.get(ne_id, []),
+            "link": _build_group_link_info(ne_id, set(group_ne_ids), ne_graph_data),
+            "group": group_id,
+            "name": ne_graph_entry.get("name", ne_id),
+            "site_id": site_id,
+            "site_name": ne_graph_entry.get("site_name", ""),
+            "type": str(ne_graph_entry.get("type", "")).upper(),
+            "network_type": str(ne_graph_entry.get("network_type", "")).upper(),
+            "manufacturer": str(ne_graph_entry.get("manufacturer", "")).upper(),
+            "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
+            "domain": str(ne_graph_entry.get("domain", "")).upper(),
+            "region_id": ne_graph_entry.get("region_id", ""),
+            "longitude": ne_graph_entry.get("longitude", ""),
+            "latitude": ne_graph_entry.get("latitude", ""),
+        }
+
+    return {
+        "match_info": {
+            "uuid": match.get("uuid", ""),
+            "rule": match.get("rule", ""),
+            "merged_rules": match.get("merged_rules", []),
+            "related_group_uuids": match.get("related_group_uuids", []),
+            "inferred_roots": match.get("inferred_roots", {}),
+            "role_mapping": match.get("role_mapping", {}),
+        },
+        "ne_info": ne_info,
+        "group_info": {
+            group_id: {
+                "ne_list": group_ne_ids,
+                "site_list": sorted(group_site_ids),
+            }
+        }
+    }
+
+
+def _merge_group_output(aggregated_output, group_output):
+    aggregated_output["group_info"].update(group_output.get("group_info", {}))
+
+    group_info = next(iter(group_output.get("group_info", {}).values()), {})
+    group_ne_ids = set(group_info.get("ne_list", []))
+    match_info = group_output.get("match_info", {})
+    group_id = match_info.get("uuid", "")
+
+    for ne_id, ne_data in group_output.get("ne_info", {}).items():
+        aggregated_ne_id = f"{group_id}::{ne_id}" if group_id else ne_id
+        aggregated_ne_data = dict(ne_data)
+        aggregated_ne_data["group"] = group_id
+
+        link_info = {}
+        for neighbor_id, link_data in ne_data.get("link", {}).items():
+            if neighbor_id not in group_ne_ids:
+                continue
+            aggregated_neighbor_id = f"{group_id}::{neighbor_id}" if group_id else neighbor_id
+            link_info[aggregated_neighbor_id] = link_data
+        aggregated_ne_data["link"] = link_info
+
+        aggregated_output["ne_info"][aggregated_ne_id] = aggregated_ne_data
+
+    aggregated_output["match_info"][group_id] = match_info
 
 
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
@@ -137,6 +304,8 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
+    parser.add_argument('--output-format', type=str, choices=('jsonl', 'propagation-json'), default='jsonl',
+                        help='jsonl: 每行一个原始故障组; propagation-json: 输出单个传播图 JSON 文件')
     parser.add_argument('--topo', type=str, default='site_graph_by_ne.json')
     parser.add_argument('--site-domain', type=str, default='site_device_counts.json')
     parser.add_argument('--ne-graph', type=str, default='ne_graph.json', help='ne_graph.json 文件')
@@ -147,6 +316,7 @@ def main():
 
     topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
+    ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
 
     print("加载有效站点集合...")
     valid_sites = load_site_graph(args.topo)
@@ -170,7 +340,7 @@ def main():
     alarm_file_path = args.alarms
     start_time = time.time()
 
-    processed_count, valid_alarms = _load_valid_alarms(
+    processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = _load_valid_alarms(
         alarm_file_path,
         valid_alarm_titles,
         valid_sites,
@@ -183,25 +353,34 @@ def main():
     sort_elapsed = time.time() - sort_start_time
     filtered_count = len(valid_alarms)
     print(f"有效告警数: {filtered_count}，排序耗时: {sort_elapsed:.4f} 秒")
+    print(f"正常告警数: {normal_alarm_count}，清除告警数: {clear_alarm_count}")
 
     speedup = max(float(args.speedup), 1e-9)
     real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
 
     match_count = 0
     output_lock = threading.Lock()
+    aggregated_output = {"ne_info": {}, "group_info": {}, "match_info": {}}
 
-    # 输出改为 jsonl 追加写，避免把全部故障组长期堆在内存里。
-    with open(args.output, 'w', encoding='utf-8'):
-        pass
+    if args.output_format == 'jsonl':
+        # 默认输出为 jsonl，避免把全部故障组长期堆在内存里。
+        with open(args.output, 'w', encoding='utf-8'):
+            pass
 
     def on_matches(matches):
-        # 统一处理一批新产出的故障组：边输出报告，边按 jsonl 追加落盘。
+        # 统一处理一批新产出的故障组：边输出报告，边按指定格式落盘。
         nonlocal match_count
         with output_lock:
-            with open(args.output, 'a', encoding='utf-8') as fw:
+            if args.output_format == 'jsonl':
+                with open(args.output, 'a', encoding='utf-8') as fw:
+                    for match in matches:
+                        generate_incident_report(match)
+                        fw.write(json.dumps(match, ensure_ascii=False) + '\n')
+            else:
                 for match in matches:
                     generate_incident_report(match)
-                    fw.write(json.dumps(match, ensure_ascii=False) + '\n')
+                    group_output = _build_group_output(match, ne_graph_data)
+                    _merge_group_output(aggregated_output, group_output)
             match_count += len(matches)
 
     process_progress = ProgressBar(filtered_count, "处理有效告警")
@@ -224,6 +403,10 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")
+
+    if args.output_format == 'propagation-json':
+        with open(args.output, 'w', encoding='utf-8') as fw:
+            json.dump(aggregated_output, fw, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

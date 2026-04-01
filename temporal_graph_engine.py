@@ -33,7 +33,7 @@ class TemporalGraphEngine:
             for down in downs:
                 self.topo_up[down].append(up)
 
-        # 状态缓存: { node: deque([(ts, event_id, alarm_type)]) }
+        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source)]) }
         self.event_cache = collections.defaultdict(collections.deque)
         self.global_ttl = 3600
 
@@ -98,7 +98,7 @@ class TemporalGraphEngine:
         # 当 heap 脏条目过多时触发重建的倍率阈值
         self._pending_heap_rebuild_factor = 3
 
-    def process_event(self, node, alarm_type, ts, event_id, is_clear=False, collect_matches=False):
+    def process_event(self, node, alarm_type, ts, event_id, alarm_source="", is_clear=False, collect_matches=False):
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
         with self._lock:
@@ -117,7 +117,7 @@ class TemporalGraphEngine:
                 self._remove_cleared_trigger_events(node, event_id)
                 self._refresh_pending_triggers_for_node(node)
             else:
-                q.append((ts, event_id, alarm_type))
+                q.append((ts, event_id, alarm_type, alarm_source))
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear:
@@ -347,10 +347,10 @@ class TemporalGraphEngine:
         q = self.event_cache[node]
         kept = collections.deque()
 
-        for cached_ts, cached_eid, cached_alarm_type in q:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source in q:
             if event_id and cached_eid == event_id:
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source))
 
         self.event_cache[node] = kept
 
@@ -362,12 +362,12 @@ class TemporalGraphEngine:
 
         removed_event_ids = set()
         kept = collections.deque()
-        for cached_ts, cached_eid, cached_alarm_type in q:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source in q:
             if cached_alarm_type == alarm_type and cached_ts <= cutoff_ts:
                 if cached_eid not in (None, ""):
                     removed_event_ids.add(cached_eid)
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source))
         self.event_cache[node] = kept
 
         if not removed_event_ids:

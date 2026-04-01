@@ -13,8 +13,8 @@ class NodeRuleHelper:
     def events_in_window(self, physical_node, reference_ts, edge_window):
         """获取某个节点在指定时间窗口内的缓存事件。"""
         return [
-            {"node": physical_node, "ts": ts, "eid": eid, "alarm": alarm}
-            for ts, eid, alarm in self.event_getter(physical_node)
+            {"node": physical_node, "ts": ts, "eid": eid, "alarm": alarm, "alarm_source": alarm_source}
+            for ts, eid, alarm, alarm_source in self.event_getter(physical_node)
             if abs(reference_ts - ts) <= edge_window
         ]
 
