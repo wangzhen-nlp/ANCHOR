@@ -849,6 +849,33 @@
             color: #57606a;
         }
 
+        .alarm-timeline {
+            margin-top: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .alarm-timeline-item {
+            padding: 8px 10px;
+            background: #f6f8fa;
+            border: 1px solid #d8dee4;
+            border-radius: 8px;
+        }
+
+        .alarm-timeline-time {
+            color: #57606a;
+            font-size: 11px;
+            margin-bottom: 3px;
+        }
+
+        .alarm-timeline-title {
+            color: #cf222e;
+            font-size: 12px;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
         /* Domain 图例样式 */
         .legend {
             position: absolute;
@@ -2931,14 +2958,6 @@
         function showNodeAlarms(nodeId) {
             const node = allNodes.find(function(n) { return n.id === nodeId; });
             if (!node) return;
-
-            // 显示节点详情面板
-            showDetailPanel(nodeId);
-
-            // 如果有告警，显示告警弹窗
-            if (node.alarm && node.alarm.length > 0) {
-                showAlarmPopup(node);
-            }
         }
 
         // 显示告警弹窗（非模态）
@@ -3711,7 +3730,7 @@
                 return '<div class="node-item ' + (n.id === highlightId ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
-                        '<div class="ne-id">' + n.id + '</div>' +
+                        '<div class="ne-id">' + getRawNodeId(n) + '</div>' +
                         '<div class="site-name">' + (n.site_id || '-') + ' | ' + style.label + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
                     '</div>' +
@@ -3764,51 +3783,8 @@
         }
 
         function showDetailPanel(nodeId) {
-            const node = allNodes.find(function(n) { return n.id === nodeId; });
-            if (!node) return;
-
             const panel = document.getElementById('detailPanel');
-            const title = document.getElementById('detailPanelTitle');
-            const content = document.getElementById('detailContent');
-            
-            title.textContent = '节点详情';
-            const domain = node.domain || '';
-            const style = getDomainStyle(domain);
-
-            let locationHtml = '';
-            if (hasValidCoords(node)) {
-                locationHtml = '<div class="detail-row"><span class="key">纬度:</span><span class="value" style="color: #0969da;">' + parseFloat(node.latitude).toFixed(6) + '°</span></div>' +
-                    '<div class="detail-row"><span class="key">经度:</span><span class="value" style="color: #0969da;">' + parseFloat(node.longitude).toFixed(6) + '°</span></div>';
-            }
-
-            // 告警类型列表
-            let alarmTypesHtml = '';
-            if (node.alarm_types && node.alarm_types.length > 0) {
-                alarmTypesHtml = '<div class="detail-row" style="align-items: flex-start;"><span class="key">告警类型:</span><span class="value" style="color: #cf222e;">' + node.alarm_types.join(', ') + '</span></div>';
-            } else if (node.alarm && node.alarm.length > 0) {
-                const types = [];
-                node.alarm.forEach(function(a) {
-                    if (a.alarm_type && types.indexOf(a.alarm_type) === -1) {
-                        types.push(a.alarm_type);
-                    }
-                });
-                if (types.length > 0) {
-                    alarmTypesHtml = '<div class="detail-row" style="align-items: flex-start;"><span class="key">告警类型:</span><span class="value" style="color: #cf222e;">' + types.join(', ') + '</span></div>';
-                }
-            }
-
-            content.innerHTML = '<div class="detail-row"><span class="key">NE ID:</span><span class="value">' + getRawNodeId(node) + '</span></div>' +
-                '<div class="detail-row"><span class="key">名称:</span><span class="value">' + (node.name || '-') + '</span></div>' +
-                '<div class="detail-row"><span class="key">站点:</span><span class="value">' + (node.site_id || '-') + '</span></div>' +
-                '<div class="detail-row"><span class="key">Domain:</span><span class="value" style="color: ' + style.color + '; font-weight: bold;">' + style.symbol + ' ' + style.label + '</span></div>' +
-                '<div class="detail-row"><span class="key">类型:</span><span class="value">' + (node.network_type || node.type || '-') + '</span></div>' +
-                '<div class="detail-row"><span class="key">厂商:</span><span class="value">' + (node.manufacturer || '-') + '</span></div>' +
-                '<div class="detail-row"><span class="key">Group:</span><span class="value">' + (node.group || '-') + '</span></div>' +
-                locationHtml +
-                '<div class="detail-row"><span class="key">告警数:</span><span class="value" style="color: ' + (node.alarm_count > 3 ? '#cf222e' : (node.alarm_count > 0 ? '#d29922' : '#2da44e')) + '">' + node.alarm_count + '</span></div>' +
-                alarmTypesHtml +
-                (node.alarm && node.alarm.length > 0 ? '<div class="detail-row" style="margin-top: 8px;"><span class="key"></span><span class="value" style="color: #0969da; cursor: pointer; text-decoration: underline;" onclick="showAlarmPopup(allNodes.find(function(n){return n.id===\'' + node.id + '\'}))">点击查看详细告警</span></div>' : '');
-            panel.classList.add('show');
+            panel.classList.remove('show');
         }
 
         // 缩放控制
