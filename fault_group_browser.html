@@ -105,6 +105,31 @@
             font-size: 13px;
             font-weight: 600;
         }
+        .duration-filter-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .duration-filter-input {
+            width: 84px;
+            padding: 10px 12px;
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+            background: #fff;
+            color: #1f2937;
+            font-size: 14px;
+        }
+        .duration-filter-input:focus {
+            outline: none;
+            border-color: #0969da;
+            box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
+        }
+        .duration-filter-text {
+            color: #475467;
+            font-size: 13px;
+            font-weight: 600;
+        }
         .list {
             margin-top: 22px;
             display: grid;
@@ -218,6 +243,17 @@
                 <span class="site-filter-label">站点过滤</span>
                 <input id="siteFilterInput" class="site-filter-input" type="text" placeholder="输入站点ID，支持包含匹配">
             </div>
+            <div class="filter-row">
+                <span class="site-filter-label">时间范围大于</span>
+                <div class="duration-filter-group">
+                    <input id="durationHoursInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="时">
+                    <span class="duration-filter-text">时</span>
+                    <input id="durationMinutesInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="分">
+                    <span class="duration-filter-text">分</span>
+                    <input id="durationSecondsInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="秒">
+                    <span class="duration-filter-text">秒</span>
+                </div>
+            </div>
             <div class="status" id="status">尚未加载文件</div>
         </div>
 
@@ -229,6 +265,7 @@
         let faultGroups = [];
         let activeFilters = new Set(['all']);
         let siteFilterQuery = '';
+        let durationFilterSeconds = 0;
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -257,6 +294,19 @@
             };
 
             return `${formatTs(timestamps[0])} ~ ${formatTs(timestamps[timestamps.length - 1])}`;
+        }
+
+        function getGroupDurationSeconds(group) {
+            const symptoms = group.symptoms || [];
+            const timestamps = symptoms
+                .map(symptom => symptom && symptom.ts)
+                .filter(ts => ts !== null && ts !== undefined)
+                .sort((a, b) => a - b);
+
+            if (timestamps.length < 2) {
+                return 0;
+            }
+            return timestamps[timestamps.length - 1] - timestamps[0];
         }
 
         function getGroupRuleText(group) {
@@ -338,6 +388,10 @@
                     if (!siteList.some(site => String(site).toLowerCase().includes(query))) {
                         return false;
                     }
+                }
+
+                if (durationFilterSeconds > 0 && getGroupDurationSeconds(group) <= durationFilterSeconds) {
+                    return false;
                 }
                 return true;
             });
@@ -459,6 +513,18 @@
             siteFilterQuery = event.target.value.trim();
             renderGroups();
         });
+
+        function updateDurationFilter() {
+            const hours = parseInt(document.getElementById('durationHoursInput').value || '0', 10) || 0;
+            const minutes = parseInt(document.getElementById('durationMinutesInput').value || '0', 10) || 0;
+            const seconds = parseInt(document.getElementById('durationSecondsInput').value || '0', 10) || 0;
+            durationFilterSeconds = hours * 3600 + minutes * 60 + seconds;
+            renderGroups();
+        }
+
+        document.getElementById('durationHoursInput').addEventListener('input', updateDurationFilter);
+        document.getElementById('durationMinutesInput').addEventListener('input', updateDurationFilter);
+        document.getElementById('durationSecondsInput').addEventListener('input', updateDurationFilter);
     </script>
 </body>
 </html>
