@@ -804,6 +804,21 @@
             z-index: 1000 !important;
         }
 
+        .site-label-map {
+            color: #1f2937;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.2;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(9, 105, 218, 0.18);
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+            backdrop-filter: blur(4px);
+            white-space: nowrap;
+            pointer-events: none;
+        }
+
         .leaflet-popup-content-wrapper {
             background: #ffffff;
             color: #24292f;
@@ -1819,6 +1834,7 @@
         let mapPolylines = []; // 存储边引用，用于点击事件
         let showMapConnections = true;
         let mapDistanceLines = [];
+        let mapSiteOverlays = [];
 
         // Group 管理变量
         let activeGroups = new Set();
@@ -2455,6 +2471,14 @@
             L.control.zoom({
                 position: 'topright'
             }).addTo(map);
+
+            map.createPane('siteOverlayPane');
+            map.getPane('siteOverlayPane').style.zIndex = 320;
+            map.getPane('siteOverlayPane').style.pointerEvents = 'none';
+
+            map.createPane('siteLabelPane');
+            map.getPane('siteLabelPane').style.zIndex = 330;
+            map.getPane('siteLabelPane').style.pointerEvents = 'none';
         }
 
         function hasValidCoords(node) {
@@ -2462,6 +2486,102 @@
                    node.longitude !== undefined && 
                    !isNaN(parseFloat(node.latitude)) && 
                    !isNaN(parseFloat(node.longitude));
+        }
+
+        function getSiteDisplayName(node) {
+            return node.site_name || node.site_id || node.name || node.id || '未知站点';
+        }
+
+        function getCurrentSiteLocations() {
+            const siteMap = new Map();
+
+            currentNodes.forEach(function(node) {
+                if (!hasValidCoords(node)) return;
+
+                const siteId = node.site_id || '';
+                const siteName = node.site_name || '';
+                const siteKey = siteId || siteName;
+                if (!siteKey) return;
+
+                const lat = parseFloat(node.latitude);
+                const lng = parseFloat(node.longitude);
+                const existing = siteMap.get(siteKey);
+
+                if (existing) {
+                    existing.latSum += lat;
+                    existing.lngSum += lng;
+                    existing.count += 1;
+                } else {
+                    siteMap.set(siteKey, {
+                        siteId: siteId,
+                        siteName: siteName || getSiteDisplayName(node),
+                        latSum: lat,
+                        lngSum: lng,
+                        count: 1
+                    });
+                }
+            });
+
+            return Array.from(siteMap.values()).map(function(site) {
+                return {
+                    siteId: site.siteId,
+                    siteName: site.siteName,
+                    latitude: site.latSum / site.count,
+                    longitude: site.lngSum / site.count,
+                    deviceCount: site.count
+                };
+            });
+        }
+
+        function renderSiteOverlays() {
+            mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
+            mapSiteOverlays = [];
+
+            if (!map) return;
+
+            const sites = getCurrentSiteLocations();
+            sites.forEach(function(site) {
+                const latlng = [site.latitude, site.longitude];
+                const radius = Math.min(36, 18 + Math.max(0, site.deviceCount - 1) * 2);
+
+                const halo = L.circleMarker(latlng, {
+                    pane: 'siteOverlayPane',
+                    radius: radius,
+                    stroke: true,
+                    color: '#0969da',
+                    weight: 1.5,
+                    opacity: 0.28,
+                    fillColor: '#0969da',
+                    fillOpacity: 0.07,
+                    interactive: false
+                }).addTo(map);
+
+                const core = L.circleMarker(latlng, {
+                    pane: 'siteOverlayPane',
+                    radius: 5,
+                    stroke: false,
+                    fillColor: '#0969da',
+                    fillOpacity: 0.22,
+                    interactive: false
+                }).addTo(map);
+
+                const label = L.marker(latlng, {
+                    pane: 'siteLabelPane',
+                    interactive: false,
+                    keyboard: false,
+                    zIndexOffset: -1000,
+                    icon: L.divIcon({
+                        className: 'site-label-container',
+                        html: '<div class="site-label-map">' + (site.siteName || site.siteId || '未知站点') + '</div>',
+                        iconSize: null,
+                        iconAnchor: [-8, 14]
+                    })
+                }).addTo(map);
+
+                mapSiteOverlays.push(halo);
+                mapSiteOverlays.push(core);
+                mapSiteOverlays.push(label);
+            });
         }
 
         // 获取 SVG 形状路径
@@ -2510,6 +2630,8 @@
             mapPolylines = [];
             mapDistanceLines.forEach(function(line) { map.removeLayer(line); });
             mapDistanceLines = [];
+            mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
+            mapSiteOverlays = [];
 
             const geoNodes = currentNodes.filter(function(n) { return hasValidCoords(n); });
             
@@ -2521,6 +2643,8 @@
             // 获取扰动后的坐标（距离相近的节点会被错开）
             const jitterResult = getJitteredCoords();
             const jitteredCoords = jitterResult.coords;
+
+            renderSiteOverlays();
             
             // 显示/隐藏扰动指示器，并显示错开的节点数量
             const jitterIndicator = document.getElementById('jitterIndicator');
