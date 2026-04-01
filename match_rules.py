@@ -471,8 +471,14 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
         datetime.fromtimestamp(watermark).strftime("%Y-%m-%d %H:%M:%S")
         if watermark is not None else "-"
     )
+    effective_harvest_ts = snapshot.get("effective_harvest_ts")
+    effective_harvest_str = (
+        datetime.fromtimestamp(effective_harvest_ts).strftime("%Y-%m-%d %H:%M:%S")
+        if effective_harvest_ts is not None else "-"
+    )
     print(
         f"🔎 收割阶段快照: watermark={watermark_str}, "
+        f"effective_harvest_ts={effective_harvest_str}, "
         f"force={snapshot.get('force', False)}"
     )
     if mature_triggers:

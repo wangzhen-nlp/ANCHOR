@@ -252,6 +252,7 @@ class TemporalGraphEngine:
     def _collect_mature_pending_locked(self, force=False):
         """在锁内摘取当前已成熟的 pending trigger。"""
         mature_items = []
+        effective_harvest_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
 
         if force:
             for trigger_key, trigger_anchor in list(self.pending_triggers.items()):
@@ -261,7 +262,7 @@ class TemporalGraphEngine:
 
         while self.pending_trigger_heap:
             ready_ts, first_trigger_ts, trigger_seq, trigger_key = self.pending_trigger_heap[0]
-            if ready_ts > self.current_watermark:
+            if ready_ts > effective_harvest_ts:
                 break
 
             heapq.heappop(self.pending_trigger_heap)
@@ -305,12 +306,14 @@ class TemporalGraphEngine:
         with self._lock:
             self._prune_expired_state_locked(self.latest_arrived_event_ts)
             current_watermark = self.current_watermark
+            effective_harvest_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
             finalized_matches = self._finalize_matches_with_history(expanded_matches)
 
         if self.debug_observer:
             self.debug_observer({
                 "force": force,
                 "watermark": current_watermark,
+                "effective_harvest_ts": effective_harvest_ts,
                 "mature_items": [
                     {
                         "node": trigger_key[0],
