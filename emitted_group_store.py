@@ -58,12 +58,13 @@ class EmittedGroupStore:
 
         merged_group_indexes = set()
         related_group_uuids = set()
-        historical_alarm_keys = set()
+        fully_containing_history_exists = False
         for idx, item in related_groups:
             merged_group_indexes.add(idx)
             previous_match = item["match"]
             previous_alarm_keys = self._get_alarm_keys(previous_match.get("symptoms", []))
-            historical_alarm_keys.update(previous_alarm_keys)
+            if current_alarm_keys.issubset(previous_alarm_keys):
+                fully_containing_history_exists = True
             previous_uuid = previous_match.get("uuid")
             if previous_uuid:
                 related_group_uuids.add(previous_uuid)
@@ -89,7 +90,7 @@ class EmittedGroupStore:
                     symptom_map[alarm_key] = symptom
             merged["symptoms"] = list(symptom_map.values())
 
-        if current_alarm_keys.issubset(historical_alarm_keys):
+        if fully_containing_history_exists:
             return merged, merged_group_indexes, related_group_uuids, False
 
         return merged, merged_group_indexes, related_group_uuids, True
