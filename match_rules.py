@@ -103,6 +103,19 @@ def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_s
     return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
 
 
+def _trim_trailing_clear_alarms(valid_alarms):
+    """删除尾部仅由清除告警组成的区段。"""
+    last_non_clear_index = -1
+    for idx, item in enumerate(valid_alarms):
+        if not _is_clear_alarm(item.get("alarm", {})):
+            last_non_clear_index = idx
+
+    if last_non_clear_index < 0:
+        return []
+
+    return valid_alarms[: last_non_clear_index + 1]
+
+
 def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
     alarm = item["alarm"]
     return engine.process_event(
@@ -650,6 +663,7 @@ def main():
     print("⏳ 正在按时间排序有效告警...")
     sort_start_time = time.time()
     valid_alarms.sort(key=lambda item: item["ts"])
+    valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
     sort_elapsed = time.time() - sort_start_time
     filtered_count = len(valid_alarms)
     print(f"有效告警数: {filtered_count}，排序耗时: {sort_elapsed:.4f} 秒")
