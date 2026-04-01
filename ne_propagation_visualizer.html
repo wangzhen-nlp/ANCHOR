@@ -2958,6 +2958,10 @@
         function showNodeAlarms(nodeId) {
             const node = allNodes.find(function(n) { return n.id === nodeId; });
             if (!node) return;
+
+            if (node.alarm && node.alarm.length > 0) {
+                showAlarmPopup(node);
+            }
         }
 
         // 显示告警弹窗（非模态）
