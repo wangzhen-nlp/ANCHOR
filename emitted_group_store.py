@@ -48,6 +48,7 @@ class EmittedGroupStore:
         merged = {
             "uuid": match_result.get("uuid"),
             "rule": match_result.get("rule"),
+            "merged_rules": list(match_result.get("merged_rules", [match_result.get("rule")])),
             "inferred_roots": copy.deepcopy(match_result.get("inferred_roots", {})),
             "role_mapping": copy.deepcopy(match_result.get("role_mapping", {})),
             "symptoms": list(match_result.get("symptoms", []))
@@ -66,6 +67,9 @@ class EmittedGroupStore:
             previous_uuid = previous_match.get("uuid")
             if previous_uuid:
                 related_group_uuids.add(previous_uuid)
+            related_group_uuids.update(previous_match.get("related_group_uuids", []))
+            previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
+            merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
             for role, nodes in previous_match.get("inferred_roots", {}).items():
                 merged["inferred_roots"].setdefault(role, [])
                 merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))

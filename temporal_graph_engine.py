@@ -33,7 +33,7 @@ class TemporalGraphEngine:
             for down in downs:
                 self.topo_up[down].append(up)
 
-        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source)]) }
+        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_as_trigger)]) }
         self.event_cache = collections.defaultdict(collections.deque)
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
@@ -120,7 +120,7 @@ class TemporalGraphEngine:
                 self._remove_cleared_trigger_events(node, event_id)
                 self._refresh_pending_triggers_for_node(node)
             else:
-                q.append((ts, event_id, alarm_type, alarm_source))
+                q.append((ts, event_id, alarm_type, alarm_source, False))
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear:
@@ -353,27 +353,28 @@ class TemporalGraphEngine:
         q = self.event_cache[node]
         kept = collections.deque()
 
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source in q:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger in q:
             if event_id and cached_eid == event_id:
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger))
 
         self.event_cache[node] = kept
 
     def _prune_node_alarm_history_before(self, node, alarm_type, cutoff_ts):
-        """删除某节点同告警名下不晚于 cutoff_ts 的缓存与 trigger 候选。"""
+        """把某节点同告警名下不晚于 cutoff_ts 的事件打上 consumed_as_trigger 并移出 trigger 候选。"""
         q = self.event_cache.get(node)
         if not q:
             return
 
         removed_event_ids = set()
         kept = collections.deque()
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source in q:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger in q:
             if cached_alarm_type == alarm_type and cached_ts <= cutoff_ts:
                 if cached_eid not in (None, ""):
                     removed_event_ids.add(cached_eid)
+                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, True))
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger))
         self.event_cache[node] = kept
 
         if not removed_event_ids:
@@ -591,7 +592,12 @@ class TemporalGraphEngine:
         # 3. 校验触发节点自身
         trigger_node_domain = self.sites_domain_map.get(trigger_node, {})
         is_trig_valid, trig_evts = helper.validate_node(
-            trigger_node, trigger_node_domain, nodes_cfg[trigger_role], trigger_ts, edge_window=0
+            trigger_node,
+            trigger_node_domain,
+            nodes_cfg[trigger_role],
+            trigger_ts,
+            edge_window=0,
+            exclude_consumed_trigger=True
         )
         if not is_trig_valid:
             return []
@@ -658,7 +664,12 @@ class TemporalGraphEngine:
                         else:
                             cand_phys_domain = self.sites_domain_map.get(cand_phys, {})
                             is_valid, evts = helper.validate_node(
-                                cand_phys, cand_phys_domain, tgt_cfg, ref_ts, edge["win"]
+                                cand_phys,
+                                cand_phys_domain,
+                                tgt_cfg,
+                                ref_ts,
+                                edge["win"],
+                                exclude_consumed_trigger=(tgt_role == trigger_role)
                             )
                             validation_cache[cache_key] = (is_valid, evts)
 
