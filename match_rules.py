@@ -141,7 +141,7 @@ def main():
     parser.add_argument('--site-domain', type=str, default='site_device_counts.json')
     parser.add_argument('--ne-graph', type=str, default='ne_graph.json', help='ne_graph.json 文件')
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='live', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
-    parser.add_argument('--harvest-interval-sec', type=float, default=10.0, help='模拟时间下的定时收割周期，单位秒')
+    parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     args = parser.parse_args()
 

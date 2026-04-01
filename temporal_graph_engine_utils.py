@@ -93,9 +93,6 @@ def merge_match_component(component_matches):
             symptom_map[alarm_key] = symptom
 
         related_group_uuids.update(source.get("related_group_uuids", []))
-        existing_uuid = source.get("uuid")
-        if existing_uuid:
-            related_group_uuids.add(existing_uuid)
 
     merged["symptoms"] = list(symptom_map.values())
     if related_group_uuids:
