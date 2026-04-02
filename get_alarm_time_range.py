@@ -49,14 +49,14 @@ def main():
     parser.add_argument(
         "--show-progress",
         action="store_true",
-        help="读取输入时显示进度"
+        help="读取输入时显示进度（当前默认已开启，仅保留兼容）"
     )
     args = parser.parse_args()
 
     field_stats = {field: _init_field_stats() for field in args.fields}
     processed_count = 0
 
-    for alarm in stream_alarm_inputs(args.alarms, show_progress=args.show_progress):
+    for alarm in stream_alarm_inputs(args.alarms, show_progress=True):
         processed_count += 1
         for field in args.fields:
             dt_obj = _parse_time(alarm.get(field))
