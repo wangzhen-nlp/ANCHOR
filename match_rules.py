@@ -510,7 +510,6 @@ def _print_debug_pending_eval_profiles(snapshot, debug_sites):
     if not profiles:
         return
 
-    print(f"   ↳ pending 弹出后 evaluate_rule 概况: {len(profiles)} 个")
     for idx, profile in enumerate(profiles, start=1):
         trigger_ts = profile.get("trigger_ts")
         trigger_time = (
@@ -518,16 +517,16 @@ def _print_debug_pending_eval_profiles(snapshot, debug_sites):
             if trigger_ts is not None else "-"
         )
         print(
-            f"      [{idx}] pending: "
+            f"   ↳ [{idx}] pending 弹出后: "
             f"site={profile.get('node', '')}, "
             f"rule={profile.get('rule', '')}, "
             f"trigger_time={trigger_time}, "
             f"trigger_seq={profile.get('trigger_seq', '')}"
         )
-        print(f"         evaluate_rule 原始候选组数: {profile.get('raw_match_count', 0)}")
+        print(f"      evaluate_rule 原始候选组数: {profile.get('raw_match_count', 0)}")
         raw_matches = profile.get("raw_matches", [])
         if not raw_matches:
-            print("         ↳ 未产出原始候选组")
+            print("      ↳ 未产出原始候选组")
             continue
         for match in raw_matches:
             _print_debug_match_details(match)
@@ -586,8 +585,7 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engi
             for item in mature_triggers
         ]
         print(f"   ↳ 本轮成熟 trigger: {json.dumps(mature_preview, ensure_ascii=False)}")
-
-    _print_debug_pending_eval_profiles(snapshot, debug_sites)
+        _print_debug_pending_eval_profiles(snapshot, debug_sites)
 
     stage_mapping = (
         ("原始候选组", raw_debug_matches),
