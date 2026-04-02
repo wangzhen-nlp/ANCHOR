@@ -209,6 +209,7 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 
 - 如果某条事件时间 `<=` 某个 `rule` 的 cutoff，就把该 `rule` 加进这条事件的 `consumed_trigger_rules`；
 - 同时只从该 `(node, rule)` 对应的 `trigger_event_index` 里移除这条事件；
+- 如果这些删除影响到了某个 `(node, rule)` 当前挂着的 pending，也只会刷新这个 `rule` 自己的 `pending_triggers` 锚点，不会把同站点其它 rule 的 pending 一起重算；
 - 后续 `validate_node()` 在校验 trigger 角色时，也只会排除“已被当前 rule 消费过”的事件。
 
 这样一条告警可以表现成：
