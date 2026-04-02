@@ -378,6 +378,7 @@ class TemporalGraphEngine:
 
         helper = self._build_snapshot_helper(event_cache_snapshot)
         raw_matches = []
+        pending_eval_profiles = []
         for trigger_key, trigger_anchor in mature_items:
             trig_node, trig_rule_name = trigger_key
             rule = self.rules[trig_rule_name]
@@ -389,6 +390,14 @@ class TemporalGraphEngine:
                 trigger_ts,
                 node_rule_helper=helper
             )
+            pending_eval_profiles.append({
+                "node": trig_node,
+                "rule": trig_rule_name,
+                "trigger_ts": trigger_ts,
+                "trigger_seq": trigger_anchor[1],
+                "raw_match_count": len(results),
+                "raw_matches": results,
+            })
             if results:
                 raw_matches.extend(results)
 
@@ -414,6 +423,7 @@ class TemporalGraphEngine:
                     }
                     for trigger_key, trigger_anchor in mature_items
                 ],
+                "pending_eval_profiles": pending_eval_profiles,
                 "raw_matches": raw_matches,
                 "batch_merged_matches": merged_matches,
                 "expanded_matches": expanded_matches,

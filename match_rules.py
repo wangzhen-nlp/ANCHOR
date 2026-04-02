@@ -473,6 +473,34 @@ def _print_debug_post_batch_state(engine, debug_sites):
         print(f"      pending={_format_debug_pending(engine, site_id)}")
 
 
+def _print_debug_pending_eval_profiles(snapshot, debug_sites):
+    profiles = [
+        profile
+        for profile in snapshot.get("pending_eval_profiles", [])
+        if profile.get("node") in debug_sites
+    ]
+    if not profiles:
+        return
+
+    print(f"   ↳ pending 弹出后 evaluate_rule 概况: {len(profiles)} 个")
+    for profile in profiles:
+        trigger_ts = profile.get("trigger_ts")
+        trigger_time = (
+            datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S")
+            if trigger_ts is not None else "-"
+        )
+        print(
+            "      "
+            f"site={profile.get('node', '')}, "
+            f"rule={profile.get('rule', '')}, "
+            f"trigger_time={trigger_time}, "
+            f"trigger_seq={profile.get('trigger_seq', '')}, "
+            f"raw_match_count={profile.get('raw_match_count', 0)}"
+        )
+        for match in profile.get("raw_matches", []):
+            _print_debug_match_details(match)
+
+
 def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine):
     debug_sites = {site_id for site_id, _alarm_name in debug_targets}
     raw_debug_matches = [
@@ -526,6 +554,8 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engi
             for item in mature_triggers
         ]
         print(f"   ↳ 本轮成熟 trigger: {json.dumps(mature_preview, ensure_ascii=False)}")
+
+    _print_debug_pending_eval_profiles(snapshot, debug_sites)
 
     stage_mapping = (
         ("原始候选组", raw_debug_matches),
