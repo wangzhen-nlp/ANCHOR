@@ -58,6 +58,13 @@
             color: #475467;
             font-size: 14px;
         }
+        .file-path {
+            margin-top: 8px;
+            color: #667085;
+            font-size: 13px;
+            word-break: break-all;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        }
         .filter-summary {
             margin-top: 8px;
             color: #667085;
@@ -261,6 +268,7 @@
                 </div>
             </div>
             <div class="status" id="status">尚未加载文件</div>
+            <div class="file-path" id="filePath">文件路径：-</div>
             <div class="filter-summary" id="filterSummary">过滤后 0 条</div>
         </div>
 
@@ -500,6 +508,8 @@
         document.getElementById('fileInput').addEventListener('change', function(event) {
             const file = event.target.files[0];
             if (!file) return;
+            const inputPath = event.target.value || file.webkitRelativePath || file.name || '-';
+            document.getElementById('filePath').textContent = `文件路径：${inputPath}`;
 
             const reader = new FileReader();
             reader.onload = function(e) {
