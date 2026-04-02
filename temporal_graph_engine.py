@@ -566,7 +566,10 @@ class TemporalGraphEngine:
             else:
                 self.trigger_event_index.pop(trigger_key, None)
 
-        self._refresh_pending_triggers_for_node(node)
+        self._refresh_pending_triggers_for_node(
+            node,
+            affected_rule_names=removed_event_ids_by_rule.keys()
+        )
 
     def _prune_consumed_alarm_history(self, matches):
         """在本轮定时收割结束时，只回收命中 trigger_role 的节点告警历史。"""
@@ -654,9 +657,14 @@ class TemporalGraphEngine:
             else:
                 self.trigger_event_index.pop(trigger_key, None)
 
-    def _refresh_pending_triggers_for_node(self, node):
-        """在清除事件后，重新校正该节点仍然有效的 pending 起点。"""
-        for rule_name, _ in self.trigger_specs_by_node.get(node, ()):
+    def _refresh_pending_triggers_for_node(self, node, affected_rule_names=None):
+        """在 trigger 候选被删除后，重新校正该节点对应 rule 的 pending 起点。"""
+        if affected_rule_names is None:
+            rule_names = [rule_name for rule_name, _ in self.trigger_specs_by_node.get(node, ())]
+        else:
+            rule_names = [rule_name for rule_name in affected_rule_names if rule_name]
+
+        for rule_name in rule_names:
             trigger_key = (node, rule_name)
             if trigger_key not in self.pending_triggers:
                 continue
