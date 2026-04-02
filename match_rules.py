@@ -440,6 +440,34 @@ def _format_debug_pending(engine, site_id):
     return json.dumps(pending, ensure_ascii=False)
 
 
+def _print_debug_pending_items(engine, site_id, header):
+    with engine._lock:
+        pending_items = [
+            ((node, rule_name), trigger_anchor)
+            for (node, rule_name), trigger_anchor in engine.pending_triggers.items()
+            if node == site_id
+        ]
+
+    if not pending_items:
+        print(f"{header}: 0 个")
+        return
+
+    print(f"{header}: {len(pending_items)} 个")
+    for idx, ((_node, rule_name), trigger_anchor) in enumerate(pending_items, start=1):
+        trigger_ts, _trigger_seq = trigger_anchor
+        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor)
+        print(
+            f"      [{idx}] pending: "
+            f"site={site_id}, "
+            f"rule={rule_name}, "
+            f"alarm={trigger_detail['alarm']}, "
+            f"eid={trigger_detail['eid']}, "
+            f"trigger_time={datetime.fromtimestamp(trigger_ts).strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"trigger_seq={trigger_detail['seq']}, "
+            f"ready_time={datetime.fromtimestamp(trigger_ts + engine.aggregation_wait_sec).strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+
 def _print_debug_match_details(match):
     print(
         "   ↳ 命中故障组: "
@@ -470,7 +498,7 @@ def _print_debug_post_batch_state(engine, debug_sites):
         print(f"   ↳ 本批完成后站点状态[{site_id}]")
         print(f"      event_cache={_format_debug_site_events(engine, site_id)}")
         print(f"      trigger_index={_format_debug_trigger_index(engine, site_id)}")
-        print(f"      pending={_format_debug_pending(engine, site_id)}")
+        _print_debug_pending_items(engine, site_id, "      pending")
 
 
 def _print_debug_pending_eval_profiles(snapshot, debug_sites):
@@ -709,7 +737,7 @@ def _run_debug_mode(
                     )
                     print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                     print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                    print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                    _print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
                 elif is_debug_site_power_alarm:
                     debug_site = item.get("site_id", "")
                     power_alarm = item.get("alarm_title", "")
@@ -729,7 +757,7 @@ def _run_debug_mode(
                     )
                     print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                     print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                    print(f"   ↳ 清除后 pending: {_format_debug_pending(engine, debug_site)}")
+                    _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
                 process_progress.update()
         finally:
             process_progress.close()
@@ -765,7 +793,7 @@ def _run_debug_mode(
                 )
                 print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                 print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                print(f"   ↳ 当前 pending: {_format_debug_pending(engine, debug_site)}")
+                _print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
                 if not matches:
                     print("   ↳ 当前触发点暂未产出故障组")
             elif is_debug_site_power_alarm:
@@ -787,7 +815,7 @@ def _run_debug_mode(
                 )
                 print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                 print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                print(f"   ↳ 清除后 pending: {_format_debug_pending(engine, debug_site)}")
+                _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
             if matches:
                 on_debug_matches(matches, "同步检查")
             process_progress.update()
