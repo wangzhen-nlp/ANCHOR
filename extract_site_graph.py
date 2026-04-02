@@ -17,7 +17,7 @@ from collections import defaultdict
 
 
 def _merge_fields_preserve_first(existing: dict, incoming: dict, entity_label: str, entity_id: str, source_label: str) -> dict:
-    """按字段合并记录；冲突时保留首个非空值并打印告警。"""
+    """按字段合并记录；冲突时优先保留字符更长的非空值。"""
     merged = dict(existing)
     for field, incoming_value in incoming.items():
         if incoming_value in ("", None):
@@ -29,15 +29,13 @@ def _merge_fields_preserve_first(existing: dict, incoming: dict, entity_label: s
             continue
 
         if existing_value != incoming_value:
-            print(
-                f"警告: {entity_label}={entity_id} 字段 {field} 冲突，"
-                f"保留首个值 {existing_value!r}，忽略 {incoming_value!r} (来源: {source_label})"
-            )
+            if len(str(incoming_value)) > len(str(existing_value)):
+                merged[field] = incoming_value
     return merged
 
 
 def _merge_scalar_preserve_first(mapping: dict, key: str, value: str, entity_label: str, field_name: str, source_label: str) -> None:
-    """合并单字段映射；冲突时保留首个非空值并打印告警。"""
+    """合并单字段映射；冲突时优先保留字符更长的非空值。"""
     if not key or value in ("", None):
         return
 
@@ -47,10 +45,8 @@ def _merge_scalar_preserve_first(mapping: dict, key: str, value: str, entity_lab
         return
 
     if existing_value != value:
-        print(
-            f"警告: {entity_label}={key} 字段 {field_name} 冲突，"
-            f"保留首个值 {existing_value!r}，忽略 {value!r} (来源: {source_label})"
-        )
+        if len(str(value)) > len(str(existing_value)):
+            mapping[key] = value
 
 
 def load_ne_site_mapping(data_dir: str = "SYS_NE_0306") -> dict:
