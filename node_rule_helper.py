@@ -21,14 +21,17 @@ class NodeRuleHelper:
         win = float(edge_window)
         return win, win
 
-    def events_in_window(self, physical_node, reference_ts, edge_window, exclude_consumed_trigger=False):
+    def events_in_window(self, physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
         """获取某个节点在指定时间窗口内的缓存事件。"""
         before_sec, after_sec = self.normalize_edge_window(edge_window)
         return [
             {"node": physical_node, "ts": ts, "eid": eid, "alarm": alarm, "alarm_source": alarm_source}
-            for ts, eid, alarm, alarm_source, consumed_as_trigger in self.event_getter(physical_node)
+            for ts, eid, alarm, alarm_source, consumed_trigger_rules in self.event_getter(physical_node)
             if (reference_ts - before_sec) <= ts <= (reference_ts + after_sec)
-            and not (exclude_consumed_trigger and consumed_as_trigger)
+            and not (
+                exclude_consumed_trigger_rule
+                and exclude_consumed_trigger_rule in consumed_trigger_rules
+            )
         ]
 
     @staticmethod
@@ -126,7 +129,7 @@ class NodeRuleHelper:
             return None
         return None
 
-    def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger=False):
+    def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
         """按结构与时间窗口告警共同校验一个节点是否满足规则定义。"""
         if not self.matches_node_structure(physical_node_domain, node_config):
             return False, []
@@ -138,7 +141,7 @@ class NodeRuleHelper:
             if expected is None:
                 return False, []
             events_in_win = self.events_in_window(
-                physical_node, reference_ts, edge_window, exclude_consumed_trigger
+                physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule
             )
 
             if expected == "NONE":
@@ -163,7 +166,7 @@ class NodeRuleHelper:
                     pattern,
                     reference_ts,
                     edge_window,
-                    exclude_consumed_trigger
+                    exclude_consumed_trigger_rule
                 )
                 if is_valid:
                     matched_patterns += 1

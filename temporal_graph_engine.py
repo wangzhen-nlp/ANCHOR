@@ -124,7 +124,7 @@ class TemporalGraphEngine:
             for down in downs:
                 self.topo_up[down].append(up)
 
-        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_as_trigger)]) }
+        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]) }
         self.event_cache = collections.defaultdict(collections.deque)
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
@@ -219,7 +219,7 @@ class TemporalGraphEngine:
                 self._remove_cleared_trigger_events(node, event_id)
                 self._refresh_pending_triggers_for_node(node)
             else:
-                q.append((ts, event_id, alarm_type, alarm_source, False))
+                q.append((ts, event_id, alarm_type, alarm_source, frozenset()))
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear and register_trigger:
@@ -246,14 +246,14 @@ class TemporalGraphEngine:
         if not self.debug_event_logger:
             return
 
-        ts, event_id, alarm_type, alarm_source, consumed_as_trigger = event
+        ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
         payload = {
             "node": node,
             "ts": ts,
             "event_id": event_id,
             "alarm_type": alarm_type,
             "alarm_source": alarm_source,
-            "consumed_as_trigger": consumed_as_trigger,
+            "consumed_trigger_rules": sorted(consumed_trigger_rules),
             "reason": reason,
         }
         payload.update(extra)
@@ -495,40 +495,51 @@ class TemporalGraphEngine:
         q = self.event_cache[node]
         kept = collections.deque()
 
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger in q:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
             if event_id and cached_eid == event_id:
                 self._log_debug_event_removal(
                     node,
-                    (cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger),
+                    (cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules),
                     "clear",
                     cleared_event_id=event_id,
                 )
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
 
         self.event_cache[node] = kept
 
-    def _prune_node_alarm_history_before(self, node, alarm_type, cutoff_ts):
-        """把某节点同告警名下不晚于 cutoff_ts 的事件打上 consumed_as_trigger 并移出 trigger 候选。"""
+    def _prune_node_alarm_history_before(self, node, alarm_type, cutoff_by_rule):
+        """把某节点同告警名下不晚于各 rule cutoff 的事件标记为已被对应 rule 消费并移出对应 trigger 候选。"""
         q = self.event_cache.get(node)
         if not q:
             return
 
-        removed_event_ids = set()
+        removed_event_ids_by_rule = collections.defaultdict(set)
         kept = collections.deque()
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger in q:
-            if cached_alarm_type == alarm_type and cached_ts <= cutoff_ts:
+        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
+            if cached_alarm_type == alarm_type:
+                matched_rules = {
+                    rule_name
+                    for rule_name, cutoff_ts in cutoff_by_rule.items()
+                    if cached_ts <= cutoff_ts
+                }
+            else:
+                matched_rules = set()
+
+            if matched_rules:
                 if cached_eid not in (None, ""):
-                    removed_event_ids.add(cached_eid)
-                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, True))
+                    for rule_name in matched_rules:
+                        removed_event_ids_by_rule[rule_name].add(cached_eid)
+                updated_consumed_rules = frozenset(set(consumed_trigger_rules) | matched_rules)
+                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, updated_consumed_rules))
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_as_trigger))
+            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
         self.event_cache[node] = kept
 
-        if not removed_event_ids:
+        if not removed_event_ids_by_rule:
             return
 
-        for rule_name, _ in self.trigger_specs_by_node.get(node, ()):
+        for rule_name, removed_event_ids in removed_event_ids_by_rule.items():
             trigger_key = (node, rule_name)
             trigger_events = self.trigger_event_index.get(trigger_key)
             if not trigger_events:
@@ -552,14 +563,19 @@ class TemporalGraphEngine:
         prune_points = {}
         for match in matches:
             merged_rules = match.get("merged_rules", [match.get("rule")])
-            trigger_roles = {
-                self.rules[rule_name]["trigger_role"]
+            rule_to_trigger_role = {
+                rule_name: self.rules[rule_name]["trigger_role"]
                 for rule_name in merged_rules
                 if rule_name in self.rules and self.rules[rule_name].get("trigger_role")
             }
             for symptom in match.get("symptoms", []):
                 matched_role = symptom.get("matched_role")
-                if matched_role not in trigger_roles:
+                matched_rule_names = {
+                    rule_name
+                    for rule_name, trigger_role in rule_to_trigger_role.items()
+                    if matched_role == trigger_role
+                }
+                if not matched_rule_names:
                     continue
                 node = symptom.get("node")
                 alarm_type = symptom.get("alarm")
@@ -567,10 +583,16 @@ class TemporalGraphEngine:
                 if node in (None, "") or alarm_type in (None, "") or ts is None:
                     continue
                 key = (node, alarm_type)
-                prune_points[key] = max(prune_points.get(key, float("-inf")), ts)
+                entry = prune_points.setdefault(key, {})
+                for rule_name in matched_rule_names:
+                    entry[rule_name] = max(entry.get(rule_name, float("-inf")), ts)
 
-        for (node, alarm_type), cutoff_ts in prune_points.items():
-            self._prune_node_alarm_history_before(node, alarm_type, cutoff_ts)
+        for (node, alarm_type), cutoff_by_rule in prune_points.items():
+            self._prune_node_alarm_history_before(
+                node,
+                alarm_type,
+                cutoff_by_rule,
+            )
 
     def _prune_expired_trigger_index(self, node, current_ts):
         """清理某个节点 trigger 索引中超出 TTL 的旧事件。"""
@@ -812,7 +834,7 @@ class TemporalGraphEngine:
             nodes_cfg[trigger_role],
             trigger_ts,
             edge_window=0,
-            exclude_consumed_trigger=True
+            exclude_consumed_trigger_rule=rule_name
         )
         if not is_trig_valid:
             return []
@@ -892,7 +914,7 @@ class TemporalGraphEngine:
                                 tgt_cfg,
                                 ref_ts,
                                 edge["win"],
-                                exclude_consumed_trigger=(tgt_role == trigger_role)
+                                exclude_consumed_trigger_rule=(rule_name if tgt_role == trigger_role else None)
                             )
                             validation_cache[cache_key] = (is_valid, evts)
 

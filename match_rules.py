@@ -360,14 +360,14 @@ def _format_debug_site_events(engine, site_id, limit=50):
         return json.dumps({"total": 0, "events": []}, ensure_ascii=False)
 
     formatted = []
-    for ts, eid, alarm_type, alarm_source, consumed_as_trigger in events:
+    for ts, eid, alarm_type, alarm_source, consumed_trigger_rules in events:
         formatted.append(
             {
                 "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                 "eid": eid,
                 "alarm": alarm_type,
                 "source": alarm_source,
-                "consumed_as_trigger": consumed_as_trigger,
+                "consumed_trigger_rules": sorted(consumed_trigger_rules),
             }
         )
     return json.dumps({"total": len(site_events), "events": formatted}, ensure_ascii=False)

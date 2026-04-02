@@ -44,7 +44,7 @@ transmission_rule = {
     },
     "downstream_compound_node": {
       "type": "compound",
-      "min_count": 3,
+      "min_count": 1,
       "patterns": [
         {
           "type": "primitive",
