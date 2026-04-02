@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import threading
 
@@ -173,7 +174,30 @@ def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data):
     return link_info
 
 
-def _build_group_output(match, ne_graph_data):
+def _resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data):
+    ne_graph_entry = ne_graph_data.get(ne_id, {})
+    resolved_site_id = ne_graph_entry.get("site_id", "")
+
+    alarm_site_ids = sorted({
+        alarm.get("site_id", "")
+        for alarm in alarms
+        if alarm.get("site_id")
+    })
+    if not resolved_site_id and len(alarm_site_ids) == 1:
+        resolved_site_id = alarm_site_ids[0]
+
+    site_graph_entry = site_graph_data.get(resolved_site_id, {}) if resolved_site_id else {}
+    return {
+        "site_id": resolved_site_id,
+        "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
+        "site_type": ne_graph_entry.get("site_type", "") or site_graph_entry.get("site_type", ""),
+        "region_id": ne_graph_entry.get("region_id", "") or site_graph_entry.get("region_id", ""),
+        "longitude": ne_graph_entry.get("longitude", "") or site_graph_entry.get("longitude", ""),
+        "latitude": ne_graph_entry.get("latitude", "") or site_graph_entry.get("latitude", ""),
+    }
+
+
+def _build_group_output(match, ne_graph_data, site_graph_data):
     group_id = match.get("uuid", "")
     ne_info = {}
     ne_alarms = defaultdict(list)
@@ -193,6 +217,7 @@ def _build_group_output(match, ne_graph_data):
         ne_graph_entry = ne_graph_data.get(ne_id, {})
         if site_id:
             group_site_ids.add(site_id)
+        site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
 
         ne_alarms[ne_id].append({
             "alarm_id": symptom.get("eid", ""),
@@ -200,7 +225,7 @@ def _build_group_output(match, ne_graph_data):
             "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
             "domain": ne_graph_entry.get("domain", ""),
             "site_id": site_id,
-            "site_name": ne_graph_entry.get("site_name", ""),
+            "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
         })
 
@@ -212,14 +237,14 @@ def _build_group_output(match, ne_graph_data):
 
     for ne_id in group_ne_ids:
         ne_graph_entry = ne_graph_data.get(ne_id, {})
-        site_id = ne_graph_entry.get("site_id", "")
-        if site_id:
-            group_site_ids.add(site_id)
-
         alarms = sorted(
             ne_alarms.get(ne_id, []),
             key=lambda alarm: (alarm.get("alarm_time", ""), alarm.get("alarm_id", ""))
         )
+        site_context = _resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data)
+        site_id = site_context["site_id"]
+        if site_id:
+            group_site_ids.add(site_id)
 
         ne_info[ne_id] = {
             "alarm": alarms,
@@ -227,15 +252,15 @@ def _build_group_output(match, ne_graph_data):
             "group": group_id,
             "name": ne_graph_entry.get("name", ne_id),
             "site_id": site_id,
-            "site_name": ne_graph_entry.get("site_name", ""),
+            "site_name": site_context["site_name"],
             "type": str(ne_graph_entry.get("type", "")).upper(),
             "network_type": str(ne_graph_entry.get("network_type", "")).upper(),
             "manufacturer": str(ne_graph_entry.get("manufacturer", "")).upper(),
             "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
             "domain": str(ne_graph_entry.get("domain", "")).upper(),
-            "region_id": ne_graph_entry.get("region_id", ""),
-            "longitude": ne_graph_entry.get("longitude", ""),
-            "latitude": ne_graph_entry.get("latitude", ""),
+            "region_id": site_context["region_id"],
+            "longitude": site_context["longitude"],
+            "latitude": site_context["latitude"],
         }
 
     return {
@@ -257,8 +282,8 @@ def _build_group_output(match, ne_graph_data):
     }
 
 
-def _build_jsonl_match_output(match, ne_graph_data):
-    group_output = _build_group_output(match, ne_graph_data)
+def _build_jsonl_match_output(match, ne_graph_data, site_graph_data):
+    group_output = _build_group_output(match, ne_graph_data, site_graph_data)
     timestamps = [symptom["ts"] for symptom in match.get("symptoms", []) if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
 
@@ -733,6 +758,7 @@ def main():
     parser.add_argument('output', type=str, help='output jsonl file')
     parser.add_argument('--topo', type=str, default='site_graph_by_ne.json')
     parser.add_argument('--site-domain', type=str, default='site_device_counts.json')
+    parser.add_argument('--site-graph', type=str, default='site_graph.json', help='site_graph.json 文件')
     parser.add_argument('--ne-graph', type=str, default='ne_graph.json', help='ne_graph.json 文件')
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='live', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
@@ -742,6 +768,7 @@ def main():
 
     topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
+    site_graph_data = json.load(open(args.site_graph, 'r', encoding='utf-8'))
     ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
 
     print("加载有效站点集合...")
@@ -805,7 +832,7 @@ def main():
             with open(args.output, 'a', encoding='utf-8') as fw:
                 for match in matches:
                     generate_incident_report(match)
-                    enriched_match = _build_jsonl_match_output(match, ne_graph_data)
+                    enriched_match = _build_jsonl_match_output(match, ne_graph_data, site_graph_data)
                     fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)
 
