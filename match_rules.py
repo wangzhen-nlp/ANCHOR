@@ -465,7 +465,15 @@ def _print_debug_match_details(match):
     print(f"      symptoms={json.dumps(symptom_preview, ensure_ascii=False)}")
 
 
-def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
+def _print_debug_post_batch_state(engine, debug_sites):
+    for site_id in sorted(debug_sites):
+        print(f"   ↳ 本批完成后站点状态[{site_id}]")
+        print(f"      event_cache={_format_debug_site_events(engine, site_id)}")
+        print(f"      trigger_index={_format_debug_trigger_index(engine, site_id)}")
+        print(f"      pending={_format_debug_pending(engine, site_id)}")
+
+
+def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine):
     debug_sites = {site_id for site_id, _alarm_name in debug_targets}
     raw_debug_matches = [
         match for match in snapshot.get("raw_matches", [])
@@ -529,6 +537,8 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
         print(f"   ↳ {stage_name}: {len(stage_matches)} 个相关故障组")
         for match in stage_matches:
             _print_debug_match_details(match)
+
+    _print_debug_post_batch_state(engine, debug_sites)
 
 
 def _print_debug_event_removal(payload, debug_sites):
@@ -614,7 +624,7 @@ def _run_debug_mode(
     )
     debug_sites = {site_id for site_id, _alarm_name in debug_targets}
     engine.debug_observer = lambda snapshot: _print_debug_collection_snapshot(
-        snapshot, debug_targets, rules_config
+        snapshot, debug_targets, rules_config, engine
     )
     engine.debug_event_logger = lambda payload: _print_debug_event_removal(payload, debug_sites)
 
