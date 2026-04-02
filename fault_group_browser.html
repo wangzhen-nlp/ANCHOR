@@ -240,6 +240,7 @@
                 <button class="filter-chip active" data-filter="all">全部</button>
                 <button class="filter-chip" data-filter="with-related">有关联故障组</button>
                 <button class="filter-chip" data-filter="without-related">无关联故障组</button>
+                <button class="filter-chip" data-filter="ultimate">终极故障组</button>
                 <button class="filter-chip" data-filter="multi-site">站点数大于 1</button>
                 <button class="filter-chip" data-filter="rule:transmission_rule">规则: transmission_rule</button>
                 <button class="filter-chip" data-filter="rule:power_rule">规则: power_rule</button>
@@ -332,6 +333,22 @@
             return group.related_group_uuids || group.match_info?.related_group_uuids || [];
         }
 
+        function getGroupUuid(group) {
+            return group.uuid || group.match_info?.uuid || '';
+        }
+
+        function getReferencedGroupUuidSet(groups) {
+            const referenced = new Set();
+            groups.forEach(group => {
+                getRelatedGroups(group).forEach(uuid => {
+                    if (uuid) {
+                        referenced.add(String(uuid));
+                    }
+                });
+            });
+            return referenced;
+        }
+
         function getSiteCount(group) {
             const groupInfo = group.group_info || {};
             const firstGroup = Object.values(groupInfo)[0] || {};
@@ -368,6 +385,7 @@
         }
 
         function filterGroups(groups) {
+            const referencedGroupUuids = getReferencedGroupUuidSet(groups);
             return groups.filter(group => {
                 if (!activeFilters.has('all') && activeFilters.size > 0) {
                     for (const filter of activeFilters) {
@@ -376,6 +394,12 @@
                         }
                         if (filter === 'without-related' && getRelatedGroups(group).length > 0) {
                             return false;
+                        }
+                        if (filter === 'ultimate') {
+                            const uuid = getGroupUuid(group);
+                            if (!uuid || referencedGroupUuids.has(String(uuid))) {
+                                return false;
+                            }
                         }
                         if (filter === 'multi-site' && getSiteCount(group) <= 1) {
                             return false;
