@@ -13,6 +13,7 @@ from alarm_inputs import (
     stream_alarm_inputs,
 )
 from alarm_types import CRITICAL_ALARMS, POWER_ALARMS
+from compute_group_output_ticket_recall import compute_group_output_ticket_recall
 from progress_utils import ProgressBar
 from reports import generate_incident_report
 from rule_config import transmission_rule, power_rule
@@ -869,6 +870,10 @@ def main():
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
+    parser.add_argument('--compute-ticket-recall', action='store_true', help='在主故障组输出完成后额外计算工单站点召回率')
+    parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
+    parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
+    parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
     args = parser.parse_args()
 
     topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
@@ -991,6 +996,26 @@ def main():
 
     elapsed = time.time() - start_time
     print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")
+
+    if args.compute_ticket_recall:
+        ticket_recall_output = args.ticket_recall_output or f"{args.output}.ticket_recall.json"
+        print("⏳ 正在基于当前故障组输出计算工单站点召回率...")
+        try:
+            recall_result = compute_group_output_ticket_recall(
+                args.output,
+                args.ticket_sites,
+                ticket_field=args.ticket_field,
+                alarms_input=args.alarms,
+                ne_graph_file=args.ne_graph,
+                output_file=ticket_recall_output,
+            )
+            print(
+                f"✅ 工单站点召回率计算完成。工单数: {recall_result['ticket_count']}，"
+                f"平均召回率: {recall_result['average_recall']:.6f}，"
+                f"输出: {ticket_recall_output}"
+            )
+        except ValueError as exc:
+            print(f"⚠️ 工单站点召回率计算跳过: {exc}")
 
 
 if __name__ == "__main__":

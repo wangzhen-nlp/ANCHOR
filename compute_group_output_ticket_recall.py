@@ -1,10 +1,10 @@
 import json
-
 from argparse import ArgumentParser
 from collections import defaultdict
 
 from alarm_inputs import stream_alarm_inputs
 from compute_ticket_site_recall import (
+    _build_ticket_sites_from_alarms,
     _compute_ticket_recalls,
     _load_ticket_sites,
     _normalize_site_list,
@@ -85,49 +85,33 @@ def _count_ticket_occurrences_in_alarms(alarm_input, ticket_field):
         if ticket_id:
             ticket_alarm_counts[ticket_id] += 1
     return ticket_alarm_counts
+def compute_group_output_ticket_recall(
+    group_output_input,
+    ticket_sites_file=None,
+    ticket_field="工单号",
+    alarms_input=None,
+    ne_graph_file=None,
+    output_file=None,
+):
+    if ticket_sites_file:
+        ticket_sites = _load_ticket_sites(ticket_sites_file)
+        ticket_site_source = "ticket_sites"
+    else:
+        if not alarms_input:
+            raise ValueError("未提供 ticket_sites 时，必须提供 alarms 以便从告警中回推工单站点")
+        ticket_sites = _build_ticket_sites_from_alarms(alarms_input, ticket_field, ne_graph_file)
+        ticket_site_source = "alarms"
 
-
-def main():
-    parser = ArgumentParser(description="基于 match_rules.py 输出故障组计算工单站点召回率")
-    parser.add_argument(
-        "group_output",
-        help="故障组输出输入，支持 jsonl/zip/目录，与 match_rules.py 输出格式一致",
-    )
-    parser.add_argument(
-        "--ticket-sites",
-        required=True,
-        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}",
-    )
-    parser.add_argument(
-        "--ticket-field",
-        default="工单号",
-        help="故障组 symptoms 中的工单字段名，默认: 工单号",
-    )
-    parser.add_argument(
-        "--alarms",
-        help="原始告警输入（可选）。提供后，工单是否纳入分母将与 compute_ticket_site_recall.py 一致，按原始告警中是否出现来判断。",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="group_output_ticket_recall.json",
-        help="输出明细 JSON 文件，默认: group_output_ticket_recall.json",
-    )
-
-    args = parser.parse_args()
-
-    ticket_sites = _load_ticket_sites(args.ticket_sites)
     if not ticket_sites:
-        print("❌ 工单站点映射为空，无法计算召回率")
-        return
+        raise ValueError("工单站点映射为空，无法计算召回率")
 
     ticket_to_groups, group_to_sites, ticket_occurrence_counts = _build_group_output_indexes(
-        args.group_output,
-        args.ticket_field,
+        group_output_input,
+        ticket_field,
     )
 
-    if args.alarms:
-        ticket_alarm_counts = _count_ticket_occurrences_in_alarms(args.alarms, args.ticket_field)
+    if alarms_input:
+        ticket_alarm_counts = _count_ticket_occurrences_in_alarms(alarms_input, ticket_field)
         denominator_source = "alarms"
     else:
         ticket_alarm_counts = dict(ticket_occurrence_counts)
@@ -149,15 +133,67 @@ def main():
         "ticket_count": evaluated_count,
         "average_recall": average_recall,
         "denominator_source": denominator_source,
+        "ticket_site_source": ticket_site_source,
         "details": details,
     }
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    if output_file:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"工单数: {evaluated_count}")
-    print(f"平均召回率: {average_recall:.6f}")
-    print(f"分母口径来源: {denominator_source}")
+    return result
+
+
+def main():
+    parser = ArgumentParser(description="基于 match_rules.py 输出故障组计算工单站点召回率")
+    parser.add_argument(
+        "group_output",
+        help="故障组输出输入，支持 jsonl/zip/目录，与 match_rules.py 输出格式一致",
+    )
+    parser.add_argument(
+        "--ticket-sites",
+        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}；不提供时会退化为从 alarms 中回推工单站点",
+    )
+    parser.add_argument(
+        "--ticket-field",
+        default="工单号",
+        help="故障组 symptoms 中的工单字段名，默认: 工单号",
+    )
+    parser.add_argument(
+        "--alarms",
+        help="原始告警输入。未提供 ticket-sites 时必填；提供后，工单是否纳入分母也会按原始告警中是否出现来判断。",
+    )
+    parser.add_argument(
+        "--ne-graph",
+        default="ne_graph.json",
+        help="未提供 ticket-sites 时，用于通过告警源回推 site_id 的 ne_graph 文件，默认: ne_graph.json",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="group_output_ticket_recall.json",
+        help="输出明细 JSON 文件，默认: group_output_ticket_recall.json",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        result = compute_group_output_ticket_recall(
+            args.group_output,
+            args.ticket_sites,
+            ticket_field=args.ticket_field,
+            alarms_input=args.alarms,
+            ne_graph_file=args.ne_graph,
+            output_file=args.output,
+        )
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        return
+
+    print(f"工单数: {result['ticket_count']}")
+    print(f"平均召回率: {result['average_recall']:.6f}")
+    print(f"分母口径来源: {result['denominator_source']}")
+    print(f"工单站点来源: {result['ticket_site_source']}")
     print(f"明细已输出到: {args.output}")
 
 

@@ -95,6 +95,28 @@ def _resolve_alarm_site_id(alarm, ne_to_site):
     return _normalize_text(ne_to_site.get(alarm_source, ""))
 
 
+def _build_ticket_sites_from_alarms(alarm_input, ticket_field, ne_graph_file=None):
+    ne_to_site = {}
+    if ne_graph_file and os.path.exists(ne_graph_file):
+        ne_to_site = build_ne_to_site_map(ne_graph_file)
+
+    ticket_sites = defaultdict(set)
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        ticket_id = _normalize_text(alarm.get(ticket_field, ""))
+        if not ticket_id:
+            continue
+
+        site_id = _resolve_alarm_site_id(alarm, ne_to_site)
+        if site_id:
+            ticket_sites[ticket_id].add(site_id)
+
+    return {
+        ticket_id: sorted(site_ids)
+        for ticket_id, site_ids in ticket_sites.items()
+        if site_ids
+    }
+
+
 def _build_ticket_group_indexes(alarm_input, ticket_field, group_field, ne_to_site):
     ticket_to_groups = defaultdict(set)
     group_to_sites = defaultdict(set)
@@ -168,8 +190,7 @@ def main():
     parser.add_argument("alarms", help="告警输入，支持 jsonl/csv/zip/目录，与 match_rules.py 一致")
     parser.add_argument(
         "--ticket-sites",
-        required=True,
-        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}",
+        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}；不提供时会退化为从 alarms 中回推工单站点",
     )
     parser.add_argument(
         "--ticket-field",
@@ -195,7 +216,13 @@ def main():
 
     args = parser.parse_args()
 
-    ticket_sites = _load_ticket_sites(args.ticket_sites)
+    if args.ticket_sites:
+        ticket_sites = _load_ticket_sites(args.ticket_sites)
+        ticket_site_source = "ticket_sites"
+    else:
+        ticket_sites = _build_ticket_sites_from_alarms(args.alarms, args.ticket_field, args.ne_graph)
+        ticket_site_source = "alarms"
+
     if not ticket_sites:
         print("❌ 工单站点映射为空，无法计算召回率")
         return
@@ -221,6 +248,7 @@ def main():
     result = {
         "ticket_count": evaluated_count,
         "average_recall": average_recall,
+        "ticket_site_source": ticket_site_source,
         "details": details,
     }
 
@@ -229,6 +257,7 @@ def main():
 
     print(f"工单数: {evaluated_count}")
     print(f"平均召回率: {average_recall:.6f}")
+    print(f"工单站点来源: {ticket_site_source}")
     print(f"明细已输出到: {args.output}")
 
 
