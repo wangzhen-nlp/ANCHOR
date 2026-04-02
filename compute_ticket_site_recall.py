@@ -125,6 +125,10 @@ def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, tick
     evaluated_count = 0
 
     for ticket_id in sorted(ticket_sites.keys()):
+        # 只统计在告警数据里实际出现过的工单，避免把完全无告警的工单按 0 计入平均。
+        if ticket_alarm_counts.get(ticket_id, 0) <= 0:
+            continue
+
         target_sites = set(ticket_sites[ticket_id])
         if not target_sites:
             continue
