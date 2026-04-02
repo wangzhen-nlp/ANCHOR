@@ -483,21 +483,25 @@ def _print_debug_pending_eval_profiles(snapshot, debug_sites):
         return
 
     print(f"   ↳ pending 弹出后 evaluate_rule 概况: {len(profiles)} 个")
-    for profile in profiles:
+    for idx, profile in enumerate(profiles, start=1):
         trigger_ts = profile.get("trigger_ts")
         trigger_time = (
             datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S")
             if trigger_ts is not None else "-"
         )
         print(
-            "      "
+            f"      [{idx}] pending: "
             f"site={profile.get('node', '')}, "
             f"rule={profile.get('rule', '')}, "
             f"trigger_time={trigger_time}, "
-            f"trigger_seq={profile.get('trigger_seq', '')}, "
-            f"raw_match_count={profile.get('raw_match_count', 0)}"
+            f"trigger_seq={profile.get('trigger_seq', '')}"
         )
-        for match in profile.get("raw_matches", []):
+        print(f"         evaluate_rule 原始候选组数: {profile.get('raw_match_count', 0)}")
+        raw_matches = profile.get("raw_matches", [])
+        if not raw_matches:
+            print("         ↳ 未产出原始候选组")
+            continue
+        for match in raw_matches:
             _print_debug_match_details(match)
 
 
