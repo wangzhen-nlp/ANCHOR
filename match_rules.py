@@ -497,8 +497,8 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config):
     stage_mapping = (
         ("原始候选组", raw_debug_matches),
         ("当前批次合并后", batch_debug_matches),
-        ("历史组合并后", finalized_debug_matches),
         ("pending 扩充后", expanded_debug_matches),
+        ("历史组合并后", finalized_debug_matches),
     )
     for stage_name, stage_matches in stage_mapping:
         print(f"   ↳ {stage_name}: {len(stage_matches)} 个相关故障组")

@@ -167,12 +167,34 @@ def merge_match_batch(matches):
 def clone_instance_with_updates(inst, curr_role, surviving_curr_phys, tgt_role, tgt_nodes):
     """只复制当前需要修改的角色分支，避免整棵实例 deepcopy。"""
     new_inst = dict(inst)
-    curr_entry = inst[curr_role]
-    new_inst[curr_role] = {
+    roles = inst.get("roles", {})
+    new_inst["roles"] = {
+        role: {
+            "nodes": dict(role_state["nodes"]),
+            "checked": role_state["checked"]
+        }
+        for role, role_state in roles.items()
+    }
+    if "_dependencies" in inst:
+        new_inst["_dependencies"] = {
+            dep_key: {
+                "src_to_dst": {
+                    src_node: set(dst_nodes)
+                    for src_node, dst_nodes in dep_value.get("src_to_dst", {}).items()
+                },
+                "dst_to_src": {
+                    dst_node: set(src_nodes)
+                    for dst_node, src_nodes in dep_value.get("dst_to_src", {}).items()
+                },
+            }
+            for dep_key, dep_value in inst["_dependencies"].items()
+        }
+    curr_entry = roles[curr_role]
+    new_inst["roles"][curr_role] = {
         "nodes": dict(surviving_curr_phys),
         "checked": curr_entry["checked"]
     }
-    new_inst[tgt_role] = {
+    new_inst["roles"][tgt_role] = {
         "nodes": dict(tgt_nodes),
         "checked": True
     }

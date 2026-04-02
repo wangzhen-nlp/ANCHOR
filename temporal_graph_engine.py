@@ -21,6 +21,97 @@ logger = logging.getLogger(__name__)
 
 
 class TemporalGraphEngine:
+    def _record_instance_dependency(self, inst, curr_role, tgt_role, curr_support_targets):
+        """记录一条已处理边上的节点依赖关系，供后续收敛裁剪使用。"""
+        if not curr_support_targets:
+            return
+
+        src_to_dst = {
+            curr_node: set(target_nodes)
+            for curr_node, target_nodes in curr_support_targets.items()
+            if target_nodes
+        }
+        if not src_to_dst:
+            return
+
+        dst_to_src = collections.defaultdict(set)
+        for curr_node, target_nodes in src_to_dst.items():
+            for target_node in target_nodes:
+                dst_to_src[target_node].add(curr_node)
+
+        dependencies = inst.setdefault("_dependencies", {})
+        dependencies[(curr_role, tgt_role)] = {
+            "src_to_dst": src_to_dst,
+            "dst_to_src": {target_node: set(src_nodes) for target_node, src_nodes in dst_to_src.items()},
+        }
+        dependencies[(tgt_role, curr_role)] = {
+            "src_to_dst": {
+                target_node: set(src_nodes)
+                for target_node, src_nodes in dst_to_src.items()
+            },
+            "dst_to_src": {
+                curr_node: set(target_nodes)
+                for curr_node, target_nodes in src_to_dst.items()
+            },
+        }
+
+    def _stabilize_instance_dependencies(self, inst, nodes_cfg):
+        """基于已记录的边依赖做收敛裁剪，把深层失效回传到上下游角色。"""
+        dependencies = inst.get("_dependencies")
+        if not dependencies:
+            return inst
+
+        stabilized_inst = dict(inst)
+        stabilized_inst["roles"] = {
+            role: {
+                "nodes": dict(role_state["nodes"]),
+                "checked": role_state["checked"]
+            }
+            for role, role_state in inst.get("roles", {}).items()
+        }
+        stabilized_roles = stabilized_inst["roles"]
+
+        while True:
+            changed = False
+
+            for (src_role, dst_role), dep in dependencies.items():
+                src_state = stabilized_roles.get(src_role)
+                dst_state = stabilized_roles.get(dst_role)
+                if src_state is None or dst_state is None:
+                    continue
+
+                live_src_nodes = src_state["nodes"]
+                live_dst_nodes = dst_state["nodes"]
+                live_dst_set = set(live_dst_nodes)
+                live_src_set = set(live_src_nodes)
+
+                kept_src_nodes = {
+                    src_node: live_src_nodes[src_node]
+                    for src_node in live_src_nodes
+                    if dep.get("src_to_dst", {}).get(src_node, set()) & live_dst_set
+                }
+                if len(kept_src_nodes) != len(live_src_nodes):
+                    src_state["nodes"] = kept_src_nodes
+                    live_src_nodes = kept_src_nodes
+                    live_src_set = set(kept_src_nodes)
+                    changed = True
+
+                kept_dst_nodes = {
+                    dst_node: live_dst_nodes[dst_node]
+                    for dst_node in live_dst_nodes
+                    if dep.get("dst_to_src", {}).get(dst_node, set()) & live_src_set
+                }
+                if len(kept_dst_nodes) != len(live_dst_nodes):
+                    dst_state["nodes"] = kept_dst_nodes
+                    changed = True
+
+            for role, role_state in stabilized_roles.items():
+                if role_state["checked"] and len(role_state["nodes"]) < nodes_cfg.get(role, {}).get("min_count", 1):
+                    return None
+
+            if not changed:
+                return stabilized_inst
+
     def __init__(self, topo_downstream_map, rules_config, site_domain_map, aggregation_wait_sec=300):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -727,7 +818,12 @@ class TemporalGraphEngine:
             return []
 
         # 4. 初始化独立子图实例池与备忘录缓存
-        initial_inst = {trigger_role: {'nodes': {trigger_node: trig_evts}, 'checked': False}}
+        initial_inst = {
+            "roles": {
+                trigger_role: {'nodes': {trigger_node: trig_evts}, 'checked': False}
+            },
+            "_dependencies": {}
+        }
         instances = [initial_inst]
         validation_cache = {}
 
@@ -736,15 +832,17 @@ class TemporalGraphEngine:
             next_instances = []
 
             for inst in instances:
-                if curr_role not in inst:
+                inst_roles = inst["roles"]
+
+                if curr_role not in inst_roles:
                     next_instances.append(inst)
                     continue
 
-                if tgt_role in inst and inst[tgt_role]["checked"]:
+                if tgt_role in inst_roles and inst_roles[tgt_role]["checked"]:
                     next_instances.append(inst)
                     continue
 
-                curr_phys_dict = inst[curr_role]
+                curr_phys_dict = inst_roles[curr_role]
                 tgt_cfg = nodes_cfg[tgt_role]
                 min_c = tgt_cfg.get("min_count", 1)
                 node_type = tgt_cfg.get("type", "primitive")
@@ -752,6 +850,7 @@ class TemporalGraphEngine:
 
                 valid_targets = {}
                 surviving_curr_phys = {}
+                curr_support_targets = {}
                 branch_survived = False
 
                 for curr_phys, curr_evts in curr_phys_dict['nodes'].items():
@@ -810,6 +909,7 @@ class TemporalGraphEngine:
                     if curr_valid_targets:
                         branch_survived = True
                         surviving_curr_phys[curr_phys] = curr_evts
+                        curr_support_targets[curr_phys] = set(curr_valid_targets)
                         for key, value in curr_valid_targets.items():
                             valid_targets[key] = value
 
@@ -818,10 +918,10 @@ class TemporalGraphEngine:
 
                 # 回溯检查数量
                 curr_cfg = nodes_cfg[curr_role]
-                if inst[curr_role]["checked"] and len(surviving_curr_phys) < curr_cfg.get("min_count", 1):
+                if inst_roles[curr_role]["checked"] and len(surviving_curr_phys) < curr_cfg.get("min_count", 1):
                     continue
 
-                existing_targets = inst.get(tgt_role, {}).get('nodes', {})
+                existing_targets = inst_roles.get(tgt_role, {}).get('nodes', {})
                 merged_targets = {**existing_targets, **valid_targets}
 
                 # 状态分叉 vs 聚合
@@ -830,7 +930,18 @@ class TemporalGraphEngine:
                         new_inst = clone_instance_with_updates(
                             inst, curr_role, surviving_curr_phys, tgt_role, {t_node: t_evts}
                         )
-                        next_instances.append(new_inst)
+                        self._record_instance_dependency(
+                            new_inst,
+                            curr_role,
+                            tgt_role,
+                            {
+                                curr_node: ({t_node} if t_node in target_nodes else set())
+                                for curr_node, target_nodes in curr_support_targets.items()
+                            }
+                        )
+                        stabilized_inst = self._stabilize_instance_dependencies(new_inst, nodes_cfg)
+                        if stabilized_inst is not None:
+                            next_instances.append(stabilized_inst)
                 else:
                     if len(merged_targets) < min_c:
                         continue
@@ -838,7 +949,10 @@ class TemporalGraphEngine:
                     new_inst = clone_instance_with_updates(
                         inst, curr_role, surviving_curr_phys, tgt_role, merged_targets
                     )
-                    next_instances.append(new_inst)
+                    self._record_instance_dependency(new_inst, curr_role, tgt_role, curr_support_targets)
+                    stabilized_inst = self._stabilize_instance_dependencies(new_inst, nodes_cfg)
+                    if stabilized_inst is not None:
+                        next_instances.append(stabilized_inst)
 
             instances = next_instances
 
@@ -851,17 +965,22 @@ class TemporalGraphEngine:
         root_roles = [r for r in nodes_cfg.keys() if r not in targets]
 
         for inst in instances:
+            stabilized_inst = self._stabilize_instance_dependencies(inst, nodes_cfg)
+            if stabilized_inst is None:
+                continue
+            inst = stabilized_inst
+            inst_roles = inst["roles"]
             # 提取物理根因节点
             inferred_roots = {}
             for r_role in root_roles:
-                nodes = list(inst.get(r_role, {}).get('nodes', {}).keys())
+                nodes = list(inst_roles.get(r_role, {}).get('nodes', {}).keys())
                 inferred_roots[r_role] = nodes
 
             symp_dict = {}
             role_mapping = {}
 
-            for role in inst:
-                nodes_dict = inst[role]['nodes']
+            for role, role_state in inst_roles.items():
+                nodes_dict = role_state['nodes']
                 valid_phys_nodes = []
 
                 for phys_node, evts in nodes_dict.items():

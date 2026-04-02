@@ -58,6 +58,11 @@
             color: #475467;
             font-size: 14px;
         }
+        .filter-summary {
+            margin-top: 8px;
+            color: #667085;
+            font-size: 13px;
+        }
         .filters {
             display: flex;
             gap: 10px;
@@ -255,6 +260,7 @@
                 </div>
             </div>
             <div class="status" id="status">尚未加载文件</div>
+            <div class="filter-summary" id="filterSummary">过滤后 0 条</div>
         </div>
 
         <div class="list" id="groupList"></div>
@@ -410,7 +416,10 @@
         function renderGroups() {
             const list = document.getElementById('groupList');
             const emptyState = document.getElementById('emptyState');
+            const filterSummary = document.getElementById('filterSummary');
             const visibleGroups = filterGroups(faultGroups);
+
+            filterSummary.textContent = `过滤后 ${visibleGroups.length} 条`;
 
             if (visibleGroups.length === 0) {
                 list.innerHTML = '';

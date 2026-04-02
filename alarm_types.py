@@ -45,6 +45,8 @@ POWER_ALARMS = {
     "The main power supply abnormal",
     "The voltage of the power supply is abnormal.",
     "cseShutDownNotify",
+    "DC Low Voltage",
+    "Genset Stop"
 }
 
 CRITICAL_ALARMS = OFFLINE_ALARMS | POWER_ALARMS
