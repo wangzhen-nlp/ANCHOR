@@ -227,6 +227,8 @@ def _build_group_output(match, ne_graph_data, site_graph_data):
             "site_id": site_id,
             "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
+            "工单号": symptom.get("工单号", ""),
+            "故障组": symptom.get("故障组", ""),
         })
 
     group_ne_ids = sorted({
@@ -282,12 +284,45 @@ def _build_group_output(match, ne_graph_data, site_graph_data):
     }
 
 
-def _build_jsonl_match_output(match, ne_graph_data, site_graph_data):
-    group_output = _build_group_output(match, ne_graph_data, site_graph_data)
-    timestamps = [symptom["ts"] for symptom in match.get("symptoms", []) if symptom.get("ts") is not None]
+def _build_alarm_metadata_index(valid_alarms):
+    alarm_metadata_index = {}
+    for item in valid_alarms:
+        alarm = item.get("alarm", {})
+        event_id = alarm.get("告警编码ID", "")
+        if not event_id:
+            continue
+
+        existing = alarm_metadata_index.setdefault(event_id, {})
+        for field_name in ("工单号", "故障组"):
+            value = str(alarm.get(field_name, "")).strip()
+            if value and not existing.get(field_name):
+                existing[field_name] = value
+
+    return alarm_metadata_index
+
+
+def _enrich_match_symptoms(match, alarm_metadata_index):
+    enriched_symptoms = []
+    for symptom in match.get("symptoms", []):
+        enriched_symptom = dict(symptom)
+        event_id = enriched_symptom.get("eid", "")
+        if event_id:
+            metadata = alarm_metadata_index.get(event_id, {})
+            for field_name in ("工单号", "故障组"):
+                if metadata.get(field_name) and not enriched_symptom.get(field_name):
+                    enriched_symptom[field_name] = metadata[field_name]
+        enriched_symptoms.append(enriched_symptom)
+    return enriched_symptoms
+
+
+def _build_jsonl_match_output(match, ne_graph_data, site_graph_data, alarm_metadata_index):
+    enriched_match = dict(match)
+    enriched_match["symptoms"] = _enrich_match_symptoms(match, alarm_metadata_index)
+
+    group_output = _build_group_output(enriched_match, ne_graph_data, site_graph_data)
+    timestamps = [symptom["ts"] for symptom in enriched_match.get("symptoms", []) if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
 
-    enriched_match = dict(match)
     enriched_match["group_anchor_ts"] = group_anchor_ts
     enriched_match["group_anchor_time"] = (
         datetime.fromtimestamp(group_anchor_ts).strftime("%Y-%m-%d %H:%M:%S")
@@ -875,6 +910,7 @@ def main():
     sort_start_time = time.time()
     valid_alarms.sort(key=lambda item: item["ts"])
     valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
+    alarm_metadata_index = _build_alarm_metadata_index(valid_alarms)
     sort_elapsed = time.time() - sort_start_time
     filtered_count = len(valid_alarms)
     print(f"有效告警数: {filtered_count}，排序耗时: {sort_elapsed:.4f} 秒")
@@ -902,7 +938,12 @@ def main():
             with open(args.output, 'a', encoding='utf-8') as fw:
                 for match in matches:
                     generate_incident_report(match)
-                    enriched_match = _build_jsonl_match_output(match, ne_graph_data, site_graph_data)
+                    enriched_match = _build_jsonl_match_output(
+                        match,
+                        ne_graph_data,
+                        site_graph_data,
+                        alarm_metadata_index
+                    )
                     fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)
 
