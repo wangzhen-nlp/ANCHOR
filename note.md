@@ -70,12 +70,12 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 - `trigger_event_index`：按 `(node, rule)` 保存还能作为 trigger 候选的事件索引。
 - `pending_triggers`：按 `(node, rule)` 保存当前仍在等待聚合窗口成熟的 trigger 锚点。
 - `pending_trigger_heap`：按成熟时间排序的最小堆，用来高效摘取已成熟的 pending trigger。
-- `consumed_as_trigger`：表示这条告警已经作为 trigger 被消费过，后续不能再作为任何规则的 trigger。
+- `consumed_trigger_rules`：表示这条告警已经被哪些规则当作 trigger 消费过；后续它不能再作为这些规则的 trigger，但仍可作为其它规则的 trigger。
 
 **【意义】**
 
-把 trigger 候选、pending 等待态、已消费状态拆开管理，
-能同时满足三件事：一是避免同一条告警被重复触发；二是保留聚合等待窗口；三是允许告警在失去 trigger 身份后仍作为普通证据参与其它角色匹配。
+把 trigger 候选、pending 等待态、按 rule 维度的已消费状态拆开管理，
+能同时满足三件事：一是避免同一条告警被同一条规则重复触发；二是保留聚合等待窗口；三是允许告警在失去某条规则的 trigger 身份后，仍作为其它规则的 trigger 或普通证据参与匹配。
 
 ## 4. `transmission_rule` 的逻辑与意义
 
@@ -197,16 +197,29 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 这次失效可以通过 dependency 回传回来，把中间 role 乃至更上游 role 一起收缩掉，
 避免保留实际上已经无法支撑完整规则链的伪匹配分支。
 
-## 10. `consumed_as_trigger=True`
+## 10. `consumed_trigger_rules`
 
 **【逻辑】**
 
-这条告警已经作为 trigger 被消费过，后续不能再充当任何规则的 trigger；
-但它仍然保留在 `event_cache` 中，可以继续作为普通 symptom / 非 trigger 角色参与匹配。
+当前不再用一个全局布尔值表示“这条告警是否已经被消费成 trigger”，
+而是在 `event_cache` 里为每条事件保存一个 `consumed_trigger_rules` 集合。
+
+一轮故障组最终成型后，会先按 `(node, alarm_type, rule)` 计算各自的 trigger cutoff；
+然后对同一个 `node + alarm_type` 下的缓存事件逐条判断：
+
+- 如果某条事件时间 `<=` 某个 `rule` 的 cutoff，就把该 `rule` 加进这条事件的 `consumed_trigger_rules`；
+- 同时只从该 `(node, rule)` 对应的 `trigger_event_index` 里移除这条事件；
+- 后续 `validate_node()` 在校验 trigger 角色时，也只会排除“已被当前 rule 消费过”的事件。
+
+这样一条告警可以表现成：
+
+- 对 `rule_A` 已经不能再作为 trigger；
+- 但对 `rule_B` 仍然还可以继续作为 trigger。
 
 **【意义】**
 
-这样可以避免同一条告警被反复作为 trigger 触发重复故障组，
+这样可以避免“某条规则消费得更晚，就把其它规则也一起误伤”的问题，
+也能让同一条告警在不同规则上的 trigger 生命周期彼此独立；
 同时又不丢失它在后续结构匹配中作为普通证据节点的价值。
 
 ## 11. 当前的 pending 扩充

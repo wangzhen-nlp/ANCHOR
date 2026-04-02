@@ -20,3 +20,8 @@
   以及是否要把 edge 本身的身份也纳入 dependency key。  
   同时，对于多条独立入边、菱形/网状结构这类更复杂规则图，也需要继续评估当前 matcher 是否足够通用，  
   或者是否需要更系统的图约束求解方式。
+
+- [ ] 评估 symptom 的跨 rule 归属表达  
+  当前 trigger 消费已经按 `rule` 粒度拆开，但故障组 `symptoms` 仍主要依赖 `matched_role` 表达其角色信息；  
+  如果未来不同规则共用相同 `trigger_role`，或者同一条 `eid` 同时参与多条规则，  
+  需要考虑为 symptom 显式记录 `matched_rule(s)` / `matched_roles_by_rule`，避免 trigger 回收时的归属歧义。
