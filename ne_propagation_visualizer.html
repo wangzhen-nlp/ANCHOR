@@ -2065,6 +2065,9 @@
                 if (!recordType) {
                     return '<div class="alarm-meta-value">' + escapeHtml(value) + '</div>';
                 }
+                if (!canOpenReferenceRecord(recordType, value)) {
+                    return '<div class="alarm-meta-value" title="未在关联明细 JSON 中找到">' + escapeHtml(value) + '</div>';
+                }
                 return '<button type="button" class="alarm-meta-value-link" onclick="openReferenceRecordByEncoded(\'' + recordType + '\', \'' + encodeURIComponent(value) + '\')" title="点击查看详情">' + escapeHtml(value) + '</button>';
             }).join('');
         }
@@ -2160,7 +2163,7 @@
 
             const record = resolveReferenceRecord(recordType, recordId);
             if (!record) {
-                window.alert(`未在关联明细 JSON 中找到${recordType === 'ticket' ? '工单号' : '告警故障组'}：${recordId}`);
+                window.alert(`未在关联明细 JSON 中找到${recordType === 'ticket' ? '工单号' : '告警故障组ID'}：${recordId}`);
                 return;
             }
 
@@ -2175,6 +2178,13 @@
 
         function openReferenceRecordByEncoded(recordType, encodedRecordId) {
             openReferenceRecord(recordType, decodeURIComponent(encodedRecordId));
+        }
+
+        function canOpenReferenceRecord(recordType, recordId) {
+            if (!referenceData || !recordId) {
+                return false;
+            }
+            return !!resolveReferenceRecord(recordType, recordId);
         }
 
         // 高亮站点集合
@@ -4284,10 +4294,12 @@
                 try {
                     referenceData = JSON.parse(e.target.result);
                     document.getElementById('referenceStatus').textContent = '关联明细 JSON：已加载 ' + file.name;
+                    renderAlarmMetaSummary();
                 } catch (error) {
                     referenceData = null;
                     showError('关联明细 JSON 解析失败: ' + error.message);
                     document.getElementById('referenceStatus').textContent = '关联明细 JSON：加载失败';
+                    renderAlarmMetaSummary();
                 }
             };
             reader.readAsText(file);
