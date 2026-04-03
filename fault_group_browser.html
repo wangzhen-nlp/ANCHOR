@@ -184,7 +184,7 @@
         .open-btn:hover { background: #0b1220; }
         .meta {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 10px 18px;
         }
         .meta-item {
@@ -192,6 +192,9 @@
             border-radius: 12px;
             padding: 10px 12px;
             min-height: 64px;
+        }
+        .meta-item--wide {
+            grid-column: 1 / -1;
         }
         .meta-label {
             font-size: 12px;
@@ -207,6 +210,15 @@
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
+        }
+        .stacked-values {
+            display: grid;
+            gap: 4px;
+        }
+        .stacked-value {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .inline-link {
             border: none;
@@ -407,6 +419,16 @@
             return alarmGroups.length > 0 ? alarmGroups.join('，') : '无';
         }
 
+        function renderStackedFieldValues(group, fieldNames) {
+            const values = getSymptomFieldValues(group, fieldNames);
+            if (values.length === 0) {
+                return '无';
+            }
+            return `<div class="stacked-values">${
+                values.map(value => `<div class="stacked-value">${escapeHtml(value)}</div>`).join('')
+            }</div>`;
+        }
+
         function openGroupDetail(index) {
             const group = faultGroups[index];
             const sessionKey = `fault-group-${Date.now()}-${index}`;
@@ -515,13 +537,13 @@
                             <div class="meta-label">关联故障组</div>
                             <div class="meta-value">${renderRelatedGroupLinks(group)}</div>
                         </div>
-                        <div class="meta-item">
+                        <div class="meta-item meta-item--wide">
                             <div class="meta-label">相关工单号</div>
-                            <div class="meta-value">${escapeHtml(getGroupTicketText(group))}</div>
+                            <div class="meta-value">${renderStackedFieldValues(group, ['工单号'])}</div>
                         </div>
-                        <div class="meta-item">
+                        <div class="meta-item meta-item--wide">
                             <div class="meta-label">告警故障组</div>
-                            <div class="meta-value">${escapeHtml(getGroupAlarmFaultText(group))}</div>
+                            <div class="meta-value">${renderStackedFieldValues(group, ['DRAE故障组', '故障组'])}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">站点数 / 设备数 / 告警数</div>
