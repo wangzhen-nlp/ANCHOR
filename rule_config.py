@@ -28,11 +28,15 @@ transmission_rule = {
           "site_rules": [
             {
               "include": ["Data"],
-              "expected_alarms": "NONE"
+              "expected_alarms": {
+                "forbidden_alarms": OFFLINE_ALARMS
+              }
             },
             {
               "include": ["Transmission"],
-              "expected_alarms": "NONE"
+              "expected_alarms": {
+                "forbidden_alarms": OFFLINE_ALARMS
+              }
             }
           ]
         }
@@ -79,7 +83,7 @@ transmission_rule = {
   ]
 }
 
-parent_link_to_offline_rule = {
+link_rule = {
   "pattern_name": "upstream_link_to_offline",
   "description": "父节点传输告警 -> 儿子节点断站",
   "max_stay_time_sec": 3600,

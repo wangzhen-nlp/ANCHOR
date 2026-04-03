@@ -147,6 +147,12 @@ class NodeRuleHelper:
             if expected == "NONE":
                 has_crit = any(e["alarm"] in self.critical_alarms for e in events_in_win)
                 return not has_crit, []
+            if isinstance(expected, dict):
+                forbidden_alarms = expected.get("forbidden_alarms")
+                if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
+                    has_forbidden = any(e["alarm"] in forbidden_alarms for e in events_in_win)
+                    return not has_forbidden, []
+                return False, []
             if expected == "ANY":
                 return True, events_in_win
             if isinstance(expected, Iterable):
