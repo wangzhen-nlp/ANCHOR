@@ -24,7 +24,9 @@ OFFLINE_ALARMS = {
     "Nokia 2G NE Down",
     "Nokia 4G NE Down",
     "Nokia 4G S1 NE Down",
+    "PMS Communication Failure",
     "ReachabilityProblem",
+    "SWT_SWITCH_DOWN",
     "The Device is offline",
     "The link between the server and the NE is broken",
     "WCDMA BASE STATION OUT OF USE",
@@ -50,6 +52,7 @@ POWER_ALARMS = {
 }
 
 LINK_ALARMS = {
+    "CSL Fault",
     "E1 LOS",
     "ETH LOS",
     "ETH_LINK_DOWN",
@@ -66,6 +69,9 @@ LINK_ALARMS = {
     "Link Failure",
     "MW_LOF",
     "Microwave link critical alarm.",
+    "OML FAULT-RXOTRX",
+    "OML Fault",
+    "PLA port link down alarm",
     "Physical Port Down",
     "S1AP Link Down",
     "Transmission unit link break",
