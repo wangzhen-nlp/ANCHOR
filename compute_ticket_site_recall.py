@@ -182,6 +182,12 @@ def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, tick
         evaluated_count += 1
 
     average_recall = total_recall / evaluated_count if evaluated_count else 0.0
+    details.sort(
+        key=lambda item: (
+            -item.get("ticket_site_count", 0),
+            item.get("ticket_id", ""),
+        )
+    )
     return details, average_recall, evaluated_count
 
 
