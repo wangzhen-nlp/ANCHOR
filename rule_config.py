@@ -1,4 +1,4 @@
-from alarm_types import OFFLINE_ALARMS, POWER_ALARMS
+from alarm_types import OFFLINE_ALARMS, POWER_ALARMS, LINK_ALARMS
 
 TRANSMISSION_SITE_RULES = [
   {
@@ -75,6 +75,42 @@ transmission_rule = {
           "site_rules": TRANSMISSION_SITE_RULES
         }
       }
+    }
+  ]
+}
+
+parent_link_to_offline_rule = {
+  "pattern_name": "upstream_link_to_offline",
+  "description": "父节点传输告警 -> 儿子节点断站",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "link_child_offline_node",
+  "nodes": {
+    "link_child_offline_node": {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Transmission"],
+          "expected_alarms": OFFLINE_ALARMS
+        }
+      ]
+    },
+    "link_parent_node": {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Transmission"],
+          "expected_alarms": LINK_ALARMS
+        }
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "link_parent_node",
+      "target": "link_child_offline_node",
+      "direction": "downstream",
+      "max_hops": 1,
+      "time_window_sec": 600
     }
   ]
 }

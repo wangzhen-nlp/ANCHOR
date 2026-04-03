@@ -16,7 +16,7 @@ from alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from compute_group_output_ticket_recall import compute_group_output_ticket_recall
 from progress_utils import ProgressBar
 from reports import generate_incident_report
-from rule_config import transmission_rule, power_rule
+from rule_config import transmission_rule, parent_link_to_offline_rule, power_rule
 from temporal_graph_engine import TemporalGraphEngine
 
 
@@ -894,6 +894,7 @@ def main():
 
     rules_config = {
         "transmission_rule": transmission_rule,
+        "parent_link_to_offline_rule": parent_link_to_offline_rule,
         "power_rule": power_rule
     }
 

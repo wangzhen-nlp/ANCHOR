@@ -49,4 +49,26 @@ POWER_ALARMS = {
     "Genset Stop"
 }
 
-CRITICAL_ALARMS = OFFLINE_ALARMS | POWER_ALARMS
+LINK_ALARMS = {
+    "E1 LOS",
+    "ETH LOS",
+    "ETH_LINK_DOWN",
+    "ETH_LOS",
+    "Ethernet Physical (ETPI) Interface down",
+    "Ethernet Physical (ETPI) LOS",
+    "Ethernet Physical (ETPI) Port down",
+    "Ethernet port disconnected",
+    "IF_CABLE_OPEN",
+    "InterfaceDown",
+    "LINK_DOWN",
+    "LOF",
+    "Link Down",
+    "Link Failure",
+    "MW_LOF",
+    "Microwave link critical alarm.",
+    "Physical Port Down",
+    "S1AP Link Down",
+    "Transmission unit link break",
+}
+
+CRITICAL_ALARMS = OFFLINE_ALARMS | POWER_ALARMS | LINK_ALARMS
