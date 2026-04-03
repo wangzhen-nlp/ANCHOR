@@ -199,8 +199,8 @@ def main():
     )
     parser.add_argument(
         "--group-field",
-        default="故障组",
-        help="告警中的故障组字段名，默认: 故障组",
+        default="故障组ID",
+        help="告警中的故障组字段名，默认: 故障ID",
     )
     parser.add_argument(
         "--ne-graph",

@@ -249,9 +249,8 @@ def build_ne_to_site_map(ne_graph_file: str) -> dict:
 
     ne_to_site = {}
     for ne_name, ne_info in ne_graph.items():
-        site_id = ne_info.get('site_id', '')
-        site_name = ne_info.get('site_name', '')
-        if site_id and site_name:
+        site_id = str(ne_info.get('site_id', '')).strip()
+        if site_id:
             ne_to_site[ne_name] = site_id
 
     return ne_to_site
