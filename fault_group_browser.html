@@ -374,6 +374,39 @@
             return (group.symptoms || []).length;
         }
 
+        function getSymptomFieldValues(group, fieldNames) {
+            const symptoms = group.symptoms || [];
+            const seen = new Set();
+            const values = [];
+
+            symptoms.forEach(symptom => {
+                fieldNames.forEach(fieldName => {
+                    const rawValue = symptom?.[fieldName];
+                    if (rawValue === null || rawValue === undefined) {
+                        return;
+                    }
+                    const text = String(rawValue).trim();
+                    if (!text || text === 'null' || text === 'undefined' || seen.has(text)) {
+                        return;
+                    }
+                    seen.add(text);
+                    values.push(text);
+                });
+            });
+
+            return values;
+        }
+
+        function getGroupTicketText(group) {
+            const ticketIds = getSymptomFieldValues(group, ['工单号']);
+            return ticketIds.length > 0 ? ticketIds.join('，') : '无';
+        }
+
+        function getGroupAlarmFaultText(group) {
+            const alarmGroups = getSymptomFieldValues(group, ['DRAE故障组', '故障组']);
+            return alarmGroups.length > 0 ? alarmGroups.join('，') : '无';
+        }
+
         function openGroupDetail(index) {
             const group = faultGroups[index];
             const sessionKey = `fault-group-${Date.now()}-${index}`;
@@ -481,6 +514,14 @@
                         <div class="meta-item">
                             <div class="meta-label">关联故障组</div>
                             <div class="meta-value">${renderRelatedGroupLinks(group)}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">相关工单号</div>
+                            <div class="meta-value">${escapeHtml(getGroupTicketText(group))}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">告警故障组</div>
+                            <div class="meta-value">${escapeHtml(getGroupAlarmFaultText(group))}</div>
                         </div>
                         <div class="meta-item">
                             <div class="meta-label">站点数 / 设备数 / 告警数</div>
