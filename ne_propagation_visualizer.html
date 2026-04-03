@@ -3875,7 +3875,21 @@
                     if (!rawData) {
                         throw new Error('未找到对应的故障组数据');
                     }
-                    const data = JSON.parse(rawData);
+                    const sessionPayload = JSON.parse(rawData);
+                    const data = (
+                        sessionPayload &&
+                        typeof sessionPayload === 'object' &&
+                        !Array.isArray(sessionPayload) &&
+                        sessionPayload.group
+                    ) ? sessionPayload.group : sessionPayload;
+                    referenceData = (
+                        sessionPayload &&
+                        typeof sessionPayload === 'object' &&
+                        !Array.isArray(sessionPayload)
+                    ) ? (sessionPayload.referenceData || null) : null;
+                    document.getElementById('referenceStatus').textContent = referenceData
+                        ? '关联明细 JSON：已从总览页自动加载'
+                        : '关联明细 JSON：未加载';
                     graphData = data;
                     if (graphData.ne_info) {
                         loadOriginalFormat(graphData);

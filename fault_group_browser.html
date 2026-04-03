@@ -586,7 +586,10 @@
         function openGroupDetail(index) {
             const group = faultGroups[index];
             const sessionKey = `fault-group-${Date.now()}-${index}`;
-            localStorage.setItem(sessionKey, JSON.stringify(group));
+            localStorage.setItem(sessionKey, JSON.stringify({
+                group,
+                referenceData
+            }));
             window.open(`fault_group_detail.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
         }
 
