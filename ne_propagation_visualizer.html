@@ -1988,6 +1988,10 @@
         // 搜索类型
         let currentSearchType = 'site';
         let referenceData = null;
+        let referenceIndex = {
+            ticket: new Map(),
+            'alarm-group': new Map()
+        };
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -2084,6 +2088,108 @@
             };
         }
 
+        function resetReferenceIndex() {
+            referenceIndex = {
+                ticket: new Map(),
+                'alarm-group': new Map()
+            };
+        }
+
+        function getReferenceConfig(recordType) {
+            return recordType === 'ticket'
+                ? {
+                    bucketNames: ['工单号', '工单', 'tickets', 'ticket'],
+                    idFieldCandidates: ['工单号', 'ticket_id', 'ticketId', 'id']
+                }
+                : {
+                    bucketNames: ['故障组ID', 'alarm_groups', 'fault_groups', 'groups'],
+                    idFieldCandidates: ['故障组ID', 'group_id', 'groupId', 'id']
+                };
+        }
+
+        function addReferenceIndexRecord(recordType, recordId, record, idFieldName) {
+            const normalizedId = String(recordId ?? '').trim();
+            if (!normalizedId) {
+                return;
+            }
+            const targetMap = referenceIndex[recordType];
+            if (!targetMap.has(normalizedId)) {
+                targetMap.set(normalizedId, normalizeReferenceRecord(record, idFieldName, normalizedId));
+            }
+        }
+
+        function indexReferenceBucket(recordType, bucket, idFieldCandidates, allowDirectKeys) {
+            if (!bucket || typeof bucket !== 'object') {
+                return;
+            }
+
+            const primaryIdField = idFieldCandidates[0];
+            if (Array.isArray(bucket)) {
+                bucket.forEach(function(item) {
+                    if (!item || typeof item !== 'object') {
+                        return;
+                    }
+                    idFieldCandidates.forEach(function(fieldName) {
+                        const fieldValue = item[fieldName];
+                        if (fieldValue !== null && fieldValue !== undefined) {
+                            addReferenceIndexRecord(recordType, fieldValue, item, primaryIdField);
+                        }
+                    });
+                });
+                return;
+            }
+
+            Object.entries(bucket).forEach(function(entry) {
+                const key = entry[0];
+                const value = entry[1];
+                if (allowDirectKeys) {
+                    addReferenceIndexRecord(recordType, key, value, primaryIdField);
+                }
+                if (!value || typeof value !== 'object') {
+                    return;
+                }
+                idFieldCandidates.forEach(function(fieldName) {
+                    const fieldValue = value[fieldName];
+                    if (fieldValue !== null && fieldValue !== undefined) {
+                        addReferenceIndexRecord(recordType, fieldValue, value, primaryIdField);
+                    }
+                });
+            });
+        }
+
+        function rebuildReferenceIndex() {
+            resetReferenceIndex();
+            if (!referenceData || typeof referenceData !== 'object') {
+                return;
+            }
+
+            ['ticket', 'alarm-group'].forEach(function(recordType) {
+                const config = getReferenceConfig(recordType);
+                const preferredBuckets = new Set(config.bucketNames);
+                let usedPreferredBucket = false;
+
+                config.bucketNames.forEach(function(bucketName) {
+                    if (referenceData[bucketName] !== undefined) {
+                        usedPreferredBucket = true;
+                        indexReferenceBucket(recordType, referenceData[bucketName], config.idFieldCandidates, true);
+                    }
+                });
+
+                if (!usedPreferredBucket) {
+                    indexReferenceBucket(recordType, referenceData, config.idFieldCandidates, true);
+                }
+
+                Object.entries(referenceData).forEach(function(entry) {
+                    const bucketName = entry[0];
+                    const bucketValue = entry[1];
+                    if (preferredBuckets.has(bucketName)) {
+                        return;
+                    }
+                    indexReferenceBucket(recordType, bucketValue, config.idFieldCandidates, true);
+                });
+            });
+        }
+
         function findReferenceRecordInBucket(bucket, recordId, idFieldCandidates) {
             if (!bucket || typeof bucket !== 'object') {
                 return null;
@@ -2116,37 +2222,11 @@
             if (!referenceData || !recordId) {
                 return null;
             }
-
-            const config = recordType === 'ticket'
-                ? {
-                    bucketNames: ['工单号', '工单', 'tickets', 'ticket'],
-                    idFieldCandidates: ['工单号', 'ticket_id', 'ticketId', 'id']
-                }
-                : {
-                    bucketNames: ['故障组ID', 'alarm_groups', 'fault_groups', 'groups'],
-                    idFieldCandidates: ['故障组ID', 'group_id', 'groupId', 'id']
-                };
-
-            for (const bucketName of config.bucketNames) {
-                const match = findReferenceRecordInBucket(referenceData[bucketName], recordId, config.idFieldCandidates);
-                if (match) {
-                    return match;
-                }
+            const normalizedId = String(recordId).trim();
+            if (!normalizedId) {
+                return null;
             }
-
-            let match = findReferenceRecordInBucket(referenceData, recordId, config.idFieldCandidates);
-            if (match) {
-                return match;
-            }
-
-            for (const bucket of Object.values(referenceData)) {
-                match = findReferenceRecordInBucket(bucket, recordId, config.idFieldCandidates);
-                if (match) {
-                    return match;
-                }
-            }
-
-            return null;
+            return referenceIndex[recordType]?.get(normalizedId) || null;
         }
 
         function openReferenceRecord(recordType, recordId) {
@@ -3882,11 +3962,21 @@
                         !Array.isArray(sessionPayload) &&
                         sessionPayload.group
                     ) ? sessionPayload.group : sessionPayload;
-                    referenceData = (
+                    const payloadReferenceData = (
                         sessionPayload &&
                         typeof sessionPayload === 'object' &&
                         !Array.isArray(sessionPayload)
                     ) ? (sessionPayload.referenceData || null) : null;
+                    let openerReferenceData = null;
+                    try {
+                        if (window.opener && typeof window.opener.getLoadedReferenceData === 'function') {
+                            openerReferenceData = window.opener.getLoadedReferenceData();
+                        }
+                    } catch (error) {
+                        openerReferenceData = null;
+                    }
+                    referenceData = openerReferenceData || payloadReferenceData || null;
+                    rebuildReferenceIndex();
                     document.getElementById('referenceStatus').textContent = referenceData
                         ? '关联明细 JSON：已从总览页自动加载'
                         : '关联明细 JSON：未加载';
@@ -4283,11 +4373,15 @@
             reader.onload = function(e) {
                 try {
                     referenceData = JSON.parse(e.target.result);
+                    rebuildReferenceIndex();
                     document.getElementById('referenceStatus').textContent = '关联明细 JSON：已加载 ' + file.name;
+                    renderAlarmMetaSummary();
                 } catch (error) {
                     referenceData = null;
+                    resetReferenceIndex();
                     showError('关联明细 JSON 解析失败: ' + error.message);
                     document.getElementById('referenceStatus').textContent = '关联明细 JSON：加载失败';
+                    renderAlarmMetaSummary();
                 }
             };
             reader.readAsText(file);
