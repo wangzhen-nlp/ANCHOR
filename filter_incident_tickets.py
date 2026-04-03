@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import warnings
 from collections import deque
 
 import pandas as pd
@@ -215,7 +216,13 @@ def _filter_incident_tickets_xlsx_stream(input_file: str, site_device_mapping: d
     if load_workbook is None:
         raise ImportError("openpyxl 不可用，无法启用 xlsx 流式读取")
 
-    workbook = load_workbook(input_file, read_only=True, data_only=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Workbook contains no default style, apply openpyxl's default",
+            category=UserWarning,
+        )
+        workbook = load_workbook(input_file, read_only=True, data_only=True)
     try:
         worksheet = workbook.worksheets[0]
         row_iter = worksheet.iter_rows(values_only=True)
