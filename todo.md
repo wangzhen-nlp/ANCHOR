@@ -21,6 +21,12 @@
   同时，对于多条独立入边、菱形/网状结构这类更复杂规则图，也需要继续评估当前 matcher 是否足够通用，  
   或者是否需要更系统的图约束求解方式。
 
+- [ ] 评估单条规则支持多个 `trigger_role` 的改造方案  
+  当前引擎默认一条规则只有一个 `trigger_role`；  
+  `trigger` 索引构建、规则起算、trigger 消费回收、debug 识别等逻辑都按单 trigger 入口实现。  
+  如果未来需要在一个 rule 里配置多个 `trigger_role`，需要统一改造上述链路，  
+  或者明确继续采用“拆成多条 rule”的约束。
+
 - [ ] 评估 symptom 的跨 rule 归属表达  
   当前 trigger 消费已经按 `rule` 粒度拆开，但故障组 `symptoms` 仍主要依赖 `matched_role` 表达其角色信息；  
   如果未来不同规则共用相同 `trigger_role`，或者同一条 `eid` 同时参与多条规则，  

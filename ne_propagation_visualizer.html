@@ -448,6 +448,82 @@
             margin-top: 2px;
         }
 
+        .alarm-meta-panel {
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #b6d4fe;
+        }
+
+        .alarm-meta-panel h3 {
+            font-size: 13px;
+            color: #0969da;
+            margin-bottom: 10px;
+            border-bottom: 1px solid #d0d7de;
+            padding-bottom: 6px;
+        }
+
+        .alarm-meta-row {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .alarm-meta-row:first-of-type {
+            margin-top: 0;
+        }
+
+        .alarm-meta-label {
+            font-size: 11px;
+            color: #57606a;
+            font-weight: 600;
+        }
+
+        .alarm-meta-values {
+            display: grid;
+            gap: 4px;
+            padding: 8px 10px;
+            background: #ffffff;
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            min-height: 40px;
+        }
+
+        .alarm-meta-value {
+            font-size: 12px;
+            color: #24292f;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+
+        .alarm-meta-value-link {
+            display: inline-flex;
+            align-items: center;
+            width: fit-content;
+            max-width: 100%;
+            padding: 4px 10px;
+            border: 1px solid #b6d4fe;
+            border-radius: 999px;
+            background: #eff6ff;
+            color: #0969da;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .alarm-meta-value-link:hover {
+            background: #dbeafe;
+            border-color: #96c2ff;
+        }
+
+        .alarm-meta-empty {
+            color: #8c959f;
+        }
+
         .node-list {
             background: #f6f8fa;
             padding: 12px;
@@ -1489,6 +1565,13 @@
                     </button>
                     <p id="fileStatus">请选择 JSON 文件</p>
                 </div>
+                <div class="file-select" style="margin-top: 10px;">
+                    <input type="file" id="referenceFileInput" accept=".json" style="display: none;">
+                    <button onclick="document.getElementById('referenceFileInput').click()">
+                        📘 选择关联明细 JSON
+                    </button>
+                    <p id="referenceStatus">关联明细 JSON：未加载</p>
+                </div>
             </div>
 
             <!-- Group 管理区域 -->
@@ -1525,6 +1608,22 @@
                         <div class="search-suggestions" id="searchSuggestions"></div>
                     </div>
                     <button onclick="addBySearch()" id="searchAddBtn" disabled>查找</button>
+                </div>
+            </div>
+
+            <div class="alarm-meta-panel">
+                <h3>关联告警信息</h3>
+                <div class="alarm-meta-row">
+                    <div class="alarm-meta-label">相关工单号</div>
+                    <div class="alarm-meta-values" id="relatedTicketValues">
+                        <div class="alarm-meta-value alarm-meta-empty">无</div>
+                    </div>
+                </div>
+                <div class="alarm-meta-row">
+                    <div class="alarm-meta-label">告警故障组ID</div>
+                    <div class="alarm-meta-values" id="alarmFaultGroupValues">
+                        <div class="alarm-meta-value alarm-meta-empty">无</div>
+                    </div>
                 </div>
             </div>
 
@@ -1888,6 +1987,195 @@
 
         // 搜索类型
         let currentSearchType = 'site';
+        let referenceData = null;
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function collectGraphAlarmEntries(data) {
+            if (!data) return [];
+            if (Array.isArray(data.symptoms) && data.symptoms.length > 0) {
+                return data.symptoms;
+            }
+
+            const entries = [];
+            if (data.ne_info) {
+                for (const neId in data.ne_info) {
+                    const neInfo = data.ne_info[neId];
+                    if (Array.isArray(neInfo.alarm)) {
+                        neInfo.alarm.forEach(function(alarm) {
+                            entries.push(alarm);
+                        });
+                    }
+                }
+                return entries;
+            }
+
+            if (Array.isArray(data.nodes)) {
+                data.nodes.forEach(function(node) {
+                    if (Array.isArray(node.alarm)) {
+                        node.alarm.forEach(function(alarm) {
+                            entries.push(alarm);
+                        });
+                    }
+                });
+            }
+            return entries;
+        }
+
+        function getGraphAlarmFieldValues(data, fieldNames) {
+            const entries = collectGraphAlarmEntries(data);
+            const seen = new Set();
+            const values = [];
+
+            entries.forEach(function(entry) {
+                fieldNames.forEach(function(fieldName) {
+                    const rawValue = entry && entry[fieldName];
+                    if (rawValue === null || rawValue === undefined) {
+                        return;
+                    }
+                    const text = String(rawValue).trim();
+                    if (!text || text === 'null' || text === 'undefined' || seen.has(text)) {
+                        return;
+                    }
+                    seen.add(text);
+                    values.push(text);
+                });
+            });
+
+            return values;
+        }
+
+        function renderAlarmMetaValues(containerId, values, recordType) {
+            const container = document.getElementById(containerId);
+            if (!container) return;
+
+            if (!values || values.length === 0) {
+                container.innerHTML = '<div class="alarm-meta-value alarm-meta-empty">无</div>';
+                return;
+            }
+
+            container.innerHTML = values.map(function(value) {
+                if (!recordType) {
+                    return '<div class="alarm-meta-value">' + escapeHtml(value) + '</div>';
+                }
+                return '<button type="button" class="alarm-meta-value-link" onclick="openReferenceRecordByEncoded(\'' + recordType + '\', \'' + encodeURIComponent(value) + '\')" title="点击查看详情">' + escapeHtml(value) + '</button>';
+            }).join('');
+        }
+
+        function renderAlarmMetaSummary() {
+            renderAlarmMetaValues('relatedTicketValues', getGraphAlarmFieldValues(graphData, ['工单号']), 'ticket');
+            renderAlarmMetaValues('alarmFaultGroupValues', getGraphAlarmFieldValues(graphData, ['故障组ID']), 'alarm-group');
+        }
+
+        function normalizeReferenceRecord(record, idFieldName, recordId) {
+            if (record && typeof record === 'object' && !Array.isArray(record)) {
+                return record;
+            }
+            return {
+                [idFieldName]: recordId,
+                value: record
+            };
+        }
+
+        function findReferenceRecordInBucket(bucket, recordId, idFieldCandidates) {
+            if (!bucket || typeof bucket !== 'object') {
+                return null;
+            }
+
+            if (!Array.isArray(bucket) && Object.prototype.hasOwnProperty.call(bucket, recordId)) {
+                return normalizeReferenceRecord(bucket[recordId], idFieldCandidates[0], recordId);
+            }
+
+            const entries = Array.isArray(bucket) ? bucket.entries() : Object.entries(bucket);
+            for (const [key, value] of entries) {
+                if (String(key).trim() === recordId) {
+                    return normalizeReferenceRecord(value, idFieldCandidates[0], recordId);
+                }
+                if (!value || typeof value !== 'object') {
+                    continue;
+                }
+                const matched = idFieldCandidates.some(function(fieldName) {
+                    const fieldValue = value[fieldName];
+                    return fieldValue !== null && fieldValue !== undefined && String(fieldValue).trim() === recordId;
+                });
+                if (matched) {
+                    return normalizeReferenceRecord(value, idFieldCandidates[0], recordId);
+                }
+            }
+            return null;
+        }
+
+        function resolveReferenceRecord(recordType, recordId) {
+            if (!referenceData || !recordId) {
+                return null;
+            }
+
+            const config = recordType === 'ticket'
+                ? {
+                    bucketNames: ['工单号', '工单', 'tickets', 'ticket'],
+                    idFieldCandidates: ['工单号', 'ticket_id', 'ticketId', 'id']
+                }
+                : {
+                    bucketNames: ['故障组ID', 'alarm_groups', 'fault_groups', 'groups'],
+                    idFieldCandidates: ['故障组ID', 'group_id', 'groupId', 'id']
+                };
+
+            for (const bucketName of config.bucketNames) {
+                const match = findReferenceRecordInBucket(referenceData[bucketName], recordId, config.idFieldCandidates);
+                if (match) {
+                    return match;
+                }
+            }
+
+            let match = findReferenceRecordInBucket(referenceData, recordId, config.idFieldCandidates);
+            if (match) {
+                return match;
+            }
+
+            for (const bucket of Object.values(referenceData)) {
+                match = findReferenceRecordInBucket(bucket, recordId, config.idFieldCandidates);
+                if (match) {
+                    return match;
+                }
+            }
+
+            return null;
+        }
+
+        function openReferenceRecord(recordType, recordId) {
+            if (!recordId) {
+                return;
+            }
+            if (!referenceData) {
+                window.alert('请先加载关联明细 JSON');
+                return;
+            }
+
+            const record = resolveReferenceRecord(recordType, recordId);
+            if (!record) {
+                window.alert(`未在关联明细 JSON 中找到${recordType === 'ticket' ? '工单号' : '告警故障组'}：${recordId}`);
+                return;
+            }
+
+            const sessionKey = `reference-record-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            localStorage.setItem(sessionKey, JSON.stringify({
+                recordType,
+                recordId,
+                record
+            }));
+            window.open(`reference_record_viewer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+        }
+
+        function openReferenceRecordByEncoded(recordType, encodedRecordId) {
+            openReferenceRecord(recordType, decodeURIComponent(encodedRecordId));
+        }
 
         // 高亮站点集合
         let highlightedNodes = new Set();
@@ -1940,6 +2228,7 @@
             });
 
             document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+            document.getElementById('referenceFileInput').addEventListener('change', handleReferenceFileSelect);
         });
 
         // 显示错误提示
@@ -2767,14 +3056,16 @@
                 if (node.alarm && node.alarm.length > 0) {
                     const alarmRows = node.alarm.map(function(alarm) {
                         const alarmTime = alarm.time || alarm.alarm_time || '-';
+                        const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
                         const ticketId = alarm['工单号'] || '-';
-                        const faultGroup = alarm['故障组'] || '-';
+                        const faultGroup = alarm['故障组ID'] || '-';
                         return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
                             '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
                             '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4;">' + alarmTitle + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
-                            '<div style="font-size: 10px; color: #57606a;">故障组: ' + faultGroup + '</div>' +
+                            '<div style="font-size: 10px; color: #57606a;">故障组ID: ' + faultGroup + '</div>' +
+                            '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
                             '</div>';
                     }).join('');
 
@@ -3011,8 +3302,9 @@
                 const severity = alarm.severity || alarm.alarm_level || 'warning';
                 const description = alarm.description || alarm.alarm_desc || '-';
                 const time = alarm.time || alarm.alarm_time || '-';
+                const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                 const ticketId = alarm['工单号'] || '-';
-                const faultGroup = alarm['故障组'] || '-';
+                const faultGroup = alarm['故障组ID'] || '-';
                 
                 // 根据严重级别设置样式
                 let severityClass = 'warning';
@@ -3040,7 +3332,8 @@
                     '</div>' +
                     '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
-                    '<div style="color: #57606a; font-size: 11px;">故障组: ' + faultGroup + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px;">故障组ID: ' + faultGroup + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
                     '</div>';
             });
             
@@ -3763,6 +4056,7 @@
             document.getElementById('searchAddBtn').disabled = false;
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info).length + ' 个 Group, ' + allNodes.length + ' 个节点';
             
+            renderAlarmMetaSummary();
             updateStats();
             if (graphData.group_info && Object.keys(graphData.group_info).length > 0) {
                 showAllGroups();
@@ -3789,6 +4083,7 @@
             document.getElementById('searchAddBtn').disabled = false;
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info || {}).length + ' 个 Group, ' + allNodes.length + ' 个节点';
             
+            renderAlarmMetaSummary();
             updateStats();
             if (graphData.group_info && Object.keys(graphData.group_info).length > 0) {
                 showAllGroups();
@@ -3956,6 +4251,29 @@
                 } catch (error) {
                     showError('解析文件失败: ' + error.message);
                     showLoading(false);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function handleReferenceFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (!file.name.endsWith('.json')) {
+                showError('请选择 JSON 文件');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    referenceData = JSON.parse(e.target.result);
+                    document.getElementById('referenceStatus').textContent = '关联明细 JSON：已加载 ' + file.name;
+                } catch (error) {
+                    referenceData = null;
+                    showError('关联明细 JSON 解析失败: ' + error.message);
+                    document.getElementById('referenceStatus').textContent = '关联明细 JSON：加载失败';
                 }
             };
             reader.readAsText(file);

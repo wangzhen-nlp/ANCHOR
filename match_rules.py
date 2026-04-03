@@ -224,12 +224,13 @@ def _build_group_output(match, ne_graph_data, site_graph_data):
             "alarm_id": symptom.get("eid", ""),
             "alarm_type": symptom.get("alarm", ""),
             "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
+            "alarm_clear_time": symptom.get("告警清除时间", ""),
             "domain": ne_graph_entry.get("domain", ""),
             "site_id": site_id,
             "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
             "工单号": symptom.get("工单号", ""),
-            "故障组": symptom.get("故障组", ""),
+            "故障组ID": symptom.get("故障组ID", ""),
         })
 
     group_ne_ids = sorted({
@@ -294,8 +295,18 @@ def _build_alarm_metadata_index(valid_alarms):
             continue
 
         existing = alarm_metadata_index.setdefault(event_id, {})
-        for field_name in ("工单号", "故障组"):
-            value = str(alarm.get(field_name, "")).strip()
+        field_aliases = {
+            "工单号": ("工单号",),
+            "故障组ID": ("故障组ID",),
+            "告警清除时间": ("告警清除时间",),
+        }
+        for field_name, aliases in field_aliases.items():
+            value = ""
+            for alias in aliases:
+                raw_value = str(alarm.get(alias, "")).strip()
+                if raw_value:
+                    value = raw_value
+                    break
             if value and not existing.get(field_name):
                 existing[field_name] = value
 
@@ -309,7 +320,7 @@ def _enrich_match_symptoms(match, alarm_metadata_index):
         event_id = enriched_symptom.get("eid", "")
         if event_id:
             metadata = alarm_metadata_index.get(event_id, {})
-            for field_name in ("工单号", "故障组"):
+            for field_name in ("工单号", "故障组ID", "告警清除时间"):
                 if metadata.get(field_name) and not enriched_symptom.get(field_name):
                     enriched_symptom[field_name] = metadata[field_name]
         enriched_symptoms.append(enriched_symptom)
@@ -870,6 +881,7 @@ def main():
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
+    parser.add_argument('--verbose-groups', action='store_true', help='打印每个故障组的详细报告；默认静默，仅输出进度与汇总')
     parser.add_argument('--compute-ticket-recall', action='store_true', help='在主故障组输出完成后额外计算工单站点召回率')
     parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
@@ -933,6 +945,7 @@ def main():
     real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
 
     match_count = 0
+    process_progress = None
     output_lock = threading.Lock()
     with open(args.output, 'w', encoding='utf-8'):
         pass
@@ -943,7 +956,8 @@ def main():
         with output_lock:
             with open(args.output, 'a', encoding='utf-8') as fw:
                 for match in matches:
-                    generate_incident_report(match)
+                    if args.verbose_groups:
+                        generate_incident_report(match)
                     enriched_match = _build_jsonl_match_output(
                         match,
                         ne_graph_data,
@@ -952,8 +966,11 @@ def main():
                     )
                     fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)
+            if process_progress is not None:
+                process_progress.set_extra_text(f"已汇聚故障组数: {match_count}")
 
     process_progress = ProgressBar(filtered_count, "处理有效告警")
+    process_progress.set_extra_text(f"已汇聚故障组数: {match_count}", force=True)
     if debug_enabled:
         _run_debug_mode(
             engine,

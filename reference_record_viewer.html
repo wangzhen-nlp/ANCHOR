@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>关联明细查看</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background: #f5f7fb;
+            color: #1f2937;
+        }
+        .page {
+            min-height: 100vh;
+            padding: 24px;
+        }
+        .hero {
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            border: 1px solid #dbe4f0;
+            border-radius: 18px;
+            padding: 20px 24px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        }
+        .title {
+            font-size: 26px;
+            font-weight: 700;
+            margin: 0 0 10px;
+        }
+        .sub {
+            color: #5b6472;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .summary {
+            margin-top: 14px;
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .summary-item {
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 12px 14px;
+        }
+        .summary-label {
+            font-size: 12px;
+            color: #667085;
+            margin-bottom: 6px;
+        }
+        .summary-value {
+            font-size: 14px;
+            font-weight: 600;
+            color: #111827;
+            word-break: break-word;
+        }
+        .layout {
+            margin-top: 18px;
+            display: grid;
+            grid-template-columns: 320px minmax(0, 1fr);
+            gap: 18px;
+        }
+        .panel {
+            background: #ffffff;
+            border: 1px solid #e4e7ec;
+            border-radius: 16px;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
+            min-height: 480px;
+        }
+        .panel-head {
+            padding: 16px 18px 12px;
+            border-bottom: 1px solid #edf2f7;
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .field-list {
+            padding: 10px;
+            display: grid;
+            gap: 8px;
+            max-height: calc(100vh - 240px);
+            overflow-y: auto;
+        }
+        .field-btn {
+            width: 100%;
+            text-align: left;
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+            background: #fff;
+            color: #344054;
+            padding: 10px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .field-btn:hover {
+            border-color: #96c2ff;
+            background: #f8fbff;
+        }
+        .field-btn.active {
+            background: #111827;
+            border-color: #111827;
+            color: #fff;
+        }
+        .field-preview {
+            display: block;
+            margin-top: 4px;
+            font-size: 12px;
+            font-weight: 400;
+            opacity: 0.82;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .value-panel {
+            padding: 18px;
+        }
+        .value-label {
+            font-size: 13px;
+            color: #667085;
+            margin-bottom: 8px;
+        }
+        .value-box {
+            min-height: 380px;
+            background: #0f172a;
+            color: #e5eefc;
+            border-radius: 14px;
+            padding: 16px;
+            overflow: auto;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .empty {
+            margin-top: 18px;
+            background: #fff;
+            border: 1px dashed #d0d5dd;
+            border-radius: 18px;
+            padding: 40px 24px;
+            color: #667085;
+            text-align: center;
+        }
+        @media (max-width: 960px) {
+            .summary {
+                grid-template-columns: 1fr;
+            }
+            .layout {
+                grid-template-columns: 1fr;
+            }
+            .panel {
+                min-height: auto;
+            }
+            .field-list {
+                max-height: 260px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="hero">
+            <div class="title">关联明细查看</div>
+            <div class="sub">点击左侧字段名，即可查看该字段的完整值。对象和数组会按 JSON 格式展示。</div>
+            <div class="summary">
+                <div class="summary-item">
+                    <div class="summary-label">记录类型</div>
+                    <div class="summary-value" id="recordType">-</div>
+                </div>
+                <div class="summary-item">
+                    <div class="summary-label">记录 ID</div>
+                    <div class="summary-value" id="recordId">-</div>
+                </div>
+                <div class="summary-item">
+                    <div class="summary-label">字段数</div>
+                    <div class="summary-value" id="fieldCount">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="content" style="display:none;">
+            <div class="layout">
+                <div class="panel">
+                    <div class="panel-head">字段列表</div>
+                    <div class="field-list" id="fieldList"></div>
+                </div>
+                <div class="panel">
+                    <div class="panel-head">字段值</div>
+                    <div class="value-panel">
+                        <div class="value-label" id="valueLabel">请选择字段</div>
+                        <div class="value-box" id="valueBox">-</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="empty" id="emptyState">未找到对应的关联明细数据</div>
+    </div>
+
+    <script>
+        let currentRecord = null;
+        let currentFieldName = '';
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function formatValuePreview(value) {
+            if (value === null || value === undefined) {
+                return '空';
+            }
+            if (typeof value === 'object') {
+                return Array.isArray(value) ? `数组(${value.length})` : `对象(${Object.keys(value).length})`;
+            }
+            const text = String(value);
+            return text.length > 32 ? `${text.slice(0, 32)}...` : text;
+        }
+
+        function formatValueForDisplay(value) {
+            if (value === null || value === undefined) {
+                return 'null';
+            }
+            if (typeof value === 'object') {
+                try {
+                    return JSON.stringify(value, null, 2);
+                } catch (error) {
+                    return String(value);
+                }
+            }
+            return String(value);
+        }
+
+        function getRecordTypeLabel(recordType) {
+            if (recordType === 'ticket') {
+                return '相关工单号';
+            }
+            if (recordType === 'alarm-group') {
+                return '告警故障组ID';
+            }
+            return recordType || '-';
+        }
+
+        function renderFieldList(record) {
+            const fieldNames = Object.keys(record || {});
+            const fieldList = document.getElementById('fieldList');
+            fieldList.innerHTML = fieldNames.map(fieldName => {
+                const preview = formatValuePreview(record[fieldName]);
+                const activeClass = fieldName === currentFieldName ? ' active' : '';
+                return `<button type="button" class="field-btn${activeClass}" onclick="selectFieldByEncoded('${encodeURIComponent(fieldName)}')">
+                    ${escapeHtml(fieldName)}
+                    <span class="field-preview">${escapeHtml(preview)}</span>
+                </button>`;
+            }).join('');
+        }
+
+        function selectField(fieldName) {
+            if (!currentRecord || !Object.prototype.hasOwnProperty.call(currentRecord, fieldName)) {
+                return;
+            }
+            currentFieldName = fieldName;
+            document.getElementById('valueLabel').textContent = `字段：${fieldName}`;
+            document.getElementById('valueBox').textContent = formatValueForDisplay(currentRecord[fieldName]);
+            renderFieldList(currentRecord);
+        }
+
+        function selectFieldByEncoded(encodedFieldName) {
+            selectField(decodeURIComponent(encodedFieldName));
+        }
+
+        function loadRecordFromSession() {
+            const params = new URLSearchParams(window.location.search);
+            const sessionKey = params.get('session_key');
+            if (!sessionKey) {
+                return null;
+            }
+
+            const raw = localStorage.getItem(sessionKey);
+            if (!raw) {
+                return null;
+            }
+
+            localStorage.removeItem(sessionKey);
+            return JSON.parse(raw);
+        }
+
+        function initPage() {
+            const payload = loadRecordFromSession();
+            if (!payload || !payload.record || typeof payload.record !== 'object') {
+                return;
+            }
+
+            currentRecord = payload.record;
+            document.getElementById('recordType').textContent = getRecordTypeLabel(payload.recordType);
+            document.getElementById('recordId').textContent = payload.recordId || '-';
+            document.getElementById('fieldCount').textContent = String(Object.keys(currentRecord).length);
+
+            const fieldNames = Object.keys(currentRecord);
+            if (fieldNames.length > 0) {
+                currentFieldName = fieldNames[0];
+                renderFieldList(currentRecord);
+                selectField(currentFieldName);
+            } else {
+                document.getElementById('valueLabel').textContent = '字段：无';
+                document.getElementById('valueBox').textContent = '{}';
+            }
+
+            document.getElementById('content').style.display = 'block';
+            document.getElementById('emptyState').style.display = 'none';
+        }
+
+        initPage();
+    </script>
+</body>
+</html>
