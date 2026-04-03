@@ -126,6 +126,50 @@ def build_known_site_ids(site_device_mapping: dict) -> list:
     return sorted(site_device_mapping.keys(), key=lambda site_id: (-len(site_id), site_id))
 
 
+def _print_section(title: str):
+    print(f"\n[{title}]")
+
+
+def _print_key_values(items):
+    if not items:
+        return
+    width = max(len(label) for label, _ in items)
+    for label, value in items:
+        print(f"{label:<{width}} : {value}")
+
+
+def _print_file_start(input_file: str, total_rows: int = None):
+    _print_section("处理文件")
+    _print_key_values([
+        ("文件路径", input_file),
+        ("文件名称", os.path.basename(input_file)),
+    ])
+    if total_rows is not None:
+        _print_key_values([("原始记录数", total_rows)])
+    print("开始逐行筛选...")
+
+
+def _print_stats(title: str, stats: dict):
+    _print_section(title)
+    _print_key_values([
+        ("总记录数", stats['total']),
+        ("命中记录数", stats['valid']),
+        ("不足 2 个站点", stats['only_one_site']),
+        ("包含 Data 设备", stats['has_data_device']),
+    ])
+
+
+def _print_output_result(row_count: int, output_file: str, json_output_file: str = None, aggregated: bool = False):
+    action = "汇总输出" if aggregated else "输出"
+    items = [
+        (f"{action}记录数", row_count),
+        (f"{action}Excel", output_file),
+    ]
+    if json_output_file:
+        items.append((f"{action}JSON", json_output_file))
+    _print_key_values(items)
+
+
 def _get_ticket_column_index(df: pd.DataFrame) -> int:
     try:
         return df.columns.get_loc('工单ID')
@@ -283,8 +327,7 @@ def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row):
 
 def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, site_matcher: dict, output_file: str, json_output_file: str = None):
     """筛选单个 Excel 文件。"""
-    print(f"\n=== 处理文件: {input_file} ===")
-    print(f"开始逐行筛选: {os.path.basename(input_file)}")
+    _print_file_start(input_file)
 
     result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
         input_file,
@@ -293,28 +336,25 @@ def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, si
         progress_label=f"处理记录 {os.path.basename(input_file)}",
     )
 
-    print(f"\n=== 筛选统计 ===")
-    print(f"总记录数: {stats['total']}")
-    print(f"满足条件（至少2站点+仅Ran/Transmission）: {stats['valid']}")
-    print(f"不足2个站点: {stats['only_one_site']}")
-    print(f"包含Data设备: {stats['has_data_device']}")
+    _print_stats("筛选统计", stats)
 
     # 输出结果
     if result_df is not None:
         os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         result_df.to_excel(output_file, index=False)
-        print(f"\n已输出 {len(result_df)} 条记录到: {output_file}")
 
         if json_output_file:
             os.makedirs(os.path.dirname(json_output_file) or '.', exist_ok=True)
             json_data = _build_ticket_site_json(result_df, matched_sites_by_row)
             with open(json_output_file, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
-            print(f"已输出JSON到: {json_output_file}")
+        _print_section("处理结果")
+        _print_output_result(len(result_df), output_file, json_output_file)
 
         return result_df, stats
     else:
-        print("\n没有满足条件的记录")
+        _print_section("处理结果")
+        print("没有满足条件的记录")
         return None, stats
 
 
@@ -324,7 +364,8 @@ def filter_incident_tickets(input_file: str, site_device_file: str, output_file:
     site_device_mapping = load_site_device_mapping(site_device_file)
     known_site_ids = build_known_site_ids(site_device_mapping)
     site_matcher = build_site_matcher(known_site_ids)
-    print(f"已加载 {len(site_device_mapping)} 个站点的设备信息")
+    _print_section("初始化")
+    _print_key_values([("已加载站点数", len(site_device_mapping))])
     return _filter_incident_tickets_file(input_file, site_device_mapping, site_matcher, output_file, json_output_file)
 
 
@@ -366,7 +407,8 @@ def main():
     site_device_mapping = load_site_device_mapping(args.site_device)
     known_site_ids = build_known_site_ids(site_device_mapping)
     site_matcher = build_site_matcher(known_site_ids)
-    print(f"已加载 {len(site_device_mapping)} 个站点的设备信息")
+    _print_section("初始化")
+    _print_key_values([("已加载站点数", len(site_device_mapping))])
 
     input_files = list(_iter_incident_input_files(args.input))
     if not input_files:
@@ -382,8 +424,7 @@ def main():
 
         try:
             for input_file in input_files:
-                print(f"\n=== 处理文件: {input_file} ===")
-                print(f"开始逐行筛选: {os.path.basename(input_file)}")
+                _print_file_start(input_file)
 
                 result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
                     input_file,
@@ -392,11 +433,7 @@ def main():
                     progress_label=f"处理记录 {os.path.basename(input_file)}",
                 )
 
-                print(f"\n=== 筛选统计 ===")
-                print(f"总记录数: {stats['total']}")
-                print(f"满足条件（至少2站点+仅Ran/Transmission）: {stats['valid']}")
-                print(f"不足2个站点: {stats['only_one_site']}")
-                print(f"包含Data设备: {stats['has_data_device']}")
+                _print_stats("筛选统计", stats)
 
                 processed_files += 1
                 for key in aggregate_stats:
@@ -408,26 +445,29 @@ def main():
         finally:
             file_progress.close()
 
-        print(f"\n=== 目录处理汇总 ===")
-        print(f"处理文件数: {processed_files}")
-        print(f"总记录数: {aggregate_stats['total']}")
-        print(f"满足条件（至少2站点+仅Ran/Transmission）: {aggregate_stats['valid']}")
-        print(f"不足2个站点: {aggregate_stats['only_one_site']}")
-        print(f"包含Data设备: {aggregate_stats['has_data_device']}")
+        _print_section("目录处理汇总")
+        _print_key_values([
+            ("处理文件数", processed_files),
+            ("总记录数", aggregate_stats['total']),
+            ("命中记录数", aggregate_stats['valid']),
+            ("不足 2 个站点", aggregate_stats['only_one_site']),
+            ("包含 Data 设备", aggregate_stats['has_data_device']),
+        ])
 
         if aggregated_result_dfs:
             final_result_df = pd.concat(aggregated_result_dfs, ignore_index=True)
             os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
             final_result_df.to_excel(args.output, index=False)
-            print(f"已汇总输出 {len(final_result_df)} 条记录到: {args.output}")
+            _print_section("汇总结果")
+            _print_output_result(len(final_result_df), args.output, args.json_output, aggregated=True)
         else:
+            _print_section("汇总结果")
             print("没有满足条件的记录")
 
         if args.json_output:
             os.makedirs(os.path.dirname(args.json_output) or '.', exist_ok=True)
             with open(args.json_output, 'w', encoding='utf-8') as f:
                 json.dump(aggregated_json, f, ensure_ascii=False, indent=2)
-            print(f"已汇总输出JSON到: {args.json_output}")
         return
 
     filter_incident_tickets(args.input, args.site_device, args.output, args.json_output)
