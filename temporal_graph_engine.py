@@ -112,7 +112,7 @@ class TemporalGraphEngine:
             if not changed:
                 return stabilized_inst
 
-    def __init__(self, topo_downstream_map, rules_config, site_domain_map, aggregation_wait_sec=300):
+    def __init__(self, topo_downstream_map, rules_config, site_domain_map, aggregation_wait_sec=900):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
         self.rules = rules_config

@@ -3626,12 +3626,49 @@
             document.getElementById('loadingOverlay').classList.toggle('show', show);
         }
 
+        function getVisualizationExcludedSiteIds(data) {
+            const matchInfo = data.match_info || {};
+            const mergedRules = matchInfo.merged_rules || (matchInfo.rule ? [matchInfo.rule] : []);
+            if (mergedRules.indexOf('transmission_rule') === -1) {
+                return new Set();
+            }
+
+            const roleMapping = matchInfo.role_mapping || {};
+            return new Set((roleMapping.grandparent_node || []).map(function(siteId) {
+                return String(siteId);
+            }));
+        }
+
+        function buildDisplayGroupInfo(groupInfo, hiddenNeIds, hiddenSiteIds) {
+            const displayGroupInfo = {};
+
+            for (const gid in (groupInfo || {})) {
+                const groupEntry = groupInfo[gid] || {};
+                displayGroupInfo[gid] = Object.assign({}, groupEntry, {
+                    ne_list: (groupEntry.ne_list || []).filter(function(neId) {
+                        return !hiddenNeIds.has(neId);
+                    }),
+                    site_list: (groupEntry.site_list || []).filter(function(siteId) {
+                        return !hiddenSiteIds.has(String(siteId));
+                    })
+                });
+            }
+
+            return displayGroupInfo;
+        }
+
         function loadOriginalFormat(data) {
             graphData = data;
             allNodes = [];
+            const hiddenSiteIds = getVisualizationExcludedSiteIds(data);
+            const hiddenNeIds = new Set();
             
             for (const neId in data.ne_info) {
                 const neInfo = data.ne_info[neId];
+                if (hiddenSiteIds.has(String(neInfo.site_id || ''))) {
+                    hiddenNeIds.add(neId);
+                    continue;
+                }
                 const alarmTypes = [];
                 if (neInfo.alarm) {
                     for (let i = 0; i < neInfo.alarm.length; i++) {
@@ -3665,11 +3702,12 @@
             const edgeDetails = {};
 
             for (const neId in data.ne_info) {
+                if (hiddenNeIds.has(neId)) continue;
                 const neInfo = data.ne_info[neId];
                 if (neInfo.link) {
                     if (typeof neInfo.link === 'object' && !Array.isArray(neInfo.link)) {
                         for (const target in neInfo.link) {
-                            if (target === neId) continue;
+                            if (target === neId || hiddenNeIds.has(target)) continue;
                             const key = [neId, target].sort().join('|');
                             if (!linkSet.has(key)) {
                                 linkSet.add(key);
@@ -3690,7 +3728,7 @@
                     } else if (Array.isArray(neInfo.link)) {
                         for (let i = 0; i < neInfo.link.length; i++) {
                             const target = neInfo.link[i];
-                            if (target === neId) continue;
+                            if (target === neId || hiddenNeIds.has(target)) continue;
                             const key = [neId, target].sort().join('|');
                             if (!linkSet.has(key)) {
                                 linkSet.add(key);
@@ -3702,7 +3740,7 @@
             }
 
             window.edgeDetails = edgeDetails;
-            graphData.group_info = data.group_info || {};
+            graphData.group_info = buildDisplayGroupInfo(data.group_info || {}, hiddenNeIds, hiddenSiteIds);
 
             // 启用输入
             document.getElementById('groupInput').disabled = false;
