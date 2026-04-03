@@ -257,22 +257,6 @@
             background: #dbeafe;
             border-color: #96c2ff;
         }
-        .stacked-value-static {
-            display: inline-flex;
-            align-items: center;
-            width: fit-content;
-            max-width: 100%;
-            padding: 4px 10px;
-            border: 1px solid #d0d5dd;
-            border-radius: 999px;
-            background: #f8fafc;
-            color: #475467;
-            font-size: 12px;
-            font-weight: 500;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
         .inline-link {
             border: none;
             background: rgba(9, 105, 218, 0.08);
@@ -452,7 +436,7 @@
 
             const record = resolveReferenceRecord(recordType, recordId);
             if (!record) {
-                window.alert(`未在关联明细 JSON 中找到${recordType === 'ticket' ? '工单号' : '告警故障组ID'}：${recordId}`);
+                window.alert(`未在关联明细 JSON 中找到${recordType === 'ticket' ? '工单号' : '告警故障组'}：${recordId}`);
                 return;
             }
 
@@ -467,13 +451,6 @@
 
         function openReferenceRecordByEncoded(recordType, encodedRecordId) {
             openReferenceRecord(recordType, decodeURIComponent(encodedRecordId));
-        }
-
-        function canOpenReferenceRecord(recordType, recordId) {
-            if (!referenceData || !recordId) {
-                return false;
-            }
-            return !!resolveReferenceRecord(recordType, recordId);
         }
 
         function getGroupTimeRange(group) {
@@ -598,8 +575,8 @@
             }
             return `<div class="stacked-values">${
                 values.map(value => {
-                    if (!recordType || !canOpenReferenceRecord(recordType, value)) {
-                        return `<div class="stacked-value-static" title="未在关联明细 JSON 中找到">${escapeHtml(value)}</div>`;
+                    if (!recordType) {
+                        return `<div class="stacked-value">${escapeHtml(value)}</div>`;
                     }
                     return `<button type="button" class="stacked-value-link" onclick="openReferenceRecordByEncoded('${recordType}', '${encodeURIComponent(value)}')" title="点击查看详情">${escapeHtml(value)}</button>`;
                 }).join('')
@@ -787,11 +764,9 @@
                 try {
                     referenceData = JSON.parse(e.target.result);
                     document.getElementById('referenceStatus').textContent = `关联明细 JSON：已加载 ${file.name}`;
-                    renderGroups();
                 } catch (error) {
                     referenceData = null;
                     document.getElementById('referenceStatus').textContent = `关联明细 JSON：加载失败 - ${error.message}`;
-                    renderGroups();
                 }
             };
             reader.readAsText(file, 'utf-8');
