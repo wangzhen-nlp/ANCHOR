@@ -1565,13 +1565,6 @@
                     </button>
                     <p id="fileStatus">请选择 JSON 文件</p>
                 </div>
-                <div class="file-select" style="margin-top: 10px;">
-                    <input type="file" id="referenceFileInput" accept=".json" style="display: none;">
-                    <button onclick="document.getElementById('referenceFileInput').click()">
-                        📘 选择关联明细 JSON
-                    </button>
-                    <p id="referenceStatus">关联明细 JSON：未加载</p>
-                </div>
             </div>
 
             <!-- Group 管理区域 -->
@@ -2056,7 +2049,7 @@
             return values;
         }
 
-        function renderAlarmMetaValues(containerId, values, recordType) {
+        function renderAlarmMetaValues(containerId, values) {
             const container = document.getElementById(containerId);
             if (!container) return;
 
@@ -2066,16 +2059,13 @@
             }
 
             container.innerHTML = values.map(function(value) {
-                if (!recordType) {
-                    return '<div class="alarm-meta-value">' + escapeHtml(value) + '</div>';
-                }
-                return '<button type="button" class="alarm-meta-value-link" onclick="openReferenceRecordByEncoded(\'' + recordType + '\', \'' + encodeURIComponent(value) + '\')" title="点击查看详情">' + escapeHtml(value) + '</button>';
+                return '<div class="alarm-meta-value">' + escapeHtml(value) + '</div>';
             }).join('');
         }
 
         function renderAlarmMetaSummary() {
-            renderAlarmMetaValues('relatedTicketValues', getGraphAlarmFieldValues(graphData, ['工单号']), 'ticket');
-            renderAlarmMetaValues('alarmFaultGroupValues', getGraphAlarmFieldValues(graphData, ['故障组ID']), 'alarm-group');
+            renderAlarmMetaValues('relatedTicketValues', getGraphAlarmFieldValues(graphData, ['工单号']));
+            renderAlarmMetaValues('alarmFaultGroupValues', getGraphAlarmFieldValues(graphData, ['故障组ID']));
         }
 
         function normalizeReferenceRecord(record, idFieldName, recordId) {
@@ -2308,7 +2298,6 @@
             });
 
             document.getElementById('fileInput').addEventListener('change', handleFileSelect);
-            document.getElementById('referenceFileInput').addEventListener('change', handleReferenceFileSelect);
         });
 
         // 显示错误提示
@@ -3962,24 +3951,6 @@
                         !Array.isArray(sessionPayload) &&
                         sessionPayload.group
                     ) ? sessionPayload.group : sessionPayload;
-                    const payloadReferenceData = (
-                        sessionPayload &&
-                        typeof sessionPayload === 'object' &&
-                        !Array.isArray(sessionPayload)
-                    ) ? (sessionPayload.referenceData || null) : null;
-                    let openerReferenceData = null;
-                    try {
-                        if (window.opener && typeof window.opener.getLoadedReferenceData === 'function') {
-                            openerReferenceData = window.opener.getLoadedReferenceData();
-                        }
-                    } catch (error) {
-                        openerReferenceData = null;
-                    }
-                    referenceData = openerReferenceData || payloadReferenceData || null;
-                    rebuildReferenceIndex();
-                    document.getElementById('referenceStatus').textContent = referenceData
-                        ? '关联明细 JSON：已从总览页自动加载'
-                        : '关联明细 JSON：未加载';
                     graphData = data;
                     if (graphData.ne_info) {
                         loadOriginalFormat(graphData);
@@ -4355,33 +4326,6 @@
                 } catch (error) {
                     showError('解析文件失败: ' + error.message);
                     showLoading(false);
-                }
-            };
-            reader.readAsText(file);
-        }
-
-        function handleReferenceFileSelect(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-
-            if (!file.name.endsWith('.json')) {
-                showError('请选择 JSON 文件');
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                try {
-                    referenceData = JSON.parse(e.target.result);
-                    rebuildReferenceIndex();
-                    document.getElementById('referenceStatus').textContent = '关联明细 JSON：已加载 ' + file.name;
-                    renderAlarmMetaSummary();
-                } catch (error) {
-                    referenceData = null;
-                    resetReferenceIndex();
-                    showError('关联明细 JSON 解析失败: ' + error.message);
-                    document.getElementById('referenceStatus').textContent = '关联明细 JSON：加载失败';
-                    renderAlarmMetaSummary();
                 }
             };
             reader.readAsText(file);
