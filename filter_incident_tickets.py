@@ -12,6 +12,11 @@ from collections import deque
 import pandas as pd
 from progress_utils import ProgressBar
 
+try:
+    from openpyxl import load_workbook
+except ImportError:  # pragma: no cover - fallback for environments without openpyxl
+    load_workbook = None
+
 
 def load_site_device_mapping(json_file: str) -> dict:
     """加载站点设备映射，返回站点ID -> 设备类型集合的映射"""
@@ -137,17 +142,32 @@ def _build_ticket_site_json(result_df, matched_sites_by_row):
     return json_data
 
 
-def _filter_incident_tickets_df(df, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
-    """筛选单个 DataFrame。"""
-    # 筛选
+def _normalize_header_row(header_row):
+    headers = []
+    used = {}
+    for idx, value in enumerate(header_row):
+        header = str(value).strip() if value is not None and str(value).strip() else f"Unnamed:{idx}"
+        count = used.get(header, 0)
+        used[header] = count + 1
+        headers.append(header if count == 0 else f"{header}.{count}")
+    return headers
+
+
+def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+    """筛选流式行数据，并仅保留命中的记录。"""
     filtered_indices = []
+    filtered_rows = []
     matched_sites_by_row = []
     stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'has_data_device': 0}
-    row_progress = ProgressBar(len(df), progress_label or "处理工单记录")
+    row_progress = ProgressBar(total_rows, progress_label or "处理工单记录", min_interval=0.05)
 
     try:
-        for idx, row in enumerate(df.itertuples(index=False, name=None)):
+        for idx, row in enumerate(row_iter):
             stats['total'] += 1
+            if len(row) < len(columns):
+                row = tuple(row) + (None,) * (len(columns) - len(row))
+            elif len(row) > len(columns):
+                row = tuple(row[:len(columns)])
 
             # 提取站点ID
             site_ids = extract_site_ids_from_text(_row_to_text(row), site_matcher)
@@ -167,13 +187,75 @@ def _filter_incident_tickets_df(df, site_device_mapping: dict, site_matcher: dic
 
             stats['valid'] += 1
             filtered_indices.append(idx)
+            filtered_rows.append(row)
             matched_sites_by_row.append(site_ids)
             row_progress.update()
     finally:
         row_progress.close()
 
-    result_df = df.iloc[filtered_indices].copy() if filtered_indices else None
+    result_df = pd.DataFrame(filtered_rows, columns=columns) if filtered_rows else None
     return result_df, stats, matched_sites_by_row
+
+
+def _filter_incident_tickets_df(df, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+    """筛选单个 DataFrame。"""
+    row_iter = df.itertuples(index=False, name=None)
+    return _filter_incident_tickets_rows(
+        list(df.columns),
+        row_iter,
+        len(df),
+        site_device_mapping,
+        site_matcher,
+        progress_label=progress_label,
+    )
+
+
+def _filter_incident_tickets_xlsx_stream(input_file: str, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+    """使用 openpyxl 只读模式流式读取 xlsx，避免一次性把整表读入内存。"""
+    if load_workbook is None:
+        raise ImportError("openpyxl 不可用，无法启用 xlsx 流式读取")
+
+    workbook = load_workbook(input_file, read_only=True, data_only=True)
+    try:
+        worksheet = workbook.worksheets[0]
+        row_iter = worksheet.iter_rows(values_only=True)
+        header_row = next(row_iter, None)
+        if header_row is None:
+            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'has_data_device': 0}, []
+
+        columns = _normalize_header_row(header_row)
+        total_rows = max((worksheet.max_row or 1) - 1, 0)
+        return _filter_incident_tickets_rows(
+            columns,
+            row_iter,
+            total_rows,
+            site_device_mapping,
+            site_matcher,
+            progress_label=progress_label,
+        )
+    finally:
+        workbook.close()
+
+
+def _filter_incident_tickets_excel(input_file: str, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+    """按文件类型选择合适的 Excel 读取方式。"""
+    file_ext = os.path.splitext(input_file)[1].lower()
+    if file_ext in {'.xlsx', '.xlsm', '.xltx', '.xltm'} and load_workbook is not None:
+        return _filter_incident_tickets_xlsx_stream(
+            input_file,
+            site_device_mapping,
+            site_matcher,
+            progress_label=progress_label,
+        )
+
+    df = pd.read_excel(input_file)
+    print(f"原始记录数: {len(df)}")
+    return _filter_incident_tickets_df(
+        df,
+        site_device_mapping,
+        site_matcher,
+        progress_label=progress_label,
+    )
 
 
 def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row):
@@ -194,13 +276,11 @@ def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row):
 
 def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, site_matcher: dict, output_file: str, json_output_file: str = None):
     """筛选单个 Excel 文件。"""
-    # 读取Excel
-    df = pd.read_excel(input_file)
     print(f"\n=== 处理文件: {input_file} ===")
-    print(f"原始记录数: {len(df)}")
+    print(f"开始逐行筛选: {os.path.basename(input_file)}")
 
-    result_df, stats, matched_sites_by_row = _filter_incident_tickets_df(
-        df,
+    result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
+        input_file,
         site_device_mapping,
         site_matcher,
         progress_label=f"处理记录 {os.path.basename(input_file)}",
@@ -291,16 +371,15 @@ def main():
         processed_files = 0
         aggregated_result_dfs = []
         aggregated_json = {}
-        file_progress = ProgressBar(len(input_files), "处理输入文件")
+        file_progress = ProgressBar(len(input_files), "处理输入文件", min_interval=0.05)
 
         try:
             for input_file in input_files:
-                df = pd.read_excel(input_file)
                 print(f"\n=== 处理文件: {input_file} ===")
-                print(f"原始记录数: {len(df)}")
+                print(f"开始逐行筛选: {os.path.basename(input_file)}")
 
-                result_df, stats, matched_sites_by_row = _filter_incident_tickets_df(
-                    df,
+                result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
+                    input_file,
                     site_device_mapping,
                     site_matcher,
                     progress_label=f"处理记录 {os.path.basename(input_file)}",
