@@ -3634,9 +3634,23 @@
             }
 
             const roleMapping = matchInfo.role_mapping || {};
-            return new Set((roleMapping.grandparent_node || []).map(function(siteId) {
+            const grandparentSites = new Set((roleMapping.grandparent_node || []).map(function(siteId) {
                 return String(siteId);
             }));
+            const sitesReferencedByOtherRoles = new Set();
+
+            for (const roleName in roleMapping) {
+                if (roleName === 'grandparent_node') continue;
+                (roleMapping[roleName] || []).forEach(function(siteId) {
+                    sitesReferencedByOtherRoles.add(String(siteId));
+                });
+            }
+
+            return new Set(
+                Array.from(grandparentSites).filter(function(siteId) {
+                    return !sitesReferencedByOtherRoles.has(siteId);
+                })
+            );
         }
 
         function buildDisplayGroupInfo(groupInfo, hiddenNeIds, hiddenSiteIds) {
