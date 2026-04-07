@@ -139,8 +139,17 @@ def _build_ultimate_group_indexes(group_records, group_field):
 
 def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     ne_to_site = {}
+    ne_to_domain = {}
     if ne_graph_file and os.path.exists(ne_graph_file):
         ne_to_site = build_ne_to_site_map(ne_graph_file)
+        with open(ne_graph_file, "r", encoding="utf-8") as f:
+            ne_graph_data = json.load(f)
+        if isinstance(ne_graph_data, dict):
+            ne_to_domain = {
+                _normalize_text(ne_id): _extract_domain(ne_info)
+                for ne_id, ne_info in ne_graph_data.items()
+                if _normalize_text(ne_id)
+            }
 
     alarm_group_to_sites = defaultdict(set)
     alarm_group_to_alarm_ids = defaultdict(set)
@@ -154,6 +163,10 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
 
         alarm_id = _extract_alarm_id(alarm)
         domain = _extract_domain(alarm)
+        if not domain:
+            alarm_source = _normalize_text(alarm.get("告警源", ""))
+            if alarm_source:
+                domain = _normalize_text(ne_to_domain.get(alarm_source, "")).upper()
         is_allowed_domain = _is_allowed_gold_domain(domain)
         site_id = _resolve_alarm_site_id(alarm, ne_to_site)
 
