@@ -1776,9 +1776,6 @@
                     <button class="btn-save-note" id="saveNoteBtn" onclick="saveNoteToFile()" disabled>
                         💾 保存到文件
                     </button>
-                    <button class="btn-download-note" id="downloadNoteBtn" onclick="downloadNoteJsonl()" disabled>
-                        📥 下载 JSONL
-                    </button>
                 </div>
                 <div class="note-status" id="noteStatus"></div>
             </div>
@@ -4484,14 +4481,12 @@
         function enableNotePanel() {
             document.getElementById('noteTextarea').disabled = false;
             document.getElementById('saveNoteBtn').disabled = false;
-            document.getElementById('downloadNoteBtn').disabled = false;
         }
 
         // 禁用备注面板
         function disableNotePanel() {
             document.getElementById('noteTextarea').disabled = true;
             document.getElementById('saveNoteBtn').disabled = true;
-            document.getElementById('downloadNoteBtn').disabled = true;
             document.getElementById('noteTextarea').value = '';
             currentNote = '';
         }
@@ -4617,8 +4612,16 @@
                     currentNote = dataWithNote.note || '';
                     updateNoteStatus('✓ 备注已保存到原始文件', false);
                 } else {
-                    // 如果不支持或没有文件句柄，使用下载方式
-                    downloadNoteJsonl();
+                    const uuid = dataWithNote.uuid || dataWithNote.match_info?.uuid || 'fault-group';
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+                    const filename = `${uuid}_${timestamp}_with_note.jsonl`;
+                    const saveResult = await saveTextAsJsonlFile(JSON.stringify(dataWithNote) + '\n', filename);
+                    currentNote = dataWithNote.note || '';
+                    if (saveResult && saveResult.mode === 'download') {
+                        updateNoteStatus(`✓ 备注已下载到 ${saveResult.fileName || 'JSONL 文件'}`, false);
+                    } else {
+                        updateNoteStatus('✓ 备注已写入更新后的 JSONL 文件', false);
+                    }
                 }
             } catch (error) {
                 if (error && error.name === 'AbortError') {
@@ -4626,41 +4629,8 @@
                     return;
                 }
                 console.error('保存失败:', error);
-                // 降级到下载方式
-                downloadNoteJsonl();
+                updateNoteStatus(`保存失败：${error.message || error}`, true);
             }
-        }
-
-        // 下载带备注的 JSONL 文件
-        function downloadNoteJsonl() {
-            if (!graphData) {
-                updateNoteStatus('请先加载数据文件', true);
-                return;
-            }
-
-            const dataWithNote = getDataWithNote();
-            if (!dataWithNote) return;
-
-            // 生成文件名
-            const uuid = dataWithNote.uuid || dataWithNote.match_info?.uuid || 'fault-group';
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-            const filename = `${uuid}_${timestamp}_with_note.jsonl`;
-
-            // 创建 JSONL 内容（每行一个 JSON 对象）
-            const jsonlContent = JSON.stringify(dataWithNote);
-
-            const blob = new Blob([jsonlContent + '\n'], { type: 'application/jsonl' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-
-            currentNote = dataWithNote.note || '';
-            updateNoteStatus('✓ 文件已下载: ' + filename, false);
         }
 
         // 监听备注输入变化
