@@ -4570,14 +4570,19 @@
                 if (browserBridge && originalGroupUuid) {
                     try {
                         if (typeof browserBridge.prepareFaultGroupNoteSave === 'function') {
-                            const prepared = await browserBridge.prepareFaultGroupNoteSave(originalGroupUuid, dataWithNote.note || '');
+                            const prepared = browserBridge.prepareFaultGroupNoteSave(originalGroupUuid, dataWithNote.note || '');
                             let saveResult = null;
-                            if (typeof browserBridge.tryOverwriteFaultGroupSource === 'function') {
-                                saveResult = await browserBridge.tryOverwriteFaultGroupSource(prepared.content);
-                            }
 
-                            if (!saveResult || !saveResult.ok) {
+                            // 没有绑定原文件句柄时，直接在当前点击事件里弹保存窗口，
+                            // 避免经过额外 await 后丢失 user activation。
+                            if (!prepared.hasBoundWritableHandle) {
                                 saveResult = await saveTextAsJsonlFile(prepared.content, prepared.suggestedFileName);
+                            } else if (typeof browserBridge.tryOverwriteFaultGroupSource === 'function') {
+                                saveResult = await browserBridge.tryOverwriteFaultGroupSource(prepared.content);
+                                if (!saveResult || !saveResult.ok) {
+                                    updateNoteStatus('写回原始 JSONL 失败，请重新打开文件或改用另存方式', true);
+                                    return;
+                                }
                             }
 
                             if (typeof browserBridge.applySavedFaultGroupNote === 'function') {
