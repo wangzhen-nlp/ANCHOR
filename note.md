@@ -86,12 +86,14 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 
 - 同一个 `parent_microwave_node` 下，至少有 `3` 个 `downstream_compound_node` 命中传输/传输+无线离线类告警；
 - 同时这个 `parent_microwave_node` 往上还要能找到最近的 `grandparent_node`；
-- 这个 `grandparent_node` 在 `Data` 或 `Transmission` 画像上需要满足“无关键告警（NONE）”；
+- 这个 `grandparent_node` 在 `Data` 或 `Transmission` 画像上不能出现 `OFFLINE_ALARMS`；
+  也就是说，这里现在不是“完全 `NONE`”，而是通过 `forbidden_alarms`
+  只禁止更上游出现离线类告警；
 - 关联时间窗主要是 `600s`，表示上下游传播关系在 10 分钟内成立。
 
 **【意义】**
 
-这条规则表达的是一种“表层多点断站，向上传播收敛到同一个父层传输节点，并进一步校验更上游静默”的传播语义，
+这条规则表达的是一种“表层多点断站，向上传播收敛到同一个父层传输节点，并进一步校验更上游没有离线类告警”的传播语义，
 用于识别跨域传播、父层传输异常或上游静默导致的成片站点断站场景。
 
 ## 5. `power_rule` 的逻辑与意义
@@ -110,6 +112,30 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 
 这条规则表达的是“同站点离线表象，回看电源类根因”的本地根因关联语义，
 用于把离线类告警与同站点电源异常串起来，补足根因解释。
+
+## 5.1 `link_rule` 的逻辑与意义
+
+**【逻辑】**
+
+`link_rule` 的 `trigger_role` 是 `link_child_offline_node`。
+它要求：
+
+- 儿子节点命中 `OFFLINE_ALARMS`；
+- 其直接上游 `1` 跳的 `link_parent_node` 命中 `LINK_ALARMS`；
+- 两者的关联时间窗是 `600s`。
+
+也就是说，这条规则当前表达的是：
+
+- “父节点出现链路/传输类告警”
+- “随后儿子节点在时间窗内出现离线”
+
+并且 role 命名已经和其它规则解耦，不会和 `offline_node`、`power_node` 等旧 role 混用。
+
+**【意义】**
+
+这条规则用于表达一种更直接的“上游链路异常 -> 下游断站”传播关系，
+适合补充那些不一定会形成 `transmission_rule` 那种多分支聚集，
+但确实存在明显父子传播迹象的场景。
 
 ## 6. 配置中 `ALL / ANY / NONE` 的含义
 
@@ -743,6 +769,24 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 如果一个站点出现在 `direct_site_alarms`，说明它本来就被工单字段显式标出来了；
 - 如果一个站点只出现在 `inferred_site_alarms`，说明它完全依赖时间窗补关联；
 - 后面的 `only-offline`、`potential` 等逻辑，本质上都是建立在这两桶 evidence 的统一读取之上。
+
+### 6. 为什么 `precision_upper_bound` 往往是 `1`
+
+当前 upper bound 的“预测站点集合”本身就是从工单 `target_sites` 里长出来的：
+
+- `direct_sites` 先取的是“带工单号告警命中的目标站点”；
+- `inferred_sites` 也是只在“目标站点里的缺失站点”上做时间窗补关联；
+- 最终 `associated_sites` 仍然是 `target_sites` 的子集。
+
+因此在当前定义下：
+
+- false positive site 基本不存在；
+- 只要 `associated_sites` 非空，
+  `precision_upper_bound = |associated_sites ∩ target_sites| / |associated_sites|`
+  就会等于 `1.0`。
+
+所以 `precision_upper_bound` 目前更像是一个“口径补充字段”，
+而不是像真实评测那样有明显区分度的指标。
 
 ## 23. `compute_filtered_real_recall.py` 的流程与作用
 
