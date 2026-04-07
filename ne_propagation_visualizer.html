@@ -1547,6 +1547,112 @@
             font-size: 16px;
             color: #0969da;
         }
+
+        /* 备注编辑区域样式 */
+        .note-panel {
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #f59e0b;
+            margin-top: 10px;
+        }
+
+        .note-panel h3 {
+            font-size: 13px;
+            color: #b45309;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .note-panel h3::before {
+            content: '📝';
+        }
+
+        .note-textarea {
+            width: 100%;
+            min-height: 80px;
+            padding: 10px;
+            border: 1px solid #fcd34d;
+            border-radius: 6px;
+            background: #ffffff;
+            color: #1f2937;
+            font-size: 13px;
+            resize: vertical;
+            font-family: inherit;
+        }
+
+        .note-textarea:focus {
+            outline: none;
+            border-color: #f59e0b;
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.1);
+        }
+
+        .note-textarea:disabled {
+            background: #f3f4f6;
+            cursor: not-allowed;
+        }
+
+        .note-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        .note-actions button {
+            flex: 1;
+            padding: 8px 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        .btn-save-note {
+            background: #f59e0b;
+            color: #fff;
+        }
+
+        .btn-save-note:hover:not(:disabled) {
+            background: #d97706;
+        }
+
+        .btn-save-note:disabled {
+            background: #fcd34d;
+            cursor: not-allowed;
+        }
+
+        .btn-download-note {
+            background: #10b981;
+            color: #fff;
+        }
+
+        .btn-download-note:hover:not(:disabled) {
+            background: #059669;
+        }
+
+        .btn-download-note:disabled {
+            background: #6ee7b7;
+            cursor: not-allowed;
+        }
+
+        .note-status {
+            font-size: 11px;
+            color: #92400e;
+            margin-top: 8px;
+            min-height: 16px;
+        }
+
+        .note-status.success {
+            color: #059669;
+        }
+
+        .note-status.error {
+            color: #dc2626;
+        }
     </style>
 </head>
 <body>
@@ -1655,6 +1761,26 @@
                     <button class="primary" onclick="buildDistanceEdges()">建立连边</button>
                     <button onclick="exitMultiSelect()">退出</button>
                 </div>
+            </div>
+
+            <!-- 备注编辑区域 -->
+            <div class="note-panel" id="notePanel">
+                <h3>故障组备注</h3>
+                <textarea 
+                    id="noteTextarea" 
+                    class="note-textarea" 
+                    placeholder="在此输入备注信息..."
+                    disabled
+                ></textarea>
+                <div class="note-actions">
+                    <button class="btn-save-note" id="saveNoteBtn" onclick="saveNoteToFile()" disabled>
+                        💾 保存到文件
+                    </button>
+                    <button class="btn-download-note" id="downloadNoteBtn" onclick="downloadNoteJsonl()" disabled>
+                        📥 下载 JSONL
+                    </button>
+                </div>
+                <div class="note-status" id="noteStatus"></div>
             </div>
 
             <div class="node-list">
@@ -1980,6 +2106,11 @@
 
         // 搜索类型
         let currentSearchType = 'site';
+
+        // 备注功能变量
+        let currentFileHandle = null; // File System Access API 文件句柄
+        let currentNote = ''; // 当前备注内容
+        let originalGroupUuid = ''; // 当前故障组UUID
         let referenceData = null;
         let referenceIndex = {
             ticket: new Map(),
@@ -3953,6 +4084,10 @@
                         sessionPayload.group
                     ) ? sessionPayload.group : sessionPayload;
                     graphData = data;
+                    // 提取已有备注
+                    currentNote = data.note || '';
+                    originalGroupUuid = data.uuid || data.match_info?.uuid || '';
+                    
                     if (graphData.ne_info) {
                         loadOriginalFormat(graphData);
                     } else if (graphData.nodes) {
@@ -3960,11 +4095,17 @@
                     } else {
                         throw new Error('未知数据格式');
                     }
+                    
+                    // 启用备注面板并加载备注
+                    enableNotePanel();
+                    loadNoteToPanel();
+                    
                     localStorage.removeItem(sessionKey);
                     document.getElementById('fileStatus').textContent = '已加载单个故障组详情';
                 } catch (error) {
                     showError('加载故障组详情失败: ' + error.message);
                     showLoading(false);
+                    disableNotePanel();
                 }
                 return;
             }
@@ -3975,19 +4116,29 @@
                     .then(function(response) { return response.json(); })
                     .then(function(data) {
                         graphData = data;
+                        // 提取已有备注
+                        currentNote = data.note || '';
+                        originalGroupUuid = data.uuid || data.match_info?.uuid || '';
+                        
                         if (graphData.ne_info) {
                             loadOriginalFormat(graphData);
                         } else if (graphData.nodes) {
                             loadVizFormat(graphData);
                         }
+                        
+                        // 启用备注面板并加载备注
+                        enableNotePanel();
+                        loadNoteToPanel();
                     })
                     .catch(function(error) {
                         showError('加载数据失败: ' + error.message);
                         showLoading(false);
+                        disableNotePanel();
                     });
             } else {
                 document.getElementById('fileStatus').textContent = '请选择 JSON 文件或拖拽文件到此处';
                 showLoading(false);
+                disableNotePanel();
             }
         }
 
@@ -4302,8 +4453,124 @@
             URL.revokeObjectURL(url);
         }
 
+        // ==========================================
+        // 备注功能相关函数
+        // ==========================================
+
+        // 启用备注面板
+        function enableNotePanel() {
+            document.getElementById('noteTextarea').disabled = false;
+            document.getElementById('saveNoteBtn').disabled = false;
+            document.getElementById('downloadNoteBtn').disabled = false;
+        }
+
+        // 禁用备注面板
+        function disableNotePanel() {
+            document.getElementById('noteTextarea').disabled = true;
+            document.getElementById('saveNoteBtn').disabled = true;
+            document.getElementById('downloadNoteBtn').disabled = true;
+            document.getElementById('noteTextarea').value = '';
+            currentNote = '';
+        }
+
+        // 加载备注到编辑区
+        function loadNoteToPanel() {
+            document.getElementById('noteTextarea').value = currentNote || '';
+        }
+
+        // 更新备注状态显示
+        function updateNoteStatus(message, isError) {
+            const statusEl = document.getElementById('noteStatus');
+            statusEl.textContent = message || '';
+            statusEl.className = 'note-status' + (isError ? ' error' : ' success');
+            if (message) {
+                setTimeout(function() {
+                    statusEl.textContent = '';
+                    statusEl.className = 'note-status';
+                }, 3000);
+            }
+        }
+
+        // 获取带备注的数据对象
+        function getDataWithNote() {
+            if (!graphData) return null;
+            const noteText = document.getElementById('noteTextarea').value.trim();
+            // 更新原始数据对象
+            graphData.note = noteText;
+            graphData.note_updated_at = new Date().toISOString();
+            // 创建数据副本用于保存
+            const dataWithNote = JSON.parse(JSON.stringify(graphData));
+            return dataWithNote;
+        }
+
+        // 保存备注到原始文件（使用 File System Access API）
+        async function saveNoteToFile() {
+            if (!graphData) {
+                updateNoteStatus('请先加载数据文件', true);
+                return;
+            }
+
+            const dataWithNote = getDataWithNote();
+            if (!dataWithNote) return;
+
+            try {
+                // 尝试使用 File System Access API
+                if (currentFileHandle && currentFileHandle.createWritable) {
+                    const writable = await currentFileHandle.createWritable();
+                    await writable.write(JSON.stringify(dataWithNote, null, 2));
+                    await writable.close();
+                    currentNote = dataWithNote.note || '';
+                    updateNoteStatus('✓ 备注已保存到原始文件', false);
+                } else {
+                    // 如果不支持或没有文件句柄，使用下载方式
+                    downloadNoteJsonl();
+                }
+            } catch (error) {
+                console.error('保存失败:', error);
+                // 降级到下载方式
+                downloadNoteJsonl();
+            }
+        }
+
+        // 下载带备注的 JSONL 文件
+        function downloadNoteJsonl() {
+            if (!graphData) {
+                updateNoteStatus('请先加载数据文件', true);
+                return;
+            }
+
+            const dataWithNote = getDataWithNote();
+            if (!dataWithNote) return;
+
+            // 生成文件名
+            const uuid = dataWithNote.uuid || dataWithNote.match_info?.uuid || 'fault-group';
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const filename = `${uuid}_${timestamp}_with_note.jsonl`;
+
+            // 创建 JSONL 内容（每行一个 JSON 对象）
+            const jsonlContent = JSON.stringify(dataWithNote);
+
+            const blob = new Blob([jsonlContent + '\n'], { type: 'application/jsonl' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            currentNote = dataWithNote.note || '';
+            updateNoteStatus('✓ 文件已下载: ' + filename, false);
+        }
+
+        // 监听备注输入变化
+        document.getElementById('noteTextarea').addEventListener('input', function(e) {
+            // 可以在这里添加自动保存逻辑
+        });
+
         // 文件处理
-        function handleFileSelect(event) {
+        async function handleFileSelect(event) {
             const file = event.target.files[0];
             if (!file) return;
 
@@ -4312,11 +4579,26 @@
                 return;
             }
 
+            // 尝试获取文件句柄（用于后续保存）
+            try {
+                if (event.target.files && event.target.files[0]) {
+                    // 存储文件引用，注意：File System Access API 需要特殊方式获取 handle
+                    // 这里我们尝试通过 showSaveFilePicker 获取，但首次加载时只能通过下载方式保存
+                    currentFileHandle = null;
+                }
+            } catch (e) {
+                console.log('File System Access API 不可用');
+            }
+
             showLoading(true);
             const reader = new FileReader();
             reader.onload = function(e) {
                 try {
                     const data = JSON.parse(e.target.result);
+                    // 提取已有备注
+                    currentNote = data.note || '';
+                    originalGroupUuid = data.uuid || data.match_info?.uuid || '';
+                    
                     if (data.ne_info) {
                         loadOriginalFormat(data);
                     } else if (data.nodes) {
@@ -4324,9 +4606,14 @@
                     } else {
                         throw new Error('未知数据格式');
                     }
+                    
+                    // 启用备注面板并加载备注
+                    enableNotePanel();
+                    loadNoteToPanel();
                 } catch (error) {
                     showError('解析文件失败: ' + error.message);
                     showLoading(false);
+                    disableNotePanel();
                 }
             };
             reader.readAsText(file);
