@@ -531,8 +531,10 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 4. 逐工单计算召回率  
    - 先拿到该工单的目标站点；
    - 再把该工单关联到的所有 `故障组ID` 对应站点做并集；
-   - 最后计算：
-     `|ticket_sites ∩ recalled_sites| / |ticket_sites|`。
+   - 最后同时计算：
+     - `recall = |ticket_sites ∩ recalled_sites| / |ticket_sites|`
+     - `precision = |ticket_sites ∩ recalled_sites| / |group_sites|`
+     - `f1 = 2PR / (P + R)`。
 
 5. 输出明细  
    每个工单会输出：
@@ -540,7 +542,8 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 告警数；
    - 关联故障组数与故障组列表；
    - 召回站点数与召回站点列表；
-   - 最终 `recall`。
+   - group 覆盖到的全部站点；
+   - 最终 `recall / precision / f1`。
 
 **【意义】**
 
@@ -571,15 +574,18 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 否则退化成“工单是否在故障组输出里出现过”为准。
 
 4. 复用 `compute_ticket_site_recall.py` 的同一套召回率计算函数  
-   所以最终公式仍然是：
-   `|ticket_sites ∩ recalled_sites| / |ticket_sites|`。
+   所以最终会沿用同一套站点指标：
+   - `recall`
+   - `precision`
+   - `f1`
 
 5. 输出明细  
    与原始告警口径类似，但这里统计的是：
    - `ticket_occurrence_count`
    - `fault_group_count`
    - `recalled_sites`
-   - `recall`
+   - `group_sites`
+   - `recall / precision / f1`
 
 **【意义】**
 
@@ -616,7 +622,11 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 直接命中的站点 + 时间窗补回的站点 = `associated_sites`；
    - 按：
      `associated_site_count / ticket_site_count`
-     直接计算 `recall_upper_bound`。
+     直接计算 `recall_upper_bound`；
+   - 同时也会输出：
+     - `precision_upper_bound`
+     - `f1_upper_bound`
+     作为与其它评测脚本一致的补充指标。
 
 6. 第三遍流式扫描告警，补证据  
    输出：
@@ -799,7 +809,8 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    包括：
    - `associated_site_count / associated_sites / associated_site_alarms`
    - `missing_site_count / missing_sites / missing_site_alarms`
-   - `recall`
+   - `group_site_count / group_sites`
+   - `recall / precision / f1`
 
 **【意义】**
 
@@ -820,13 +831,20 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - `--loose`
 - `--only-offline`
 - `--potential`
+- `--only-one`
+
+另外：
+
+- `compute_group_output_ticket_recall_v2.py` 还额外支持 `--ultimate-only`
 
 它们的作用层级并不一样：
 
 - 默认模式决定“当前方法本来能关联到哪些 group / 故障组ID”
 - `loose` 决定“是否允许 group 之间按时间窗进一步扩张”
 - `potential` 决定“是否允许 upper bound evidence 里的告警把额外 group 直接吸附进来”
+- `only-one` 决定“最终是否只保留一个最优 group 来算站点指标”
 - `only-offline` 决定“这个工单样本最终要不要保留到分母里”
+- `ultimate-only` 决定“对 group output 口径，是否先排除所有只是作为关联 group 被别人引用的 group”
 
 ### 1. 默认模式
 
@@ -841,7 +859,8 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 - `associated_sites`
 - `missing_sites`
-- `recall`
+- `group_sites`
+- `recall / precision / f1`
 
 此时不会引入任何额外的 group。
 
@@ -920,14 +939,22 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 1. 先算 `base_fault_groups`
 2. 如果开了 `--loose`，得到 `loose_fault_groups`
 3. 如果开了 `--potential`，再得到 `potential_fault_groups`
-4. 最终真正参与召回率计算的是：
+4. 对 `compute_group_output_ticket_recall_v2.py` 来说，如果开了 `--ultimate-only`，
+   则以上几步都只在“最终 group”范围内进行
+5. 如果开了 `--only-one`，则会在
+   `base ∪ loose ∪ potential`
+   中只保留“覆盖当前工单目标站点最多的那一个 group”
+6. 最终真正参与站点指标计算的是：
    `fault_groups = base ∪ loose ∪ potential`
-5. 如果开了 `--only-offline`，则在输出前再决定这个工单样本是否直接跳过
+   或者在 `only-one` 模式下的那一个 `selected_fault_group`
+7. 如果开了 `--only-offline`，则在输出前再决定这个工单样本是否直接跳过
 
 所以：
 
 - `loose` 和 `potential` 都会改变 `fault_groups`
+- `only-one` 会改变最终拿来计算指标的有效 group 集合
 - `only-offline` 不改 `fault_groups`，只改最终样本集
+- `ultimate-only` 会先收窄 group output 口径里可参与计算的 group 范围
 
 **【意义】**
 
@@ -936,4 +963,6 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 默认模式：当前方法本来的能力
 - `loose`：当前方法内部是否还能通过 group 间时间关系再扩一层
 - `potential`：如果直接借用 upper bound 的证据告警，还能把哪些额外 group 拉进来
+- `only-one`：如果只允许保留单个最优 group，当前方法还能保住多少站点
 - `only-offline`：最终统计时是否只看“确实有离线证据”的工单样本
+- `ultimate-only`：对于 group output 结果，只看最终 group 后，评测结果会变成什么样
