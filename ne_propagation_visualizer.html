@@ -4539,14 +4539,24 @@
             try {
                 const browserBridge = getFaultGroupBrowserBridge();
                 if (browserBridge && originalGroupUuid) {
-                    const saveResult = await browserBridge.saveFaultGroupNoteToSource(originalGroupUuid, dataWithNote.note || '');
-                    currentNote = dataWithNote.note || '';
-                    if (saveResult && saveResult.mode === 'save-as') {
-                        updateNoteStatus('✓ 备注已写入更新后的 JSONL 文件', false);
-                    } else {
-                        updateNoteStatus('✓ 备注已写回原始 JSONL 文件', false);
+                    try {
+                        const saveResult = await browserBridge.saveFaultGroupNoteToSource(originalGroupUuid, dataWithNote.note || '');
+                        currentNote = dataWithNote.note || '';
+                        if (saveResult && saveResult.mode === 'save-as') {
+                            updateNoteStatus('✓ 备注已写入更新后的 JSONL 文件', false);
+                        } else {
+                            updateNoteStatus('✓ 备注已写回原始 JSONL 文件', false);
+                        }
+                        return;
+                    } catch (bridgeError) {
+                        if (bridgeError && bridgeError.name === 'AbortError') {
+                            updateNoteStatus('已取消保存', true);
+                            return;
+                        }
+                        console.error('写回原始 JSONL 失败:', bridgeError);
+                        updateNoteStatus(`写回原始 JSONL 失败：${bridgeError.message || bridgeError}`, true);
+                        return;
                     }
-                    return;
                 }
 
                 // 尝试使用 File System Access API

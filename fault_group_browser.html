@@ -363,13 +363,46 @@
             };
         };
 
+        async function queryFaultGroupHandlePermission(handle, mode) {
+            if (!handle) {
+                return 'prompt';
+            }
+            if (typeof handle.queryPermission === 'function') {
+                try {
+                    return await handle.queryPermission({ mode });
+                } catch (error) {
+                    console.warn('queryPermission 失败:', error);
+                }
+            }
+            return 'prompt';
+        }
+
+        async function ensureFaultGroupHandlePermission(handle, mode) {
+            const currentPermission = await queryFaultGroupHandlePermission(handle, mode);
+            if (currentPermission === 'granted') {
+                return true;
+            }
+            if (typeof handle.requestPermission === 'function') {
+                try {
+                    const nextPermission = await handle.requestPermission({ mode });
+                    return nextPermission === 'granted';
+                } catch (error) {
+                    if (error && error.name === 'AbortError') {
+                        throw error;
+                    }
+                    console.warn('requestPermission 失败:', error);
+                }
+            }
+            return false;
+        }
+
         function buildFaultGroupJsonlContent(groups) {
             return groups.map(group => JSON.stringify(group)).join('\n') + '\n';
         }
 
         function updateFaultGroupFileStatus(inputPath, writableMode) {
             const pathText = inputPath || currentFaultGroupFileName || '-';
-            const writableText = writableMode ? '可直接回写备注' : '未获得原文件写入权限';
+            const writableText = writableMode ? '已绑定原文件，可尝试回写备注' : '未获得原文件写入权限';
             document.getElementById('filePath').textContent = `文件路径：${pathText}（${writableText}）`;
         }
 
@@ -391,33 +424,7 @@
             }
         }
 
-        async function openFaultGroupFile() {
-            if (window.showOpenFilePicker) {
-                try {
-                    const [handle] = await window.showOpenFilePicker({
-                        multiple: false,
-                        types: [{
-                            description: 'Fault Group JSONL',
-                            accept: {
-                                'application/json': ['.jsonl', '.json', '.txt'],
-                                'text/plain': ['.jsonl', '.txt']
-                            }
-                        }]
-                    });
-                    if (!handle) {
-                        return;
-                    }
-                    const file = await handle.getFile();
-                    const content = await file.text();
-                    loadFaultGroupText(content, file.name || handle.name || '-', handle);
-                    return;
-                } catch (error) {
-                    if (error && error.name === 'AbortError') {
-                        return;
-                    }
-                    console.warn('showOpenFilePicker 加载失败，回退到文件选择器:', error);
-                }
-            }
+        function openFaultGroupFile() {
             document.getElementById('fileInput').click();
         }
 
@@ -464,6 +471,10 @@
         async function writeUpdatedFaultGroups(groups, suggestedFileName) {
             const content = buildFaultGroupJsonlContent(groups);
             if (currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable) {
+                const granted = await ensureFaultGroupHandlePermission(currentFaultGroupFileHandle, 'readwrite');
+                if (!granted) {
+                    throw new Error('未获得原始 JSONL 文件的写入权限');
+                }
                 const writable = await currentFaultGroupFileHandle.createWritable();
                 await writable.write(content);
                 await writable.close();
