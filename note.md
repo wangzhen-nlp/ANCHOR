@@ -1010,3 +1010,173 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - `only-one`：如果只允许保留单个最优 group，当前方法还能保住多少站点
 - `only-offline`：最终统计时是否只看“确实有离线证据”的工单样本
 - `ultimate-only`：对于 group output 结果，只看最终 group 后，评测结果会变成什么样
+
+## 25. `compute_ultimate_group_alarm_group_metrics.py` 的流程与作用
+
+**【逻辑】**
+
+这份脚本不是按“工单 -> 站点”评测，而是把：
+
+- `match_rules.py` 输出里的**终极 group**
+- 和原始告警流里的**告警故障组ID**
+
+当成两套可以互相对照的站点覆盖集合，分别做双向评测。
+
+### 1. 基础对象怎么定义
+
+1. 先读取 `match_rules.py` 输出，并按 `related_group_uuids` 排除“被别的 group 作为关联 group 引用过的 group”；
+   剩下的 group 视为**终极 group**。
+
+2. 对每个终极 group，提取：
+   - `group_info.site_list` / `symptoms.node` 覆盖到的站点；
+   - `symptoms[*].故障组ID` 中出现过的告警故障组ID；
+   - `symptoms[*].eid/告警编码ID` 中出现过的告警ID。
+
+3. 对原始告警流，提取：
+   - 每个告警故障组ID覆盖到的站点；
+   - 每个告警故障组ID出现过的告警ID。
+
+这样就得到两套对象：
+
+- 终极 group -> 站点 / 告警故障组ID / 告警ID
+- 告警故障组ID -> 站点 / 告警ID
+
+### 2. 正向与反向怎么评测
+
+当前会同时算两组指标：
+
+1. `ultimate_group_as_gold`
+   - gold label = 终极 group 覆盖到的站点
+   - base prediction = 这个终极 group 的 `symptoms[*].故障组ID` 对应的告警故障组ID
+   - 预测站点 = 这些告警故障组ID 在原始告警流里覆盖到的站点并集
+
+2. `alarm_group_as_gold`
+   - gold label = 告警故障组ID 覆盖到的站点
+   - base prediction = 包含这个告警故障组ID 的终极 group
+   - 预测站点 = 这些终极 group 覆盖到的站点并集
+
+然后按站点集合计算：
+
+- `recall`
+- `precision`
+- `f1`
+
+### 3. `--min-site-num`
+
+`--min-site-num` 作用在**当前作为 gold label 的那一侧**。
+
+只有当：
+
+- `gold_site_count >= min_site_num`
+
+这个样本才会进入均值统计。
+
+所以：
+
+- 在 `ultimate_group_as_gold` 方向，过滤的是终极 group 的站点数；
+- 在 `alarm_group_as_gold` 方向，过滤的是告警故障组ID 的站点数。
+
+### 4. gold label 的 domain 过滤
+
+当前这份脚本额外有一个约束：
+
+- 如果某个 gold label 里出现过 `domain` 不属于 `Ran / Transmission` 的告警，
+  这个 gold 样本直接跳过。
+
+两边的 domain 来源不同：
+
+1. `ultimate_group_as_gold`
+   - 从 group output 的 `ne_info[*].alarm[*].domain` 判断
+
+2. `alarm_group_as_gold`
+   - 先读原始告警里的 `domain/Domain/DOMAIN`
+   - 如果没有，再用 `告警源 -> ne_graph.json -> domain` 回填
+
+所以：
+
+- `Data`
+- 未知类型
+- 或任何不属于 `Ran / Transmission` 的告警
+
+只要出现在当前 gold label 里，这个样本就不会被统计。
+
+### 5. `--loose`
+
+`--loose` 的语义和 `v2` 脚本一致，也是“group 间按时间窗做闭包扩张”，只是这里扩的是：
+
+- 终极 group <-> 告警故障组ID
+
+它的过程是：
+
+1. 先拿当前 gold 样本已有的 base prediction group
+2. 只在当前 gold 站点范围内，收集其它候选预测 group
+3. 提取这些 group 在 gold 站点上的告警时间
+4. 用当前已纳入预测 group 的时间构造 `±window_seconds` 的合并窗口
+5. 只要候选 group 在这些站点上的任意时间点落进窗口，就把它并进来
+6. 新并进来的 group 又继续提供时间，再做下一轮扩张
+
+所以 `loose` 本质上是：
+
+- 不改变 gold label
+- 只在当前 gold 站点范围内，把 prediction group 按时间窗再扩一层
+
+### 6. `--potential`
+
+`--potential` 不是按时间窗扩张，而是按**告警ID命中**来吸附额外 prediction group。
+
+它的过程是：
+
+1. 先收集当前 gold 样本里已经出现过的告警ID
+2. 看这些告警ID还落在哪些另一侧的 group 里
+3. 命中的 group 直接并入 prediction group
+
+所以 `potential` 回答的问题是：
+
+- “如果直接用同一批告警ID做桥，另一侧还有哪些 group 可以被吸进来？”
+
+### 7. `--only-one`
+
+`--only-one` 会在：
+
+- `base ∪ loose ∪ potential`
+
+这批 prediction group 里，只保留**覆盖当前 gold 站点最多的单个 group**。
+
+随后：
+
+- `predicted_sites`
+- `recall / precision / f1`
+
+都只基于这个单 group 来计算。
+
+### 8. 两个方向的 `cases.jsonl`
+
+这份脚本会像 `v2` 一样，额外输出两份 sidecar 可视化文件：
+
+- `ultimate_group_as_gold.cases.jsonl`
+- `alarm_group_as_gold.cases.jsonl`
+
+它们的用途是：
+
+- 把每个未满召回样本整理成可以直接给现有 HTML 页面加载的故障组样式 JSONL
+- 便于在页面上直接查看：
+  - gold 站点
+  - 预测站点
+  - 已命中站点
+  - 未命中站点
+  - 相关告警
+
+**【意义】**
+
+这份脚本的重点不是评测“工单召回率”，而是回答这样两个问题：
+
+- `match_rules.py` 聚出来的终极 group，和原始告警里的故障组ID，在站点覆盖上到底有多一致？
+- 如果把视角反过来，原始告警故障组ID 又能在多大程度上被终极 group 解释？
+
+再加上 `min-site-num / loose / potential / only-one / domain过滤` 这些开关后，
+它可以帮助分析：
+
+- 纯 base 关系下两侧的重合程度；
+- 时间窗扩张或告警ID吸附后是否能显著提升一致性；
+- 如果只允许一个“最优” group，匹配能力会不会明显下降；
+- Data/未知类型告警过滤后，剩下的 Ran/Transmission 场景是否更一致。

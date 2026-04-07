@@ -4,6 +4,7 @@ import os
 from argparse import ArgumentParser
 from collections import defaultdict
 
+from alarm_types import OFFLINE_ALARMS
 from alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from compute_group_output_ticket_recall import _extract_group_id, _extract_group_sites
 from compute_ticket_site_recall import (
@@ -13,13 +14,18 @@ from compute_ticket_site_recall import (
     _resolve_alarm_site_id,
 )
 from ticket_recall_v2_utils import (
+    build_site_alarm_map_for_sites,
     build_group_site_time_index,
     build_site_to_group_index,
+    build_unrecalled_visualization_cases,
+    load_ne_graph_data,
     expand_groups_by_time_window,
     select_best_group_by_target_sites,
+    write_jsonl_records,
 )
 
 ALLOWED_GOLD_DOMAINS = {"RAN", "TRANSMISSION"}
+OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 
 
 def _extract_alarm_id(record):
@@ -44,6 +50,17 @@ def _extract_domain(record):
 
 def _is_allowed_gold_domain(domain):
     return domain in ALLOWED_GOLD_DOMAINS
+
+
+def _is_offline_alarm_record(record):
+    if not isinstance(record, dict):
+        return False
+    alarm_name = (
+        _normalize_text(record.get("alarm", ""))
+        or _normalize_text(record.get("alarm_type", ""))
+        or _normalize_text(record.get("告警标题", ""))
+    )
+    return bool(alarm_name and alarm_name in OFFLINE_ALARM_SET)
 
 
 def _load_latest_group_records(group_output_input):
@@ -79,6 +96,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
     ultimate_group_to_alarm_ids = defaultdict(set)
     ultimate_group_to_site_alarms = defaultdict(lambda: defaultdict(list))
     ultimate_group_domain_allowed = {}
+    ultimate_group_has_offline = defaultdict(bool)
     alarm_group_to_ultimate_groups = defaultdict(set)
     alarm_id_to_ultimate_groups = defaultdict(set)
 
@@ -112,6 +130,8 @@ def _build_ultimate_group_indexes(group_records, group_field):
         for symptom in group_record.get("symptoms", []):
             if not isinstance(symptom, dict):
                 continue
+            if _is_offline_alarm_record(symptom):
+                ultimate_group_has_offline[group_id] = True
             site_id = _normalize_text(symptom.get("node", ""))
             if site_id:
                 evidence_record = dict(symptom)
@@ -133,6 +153,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
         ultimate_group_to_alarm_ids,
         ultimate_group_to_site_alarms,
         ultimate_group_domain_allowed,
+        dict(ultimate_group_has_offline),
         dict(alarm_id_to_ultimate_groups),
     )
 
@@ -155,6 +176,7 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     alarm_group_to_alarm_ids = defaultdict(set)
     alarm_group_to_site_alarms = defaultdict(lambda: defaultdict(list))
     alarm_group_domain_allowed = {}
+    alarm_group_has_offline = defaultdict(bool)
     alarm_id_to_alarm_groups = defaultdict(set)
     for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         group_ids = _parse_group_ids(alarm.get(group_field, ""))
@@ -175,6 +197,8 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
                 alarm_group_domain_allowed[group_id] = True
             if not is_allowed_domain:
                 alarm_group_domain_allowed[group_id] = False
+            if _is_offline_alarm_record(alarm):
+                alarm_group_has_offline[group_id] = True
             if site_id:
                 alarm_group_to_sites[group_id].add(site_id)
                 evidence_record = dict(alarm)
@@ -189,6 +213,7 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
         dict(alarm_group_to_alarm_ids),
         alarm_group_to_site_alarms,
         alarm_group_domain_allowed,
+        dict(alarm_group_has_offline),
         dict(alarm_id_to_alarm_groups),
     )
 
@@ -219,6 +244,56 @@ def _build_gold_site_count_distribution(details):
         str(site_count): counts[site_count]
         for site_count in sorted(counts)
     }
+
+
+def _merge_group_site_alarms(group_ids, group_to_site_alarms):
+    merged = defaultdict(list)
+    for group_id in group_ids:
+        for site_id, alarms in group_to_site_alarms.get(group_id, {}).items():
+            merged[site_id].extend(alarms)
+    return dict(merged)
+
+
+def _derive_case_output_path(output_file, suffix):
+    base, _ext = os.path.splitext(output_file)
+    return f"{base}.{suffix}.cases.jsonl"
+
+
+def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_group_to_site_alarms):
+    case_details = []
+    for item in details:
+        gold_sites = sorted(item.get("gold_sites", []))
+        matched_sites = sorted(item.get("matched_sites", []))
+        missing_sites = sorted(set(gold_sites) - set(matched_sites))
+        effective_predicted_groups = list(item.get("effective_predicted_groups", []))
+        merged_predicted_site_alarms = _merge_group_site_alarms(
+            effective_predicted_groups,
+            pred_group_to_site_alarms,
+        )
+        associated_site_alarms = build_site_alarm_map_for_sites(
+            merged_predicted_site_alarms,
+            matched_sites,
+        )
+        missing_site_alarms = build_site_alarm_map_for_sites(
+            gold_group_to_site_alarms.get(item.get("gold_id", ""), {}),
+            missing_sites,
+        )
+        case_details.append({
+            "ticket_id": item.get("gold_id", ""),
+            "ticket_site_count": item.get("gold_site_count", 0),
+            "ticket_sites": gold_sites,
+            "fault_groups": effective_predicted_groups,
+            "effective_fault_groups": effective_predicted_groups,
+            "selected_fault_group": item.get("selected_predicted_group", ""),
+            "associated_site_count": len(matched_sites),
+            "associated_sites": matched_sites,
+            "associated_site_alarms": associated_site_alarms,
+            "missing_site_count": len(missing_sites),
+            "missing_sites": missing_sites,
+            "missing_site_alarms": missing_site_alarms,
+            "recall": item.get("recall", 0.0),
+        })
+    return case_details
 
 
 def _build_loose_groups_by_time_window(
@@ -258,6 +333,8 @@ def _compute_direction_metrics(
     pred_group_to_sites,
     min_site_num,
     gold_domain_allowed=None,
+    gold_has_offline=None,
+    only_offline=False,
     only_one=False,
     loose_gold_to_pred_groups=None,
     potential_gold_to_pred_groups=None,
@@ -267,11 +344,14 @@ def _compute_direction_metrics(
     total_precision = 0.0
     total_f1 = 0.0
     gold_domain_allowed = gold_domain_allowed or {}
+    gold_has_offline = gold_has_offline or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
 
     for gold_id in sorted(gold_to_sites.keys()):
         if gold_domain_allowed.get(gold_id) is False:
+            continue
+        if only_offline and not gold_has_offline.get(gold_id, False):
             continue
         gold_sites = set(gold_to_sites.get(gold_id, set()))
         if not gold_sites:
@@ -349,11 +429,14 @@ def compute_ultimate_group_alarm_group_metrics(
     group_field="故障组ID",
     ne_graph_file=None,
     min_site_num=0,
+    only_offline=False,
     only_one=False,
     loose=False,
     window_seconds=600,
     potential=False,
     output_file=None,
+    ultimate_case_jsonl_output_file=None,
+    alarm_group_case_jsonl_output_file=None,
 ):
     stage_total = 3 + int(bool(loose)) + int(bool(potential))
     current_stage = 1
@@ -366,6 +449,7 @@ def compute_ultimate_group_alarm_group_metrics(
         ultimate_group_to_alarm_ids,
         ultimate_group_to_site_alarms,
         ultimate_group_domain_allowed,
+        ultimate_group_has_offline,
         alarm_id_to_ultimate_groups,
     ) = _build_ultimate_group_indexes(
         group_records,
@@ -374,7 +458,7 @@ def compute_ultimate_group_alarm_group_metrics(
     current_stage += 1
 
     print(f"阶段 {current_stage}/{stage_total}：从原始告警流提取告警故障组ID覆盖站点...")
-    alarm_group_to_sites, alarm_group_to_alarm_ids, alarm_group_to_site_alarms, alarm_group_domain_allowed, alarm_id_to_alarm_groups = _build_alarm_group_site_index(
+    alarm_group_to_sites, alarm_group_to_alarm_ids, alarm_group_to_site_alarms, alarm_group_domain_allowed, alarm_group_has_offline, alarm_id_to_alarm_groups = _build_alarm_group_site_index(
         alarm_input,
         ne_graph_file=ne_graph_file,
         group_field=group_field,
@@ -430,6 +514,8 @@ def compute_ultimate_group_alarm_group_metrics(
         pred_group_to_sites=alarm_group_to_sites,
         min_site_num=min_site_num,
         gold_domain_allowed=ultimate_group_domain_allowed,
+        gold_has_offline=ultimate_group_has_offline,
+        only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=ultimate_group_to_loose_alarm_groups,
         potential_gold_to_pred_groups=ultimate_group_to_potential_alarm_groups,
@@ -440,6 +526,8 @@ def compute_ultimate_group_alarm_group_metrics(
         pred_group_to_sites=ultimate_group_to_sites,
         min_site_num=min_site_num,
         gold_domain_allowed=alarm_group_domain_allowed,
+        gold_has_offline=alarm_group_has_offline,
+        only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=alarm_group_to_loose_ultimate_groups,
         potential_gold_to_pred_groups=alarm_group_to_potential_ultimate_groups,
@@ -448,6 +536,7 @@ def compute_ultimate_group_alarm_group_metrics(
     result = {
         "group_field": group_field,
         "min_site_num": min_site_num,
+        "only_offline_mode": only_offline,
         "only_one_mode": only_one,
         "loose_mode": loose,
         "window_seconds": window_seconds,
@@ -457,6 +546,43 @@ def compute_ultimate_group_alarm_group_metrics(
         "ultimate_group_as_gold": ultimate_as_gold,
         "alarm_group_as_gold": alarm_group_as_gold,
     }
+
+    ne_graph_data = load_ne_graph_data(ne_graph_file)
+    ultimate_case_details = _build_case_details_for_direction(
+        ultimate_as_gold["details"],
+        ultimate_group_to_site_alarms,
+        alarm_group_to_site_alarms,
+    )
+    alarm_group_case_details = _build_case_details_for_direction(
+        alarm_group_as_gold["details"],
+        alarm_group_to_site_alarms,
+        ultimate_group_to_site_alarms,
+    )
+    ultimate_case_records = build_unrecalled_visualization_cases(
+        ultimate_case_details,
+        "ultimate_group_as_gold",
+        ne_graph_data=ne_graph_data,
+    )
+    alarm_group_case_records = build_unrecalled_visualization_cases(
+        alarm_group_case_details,
+        "alarm_group_as_gold",
+        ne_graph_data=ne_graph_data,
+    )
+
+    if output_file and not ultimate_case_jsonl_output_file:
+        ultimate_case_jsonl_output_file = _derive_case_output_path(output_file, "ultimate_group_as_gold")
+    if output_file and not alarm_group_case_jsonl_output_file:
+        alarm_group_case_jsonl_output_file = _derive_case_output_path(output_file, "alarm_group_as_gold")
+
+    if ultimate_case_jsonl_output_file:
+        write_jsonl_records(ultimate_case_jsonl_output_file, ultimate_case_records)
+        result["ultimate_group_as_gold_case_jsonl_output"] = ultimate_case_jsonl_output_file
+        result["ultimate_group_as_gold_case_count"] = len(ultimate_case_records)
+
+    if alarm_group_case_jsonl_output_file:
+        write_jsonl_records(alarm_group_case_jsonl_output_file, alarm_group_case_records)
+        result["alarm_group_as_gold_case_jsonl_output"] = alarm_group_case_jsonl_output_file
+        result["alarm_group_as_gold_case_count"] = len(alarm_group_case_records)
 
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
@@ -494,6 +620,11 @@ def main():
         help="仅统计 gold label 站点数 >= 该值的样本；默认: 0（不过滤）",
     )
     parser.add_argument(
+        "--only-offline",
+        action="store_true",
+        help="仅统计包含 OFFLINE_ALARMS 的 gold label 样本",
+    )
+    parser.add_argument(
         "--only-one",
         action="store_true",
         help="只保留覆盖当前 gold 站点最多的单个预测 group，用它的站点计算指标",
@@ -515,6 +646,14 @@ def main():
         help="允许根据告警ID命中关系，把另一侧包含这些告警的额外 group 作为 potential 预测结果并入",
     )
     parser.add_argument(
+        "--ultimate-case-jsonl-output",
+        help="终极 group 作为 gold 的未满召回样本可视化 jsonl；默认随主输出生成同名 sidecar",
+    )
+    parser.add_argument(
+        "--alarm-group-case-jsonl-output",
+        help="告警故障组ID 作为 gold 的未满召回样本可视化 jsonl；默认随主输出生成同名 sidecar",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default="ultimate_group_alarm_group_metrics.json",
@@ -529,11 +668,14 @@ def main():
         group_field=args.group_field,
         ne_graph_file=args.ne_graph,
         min_site_num=args.min_site_num,
+        only_offline=args.only_offline,
         only_one=args.only_one,
         loose=args.loose,
         window_seconds=args.window_seconds,
         potential=args.potential,
         output_file=args.output,
+        ultimate_case_jsonl_output_file=args.ultimate_case_jsonl_output,
+        alarm_group_case_jsonl_output_file=args.alarm_group_case_jsonl_output,
     )
 
     print("【终极 group 作为 gold】")
@@ -550,6 +692,16 @@ def main():
     print(f"平均准确率: {result['alarm_group_as_gold']['average_precision']:.6f}")
     print(f"平均F1: {result['alarm_group_as_gold']['average_f1']:.6f}")
     print(f"结果已输出到: {args.output}")
+    if result.get("ultimate_group_as_gold_case_jsonl_output"):
+        print(
+            f"终极group-case jsonl: {result['ultimate_group_as_gold_case_jsonl_output']} "
+            f"({result.get('ultimate_group_as_gold_case_count', 0)} 条)"
+        )
+    if result.get("alarm_group_as_gold_case_jsonl_output"):
+        print(
+            f"告警故障组ID-case jsonl: {result['alarm_group_as_gold_case_jsonl_output']} "
+            f"({result.get('alarm_group_as_gold_case_count', 0)} 条)"
+        )
 
 
 if __name__ == "__main__":
