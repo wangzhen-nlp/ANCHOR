@@ -1,5 +1,6 @@
 import json
 import os
+from bisect import bisect_right
 from datetime import datetime
 from collections import defaultdict
 
@@ -38,12 +39,45 @@ def dedupe_alarm_records(records):
     return result
 
 
+def build_merged_windows_from_timestamps(raw_times, window_seconds):
+    normalized_times = sorted({int(ts) for ts in raw_times if ts is not None})
+    if not normalized_times:
+        return None
+
+    merged = []
+    for ts in normalized_times:
+        start = ts - window_seconds
+        end = ts + window_seconds
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    starts = [item[0] for item in merged]
+    ends = [item[1] for item in merged]
+    return starts, ends
+
+
+def timestamp_in_windows(ts, windows):
+    if ts is None or windows is None:
+        return False
+
+    starts, ends = windows
+    idx = bisect_right(starts, ts) - 1
+    return idx >= 0 and ts <= ends[idx]
+
+
 def load_upper_bound_index(filepath):
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     if not isinstance(data, dict):
         raise ValueError("召回率上限结果 JSON 顶层必须是对象")
+
+    try:
+        window_seconds = int(data.get("window_seconds", 600) or 600)
+    except (TypeError, ValueError):
+        window_seconds = 600
 
     ticket_index = {}
     for item in data.get("details", []):
@@ -58,6 +92,8 @@ def load_upper_bound_index(filepath):
         associated_site_count = int(item.get("associated_site_count", 0) or 0)
 
         merged_site_evidence = defaultdict(list)
+        direct_anchor_times = []
+        merged_evidence_times = []
         evidence = item.get("evidence", {})
         if isinstance(evidence, dict):
             for bucket_name in ("direct_site_alarms", "inferred_site_alarms"):
@@ -68,14 +104,25 @@ def load_upper_bound_index(filepath):
                     normalized_site_id = normalize_text(site_id)
                     if not normalized_site_id or not isinstance(alarms, list):
                         continue
-                    merged_site_evidence[normalized_site_id].extend(
-                        alarm for alarm in alarms if isinstance(alarm, dict)
-                    )
+                    valid_alarms = [alarm for alarm in alarms if isinstance(alarm, dict)]
+                    merged_site_evidence[normalized_site_id].extend(valid_alarms)
+                    for alarm in valid_alarms:
+                        ts = parse_alarm_record_ts(alarm)
+                        if ts is None:
+                            continue
+                        merged_evidence_times.append(ts)
+                        if bucket_name == "direct_site_alarms":
+                            direct_anchor_times.append(ts)
+
+        anchor_times = direct_anchor_times or merged_evidence_times
+        ticket_windows = build_merged_windows_from_timestamps(anchor_times, window_seconds)
 
         ticket_index[ticket_id] = {
             "ticket_site_count": ticket_site_count,
             "associated_site_count": associated_site_count,
             "fully_associable": ticket_site_count > 0 and associated_site_count == ticket_site_count,
+            "window_seconds": window_seconds,
+            "ticket_windows": ticket_windows,
             "site_evidence": {
                 site_id: dedupe_alarm_records(alarms)
                 for site_id, alarms in sorted(merged_site_evidence.items())
@@ -83,6 +130,26 @@ def load_upper_bound_index(filepath):
         }
 
     return ticket_index
+
+
+def load_upper_bound_settings(filepath):
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("召回率上限结果 JSON 顶层必须是对象")
+
+    try:
+        window_seconds = int(data.get("window_seconds", 600) or 600)
+    except (TypeError, ValueError):
+        window_seconds = 600
+
+    return {
+        "window_seconds": window_seconds,
+        "time_field": normalize_text(data.get("time_field", "")) or "告警首次发生时间",
+        "site_field": normalize_text(data.get("site_field", "")) or "站点ID",
+        "source_field": normalize_text(data.get("source_field", "")) or "告警源",
+    }
 
 
 def build_site_alarm_map_for_sites(site_alarm_map, site_ids):
@@ -105,6 +172,97 @@ def build_ticket_site_count_distribution(details):
         str(site_count): counts[site_count]
         for site_count in sorted(counts)
     }
+
+
+def build_site_to_group_index(group_to_sites):
+    site_to_groups = defaultdict(set)
+    for group_id, site_ids in group_to_sites.items():
+        for site_id in site_ids:
+            normalized_site_id = normalize_text(site_id)
+            if normalized_site_id:
+                site_to_groups[normalized_site_id].add(group_id)
+    return site_to_groups
+
+
+def build_group_site_time_index(group_to_site_alarms):
+    result = {}
+    for group_id, site_alarm_map in group_to_site_alarms.items():
+        if not isinstance(site_alarm_map, dict):
+            continue
+        site_time_map = {}
+        for site_id, alarms in site_alarm_map.items():
+            if not isinstance(alarms, list):
+                continue
+            timestamps = sorted({
+                ts for ts in (parse_alarm_record_ts(alarm) for alarm in alarms)
+                if ts is not None
+            })
+            if timestamps:
+                site_time_map[normalize_text(site_id)] = timestamps
+        if site_time_map:
+            result[group_id] = site_time_map
+    return result
+
+
+def expand_groups_by_time_window(base_group_ids, target_sites, site_to_groups, group_site_time_index, window_seconds):
+    normalized_target_sites = {
+        normalize_text(site_id) for site_id in target_sites if normalize_text(site_id)
+    }
+    if not normalized_target_sites:
+        return set(base_group_ids), set()
+
+    candidate_groups = set()
+    for site_id in normalized_target_sites:
+        candidate_groups.update(site_to_groups.get(site_id, set()))
+
+    if not candidate_groups:
+        return set(base_group_ids), set()
+
+    group_candidate_times = {}
+    for group_id in candidate_groups | set(base_group_ids):
+        site_time_map = group_site_time_index.get(group_id, {})
+        merged_times = []
+        for site_id in normalized_target_sites:
+            merged_times.extend(site_time_map.get(site_id, []))
+        if merged_times:
+            group_candidate_times[group_id] = sorted(set(merged_times))
+
+    expanded_groups = set(base_group_ids)
+    current_times = []
+    for group_id in expanded_groups:
+        current_times.extend(group_candidate_times.get(group_id, []))
+
+    if not current_times:
+        return expanded_groups, set()
+
+    loose_groups = set()
+    pending_groups = {
+        group_id for group_id in candidate_groups - expanded_groups
+        if group_candidate_times.get(group_id)
+    }
+
+    while pending_groups:
+        current_windows = build_merged_windows_from_timestamps(current_times, window_seconds)
+        if current_windows is None:
+            break
+
+        added_groups = []
+        for group_id in list(pending_groups):
+            candidate_times = group_candidate_times.get(group_id, [])
+            matched = any(timestamp_in_windows(ts, current_windows) for ts in candidate_times)
+            if matched:
+                added_groups.append(group_id)
+
+        if not added_groups:
+            break
+
+        for group_id in added_groups:
+            pending_groups.discard(group_id)
+            expanded_groups.add(group_id)
+            loose_groups.add(group_id)
+            current_times.extend(group_candidate_times.get(group_id, []))
+
+    return expanded_groups, loose_groups
 
 
 def parse_alarm_record_ts(record):

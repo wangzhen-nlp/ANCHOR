@@ -14,12 +14,16 @@ from compute_ticket_site_recall import (
     _resolve_alarm_site_id,
 )
 from ticket_recall_v2_utils import (
+    build_group_site_time_index,
     build_site_alarm_map_for_sites,
+    build_site_to_group_index,
     build_ticket_site_count_distribution,
     build_unrecalled_visualization_cases,
     dedupe_alarm_records,
     derive_case_jsonl_output_path,
+    expand_groups_by_time_window,
     load_upper_bound_index,
+    load_upper_bound_settings,
     load_ne_graph_data,
     write_jsonl_records,
 )
@@ -90,6 +94,32 @@ def _build_group_alarm_indexes(alarm_input, relevant_group_ids, ne_to_site, grou
     return group_to_sites, group_to_site_alarms
 
 
+def _build_group_alarm_indexes_for_sites(alarm_input, allowed_site_ids, ne_to_site, group_field):
+    group_to_sites = defaultdict(set)
+    group_to_site_alarms = defaultdict(lambda: defaultdict(list))
+    if not allowed_site_ids:
+        return group_to_sites, group_to_site_alarms
+
+    allowed_site_ids = {_normalize_text(site_id) for site_id in allowed_site_ids if _normalize_text(site_id)}
+
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        group_ids = _parse_group_ids(alarm.get(group_field, ""))
+        if not group_ids:
+            continue
+
+        resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site)
+        if not resolved_site_id or resolved_site_id not in allowed_site_ids:
+            continue
+
+        for group_id in group_ids:
+            group_to_sites[group_id].add(resolved_site_id)
+            group_to_site_alarms[group_id][resolved_site_id].append(
+                _build_alarm_record(alarm, resolved_site_id, group_id)
+            )
+
+    return group_to_sites, group_to_site_alarms
+
+
 def _merge_group_site_alarms(group_ids, group_to_site_alarms):
     merged = defaultdict(list)
     for group_id in group_ids:
@@ -130,9 +160,11 @@ def compute_ticket_site_recall_v2(
     ne_graph_file=None,
     output_file=None,
     case_jsonl_output_file=None,
-    strict=False,
+    only_offline=False,
+    loose=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
+    upper_bound_settings = load_upper_bound_settings(upper_bound_file)
     eligible_ticket_ids = {
         ticket_id
         for ticket_id, item in upper_bound_index.items()
@@ -160,27 +192,60 @@ def compute_ticket_site_recall_v2(
     if ne_graph_file and os.path.exists(ne_graph_file):
         ne_to_site = build_ne_to_site_map(ne_graph_file)
 
-    print("阶段 1/2：提取 eligible 工单的故障组索引...")
+    print(f"阶段 1/{3 if loose else 2}：提取 eligible 工单的故障组索引...")
     ticket_to_groups, ticket_alarm_counts = _build_ticket_group_index_for_eligible(
         alarm_input,
         eligible_ticket_ids=set(ticket_sites.keys()),
         ticket_field=ticket_field,
         group_field=group_field,
     )
+    ticket_to_base_groups = {
+        ticket_id: set(group_ids)
+        for ticket_id, group_ids in ticket_to_groups.items()
+    }
 
+    loose_ticket_to_groups = defaultdict(set)
     relevant_group_ids = {
         group_id
-        for group_ids in ticket_to_groups.values()
+        for group_ids in ticket_to_base_groups.values()
         for group_id in group_ids
     }
 
-    print("阶段 2/2：提取相关故障组覆盖到的站点和站点告警...")
-    group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
-        alarm_input,
-        relevant_group_ids=relevant_group_ids,
-        ne_to_site=ne_to_site,
-        group_field=group_field,
-    )
+    if loose:
+        allowed_site_ids = {
+            _normalize_text(site_id)
+            for site_list in ticket_sites.values()
+            for site_id in site_list
+            if _normalize_text(site_id)
+        }
+        print("阶段 2/3：提取工单站点上的所有故障组ID覆盖站点和站点告警...")
+        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes_for_sites(
+            alarm_input,
+            allowed_site_ids=allowed_site_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
+        print("阶段 3/3：按 upper bound 同窗口大小扩充额外故障组ID...")
+        site_to_groups = build_site_to_group_index(group_to_sites)
+        group_site_time_index = build_group_site_time_index(group_to_site_alarms)
+        for ticket_id, site_list in ticket_sites.items():
+            _, loose_groups = expand_groups_by_time_window(
+                base_group_ids=ticket_to_base_groups.get(ticket_id, set()),
+                target_sites=set(site_list),
+                site_to_groups=site_to_groups,
+                group_site_time_index=group_site_time_index,
+                window_seconds=upper_bound_settings["window_seconds"],
+            )
+            if loose_groups:
+                loose_ticket_to_groups[ticket_id] = loose_groups
+    else:
+        print("阶段 2/2：提取相关故障组覆盖到的站点和站点告警...")
+        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
+            alarm_input,
+            relevant_group_ids=relevant_group_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
 
     details = []
     total_recall = 0.0
@@ -190,7 +255,9 @@ def compute_ticket_site_recall_v2(
             continue
 
         target_sites = set(ticket_sites[ticket_id])
-        fault_groups = sorted(ticket_to_groups.get(ticket_id, set()))
+        base_fault_groups = sorted(ticket_to_base_groups.get(ticket_id, set()))
+        loose_fault_groups = sorted(loose_ticket_to_groups.get(ticket_id, set()))
+        fault_groups = sorted(set(base_fault_groups) | set(loose_fault_groups))
         merged_site_alarms = _merge_group_site_alarms(fault_groups, group_to_site_alarms)
 
         recalled_sites = set()
@@ -207,7 +274,7 @@ def compute_ticket_site_recall_v2(
             for site_id in sorted(unrecalled_sites)
         }
 
-        if strict and not _site_alarm_map_contains_offline(upper_site_evidence):
+        if only_offline and not _site_alarm_map_contains_offline(upper_site_evidence):
             continue
 
         recall = len(recalled_sites) / len(target_sites) if target_sites else 0.0
@@ -219,6 +286,8 @@ def compute_ticket_site_recall_v2(
             "ticket_sites": sorted(target_sites),
             "ticket_alarm_count": ticket_alarm_counts.get(ticket_id, 0),
             "fault_group_count": len(fault_groups),
+            "base_fault_groups": base_fault_groups,
+            "loose_fault_groups": loose_fault_groups,
             "fault_groups": fault_groups,
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
@@ -247,7 +316,8 @@ def compute_ticket_site_recall_v2(
         "denominator_source": "alarms",
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
-        "strict_mode": strict,
+        "only_offline_mode": only_offline,
+        "loose_mode": loose,
         "details": details,
     }
 
@@ -307,9 +377,14 @@ def main():
         help="额外输出召回率 < 100%% 的样本为可视化 jsonl；默认随主输出生成同名 .cases.jsonl",
     )
     parser.add_argument(
-        "--strict",
+        "--only-offline",
         action="store_true",
-        help="严格模式：若 upper bound 文件里该工单的 evidence 中未出现 OFFLINE_ALARMS，则跳过该工单样本",
+        help="仅保留 upper bound evidence 中出现过 OFFLINE_ALARMS 的工单样本",
+    )
+    parser.add_argument(
+        "--loose",
+        action="store_true",
+        help="允许用 upper bound 同口径时间窗，在工单站点上的其它故障组ID 进一步扩充关联",
     )
 
     args = parser.parse_args()
@@ -324,7 +399,8 @@ def main():
             ne_graph_file=args.ne_graph,
             output_file=args.output,
             case_jsonl_output_file=args.case_jsonl_output,
-            strict=args.strict,
+            only_offline=args.only_offline,
+            loose=args.loose,
         )
     except ValueError as exc:
         print(f"❌ {exc}")

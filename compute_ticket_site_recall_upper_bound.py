@@ -532,6 +532,8 @@ def main():
         "ticket_count": len(details),
         "window_seconds": args.window_seconds,
         "time_field": args.time_field,
+        "site_field": args.site_field,
+        "source_field": args.source_field,
         "average_recall_upper_bound": average_recall,
         "details": details,
     }
