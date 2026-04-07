@@ -614,10 +614,9 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 5. 计算上限召回率  
    - 直接命中的站点 + 时间窗补回的站点 = `associated_sites`；
-   - 如果最终只关联到 `1` 个站点，则召回率记 `0`；
-   - 否则按：
+   - 按：
      `associated_site_count / ticket_site_count`
-     计算 `recall_upper_bound`。
+     直接计算 `recall_upper_bound`。
 
 6. 第三遍流式扫描告警，补证据  
    输出：
@@ -632,6 +631,108 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 - 为真实召回率提供一个上界参考，判断当前方法离上限还有多远；
 - 把“直接命中”与“时间窗补关联”的证据一起输出，便于后续追查哪些站点本来就有希望被召回，但当前方法没做到。
+
+## 22.1 `compute_ticket_site_recall_upper_bound.py` 中 evidence 与时间窗的计算细节
+
+**【逻辑】**
+
+当前 upper bound 里的 `evidence` 不是随便把工单相关告警都存下来，而是分成两桶：
+
+- `direct_site_alarms`
+- `inferred_site_alarms`
+
+它们都依赖前面先算好的“工单时间窗”。
+
+### 1. 工单时间窗怎么计算
+
+1. 先扫描原始告警流，只看“带当前工单号”的告警  
+   这些告警的时间来自 `time_field`，默认是 `告警首次发生时间`。
+
+2. 把这些时间解析成时间戳后，按工单聚合成 `ticket_alarm_times[ticket_id]`。
+
+3. 对每个工单的时间点做排序去重，然后把每个时间点 `ts` 扩成：
+   `[ts - window_seconds, ts + window_seconds]`
+
+4. 如果相邻两个窗口重叠，就合并成一个更大的窗口；
+   如果不重叠，就保留成两段独立窗口。
+
+最终 `ticket_windows[ticket_id]` 保存的是：
+
+- `starts`
+- `ends`
+
+这两列一一对应，表示该工单所有合并后的时间窗。
+
+### 2. 时间窗合并举例
+
+如果 `window_seconds = 600`，也就是前后各 `10` 分钟：
+
+- `10:00` 会扩成 `[09:50, 10:10]`
+- `10:05` 会扩成 `[09:55, 10:15]`
+
+因为两段重叠，所以会合并成：
+
+- `[09:50, 10:15]`
+
+但如果是：
+
+- `10:00` -> `[09:50, 10:10]`
+- `10:30` -> `[10:20, 10:40]`
+
+两段不重叠，就不会合并，最终保留为两段。
+
+因此像 `10:15` 这种时间点：
+
+- 不会落在 `[09:50, 10:10]` 中
+- 也不会落在 `[10:20, 10:40]` 中
+
+所以它不会被判定为“落入工单时间窗”。
+
+### 3. `direct_site_alarms` 怎么收
+
+`direct_site_alarms` 收的是：
+
+- 告警所在站点属于该工单的 `direct_sites`
+- 并且这条告警本身的工单号就等于当前工单号
+
+也就是说，这一桶代表的是：
+
+- “这个站点本来就直接带出了该工单号”
+- “所以它是工单的直接命中站点”
+
+### 4. `inferred_site_alarms` 怎么收
+
+`inferred_site_alarms` 收的是：
+
+- 告警所在站点属于该工单通过时间窗补出来的 `inferred_sites`
+- 且这条告警的时间落进该工单的 `ticket_windows`
+
+这里不要求这条告警本身带当前工单号。
+
+也就是说，这一桶代表的是：
+
+- “这个站点并不是靠工单字段直接命中的”
+- “而是因为站点上的告警时间和该工单的时间窗对得上，所以被补关联进来”
+
+### 5. 当前 evidence 的整体含义
+
+所以当前 upper bound 输出里的 `evidence` 可以理解为：
+
+- `direct_site_alarms`：证明“这个站点为什么能直接算到这个工单头上”
+- `inferred_site_alarms`：证明“这个站点为什么能通过时间窗被补到这个工单头上”
+
+它不是“工单相关的所有告警全集”，而是：
+
+- 只保留 direct / inferred 两类已关联站点上的证据告警
+- 并且仍然会过滤掉 `FAN FAIL`
+
+**【意义】**
+
+把 evidence 拆成 direct / inferred 两桶之后，后续分析会更清楚：
+
+- 如果一个站点出现在 `direct_site_alarms`，说明它本来就被工单字段显式标出来了；
+- 如果一个站点只出现在 `inferred_site_alarms`，说明它完全依赖时间窗补关联；
+- 后面的 `only-offline`、`potential` 等逻辑，本质上都是建立在这两桶 evidence 的统一读取之上。
 
 ## 23. `compute_filtered_real_recall.py` 的流程与作用
 
@@ -708,3 +809,131 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 当前方法已经把哪些站点串起来了；
 - 剩下哪些站点其实有时间窗/故障组证据，但当前方法没用上；
 - 原始告警口径和聚合故障组口径，到底分别漏掉了哪些站点。
+
+## 24.1 `v2` 的默认模式、`loose`、`only-offline`、`potential` 的当前逻辑
+
+**【逻辑】**
+
+当前两份 `v2` 脚本都支持：
+
+- 默认模式（不开额外选项）
+- `--loose`
+- `--only-offline`
+- `--potential`
+
+它们的作用层级并不一样：
+
+- 默认模式决定“当前方法本来能关联到哪些 group / 故障组ID”
+- `loose` 决定“是否允许 group 之间按时间窗进一步扩张”
+- `potential` 决定“是否允许 upper bound evidence 里的告警把额外 group 直接吸附进来”
+- `only-offline` 决定“这个工单样本最终要不要保留到分母里”
+
+### 1. 默认模式
+
+默认模式下，两份脚本都只使用 `base groups`：
+
+- `compute_ticket_site_recall_v2.py`
+  - `base groups` 来自原始告警里的 `工单号 + 故障组ID`
+- `compute_group_output_ticket_recall_v2.py`
+  - `base groups` 来自聚合输出里的 `symptoms[*].工单号 + 当前 group id`
+
+然后用这些 `base groups` 覆盖到的站点去计算：
+
+- `associated_sites`
+- `missing_sites`
+- `recall`
+
+此时不会引入任何额外的 group。
+
+### 2. `--loose`
+
+`loose` 是“group 间按时间窗做闭包扩张”。
+
+它的过程是：
+
+1. 先拿当前工单已经有的 `base groups`
+2. 再只看这个工单 `target_sites` 上出现过的其它 group
+3. 收集这些 group 在 `target_sites` 上的告警时间
+4. 用当前已纳入 group 的时间，构造 `±window_seconds` 的合并窗口
+5. 只要某个候选 group 在 `target_sites` 上的任意时间点落进窗口，就把这个 group 并进来
+6. 新并进来的 group 又继续提供时间，再做下一轮扩张，直到不能继续扩
+
+所以 `loose` 的本质是：
+
+- 从 `base groups` 出发
+- 在工单目标站点范围内
+- 用时间窗做 group 间传递闭包
+
+当前它用的时间窗大小，来自 `compute_ticket_site_recall_upper_bound.py` 输出里的 `window_seconds`。
+
+### 3. `--only-offline`
+
+`only-offline` 不会改变 group 的关联过程，而是一个样本过滤开关。
+
+当前逻辑是：
+
+1. 先读取 upper bound 输出里的 `evidence`
+2. 把其中：
+   - `direct_site_alarms`
+   - `inferred_site_alarms`
+   合并成统一的 `site_evidence`
+3. 如果这个工单的整份 `site_evidence` 里没有出现 `OFFLINE_ALARMS`
+4. 就把这个工单样本直接跳过：
+   - 不进入 `details`
+   - 不进入 `ticket_count`
+   - 不进入 `average_recall` 的分母
+
+所以 `only-offline` 的作用是：
+
+- 不是改“怎么关联”
+- 而是改“哪些样本值得统计”
+
+### 4. `--potential`
+
+`potential` 现在已经不是“按时间窗吸附额外 group”，而是更直接的：
+
+- 看 upper bound evidence 里的告警
+- 这些告警分别出现在哪些 group / 故障组ID
+- 命中的 group 就直接和当前工单建立关联
+
+也就是说，`potential` 当前只回答一个问题：
+
+- “upper bound 里已经出现过的这些证据告警，本身属于哪些 group？”
+
+如果某个 group 里包含了这些 evidence 告警，它就会被吸附进来。
+
+当前实现里：
+
+- `compute_ticket_site_recall_v2.py`
+  - 是按原始告警里的 `告警编码ID -> 故障组ID`
+    去反查
+- `compute_group_output_ticket_recall_v2.py`
+  - 是按 group output 的 `symptoms` 里的 `eid/告警编码ID -> group`
+    去反查
+
+这里不会再额外做时间窗判断。
+
+### 5. 这些模式如何叠加
+
+当前这几个模式可以组合使用，它们的顺序是：
+
+1. 先算 `base_fault_groups`
+2. 如果开了 `--loose`，得到 `loose_fault_groups`
+3. 如果开了 `--potential`，再得到 `potential_fault_groups`
+4. 最终真正参与召回率计算的是：
+   `fault_groups = base ∪ loose ∪ potential`
+5. 如果开了 `--only-offline`，则在输出前再决定这个工单样本是否直接跳过
+
+所以：
+
+- `loose` 和 `potential` 都会改变 `fault_groups`
+- `only-offline` 不改 `fault_groups`，只改最终样本集
+
+**【意义】**
+
+把这几个模式区分清楚之后，就能更准确地理解 `v2` 输出里每一部分差异是怎么来的：
+
+- 默认模式：当前方法本来的能力
+- `loose`：当前方法内部是否还能通过 group 间时间关系再扩一层
+- `potential`：如果直接借用 upper bound 的证据告警，还能把哪些额外 group 拉进来
+- `only-offline`：最终统计时是否只看“确实有离线证据”的工单样本

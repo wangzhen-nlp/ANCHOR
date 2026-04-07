@@ -31,6 +31,7 @@ from ticket_recall_v2_utils import (
     load_upper_bound_index,
     load_upper_bound_settings,
     load_ne_graph_data,
+    select_best_group_by_target_sites,
     write_jsonl_records,
 )
 
@@ -174,6 +175,7 @@ def compute_group_output_ticket_recall_v2(
     only_offline=False,
     loose=False,
     potential=False,
+    only_one=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
@@ -287,10 +289,21 @@ def compute_group_output_ticket_recall_v2(
         loose_fault_groups = sorted(loose_ticket_to_groups.get(ticket_id, set()))
         potential_fault_groups = sorted(potential_ticket_to_groups.get(ticket_id, set()))
         fault_groups = sorted(set(base_fault_groups) | set(loose_fault_groups) | set(potential_fault_groups))
-        merged_site_alarms = _merge_group_site_alarms(fault_groups, group_to_site_alarms)
+        if only_one:
+            selected_fault_group = select_best_group_by_target_sites(
+                group_ids=fault_groups,
+                group_to_sites=group_to_sites,
+                target_sites=target_sites,
+            )
+            effective_fault_groups = [selected_fault_group] if selected_fault_group else []
+        else:
+            selected_fault_group = ""
+            effective_fault_groups = list(fault_groups)
+
+        merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
 
         recalled_sites = set()
-        for group_id in fault_groups:
+        for group_id in effective_fault_groups:
             recalled_sites.update(group_to_sites.get(group_id, set()))
         recalled_sites &= target_sites
 
@@ -319,6 +332,9 @@ def compute_group_output_ticket_recall_v2(
             "loose_fault_groups": loose_fault_groups,
             "potential_fault_groups": potential_fault_groups,
             "fault_groups": fault_groups,
+            "effective_fault_group_count": len(effective_fault_groups),
+            "effective_fault_groups": effective_fault_groups,
+            "selected_fault_group": selected_fault_group,
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
             "associated_site_alarms": associated_site_alarms,
@@ -349,6 +365,7 @@ def compute_group_output_ticket_recall_v2(
         "only_offline_mode": only_offline,
         "loose_mode": loose,
         "potential_mode": potential,
+        "only_one_mode": only_one,
         "details": details,
     }
 
@@ -424,6 +441,11 @@ def main():
         action="store_true",
         help="允许用 upper bound evidence 中出现过的告警，直接吸附这些告警所在的额外 group",
     )
+    parser.add_argument(
+        "--only-one",
+        action="store_true",
+        help="只保留覆盖该工单目标站点最多的单个 group，用它的站点计算召回率",
+    )
 
     args = parser.parse_args()
 
@@ -440,6 +462,7 @@ def main():
             only_offline=args.only_offline,
             loose=args.loose,
             potential=args.potential,
+            only_one=args.only_one,
         )
     except ValueError as exc:
         print(f"❌ {exc}")

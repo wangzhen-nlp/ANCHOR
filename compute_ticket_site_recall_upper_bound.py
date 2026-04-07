@@ -279,10 +279,7 @@ def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_co
         inferred_site_set = set(inferred_sites.get(ticket_id, set())) & target_sites
         associated_site_set = set(associated_sites.get(ticket_id, set())) & target_sites
 
-        if len(associated_site_set) <= 1:
-            recall = 0.0
-        else:
-            recall = len(associated_site_set) / len(target_sites) if target_sites else 0.0
+        recall = len(associated_site_set) / len(target_sites) if target_sites else 0.0
 
         details.append({
             "ticket_id": ticket_id,

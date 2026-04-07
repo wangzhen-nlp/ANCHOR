@@ -184,6 +184,26 @@ def build_ticket_site_count_distribution(details):
     }
 
 
+def select_best_group_by_target_sites(group_ids, group_to_sites, target_sites):
+    normalized_target_sites = {
+        normalize_text(site_id) for site_id in target_sites if normalize_text(site_id)
+    }
+    normalized_group_ids = sorted({
+        normalize_text(group_id) for group_id in group_ids if normalize_text(group_id)
+    })
+    if not normalized_group_ids:
+        return ""
+
+    best_group_id = ""
+    best_count = -1
+    for group_id in normalized_group_ids:
+        covered_count = len(set(group_to_sites.get(group_id, set())) & normalized_target_sites)
+        if covered_count > best_count:
+            best_group_id = group_id
+            best_count = covered_count
+    return best_group_id
+
+
 def build_site_to_group_index(group_to_sites):
     site_to_groups = defaultdict(set)
     for group_id, site_ids in group_to_sites.items():
