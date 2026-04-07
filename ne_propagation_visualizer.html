@@ -4526,6 +4526,40 @@
             return dataWithNote;
         }
 
+        async function saveTextAsJsonlFile(content, suggestedName) {
+            if (window.showSaveFilePicker) {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: suggestedName || 'fault_groups_with_note.jsonl',
+                    types: [{
+                        description: 'Fault Group JSONL',
+                        accept: {
+                            'application/json': ['.jsonl', '.json'],
+                            'text/plain': ['.jsonl', '.txt']
+                        }
+                    }]
+                });
+                if (!handle) {
+                    throw new Error('未选择保存文件');
+                }
+                const writable = await handle.createWritable();
+                await writable.write(content);
+                await writable.close();
+                return { mode: 'save-as', fileName: handle.name || suggestedName || '' };
+            }
+
+            const filename = suggestedName || 'fault_groups_with_note.jsonl';
+            const blob = new Blob([content], { type: 'application/jsonl' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            return { mode: 'download', fileName: filename };
+        }
+
         // 保存备注到原始文件（使用 File System Access API）
         async function saveNoteToFile() {
             if (!graphData) {
@@ -4540,14 +4574,30 @@
                 const browserBridge = getFaultGroupBrowserBridge();
                 if (browserBridge && originalGroupUuid) {
                     try {
-                        const saveResult = await browserBridge.saveFaultGroupNoteToSource(originalGroupUuid, dataWithNote.note || '');
-                        currentNote = dataWithNote.note || '';
-                        if (saveResult && saveResult.mode === 'save-as') {
-                            updateNoteStatus('✓ 备注已写入更新后的 JSONL 文件', false);
-                        } else {
-                            updateNoteStatus('✓ 备注已写回原始 JSONL 文件', false);
+                        if (typeof browserBridge.prepareFaultGroupNoteSave === 'function') {
+                            const prepared = await browserBridge.prepareFaultGroupNoteSave(originalGroupUuid, dataWithNote.note || '');
+                            let saveResult = null;
+                            if (typeof browserBridge.tryOverwriteFaultGroupSource === 'function') {
+                                saveResult = await browserBridge.tryOverwriteFaultGroupSource(prepared.content);
+                            }
+
+                            if (!saveResult || !saveResult.ok) {
+                                saveResult = await saveTextAsJsonlFile(prepared.content, prepared.suggestedFileName);
+                            }
+
+                            if (typeof browserBridge.applySavedFaultGroupNote === 'function') {
+                                browserBridge.applySavedFaultGroupNote(originalGroupUuid, prepared.note, prepared.noteUpdatedAt);
+                            }
+                            currentNote = prepared.note || '';
+                            if (saveResult && saveResult.mode === 'overwrite') {
+                                updateNoteStatus('✓ 备注已写回原始 JSONL 文件', false);
+                            } else if (saveResult && saveResult.mode === 'download') {
+                                updateNoteStatus(`✓ 备注已下载到 ${saveResult.fileName || 'JSONL 文件'}`, false);
+                            } else {
+                                updateNoteStatus('✓ 备注已写入更新后的 JSONL 文件', false);
+                            }
+                            return;
                         }
-                        return;
                     } catch (bridgeError) {
                         if (bridgeError && bridgeError.name === 'AbortError') {
                             updateNoteStatus('已取消保存', true);

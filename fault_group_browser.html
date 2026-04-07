@@ -464,6 +464,70 @@
             throw new Error('当前浏览器未提供可写文件句柄，请重新通过“选择 JSONL 文件”加载，或使用支持 File System Access API 的环境');
         }
 
+        window.prepareFaultGroupNoteSave = function(groupUuid, noteText) {
+            const normalizedUuid = String(groupUuid || '').trim();
+            if (!normalizedUuid) {
+                throw new Error('缺少故障组 UUID，无法准备备注保存');
+            }
+            const noteUpdatedAt = new Date().toISOString();
+            let found = false;
+            const content = faultGroups.map(group => {
+                const currentUuid = group.uuid || group.match_info?.uuid || '';
+                if (currentUuid !== normalizedUuid) {
+                    return JSON.stringify(group);
+                }
+                found = true;
+                const updatedGroup = {
+                    ...group,
+                    note: noteText || '',
+                    note_updated_at: noteUpdatedAt,
+                };
+                return JSON.stringify(updatedGroup);
+            }).join('\n') + '\n';
+
+            if (!found) {
+                throw new Error(`未在当前总览中找到故障组：${normalizedUuid}`);
+            }
+
+            return {
+                content,
+                note: noteText || '',
+                noteUpdatedAt,
+                suggestedFileName: currentFaultGroupFileName || `${normalizedUuid}.jsonl`,
+                hasBoundWritableHandle: !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable),
+            };
+        };
+
+        window.applySavedFaultGroupNote = function(groupUuid, noteText, noteUpdatedAt) {
+            const normalizedUuid = String(groupUuid || '').trim();
+            if (!normalizedUuid) {
+                return;
+            }
+            const index = faultGroups.findIndex(group => (group.uuid || group.match_info?.uuid || '') === normalizedUuid);
+            if (index < 0) {
+                return;
+            }
+            faultGroups[index].note = noteText || '';
+            if (noteUpdatedAt) {
+                faultGroups[index].note_updated_at = noteUpdatedAt;
+            }
+            renderGroups();
+        };
+
+        window.tryOverwriteFaultGroupSource = async function(content) {
+            if (!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable)) {
+                return { ok: false, reason: 'no-bound-handle' };
+            }
+            const granted = await ensureFaultGroupHandlePermission(currentFaultGroupFileHandle, 'readwrite');
+            if (!granted) {
+                return { ok: false, reason: 'permission-denied' };
+            }
+            const writable = await currentFaultGroupFileHandle.createWritable();
+            await writable.write(content);
+            await writable.close();
+            return { ok: true, mode: 'overwrite' };
+        };
+
         window.saveFaultGroupNoteToSource = async function(groupUuid, noteText) {
             const normalizedUuid = String(groupUuid || '').trim();
             if (!normalizedUuid) {
