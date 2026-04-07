@@ -421,6 +421,46 @@
             document.getElementById('fileInput').click();
         }
 
+        async function ensureFaultGroupWritableHandle(requiredUuid) {
+            if (currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable) {
+                return;
+            }
+            if (!window.showOpenFilePicker) {
+                return;
+            }
+
+            const [handle] = await window.showOpenFilePicker({
+                multiple: false,
+                types: [{
+                    description: 'Fault Group JSONL',
+                    accept: {
+                        'application/json': ['.jsonl', '.json', '.txt'],
+                        'text/plain': ['.jsonl', '.txt']
+                    }
+                }]
+            });
+            if (!handle) {
+                throw new Error('未选择原始 JSONL 文件');
+            }
+
+            const file = await handle.getFile();
+            const content = await file.text();
+            const loadedGroups = parseJsonl(content);
+            if (requiredUuid) {
+                const hasTargetGroup = loadedGroups.some(group => (group.uuid || group.match_info?.uuid || '') === requiredUuid);
+                if (!hasTargetGroup) {
+                    throw new Error(`所选文件中未找到当前故障组：${requiredUuid}`);
+                }
+            }
+
+            faultGroups = loadedGroups;
+            currentFaultGroupFileHandle = handle;
+            currentFaultGroupFileName = file.name || handle.name || currentFaultGroupFileName || '-';
+            document.getElementById('status').textContent = `已绑定原始文件，共 ${faultGroups.length} 个故障组`;
+            updateFaultGroupFileStatus(currentFaultGroupFileName, true);
+            renderGroups();
+        }
+
         async function writeUpdatedFaultGroups(groups, suggestedFileName) {
             const content = buildFaultGroupJsonlContent(groups);
             if (currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable) {
@@ -459,6 +499,7 @@
             if (!normalizedUuid) {
                 throw new Error('缺少故障组 UUID，无法保存备注');
             }
+            await ensureFaultGroupWritableHandle(normalizedUuid);
             const index = faultGroups.findIndex(group => (group.uuid || group.match_info?.uuid || '') === normalizedUuid);
             if (index < 0) {
                 throw new Error(`未在当前总览中找到故障组：${normalizedUuid}`);
