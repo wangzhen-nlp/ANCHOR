@@ -1726,6 +1726,23 @@
                 </div>
             </div>
 
+            <!-- 备注编辑区域 -->
+            <div class="note-panel" id="notePanel">
+                <h3>故障组备注</h3>
+                <textarea 
+                    id="noteTextarea" 
+                    class="note-textarea" 
+                    placeholder="在此输入备注信息..."
+                    disabled
+                ></textarea>
+                <div class="note-actions">
+                    <button class="btn-save-note" id="saveNoteBtn" onclick="saveNoteToFile()" disabled>
+                        💾 保存到文件
+                    </button>
+                </div>
+                <div class="note-status" id="noteStatus"></div>
+            </div>
+
             <div class="stats-panel">
                 <h3>数据统计</h3>
                 <div class="stat-grid">
@@ -1761,23 +1778,6 @@
                     <button class="primary" onclick="buildDistanceEdges()">建立连边</button>
                     <button onclick="exitMultiSelect()">退出</button>
                 </div>
-            </div>
-
-            <!-- 备注编辑区域 -->
-            <div class="note-panel" id="notePanel">
-                <h3>故障组备注</h3>
-                <textarea 
-                    id="noteTextarea" 
-                    class="note-textarea" 
-                    placeholder="在此输入备注信息..."
-                    disabled
-                ></textarea>
-                <div class="note-actions">
-                    <button class="btn-save-note" id="saveNoteBtn" onclick="saveNoteToFile()" disabled>
-                        💾 保存到文件
-                    </button>
-                </div>
-                <div class="note-status" id="noteStatus"></div>
             </div>
 
             <div class="node-list">
