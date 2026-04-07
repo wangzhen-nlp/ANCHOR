@@ -198,6 +198,7 @@ def compute_group_output_ticket_recall_v2(
     potential=False,
     only_one=False,
     ultimate_only=False,
+    min_site_num=0,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
@@ -223,6 +224,12 @@ def compute_group_output_ticket_recall_v2(
         for ticket_id, site_list in ticket_sites.items()
         if ticket_id in eligible_ticket_ids
     }
+    if min_site_num > 0:
+        ticket_sites = {
+            ticket_id: site_list
+            for ticket_id, site_list in ticket_sites.items()
+            if len(site_list) >= min_site_num
+        }
     if not ticket_sites:
         raise ValueError("没有可用于计算的工单站点映射")
 
@@ -408,6 +415,7 @@ def compute_group_output_ticket_recall_v2(
         "potential_mode": potential,
         "only_one_mode": only_one,
         "ultimate_only_mode": ultimate_only,
+        "min_site_num": min_site_num,
         "details": details,
     }
 
@@ -493,6 +501,12 @@ def main():
         action="store_true",
         help="只考虑不作为关联 group 出现的最终 group（即未出现在其它 group 的 related_group_uuids 中）",
     )
+    parser.add_argument(
+        "--min-site-num",
+        type=int,
+        default=0,
+        help="仅统计工单站点数 >= 该值的工单；默认: 0（不过滤）",
+    )
 
     args = parser.parse_args()
 
@@ -511,6 +525,7 @@ def main():
             potential=args.potential,
             only_one=args.only_one,
             ultimate_only=args.ultimate_only,
+            min_site_num=args.min_site_num,
         )
     except ValueError as exc:
         print(f"❌ {exc}")

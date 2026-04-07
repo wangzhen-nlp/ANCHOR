@@ -168,6 +168,7 @@ def compute_ticket_site_recall_v2(
     loose=False,
     potential=False,
     only_one=False,
+    min_site_num=0,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
@@ -191,6 +192,12 @@ def compute_ticket_site_recall_v2(
         for ticket_id, site_list in ticket_sites.items()
         if ticket_id in eligible_ticket_ids
     }
+    if min_site_num > 0:
+        ticket_sites = {
+            ticket_id: site_list
+            for ticket_id, site_list in ticket_sites.items()
+            if len(site_list) >= min_site_num
+        }
     if not ticket_sites:
         raise ValueError("没有可用于计算的工单站点映射")
 
@@ -371,6 +378,7 @@ def compute_ticket_site_recall_v2(
         "loose_mode": loose,
         "potential_mode": potential,
         "only_one_mode": only_one,
+        "min_site_num": min_site_num,
         "details": details,
     }
 
@@ -449,6 +457,12 @@ def main():
         action="store_true",
         help="只保留覆盖该工单目标站点最多的单个故障组ID，用它的站点计算召回率",
     )
+    parser.add_argument(
+        "--min-site-num",
+        type=int,
+        default=0,
+        help="仅统计工单站点数 >= 该值的工单；默认: 0（不过滤）",
+    )
 
     args = parser.parse_args()
 
@@ -466,6 +480,7 @@ def main():
             loose=args.loose,
             potential=args.potential,
             only_one=args.only_one,
+            min_site_num=args.min_site_num,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
