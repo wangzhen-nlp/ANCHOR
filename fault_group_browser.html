@@ -290,7 +290,7 @@
             <div class="toolbar">
                 <input id="fileInput" type="file" accept=".jsonl,.txt,.json">
                 <input id="referenceFileInput" type="file" accept=".json">
-                <button class="btn" onclick="document.getElementById('fileInput').click()">选择 JSONL 文件</button>
+                <button class="btn" onclick="openFaultGroupFile()">选择 JSONL 文件</button>
                 <button class="btn" onclick="document.getElementById('referenceFileInput').click()">选择关联明细 JSON</button>
                 <div class="hint">每行一个故障组对象</div>
             </div>
@@ -343,6 +343,8 @@
         let siteFilterQuery = '';
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
+        let currentFaultGroupFileHandle = null;
+        let currentFaultGroupFileName = '';
         let durationFilterSeconds = 0;
         let referenceData = null;
         let referenceIndex = {
@@ -352,6 +354,137 @@
 
         window.getLoadedReferenceData = function() {
             return referenceData;
+        };
+
+        window.getLoadedFaultGroupFileContext = function() {
+            return {
+                hasWritableHandle: !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable),
+                fileName: currentFaultGroupFileName || ''
+            };
+        };
+
+        function buildFaultGroupJsonlContent(groups) {
+            return groups.map(group => JSON.stringify(group)).join('\n') + '\n';
+        }
+
+        function updateFaultGroupFileStatus(inputPath, writableMode) {
+            const pathText = inputPath || currentFaultGroupFileName || '-';
+            const writableText = writableMode ? '可直接回写备注' : '未获得原文件写入权限';
+            document.getElementById('filePath').textContent = `文件路径：${pathText}（${writableText}）`;
+        }
+
+        function loadFaultGroupText(content, inputPath, fileHandle) {
+            try {
+                faultGroups = parseJsonl(content);
+                currentFaultGroupFileHandle = fileHandle || null;
+                currentFaultGroupFileName = inputPath || currentFaultGroupFileName || '';
+                document.getElementById('status').textContent = `已加载 ${faultGroups.length} 个故障组`;
+                updateFaultGroupFileStatus(inputPath, !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable));
+                renderGroups();
+            } catch (error) {
+                faultGroups = [];
+                currentFaultGroupFileHandle = fileHandle || null;
+                currentFaultGroupFileName = inputPath || currentFaultGroupFileName || '';
+                document.getElementById('status').textContent = error.message;
+                updateFaultGroupFileStatus(inputPath, !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable));
+                renderGroups();
+            }
+        }
+
+        async function openFaultGroupFile() {
+            if (window.showOpenFilePicker) {
+                try {
+                    const [handle] = await window.showOpenFilePicker({
+                        multiple: false,
+                        types: [{
+                            description: 'Fault Group JSONL',
+                            accept: {
+                                'application/json': ['.jsonl', '.json', '.txt'],
+                                'text/plain': ['.jsonl', '.txt']
+                            }
+                        }]
+                    });
+                    if (!handle) {
+                        return;
+                    }
+                    const file = await handle.getFile();
+                    const content = await file.text();
+                    loadFaultGroupText(content, file.name || handle.name || '-', handle);
+                    return;
+                } catch (error) {
+                    if (error && error.name === 'AbortError') {
+                        return;
+                    }
+                    console.warn('showOpenFilePicker 加载失败，回退到文件选择器:', error);
+                }
+            }
+            document.getElementById('fileInput').click();
+        }
+
+        async function writeUpdatedFaultGroups(groups, suggestedFileName) {
+            const content = buildFaultGroupJsonlContent(groups);
+            if (currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable) {
+                const writable = await currentFaultGroupFileHandle.createWritable();
+                await writable.write(content);
+                await writable.close();
+                return { mode: 'overwrite' };
+            }
+            if (window.showSaveFilePicker) {
+                const handle = await window.showSaveFilePicker({
+                    suggestedName: suggestedFileName || currentFaultGroupFileName || 'fault_groups_with_note.jsonl',
+                    types: [{
+                        description: 'Fault Group JSONL',
+                        accept: {
+                            'application/json': ['.jsonl', '.json'],
+                            'text/plain': ['.jsonl', '.txt']
+                        }
+                    }]
+                });
+                if (!handle) {
+                    throw new Error('未选择保存文件');
+                }
+                const writable = await handle.createWritable();
+                await writable.write(content);
+                await writable.close();
+                currentFaultGroupFileHandle = handle;
+                currentFaultGroupFileName = handle.name || currentFaultGroupFileName;
+                updateFaultGroupFileStatus(currentFaultGroupFileName, true);
+                return { mode: 'save-as' };
+            }
+            throw new Error('当前浏览器未提供可写文件句柄，请重新通过“选择 JSONL 文件”加载，或使用支持 File System Access API 的环境');
+        }
+
+        window.saveFaultGroupNoteToSource = async function(groupUuid, noteText) {
+            const normalizedUuid = String(groupUuid || '').trim();
+            if (!normalizedUuid) {
+                throw new Error('缺少故障组 UUID，无法保存备注');
+            }
+            const index = faultGroups.findIndex(group => (group.uuid || group.match_info?.uuid || '') === normalizedUuid);
+            if (index < 0) {
+                throw new Error(`未在当前总览中找到故障组：${normalizedUuid}`);
+            }
+            const group = faultGroups[index];
+            const previousNote = group.note || '';
+            const previousUpdatedAt = group.note_updated_at || '';
+            group.note = noteText || '';
+            group.note_updated_at = new Date().toISOString();
+            try {
+                const result = await writeUpdatedFaultGroups(faultGroups, currentFaultGroupFileName || `${normalizedUuid}.jsonl`);
+                renderGroups();
+                return {
+                    ok: true,
+                    mode: result.mode,
+                    note: group.note
+                };
+            } catch (error) {
+                group.note = previousNote;
+                if (previousUpdatedAt) {
+                    group.note_updated_at = previousUpdatedAt;
+                } else {
+                    delete group.note_updated_at;
+                }
+                throw error;
+            }
         };
 
         function resetReferenceIndex() {
@@ -844,19 +977,9 @@
             const file = event.target.files[0];
             if (!file) return;
             const inputPath = event.target.value || file.webkitRelativePath || file.name || '-';
-            document.getElementById('filePath').textContent = `文件路径：${inputPath}`;
-
             const reader = new FileReader();
             reader.onload = function(e) {
-                try {
-                    faultGroups = parseJsonl(e.target.result);
-                    document.getElementById('status').textContent = `已加载 ${faultGroups.length} 个故障组`;
-                    renderGroups();
-                } catch (error) {
-                    faultGroups = [];
-                    document.getElementById('status').textContent = error.message;
-                    renderGroups();
-                }
+                loadFaultGroupText(e.target.result, inputPath, null);
             };
             reader.readAsText(file, 'utf-8');
         });
