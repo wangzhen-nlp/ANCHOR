@@ -20,6 +20,7 @@ from ticket_recall_v2_utils import (
     dedupe_alarm_records,
     derive_case_jsonl_output_path,
     load_upper_bound_index,
+    load_ne_graph_data,
     write_jsonl_records,
 )
 
@@ -250,7 +251,8 @@ def compute_ticket_site_recall_v2(
         "details": details,
     }
 
-    case_records = build_unrecalled_visualization_cases(details, result["method"])
+    ne_graph_data = load_ne_graph_data(ne_graph_file)
+    case_records = build_unrecalled_visualization_cases(details, result["method"], ne_graph_data=ne_graph_data)
     if output_file and not case_jsonl_output_file:
         case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
     if case_jsonl_output_file:
