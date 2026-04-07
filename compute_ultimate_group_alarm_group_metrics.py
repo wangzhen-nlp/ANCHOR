@@ -206,6 +206,21 @@ def _build_potential_groups_by_alarm_id(source_to_alarm_ids, alarm_id_to_target_
     return result
 
 
+def _build_gold_site_count_distribution(details):
+    counts = defaultdict(int)
+    for item in details:
+        try:
+            site_count = int(item.get("gold_site_count", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        counts[site_count] += 1
+
+    return {
+        str(site_count): counts[site_count]
+        for site_count in sorted(counts)
+    }
+
+
 def _build_loose_groups_by_time_window(
     gold_to_sites,
     gold_to_base_pred_groups,
@@ -320,6 +335,7 @@ def _compute_direction_metrics(
     evaluated_count = len(details)
     return {
         "sample_count": evaluated_count,
+        "gold_site_count_distribution": _build_gold_site_count_distribution(details),
         "average_recall": total_recall / evaluated_count if evaluated_count else 0.0,
         "average_precision": total_precision / evaluated_count if evaluated_count else 0.0,
         "average_f1": total_f1 / evaluated_count if evaluated_count else 0.0,
@@ -522,12 +538,14 @@ def main():
 
     print("【终极 group 作为 gold】")
     print(f"样本数: {result['ultimate_group_as_gold']['sample_count']}")
+    print(f"gold站点数分布: {result['ultimate_group_as_gold']['gold_site_count_distribution']}")
     print(f"平均召回率: {result['ultimate_group_as_gold']['average_recall']:.6f}")
     print(f"平均准确率: {result['ultimate_group_as_gold']['average_precision']:.6f}")
     print(f"平均F1: {result['ultimate_group_as_gold']['average_f1']:.6f}")
 
     print("【告警故障组ID 作为 gold】")
     print(f"样本数: {result['alarm_group_as_gold']['sample_count']}")
+    print(f"gold站点数分布: {result['alarm_group_as_gold']['gold_site_count_distribution']}")
     print(f"平均召回率: {result['alarm_group_as_gold']['average_recall']:.6f}")
     print(f"平均准确率: {result['alarm_group_as_gold']['average_precision']:.6f}")
     print(f"平均F1: {result['alarm_group_as_gold']['average_f1']:.6f}")
