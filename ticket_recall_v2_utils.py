@@ -369,7 +369,7 @@ def parse_alarm_record_ts(record):
         except (TypeError, ValueError):
             pass
 
-    for field_name in ("告警首次发生时间", "alarm_time"):
+    for field_name in ("告警首次发生时间", "alarm_time", "time_str"):
         text = normalize_text(record.get(field_name, ""))
         if not text:
             continue
@@ -428,7 +428,16 @@ def build_site_coord_index(ne_graph_data):
 
 def _build_visual_alarm_entry(record, site_id):
     alarm_type = normalize_text(record.get("alarm", "")) or normalize_text(record.get("alarm_type", "")) or normalize_text(record.get("告警标题", ""))
-    alarm_time = normalize_text(record.get("alarm_time", "")) or normalize_text(record.get("告警首次发生时间", ""))
+    alarm_time = (
+        normalize_text(record.get("time", ""))
+        or normalize_text(record.get("alarm_time", ""))
+        or normalize_text(record.get("告警首次发生时间", ""))
+        or normalize_text(record.get("time_str", ""))
+    )
+    if not alarm_time:
+        ts = parse_alarm_record_ts(record)
+        if ts is not None:
+            alarm_time = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     alarm_clear_time = normalize_text(record.get("alarm_clear_time", "")) or normalize_text(record.get("告警清除时间", ""))
     return {
         "alarm_id": normalize_text(record.get("eid", "")) or normalize_text(record.get("alarm_id", "")) or normalize_text(record.get("告警编码ID", "")),
