@@ -4,6 +4,7 @@ import os
 from argparse import ArgumentParser
 from collections import defaultdict
 
+from alarm_types import OFFLINE_ALARMS
 from alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from compute_ticket_site_recall import (
     _build_ticket_sites_from_alarms,
@@ -14,9 +15,13 @@ from compute_ticket_site_recall import (
 )
 from ticket_recall_v2_utils import (
     build_site_alarm_map_for_sites,
+    build_ticket_site_count_distribution,
     dedupe_alarm_records,
     load_upper_bound_index,
 )
+
+
+OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 
 
 def _build_alarm_record(alarm, resolved_site_id, group_id):
@@ -92,6 +97,26 @@ def _merge_group_site_alarms(group_ids, group_to_site_alarms):
     }
 
 
+def _alarm_record_is_offline(record):
+    if not isinstance(record, dict):
+        return False
+    alarm_name = _normalize_text(record.get("alarm", ""))
+    if alarm_name and alarm_name in OFFLINE_ALARM_SET:
+        return True
+    alarm_title = _normalize_text(record.get("告警标题", ""))
+    return bool(alarm_title and alarm_title in OFFLINE_ALARM_SET)
+
+
+def _site_alarm_map_contains_offline(site_alarm_map):
+    for alarms in site_alarm_map.values():
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if _alarm_record_is_offline(record):
+                return True
+    return False
+
+
 def compute_ticket_site_recall_v2(
     alarm_input,
     upper_bound_file,
@@ -100,6 +125,7 @@ def compute_ticket_site_recall_v2(
     group_field="故障组ID",
     ne_graph_file=None,
     output_file=None,
+    strict=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     eligible_ticket_ids = {
@@ -170,6 +196,19 @@ def compute_ticket_site_recall_v2(
         unrecalled_sites = target_sites - recalled_sites
         upper_info = upper_bound_index.get(ticket_id, {})
         upper_site_evidence = upper_info.get("site_evidence", {})
+        associated_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, recalled_sites)
+        missing_site_alarms = {
+            site_id: upper_site_evidence.get(site_id, [])
+            for site_id in sorted(unrecalled_sites)
+        }
+
+        if strict:
+            has_offline_evidence = (
+                _site_alarm_map_contains_offline(associated_site_alarms)
+                or _site_alarm_map_contains_offline(missing_site_alarms)
+            )
+            if not has_offline_evidence:
+                continue
 
         recall = len(recalled_sites) / len(target_sites) if target_sites else 0.0
         total_recall += recall
@@ -183,13 +222,10 @@ def compute_ticket_site_recall_v2(
             "fault_groups": fault_groups,
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
-            "associated_site_alarms": build_site_alarm_map_for_sites(merged_site_alarms, recalled_sites),
+            "associated_site_alarms": associated_site_alarms,
             "missing_site_count": len(unrecalled_sites),
             "missing_sites": sorted(unrecalled_sites),
-            "missing_site_alarms": {
-                site_id: upper_site_evidence.get(site_id, [])
-                for site_id in sorted(unrecalled_sites)
-            },
+            "missing_site_alarms": missing_site_alarms,
             "recall": recall,
         })
 
@@ -199,15 +235,19 @@ def compute_ticket_site_recall_v2(
             item.get("ticket_id", ""),
         )
     )
+    site_count_distribution = build_ticket_site_count_distribution(details)
     average_recall = total_recall / len(details) if details else 0.0
 
     result = {
         "method": "alarm_stream_group_field",
         "ticket_count": len(details),
+        "final_sample_count": len(details),
+        "ticket_site_count_distribution": site_count_distribution,
         "average_recall": average_recall,
         "denominator_source": "alarms",
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
+        "strict_mode": strict,
         "details": details,
     }
 
@@ -253,6 +293,11 @@ def main():
         default="ticket_site_recall_v2.json",
         help="输出 JSON 文件，默认: ticket_site_recall_v2.json",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="严格模式：若 associated_site_alarms 和 missing_site_alarms 中都未出现 OFFLINE_ALARMS，则跳过该工单样本",
+    )
 
     args = parser.parse_args()
 
@@ -265,12 +310,15 @@ def main():
             group_field=args.group_field,
             ne_graph_file=args.ne_graph,
             output_file=args.output,
+            strict=args.strict,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
         return
 
     print(f"工单数: {result['ticket_count']}")
+    print(f"最终统计样本数: {result['final_sample_count']}")
+    print(f"样本 site 个数分布: {result['ticket_site_count_distribution']}")
     print(f"平均召回率: {result['average_recall']:.6f}")
     print(f"明细已输出到: {args.output}")
 

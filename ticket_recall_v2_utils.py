@@ -93,3 +93,18 @@ def build_site_alarm_map_for_sites(site_alarm_map, site_ids):
     for site_id in sorted(site_ids):
         result[site_id] = dedupe_alarm_records(site_alarm_map.get(site_id, []))
     return result
+
+
+def build_ticket_site_count_distribution(details):
+    counts = defaultdict(int)
+    for item in details:
+        try:
+            site_count = int(item.get("ticket_site_count", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        counts[site_count] += 1
+
+    return {
+        str(site_count): counts[site_count]
+        for site_count in sorted(counts)
+    }
