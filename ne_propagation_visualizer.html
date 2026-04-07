@@ -3100,6 +3100,11 @@
             return parts[parts.length - 1] || fullId;
         }
 
+        function getAlarmDisplayTime(alarm) {
+            if (!alarm || typeof alarm !== 'object') return '-';
+            return alarm.time || alarm.alarm_time || alarm.time_str || '-';
+        }
+
         function renderSiteOverlays() {
             mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
             mapSiteOverlays = [];
@@ -3275,7 +3280,7 @@
 
                 if (node.alarm && node.alarm.length > 0) {
                     const alarmRows = node.alarm.map(function(alarm) {
-                        const alarmTime = alarm.time || alarm.alarm_time || '-';
+                        const alarmTime = getAlarmDisplayTime(alarm);
                         const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
                         const ticketId = alarm['工单号'] || '-';
@@ -3522,7 +3527,7 @@
                 const alarmType = alarm.alarm_type || '未知';
                 const severity = alarm.severity || alarm.alarm_level || 'warning';
                 const description = alarm.description || alarm.alarm_desc || '-';
-                const time = alarm.time || alarm.alarm_time || '-';
+                const time = getAlarmDisplayTime(alarm);
                 const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                 const ticketId = alarm['工单号'] || '-';
                 const faultGroup = alarm['故障组ID'] || '-';
@@ -3833,7 +3838,7 @@
             if (leftAlarm) {
                 html += '<div class="edge-alarm-item">';
                 html += '<div style="font-weight: bold; color: #cf222e;">' + (leftAlarm.alarm_type || '未知告警') + '</div>';
-                html += '<div class="alarm-time">' + (leftAlarm.alarm_time || '-') + '</div>';
+                html += '<div class="alarm-time">' + getAlarmDisplayTime(leftAlarm) + '</div>';
                 html += '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">NE: ' + (leftAlarm.ne_id || sourceId) + '</div>';
                 html += '</div>';
             } else {
@@ -3847,7 +3852,7 @@
             if (rightAlarm) {
                 html += '<div class="edge-alarm-item">';
                 html += '<div style="font-weight: bold; color: #cf222e;">' + (rightAlarm.alarm_type || '未知告警') + '</div>';
-                html += '<div class="alarm-time">' + (rightAlarm.alarm_time || '-') + '</div>';
+                html += '<div class="alarm-time">' + getAlarmDisplayTime(rightAlarm) + '</div>';
                 html += '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">NE: ' + (rightAlarm.ne_id || targetId) + '</div>';
                 html += '</div>';
             } else {
