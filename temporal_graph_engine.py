@@ -21,6 +21,44 @@ logger = logging.getLogger(__name__)
 
 
 class TemporalGraphEngine:
+    def _compile_rule_execution_plan(self, rule):
+        """为单条规则预编译静态执行计划，避免每次评估重复构图和排边。"""
+        nodes_cfg = rule.get("nodes", {})
+        edges_cfg = rule.get("edges", [])
+        trigger_role = rule["trigger_role"]
+
+        pattern_adj = build_pattern_adj(edges_cfg)
+
+        edges_to_explore = []
+        visited_edges = set()
+        queue = collections.deque([trigger_role])
+        while queue:
+            curr = queue.popleft()
+            for edge in pattern_adj[curr]:
+                tgt = edge["role"]
+                edge_id = (curr, tgt)
+                if edge_id in visited_edges:
+                    continue
+                visited_edges.add(edge_id)
+                edges_to_explore.append((curr, tgt, edge))
+                queue.append(tgt)
+
+        targets = {edge["target"] for edge in edges_cfg}
+        root_roles = tuple(role for role in nodes_cfg.keys() if role not in targets)
+
+        return {
+            "trigger_role": trigger_role,
+            "edges_to_explore": tuple(edges_to_explore),
+            "root_roles": root_roles,
+        }
+
+    def _compile_rule_execution_plans(self):
+        """预编译所有规则的静态执行计划。"""
+        self.rule_execution_plans = {
+            rule_name: self._compile_rule_execution_plan(rule)
+            for rule_name, rule in self.rules.items()
+        }
+
     def _record_instance_dependency(self, inst, curr_role, tgt_role, curr_support_targets):
         """记录一条已处理边上的节点依赖关系，供后续收敛裁剪使用。"""
         if not curr_support_targets:
@@ -164,6 +202,10 @@ class TemporalGraphEngine:
             CRITICAL_ALARMS,
             lambda node: self.event_cache.get(node, [])
         )
+
+        # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
+        self.rule_execution_plans = {}
+        self._compile_rule_execution_plans()
 
         # 站点可以作为 trigger 的规则+告警组合，{node: ((rule, (alarm_type, ...)), ...)}
         self.trigger_specs_by_node = {}
@@ -824,25 +866,17 @@ class TemporalGraphEngine:
         """
         helper = node_rule_helper or self.node_rule_helper
         nodes_cfg = rule.get("nodes", {})
-        edges_cfg = rule.get("edges", [])
-        trigger_role = rule["trigger_role"]
 
-        # 1. 建立模式图的双向邻接表
-        pattern_adj = build_pattern_adj(edges_cfg)
+        # 1. 读取规则的静态执行计划
+        plan = self.rule_execution_plans.get(rule_name)
+        if plan is None:
+            plan = self._compile_rule_execution_plan(rule)
+            self.rule_execution_plans[rule_name] = plan
 
-        # 2. 生成图遍历计划
-        edges_to_explore = []
-        visited_edges = set()
-        queue = collections.deque([trigger_role])
-        while queue:
-            curr = queue.popleft()
-            for edge in pattern_adj[curr]:
-                tgt = edge["role"]
-                edge_id = (curr, tgt)
-                if edge_id not in visited_edges:
-                    visited_edges.add(edge_id)
-                    edges_to_explore.append((curr, tgt, edge))
-                    queue.append(tgt)
+        # 2. 取出本次匹配需要的静态遍历信息
+        trigger_role = plan["trigger_role"]
+        edges_to_explore = plan["edges_to_explore"]
+        root_roles = plan["root_roles"]
 
         # 3. 校验触发节点自身
         trigger_node_domain = self.sites_domain_map.get(trigger_node, {})
@@ -1001,8 +1035,6 @@ class TemporalGraphEngine:
 
         # 6. 提取结果：把一次结构匹配结果整理成候选故障组。
         results = []
-        targets = {e["target"] for e in edges_cfg}
-        root_roles = [r for r in nodes_cfg.keys() if r not in targets]
 
         for inst in instances:
             stabilized_inst = self._stabilize_instance_dependencies(inst, nodes_cfg)
