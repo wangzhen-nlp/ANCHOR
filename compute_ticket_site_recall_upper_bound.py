@@ -268,6 +268,8 @@ def _associate_missing_sites_by_time_window(
 def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_counts, direct_sites, inferred_sites, associated_sites):
     details = []
     total_recall = 0.0
+    total_precision = 0.0
+    total_f1 = 0.0
     ticket_count = 0
 
     for ticket_id in sorted(ticket_sites.keys()):
@@ -280,6 +282,12 @@ def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_co
         associated_site_set = set(associated_sites.get(ticket_id, set())) & target_sites
 
         recall = len(associated_site_set) / len(target_sites) if target_sites else 0.0
+        precision = len(associated_site_set) / len(associated_site_set) if associated_site_set else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
 
         details.append({
             "ticket_id": ticket_id,
@@ -293,8 +301,12 @@ def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_co
             "associated_site_count": len(associated_site_set),
             "associated_sites": sorted(associated_site_set),
             "recall_upper_bound": recall,
+            "precision_upper_bound": precision,
+            "f1_upper_bound": f1,
         })
         total_recall += recall
+        total_precision += precision
+        total_f1 += f1
         ticket_count += 1
 
     details.sort(
@@ -304,7 +316,9 @@ def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_co
         )
     )
     average_recall = total_recall / ticket_count if ticket_count else 0.0
-    return details, average_recall
+    average_precision = total_precision / ticket_count if ticket_count else 0.0
+    average_f1 = total_f1 / ticket_count if ticket_count else 0.0
+    return details, average_recall, average_precision, average_f1
 
 
 def _collect_association_evidence(
@@ -510,7 +524,7 @@ def main():
         ne_to_site=ne_to_site,
     )
 
-    details, average_recall = _compute_upper_bound_recalls(
+    details, average_recall, average_precision, average_f1 = _compute_upper_bound_recalls(
         ticket_sites=ticket_sites,
         ticket_site_sets=ticket_site_sets,
         ticket_alarm_counts=ticket_alarm_counts,
@@ -532,6 +546,8 @@ def main():
         "site_field": args.site_field,
         "source_field": args.source_field,
         "average_recall_upper_bound": average_recall,
+        "average_precision_upper_bound": average_precision,
+        "average_f1_upper_bound": average_f1,
         "details": details,
     }
 
@@ -540,6 +556,8 @@ def main():
 
     print(f"工单数: {len(details)}")
     print(f"平均召回率上限: {average_recall:.6f}")
+    print(f"平均准确率上限: {average_precision:.6f}")
+    print(f"平均F1上限: {average_f1:.6f}")
     print(f"结果已输出到: {args.output}")
 
 

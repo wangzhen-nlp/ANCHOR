@@ -141,9 +141,26 @@ def _build_ticket_group_indexes(alarm_input, ticket_field, group_field, ne_to_si
     return ticket_to_groups, group_to_sites, ticket_alarm_counts
 
 
+def _compute_site_metrics(target_sites, predicted_sites):
+    target_site_set = set(target_sites)
+    predicted_site_set = set(predicted_sites)
+    true_positive_sites = target_site_set & predicted_site_set
+
+    recall = len(true_positive_sites) / len(target_site_set) if target_site_set else 0.0
+    precision = len(true_positive_sites) / len(predicted_site_set) if predicted_site_set else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+    return true_positive_sites, recall, precision, f1
+
+
 def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, ticket_alarm_counts):
     details = []
     total_recall = 0.0
+    total_precision = 0.0
+    total_f1 = 0.0
     evaluated_count = 0
 
     for ticket_id in sorted(ticket_sites.keys()):
@@ -156,13 +173,13 @@ def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, tick
             continue
 
         fault_groups = sorted(ticket_to_groups.get(ticket_id, set()))
-        recalled_sites = set()
+        predicted_sites = set()
         for group_id in fault_groups:
-            recalled_sites.update(group_to_sites.get(group_id, set()))
+            predicted_sites.update(group_to_sites.get(group_id, set()))
 
-        # 召回率口径：工单目标站点中，被这些关联故障组覆盖到的比例。
-        recalled_target_sites = sorted(target_sites & recalled_sites)
-        recall = len(recalled_target_sites) / len(target_sites)
+        # 召回率 / 准确率口径：预测站点来自关联故障组覆盖到的全部站点。
+        true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
+        recalled_target_sites = sorted(true_positive_sites)
 
         details.append({
             "ticket_id": ticket_id,
@@ -173,22 +190,28 @@ def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, tick
             "fault_groups": fault_groups,
             "recalled_site_count": len(recalled_target_sites),
             "recalled_sites": recalled_target_sites,
-            "group_site_count": len(recalled_sites),
-            "group_sites": sorted(recalled_sites),
+            "group_site_count": len(predicted_sites),
+            "group_sites": sorted(predicted_sites),
             "recall": recall,
+            "precision": precision,
+            "f1": f1,
         })
 
         total_recall += recall
+        total_precision += precision
+        total_f1 += f1
         evaluated_count += 1
 
     average_recall = total_recall / evaluated_count if evaluated_count else 0.0
+    average_precision = total_precision / evaluated_count if evaluated_count else 0.0
+    average_f1 = total_f1 / evaluated_count if evaluated_count else 0.0
     details.sort(
         key=lambda item: (
             -item.get("ticket_site_count", 0),
             item.get("ticket_id", ""),
         )
     )
-    return details, average_recall, evaluated_count
+    return details, average_recall, average_precision, average_f1, evaluated_count
 
 
 def main():
@@ -244,7 +267,7 @@ def main():
         ne_to_site,
     )
 
-    details, average_recall, evaluated_count = _compute_ticket_recalls(
+    details, average_recall, average_precision, average_f1, evaluated_count = _compute_ticket_recalls(
         ticket_sites,
         ticket_to_groups,
         group_to_sites,
@@ -254,6 +277,8 @@ def main():
     result = {
         "ticket_count": evaluated_count,
         "average_recall": average_recall,
+        "average_precision": average_precision,
+        "average_f1": average_f1,
         "ticket_site_source": ticket_site_source,
         "details": details,
     }
@@ -263,6 +288,8 @@ def main():
 
     print(f"工单数: {evaluated_count}")
     print(f"平均召回率: {average_recall:.6f}")
+    print(f"平均准确率: {average_precision:.6f}")
+    print(f"平均F1: {average_f1:.6f}")
     print(f"工单站点来源: {ticket_site_source}")
     print(f"明细已输出到: {args.output}")
 

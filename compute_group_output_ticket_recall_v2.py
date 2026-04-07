@@ -13,6 +13,7 @@ from compute_group_output_ticket_recall import (
 )
 from compute_ticket_site_recall import (
     _build_ticket_sites_from_alarms,
+    _compute_site_metrics,
     _load_ticket_sites,
     _normalize_text,
 )
@@ -65,16 +66,35 @@ def _build_group_output_ticket_index_for_eligible(group_output_input, eligible_t
     return ticket_to_groups, ticket_occurrence_counts
 
 
-def _build_group_output_alarm_indexes(group_output_input, relevant_group_ids):
+def _collect_referenced_group_uuids(group_output_input):
+    referenced_group_ids = set()
+
+    for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
+        match_info = group_record.get("match_info", {})
+        related_group_ids = []
+        if isinstance(match_info, dict):
+            related_group_ids = match_info.get("related_group_uuids", [])
+        if not isinstance(related_group_ids, list):
+            continue
+        for group_id in related_group_ids:
+            normalized_group_id = _normalize_text(group_id)
+            if normalized_group_id:
+                referenced_group_ids.add(normalized_group_id)
+
+    return referenced_group_ids
+
+
+def _build_group_output_alarm_indexes(group_output_input, relevant_group_ids, excluded_group_ids=None):
     group_to_sites = defaultdict(set)
     group_to_site_alarms = defaultdict(lambda: defaultdict(list))
+    excluded_group_ids = set(excluded_group_ids or ())
 
     if not relevant_group_ids:
         return group_to_sites, group_to_site_alarms
 
     for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
         group_id = _extract_group_id(group_record)
-        if not group_id or group_id not in relevant_group_ids:
+        if not group_id or group_id not in relevant_group_ids or group_id in excluded_group_ids:
             continue
 
         for site_id in _extract_group_sites(group_record, group_id):
@@ -95,9 +115,10 @@ def _build_group_output_alarm_indexes(group_output_input, relevant_group_ids):
     return group_to_sites, group_to_site_alarms
 
 
-def _build_group_output_alarm_indexes_for_sites(group_output_input, allowed_site_ids):
+def _build_group_output_alarm_indexes_for_sites(group_output_input, allowed_site_ids, excluded_group_ids=None):
     group_to_sites = defaultdict(set)
     group_to_site_alarms = defaultdict(lambda: defaultdict(list))
+    excluded_group_ids = set(excluded_group_ids or ())
     if not allowed_site_ids:
         return group_to_sites, group_to_site_alarms
 
@@ -105,7 +126,7 @@ def _build_group_output_alarm_indexes_for_sites(group_output_input, allowed_site
 
     for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
         group_id = _extract_group_id(group_record)
-        if not group_id:
+        if not group_id or group_id in excluded_group_ids:
             continue
 
         extracted_sites = {
@@ -176,6 +197,7 @@ def compute_group_output_ticket_recall_v2(
     loose=False,
     potential=False,
     only_one=False,
+    ultimate_only=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
@@ -204,6 +226,11 @@ def compute_group_output_ticket_recall_v2(
     if not ticket_sites:
         raise ValueError("没有可用于计算的工单站点映射")
 
+    referenced_group_ids = set()
+    if ultimate_only:
+        print("预处理：提取被其它 group 引用的关联 group...")
+        referenced_group_ids = _collect_referenced_group_uuids(group_output_input)
+
     stage_total = 3 if (loose or potential) else 2
     print(f"阶段 1/{stage_total}：提取 eligible 工单和故障组输出的关联关系...")
     ticket_to_groups, ticket_occurrence_counts = _build_group_output_ticket_index_for_eligible(
@@ -212,7 +239,7 @@ def compute_group_output_ticket_recall_v2(
         ticket_field=ticket_field,
     )
     ticket_to_base_groups = {
-        ticket_id: set(group_ids)
+        ticket_id: set(group_id for group_id in group_ids if group_id not in referenced_group_ids)
         for ticket_id, group_ids in ticket_to_groups.items()
     }
     relevant_group_ids = {
@@ -234,6 +261,7 @@ def compute_group_output_ticket_recall_v2(
         group_to_sites, group_to_site_alarms = _build_group_output_alarm_indexes_for_sites(
             group_output_input,
             allowed_site_ids=allowed_site_ids,
+            excluded_group_ids=referenced_group_ids,
         )
         print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外 group...")
         site_to_groups = build_site_to_group_index(group_to_sites) if loose else {}
@@ -268,6 +296,7 @@ def compute_group_output_ticket_recall_v2(
         group_to_sites, group_to_site_alarms = _build_group_output_alarm_indexes(
             group_output_input,
             relevant_group_ids=relevant_group_ids,
+            excluded_group_ids=referenced_group_ids,
         )
 
     if alarms_input:
@@ -279,6 +308,8 @@ def compute_group_output_ticket_recall_v2(
 
     details = []
     total_recall = 0.0
+    total_precision = 0.0
+    total_f1 = 0.0
 
     for ticket_id in sorted(ticket_sites.keys()):
         if ticket_alarm_counts.get(ticket_id, 0) <= 0:
@@ -302,10 +333,11 @@ def compute_group_output_ticket_recall_v2(
 
         merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
 
-        recalled_sites = set()
+        predicted_sites = set()
         for group_id in effective_fault_groups:
-            recalled_sites.update(group_to_sites.get(group_id, set()))
-        recalled_sites &= target_sites
+            predicted_sites.update(group_to_sites.get(group_id, set()))
+        true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
+        recalled_sites = set(true_positive_sites)
 
         unrecalled_sites = target_sites - recalled_sites
         upper_info = upper_bound_index.get(ticket_id, {})
@@ -319,8 +351,9 @@ def compute_group_output_ticket_recall_v2(
         if only_offline and not _site_alarm_map_contains_offline(upper_site_evidence):
             continue
 
-        recall = len(recalled_sites) / len(target_sites) if target_sites else 0.0
         total_recall += recall
+        total_precision += precision
+        total_f1 += f1
 
         details.append({
             "ticket_id": ticket_id,
@@ -335,6 +368,8 @@ def compute_group_output_ticket_recall_v2(
             "effective_fault_group_count": len(effective_fault_groups),
             "effective_fault_groups": effective_fault_groups,
             "selected_fault_group": selected_fault_group,
+            "group_site_count": len(predicted_sites),
+            "group_sites": sorted(predicted_sites),
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
             "associated_site_alarms": associated_site_alarms,
@@ -342,6 +377,8 @@ def compute_group_output_ticket_recall_v2(
             "missing_sites": sorted(unrecalled_sites),
             "missing_site_alarms": missing_site_alarms,
             "recall": recall,
+            "precision": precision,
+            "f1": f1,
         })
 
     details.sort(
@@ -352,6 +389,8 @@ def compute_group_output_ticket_recall_v2(
     )
     site_count_distribution = build_ticket_site_count_distribution(details)
     average_recall = total_recall / len(details) if details else 0.0
+    average_precision = total_precision / len(details) if details else 0.0
+    average_f1 = total_f1 / len(details) if details else 0.0
 
     result = {
         "method": "group_output",
@@ -359,6 +398,8 @@ def compute_group_output_ticket_recall_v2(
         "final_sample_count": len(details),
         "ticket_site_count_distribution": site_count_distribution,
         "average_recall": average_recall,
+        "average_precision": average_precision,
+        "average_f1": average_f1,
         "denominator_source": denominator_source,
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
@@ -366,6 +407,7 @@ def compute_group_output_ticket_recall_v2(
         "loose_mode": loose,
         "potential_mode": potential,
         "only_one_mode": only_one,
+        "ultimate_only_mode": ultimate_only,
         "details": details,
     }
 
@@ -446,6 +488,11 @@ def main():
         action="store_true",
         help="只保留覆盖该工单目标站点最多的单个 group，用它的站点计算召回率",
     )
+    parser.add_argument(
+        "--ultimate-only",
+        action="store_true",
+        help="只考虑不作为关联 group 出现的最终 group（即未出现在其它 group 的 related_group_uuids 中）",
+    )
 
     args = parser.parse_args()
 
@@ -463,6 +510,7 @@ def main():
             loose=args.loose,
             potential=args.potential,
             only_one=args.only_one,
+            ultimate_only=args.ultimate_only,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
@@ -472,6 +520,8 @@ def main():
     print(f"最终统计样本数: {result['final_sample_count']}")
     print(f"样本 site 个数分布: {result['ticket_site_count_distribution']}")
     print(f"平均召回率: {result['average_recall']:.6f}")
+    print(f"平均准确率: {result['average_precision']:.6f}")
+    print(f"平均F1: {result['average_f1']:.6f}")
     print(f"分母口径来源: {result['denominator_source']}")
     print(f"明细已输出到: {args.output}")
     if result.get("case_jsonl_output"):

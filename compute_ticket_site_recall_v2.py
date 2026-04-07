@@ -8,6 +8,7 @@ from alarm_types import OFFLINE_ALARMS
 from alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from compute_ticket_site_recall import (
     _build_ticket_sites_from_alarms,
+    _compute_site_metrics,
     _load_ticket_sites,
     _normalize_text,
     _parse_group_ids,
@@ -271,6 +272,8 @@ def compute_ticket_site_recall_v2(
 
     details = []
     total_recall = 0.0
+    total_precision = 0.0
+    total_f1 = 0.0
 
     for ticket_id in sorted(ticket_sites.keys()):
         if ticket_alarm_counts.get(ticket_id, 0) <= 0:
@@ -294,10 +297,11 @@ def compute_ticket_site_recall_v2(
 
         merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
 
-        recalled_sites = set()
+        predicted_sites = set()
         for group_id in effective_fault_groups:
-            recalled_sites.update(group_to_sites.get(group_id, set()))
-        recalled_sites &= target_sites
+            predicted_sites.update(group_to_sites.get(group_id, set()))
+        true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
+        recalled_sites = set(true_positive_sites)
 
         unrecalled_sites = target_sites - recalled_sites
         upper_info = upper_bound_index.get(ticket_id, {})
@@ -311,8 +315,9 @@ def compute_ticket_site_recall_v2(
         if only_offline and not _site_alarm_map_contains_offline(upper_site_evidence):
             continue
 
-        recall = len(recalled_sites) / len(target_sites) if target_sites else 0.0
         total_recall += recall
+        total_precision += precision
+        total_f1 += f1
 
         details.append({
             "ticket_id": ticket_id,
@@ -327,6 +332,8 @@ def compute_ticket_site_recall_v2(
             "effective_fault_group_count": len(effective_fault_groups),
             "effective_fault_groups": effective_fault_groups,
             "selected_fault_group": selected_fault_group,
+            "group_site_count": len(predicted_sites),
+            "group_sites": sorted(predicted_sites),
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
             "associated_site_alarms": associated_site_alarms,
@@ -334,6 +341,8 @@ def compute_ticket_site_recall_v2(
             "missing_sites": sorted(unrecalled_sites),
             "missing_site_alarms": missing_site_alarms,
             "recall": recall,
+            "precision": precision,
+            "f1": f1,
         })
 
     details.sort(
@@ -344,6 +353,8 @@ def compute_ticket_site_recall_v2(
     )
     site_count_distribution = build_ticket_site_count_distribution(details)
     average_recall = total_recall / len(details) if details else 0.0
+    average_precision = total_precision / len(details) if details else 0.0
+    average_f1 = total_f1 / len(details) if details else 0.0
 
     result = {
         "method": "alarm_stream_group_field",
@@ -351,6 +362,8 @@ def compute_ticket_site_recall_v2(
         "final_sample_count": len(details),
         "ticket_site_count_distribution": site_count_distribution,
         "average_recall": average_recall,
+        "average_precision": average_precision,
+        "average_f1": average_f1,
         "denominator_source": "alarms",
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
@@ -462,6 +475,8 @@ def main():
     print(f"最终统计样本数: {result['final_sample_count']}")
     print(f"样本 site 个数分布: {result['ticket_site_count_distribution']}")
     print(f"平均召回率: {result['average_recall']:.6f}")
+    print(f"平均准确率: {result['average_precision']:.6f}")
+    print(f"平均F1: {result['average_f1']:.6f}")
     print(f"明细已输出到: {args.output}")
     if result.get("case_jsonl_output"):
         print(f"未满召回样本 jsonl: {result['case_jsonl_output']} ({result.get('unrecalled_case_count', 0)} 条)")

@@ -117,7 +117,7 @@ def compute_group_output_ticket_recall(
         ticket_alarm_counts = dict(ticket_occurrence_counts)
         denominator_source = "group_output"
 
-    details, average_recall, evaluated_count = _compute_ticket_recalls(
+    details, average_recall, average_precision, average_f1, evaluated_count = _compute_ticket_recalls(
         ticket_sites,
         ticket_to_groups,
         group_to_sites,
@@ -132,6 +132,8 @@ def compute_group_output_ticket_recall(
     result = {
         "ticket_count": evaluated_count,
         "average_recall": average_recall,
+        "average_precision": average_precision,
+        "average_f1": average_f1,
         "denominator_source": denominator_source,
         "ticket_site_source": ticket_site_source,
         "details": details,
@@ -192,6 +194,8 @@ def main():
 
     print(f"工单数: {result['ticket_count']}")
     print(f"平均召回率: {result['average_recall']:.6f}")
+    print(f"平均准确率: {result['average_precision']:.6f}")
+    print(f"平均F1: {result['average_f1']:.6f}")
     print(f"分母口径来源: {result['denominator_source']}")
     print(f"工单站点来源: {result['ticket_site_source']}")
     print(f"明细已输出到: {args.output}")
