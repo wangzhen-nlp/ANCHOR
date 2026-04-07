@@ -202,13 +202,8 @@ def compute_ticket_site_recall_v2(
             for site_id in sorted(unrecalled_sites)
         }
 
-        if strict:
-            has_offline_evidence = (
-                _site_alarm_map_contains_offline(associated_site_alarms)
-                or _site_alarm_map_contains_offline(missing_site_alarms)
-            )
-            if not has_offline_evidence:
-                continue
+        if strict and not _site_alarm_map_contains_offline(upper_site_evidence):
+            continue
 
         recall = len(recalled_sites) / len(target_sites) if target_sites else 0.0
         total_recall += recall
@@ -296,7 +291,7 @@ def main():
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="严格模式：若 associated_site_alarms 和 missing_site_alarms 中都未出现 OFFLINE_ALARMS，则跳过该工单样本",
+        help="严格模式：若 upper bound 文件里该工单的 evidence 中未出现 OFFLINE_ALARMS，则跳过该工单样本",
     )
 
     args = parser.parse_args()
