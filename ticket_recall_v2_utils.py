@@ -67,6 +67,16 @@ def timestamp_in_windows(ts, windows):
     return idx >= 0 and ts <= ends[idx]
 
 
+def extract_alarm_record_id(record):
+    if not isinstance(record, dict):
+        return ""
+    return (
+        normalize_text(record.get("eid", ""))
+        or normalize_text(record.get("alarm_id", ""))
+        or normalize_text(record.get("告警编码ID", ""))
+    )
+
+
 def load_upper_bound_index(filepath):
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -204,6 +214,21 @@ def build_group_site_time_index(group_to_site_alarms):
     return result
 
 
+def build_alarm_to_group_index(group_to_site_alarms):
+    alarm_to_groups = defaultdict(set)
+    for group_id, site_alarm_map in group_to_site_alarms.items():
+        if not isinstance(site_alarm_map, dict):
+            continue
+        for alarms in site_alarm_map.values():
+            if not isinstance(alarms, list):
+                continue
+            for record in alarms:
+                alarm_id = extract_alarm_record_id(record)
+                if alarm_id:
+                    alarm_to_groups[alarm_id].add(group_id)
+    return alarm_to_groups
+
+
 def expand_groups_by_time_window(base_group_ids, target_sites, site_to_groups, group_site_time_index, window_seconds):
     normalized_target_sites = {
         normalize_text(site_id) for site_id in target_sites if normalize_text(site_id)
@@ -263,6 +288,54 @@ def expand_groups_by_time_window(base_group_ids, target_sites, site_to_groups, g
             current_times.extend(group_candidate_times.get(group_id, []))
 
     return expanded_groups, loose_groups
+
+
+def collect_groups_by_windows(anchor_windows, candidate_sites, site_to_groups, group_site_time_index, excluded_group_ids=None):
+    normalized_candidate_sites = {
+        normalize_text(site_id) for site_id in candidate_sites if normalize_text(site_id)
+    }
+    if not normalized_candidate_sites or anchor_windows is None:
+        return set()
+
+    excluded_groups = set(excluded_group_ids or ())
+    candidate_groups = set()
+    for site_id in normalized_candidate_sites:
+        candidate_groups.update(site_to_groups.get(site_id, set()))
+
+    if not candidate_groups:
+        return set()
+
+    matched_groups = set()
+    for group_id in candidate_groups:
+        if group_id in excluded_groups:
+            continue
+        site_time_map = group_site_time_index.get(group_id, {})
+        for site_id in normalized_candidate_sites:
+            candidate_times = site_time_map.get(site_id, [])
+            if candidate_times and any(timestamp_in_windows(ts, anchor_windows) for ts in candidate_times):
+                matched_groups.add(group_id)
+                break
+
+    return matched_groups
+
+
+def collect_groups_by_evidence(site_evidence, alarm_to_groups, excluded_group_ids=None):
+    if not isinstance(site_evidence, dict) or not site_evidence:
+        return set()
+
+    excluded_groups = set(excluded_group_ids or ())
+    matched_groups = set()
+    for alarms in site_evidence.values():
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            alarm_id = extract_alarm_record_id(record)
+            if not alarm_id:
+                continue
+            for group_id in alarm_to_groups.get(alarm_id, ()):
+                if group_id not in excluded_groups:
+                    matched_groups.add(group_id)
+    return matched_groups
 
 
 def parse_alarm_record_ts(record):

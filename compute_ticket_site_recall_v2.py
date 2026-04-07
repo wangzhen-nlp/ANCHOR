@@ -14,11 +14,13 @@ from compute_ticket_site_recall import (
     _resolve_alarm_site_id,
 )
 from ticket_recall_v2_utils import (
+    build_alarm_to_group_index,
     build_group_site_time_index,
     build_site_alarm_map_for_sites,
     build_site_to_group_index,
     build_ticket_site_count_distribution,
     build_unrecalled_visualization_cases,
+    collect_groups_by_evidence,
     dedupe_alarm_records,
     derive_case_jsonl_output_path,
     expand_groups_by_time_window,
@@ -162,6 +164,7 @@ def compute_ticket_site_recall_v2(
     case_jsonl_output_file=None,
     only_offline=False,
     loose=False,
+    potential=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
@@ -192,7 +195,8 @@ def compute_ticket_site_recall_v2(
     if ne_graph_file and os.path.exists(ne_graph_file):
         ne_to_site = build_ne_to_site_map(ne_graph_file)
 
-    print(f"阶段 1/{3 if loose else 2}：提取 eligible 工单的故障组索引...")
+    stage_total = 3 if (loose or potential) else 2
+    print(f"阶段 1/{stage_total}：提取 eligible 工单的故障组索引...")
     ticket_to_groups, ticket_alarm_counts = _build_ticket_group_index_for_eligible(
         alarm_input,
         eligible_ticket_ids=set(ticket_sites.keys()),
@@ -205,39 +209,55 @@ def compute_ticket_site_recall_v2(
     }
 
     loose_ticket_to_groups = defaultdict(set)
+    potential_ticket_to_groups = defaultdict(set)
     relevant_group_ids = {
         group_id
         for group_ids in ticket_to_base_groups.values()
         for group_id in group_ids
     }
 
-    if loose:
+    if loose or potential:
         allowed_site_ids = {
             _normalize_text(site_id)
             for site_list in ticket_sites.values()
             for site_id in site_list
             if _normalize_text(site_id)
         }
-        print("阶段 2/3：提取工单站点上的所有故障组ID覆盖站点和站点告警...")
+        print(f"阶段 2/{stage_total}：提取工单站点上的所有故障组ID覆盖站点和站点告警...")
         group_to_sites, group_to_site_alarms = _build_group_alarm_indexes_for_sites(
             alarm_input,
             allowed_site_ids=allowed_site_ids,
             ne_to_site=ne_to_site,
             group_field=group_field,
         )
-        print("阶段 3/3：按 upper bound 同窗口大小扩充额外故障组ID...")
-        site_to_groups = build_site_to_group_index(group_to_sites)
-        group_site_time_index = build_group_site_time_index(group_to_site_alarms)
+        print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外故障组ID...")
+        site_to_groups = build_site_to_group_index(group_to_sites) if loose else {}
+        group_site_time_index = build_group_site_time_index(group_to_site_alarms) if loose else {}
+        alarm_to_groups = build_alarm_to_group_index(group_to_site_alarms) if potential else {}
         for ticket_id, site_list in ticket_sites.items():
-            _, loose_groups = expand_groups_by_time_window(
-                base_group_ids=ticket_to_base_groups.get(ticket_id, set()),
-                target_sites=set(site_list),
-                site_to_groups=site_to_groups,
-                group_site_time_index=group_site_time_index,
-                window_seconds=upper_bound_settings["window_seconds"],
-            )
-            if loose_groups:
-                loose_ticket_to_groups[ticket_id] = loose_groups
+            base_group_ids = ticket_to_base_groups.get(ticket_id, set())
+            loose_groups = set()
+            if loose:
+                _, loose_groups = expand_groups_by_time_window(
+                    base_group_ids=base_group_ids,
+                    target_sites=set(site_list),
+                    site_to_groups=site_to_groups,
+                    group_site_time_index=group_site_time_index,
+                    window_seconds=upper_bound_settings["window_seconds"],
+                )
+                if loose_groups:
+                    loose_ticket_to_groups[ticket_id] = loose_groups
+
+            if potential:
+                upper_info = upper_bound_index.get(ticket_id, {})
+                upper_site_evidence = upper_info.get("site_evidence", {})
+                potential_groups = collect_groups_by_evidence(
+                    site_evidence=upper_site_evidence,
+                    alarm_to_groups=alarm_to_groups,
+                    excluded_group_ids=set(base_group_ids) | set(loose_groups),
+                )
+                if potential_groups:
+                    potential_ticket_to_groups[ticket_id] = potential_groups
     else:
         print("阶段 2/2：提取相关故障组覆盖到的站点和站点告警...")
         group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
@@ -257,7 +277,8 @@ def compute_ticket_site_recall_v2(
         target_sites = set(ticket_sites[ticket_id])
         base_fault_groups = sorted(ticket_to_base_groups.get(ticket_id, set()))
         loose_fault_groups = sorted(loose_ticket_to_groups.get(ticket_id, set()))
-        fault_groups = sorted(set(base_fault_groups) | set(loose_fault_groups))
+        potential_fault_groups = sorted(potential_ticket_to_groups.get(ticket_id, set()))
+        fault_groups = sorted(set(base_fault_groups) | set(loose_fault_groups) | set(potential_fault_groups))
         merged_site_alarms = _merge_group_site_alarms(fault_groups, group_to_site_alarms)
 
         recalled_sites = set()
@@ -288,6 +309,7 @@ def compute_ticket_site_recall_v2(
             "fault_group_count": len(fault_groups),
             "base_fault_groups": base_fault_groups,
             "loose_fault_groups": loose_fault_groups,
+            "potential_fault_groups": potential_fault_groups,
             "fault_groups": fault_groups,
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
@@ -318,6 +340,7 @@ def compute_ticket_site_recall_v2(
         "upper_bound_source": upper_bound_file,
         "only_offline_mode": only_offline,
         "loose_mode": loose,
+        "potential_mode": potential,
         "details": details,
     }
 
@@ -386,6 +409,11 @@ def main():
         action="store_true",
         help="允许用 upper bound 同口径时间窗，在工单站点上的其它故障组ID 进一步扩充关联",
     )
+    parser.add_argument(
+        "--potential",
+        action="store_true",
+        help="允许用 upper bound evidence 中出现过的告警，直接吸附这些告警所在的额外故障组ID",
+    )
 
     args = parser.parse_args()
 
@@ -401,6 +429,7 @@ def main():
             case_jsonl_output_file=args.case_jsonl_output,
             only_offline=args.only_offline,
             loose=args.loose,
+            potential=args.potential,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
