@@ -1,4 +1,5 @@
 import json
+import os
 
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -20,8 +21,11 @@ from compute_ticket_site_recall import (
 from ticket_recall_v2_utils import (
     build_site_alarm_map_for_sites,
     build_ticket_site_count_distribution,
+    build_unrecalled_visualization_cases,
     dedupe_alarm_records,
+    derive_case_jsonl_output_path,
     load_upper_bound_index,
+    write_jsonl_records,
 )
 
 
@@ -121,6 +125,7 @@ def compute_group_output_ticket_recall_v2(
     alarms_input=None,
     ne_graph_file=None,
     output_file=None,
+    case_jsonl_output_file=None,
     strict=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
@@ -243,6 +248,14 @@ def compute_group_output_ticket_recall_v2(
         "details": details,
     }
 
+    case_records = build_unrecalled_visualization_cases(details, result["method"])
+    if output_file and not case_jsonl_output_file:
+        case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
+    if case_jsonl_output_file:
+        write_jsonl_records(case_jsonl_output_file, case_records)
+        result["case_jsonl_output"] = case_jsonl_output_file
+        result["unrecalled_case_count"] = len(case_records)
+
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
@@ -288,6 +301,10 @@ def main():
         help="输出 JSON 文件，默认: group_output_ticket_recall_v2.json",
     )
     parser.add_argument(
+        "--case-jsonl-output",
+        help="额外输出召回率 < 100%% 的样本为可视化 jsonl；默认随主输出生成同名 .cases.jsonl",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="严格模式：若 upper bound 文件里该工单的 evidence 中未出现 OFFLINE_ALARMS，则跳过该工单样本",
@@ -304,6 +321,7 @@ def main():
             alarms_input=args.alarms,
             ne_graph_file=args.ne_graph,
             output_file=args.output,
+            case_jsonl_output_file=args.case_jsonl_output,
             strict=args.strict,
         )
     except ValueError as exc:
@@ -316,6 +334,8 @@ def main():
     print(f"平均召回率: {result['average_recall']:.6f}")
     print(f"分母口径来源: {result['denominator_source']}")
     print(f"明细已输出到: {args.output}")
+    if result.get("case_jsonl_output"):
+        print(f"未满召回样本 jsonl: {result['case_jsonl_output']} ({result.get('unrecalled_case_count', 0)} 条)")
 
 
 if __name__ == "__main__":
