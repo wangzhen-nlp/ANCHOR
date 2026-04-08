@@ -938,12 +938,11 @@ def _run_debug_mode(
             match for match in matches
             if _match_debug_trigger(match, debug_targets, rules_config)
         ]
-        if not debug_matches:
-            return
-        print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
-        for match in debug_matches:
-            _print_debug_match_details(match)
-        on_matches(debug_matches)
+        if debug_matches:
+            print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
+            for match in debug_matches:
+                _print_debug_match_details(match)
+        on_matches(matches)
 
     if mode == 'live':
         now_ts_getter = _build_simulated_now_ts_getter(valid_alarms, speedup)
@@ -1234,7 +1233,9 @@ def main():
             ]
             if debug_final_matches:
                 print(f"🔎 Flush 阶段额外产出 {len(debug_final_matches)} 个故障组")
-                on_matches(debug_final_matches)
+                for match in debug_final_matches:
+                    _print_debug_match_details(match)
+            on_matches(final_matches)
         else:
             on_matches(final_matches)
 

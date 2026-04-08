@@ -9,6 +9,10 @@ TRANSMISSION_SITE_RULES = [
   {
     "include": ["Transmission", "Ran"],
     "expected_alarms": OFFLINE_ALARMS
+  },
+  {
+    "include": ["Data", "Ran"],
+    "expected_alarms": OFFLINE_ALARMS
   }
 ]
 
