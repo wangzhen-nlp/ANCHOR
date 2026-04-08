@@ -1,6 +1,8 @@
 import json
 from argparse import ArgumentParser
 
+from compute_group_output_ticket_recall import _extract_group_sites
+
 
 def stream_jsonl_records(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -28,7 +30,7 @@ def get_related_group_uuids(group):
     return [str(value).strip() for value in related if str(value).strip()]
 
 
-def extract_ultimate_fault_groups(input_path, output_path):
+def extract_ultimate_fault_groups(input_path, output_path, min_site_num=0):
     groups = list(stream_jsonl_records(input_path))
     referenced_group_uuids = set()
     for group in groups:
@@ -38,6 +40,14 @@ def extract_ultimate_fault_groups(input_path, output_path):
         group for group in groups
         if (group_uuid := get_group_uuid(group)) and group_uuid not in referenced_group_uuids
     ]
+    if min_site_num > 0:
+        filtered_ultimate_groups = []
+        for group in ultimate_groups:
+            group_uuid = get_group_uuid(group)
+            group_sites = _extract_group_sites(group, group_uuid)
+            if len(group_sites) >= min_site_num:
+                filtered_ultimate_groups.append(group)
+        ultimate_groups = filtered_ultimate_groups
 
     with open(output_path, "w", encoding="utf-8") as f:
         for group in ultimate_groups:
@@ -47,6 +57,7 @@ def extract_ultimate_fault_groups(input_path, output_path):
         "input_count": len(groups),
         "referenced_group_count": len(referenced_group_uuids),
         "ultimate_group_count": len(ultimate_groups),
+        "min_site_num": min_site_num,
         "output_path": output_path,
     }
 
@@ -60,12 +71,19 @@ def main():
         default="ultimate_fault_groups.jsonl",
         help="输出 jsonl 文件，默认: ultimate_fault_groups.jsonl",
     )
+    parser.add_argument(
+        "--min-site-num",
+        type=int,
+        default=0,
+        help="只保留站点数 >= min-site-num 的终极故障组，默认: 0",
+    )
     args = parser.parse_args()
 
-    result = extract_ultimate_fault_groups(args.input, args.output)
+    result = extract_ultimate_fault_groups(args.input, args.output, min_site_num=args.min_site_num)
     print(f"输入故障组数: {result['input_count']}")
     print(f"被关联故障组数: {result['referenced_group_count']}")
     print(f"终极故障组数: {result['ultimate_group_count']}")
+    print(f"最小站点数过滤: {result['min_site_num']}")
     print(f"输出文件: {result['output_path']}")
 
 
