@@ -475,31 +475,34 @@ def _snapshot_debug_trigger_index(engine, site_id):
     return entries
 
 
-def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header):
-    changed = False
+def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header, harvest_snapshot=None):
+    changed_items = []
     for site_id in sorted(debug_sites):
         current_snapshot = _snapshot_debug_trigger_index(engine, site_id)
         previous_snapshot = previous_snapshots.get(site_id, {})
         if current_snapshot == previous_snapshot:
             continue
-        changed = True
+        changed_items.append((site_id, previous_snapshot, current_snapshot))
+
+    if not changed_items:
+        return False
+
+    if harvest_snapshot is not None:
+        _print_debug_harvest_actions(harvest_snapshot, engine)
+
+    for site_id, previous_snapshot, current_snapshot in changed_items:
         print(f"{header}[{site_id}]")
         print(f"   ↳ 变化前: {json.dumps(previous_snapshot, ensure_ascii=False)}")
         print(f"   ↳ 变化后: {json.dumps(current_snapshot, ensure_ascii=False)}")
         previous_snapshots[site_id] = current_snapshot
-    return changed
+    return True
 
 
-def _print_debug_harvest_actions(snapshot, engine, debug_sites):
-    mature_items = [
-        item
-        for item in snapshot.get("mature_items", [])
-        if item.get("node") in debug_sites
-    ]
+def _print_debug_harvest_actions(snapshot, engine):
+    mature_items = list(snapshot.get("mature_items", []))
     profiles = {
         (profile.get("node"), profile.get("rule"), profile.get("trigger_ts"), profile.get("trigger_seq")): profile
         for profile in snapshot.get("pending_eval_profiles", [])
-        if profile.get("node") in debug_sites
     }
     if not mature_items:
         return
@@ -844,12 +847,12 @@ def _run_debug_mode(
 
     def on_debug_snapshot(snapshot):
         _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine)
-        _print_debug_harvest_actions(snapshot, engine, debug_sites)
         _print_debug_trigger_changes(
             engine,
             debug_sites,
             last_trigger_snapshots,
             "🔁 收割后关注站点 trigger 变化",
+            harvest_snapshot=snapshot,
         )
 
     engine.debug_observer = on_debug_snapshot
