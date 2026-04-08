@@ -236,6 +236,8 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 - 如果某条事件时间 `<=` 某个 `rule` 的 cutoff，就把该 `rule` 加进这条事件的 `consumed_trigger_rules`；
 - 同时只从该 `(node, rule)` 对应的 `trigger_event_index` 里移除这条事件；
 - 如果这些删除影响到了某个 `(node, rule)` 当前挂着的 pending，也只会刷新这个 `rule` 自己的 `pending_triggers` 锚点，不会把同站点其它 rule 的 pending 一起重算；
+- 更具体地说，当前实现只会在“被删掉的 trigger 正好就是当前 pending anchor”时，才把这个 `pending` 推进到下一条 trigger；
+  如果删掉的只是后续候选 trigger，当前 `pending` 会保持不变；
 - 后续 `validate_node()` 在校验 trigger 角色时，也只会排除“已被当前 rule 消费过”的事件。
 
 这样一条告警可以表现成：
@@ -264,6 +266,35 @@ trigger 表示“某条规则开始被激活和等待聚合的起点告警”。
 这样可以把当前批内已经成熟的故障组，与其内部非 trigger 节点上尚未成熟但已挂起的 pending 关系一起纳入考虑，
 提前补齐本轮批次视图，减少因触发时机不同导致的故障组割裂；
 同时又不会破坏这些 pending 未来作为原始 trigger 正常成熟和汇聚的时序语义。
+
+## 11.1 清除告警对 `event_cache / trigger_event_index / pending_triggers` 的影响
+
+**【逻辑】**
+
+当前 `TemporalGraphEngine.process_event(..., is_clear=True)` 收到清除告警时，会按下面顺序处理：
+
+- 先从该节点的 `event_cache[node]` 中，按 `event_id` 删除被清除的那条告警实例；
+- 再从该节点所有可能触发的 `(node, rule)` 的 `trigger_event_index` 中，按同一个 `event_id` 删除对应 trigger 候选；
+- 删除 trigger 候选后，不会无条件刷新这个节点上的所有 pending；
+- 当前实现只会检查：被删掉的这条 trigger，是否正好等于某个 `(node, rule)` 当前挂着的 `pending_triggers[(node, rule)]`；
+- 只有在这个条件成立时，才会把该 `rule` 的 pending 起点推进到“原 pending anchor 之后的下一条 trigger”；
+- 如果删掉的不是当前 pending anchor，而只是后续 trigger 候选，则 `pending_triggers` 保持不变；
+- 如果删掉的是当前 pending anchor，且后面已经没有下一条 trigger，则这个 `(node, rule)` 的 pending 会被直接移除。
+
+这里“之后的下一条 trigger”是按 `trigger_seq` 定义的，
+也就是只会向后推进，不会回退到更早的 trigger 上下文。
+
+**【意义】**
+
+这样可以避免一种错误行为：
+
+- 明明清除的是后面的 trigger 候选；
+- 却把当前以更早 trigger 为起点的 pending 错误推进或删除。
+
+当前这版逻辑更精确地把“删除 trigger 候选”和“是否需要改 pending 起点”拆开了：
+
+- `trigger_event_index` 的删除仍然是按 `event_id` 精确进行；
+- `pending_triggers` 只有在当前 anchor 被删掉时才会变化。
 
 ## 12. debug 模式的流程与作用
 
