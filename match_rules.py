@@ -508,6 +508,14 @@ def _print_debug_harvest_actions(snapshot, engine):
         return
 
     print("🔍 本次收割动作")
+    print(
+        "   ↳ 收割概览: "
+        f"mature={len(mature_items)}, "
+        f"raw={len(snapshot.get('raw_matches', []))}, "
+        f"batch_merged={len(snapshot.get('batch_merged_matches', []))}, "
+        f"expanded={len(snapshot.get('expanded_matches', []))}, "
+        f"finalized={len(snapshot.get('finalized_matches', []))}"
+    )
     for idx, item in enumerate(mature_items, start=1):
         site_id = item.get("node", "")
         rule_name = item.get("rule", "")
@@ -531,6 +539,21 @@ def _print_debug_harvest_actions(snapshot, engine):
             final_reason = debug_trace.get("final_reason", "")
             if final_reason:
                 print(f"      未产出原始候选组原因: {final_reason}")
+            else:
+                print(
+                    "      未产出原始候选组，但未拿到 evaluate_rule 的 final_reason；"
+                    " 这更像是 debug 记录异常，而不是规则正常行为"
+                )
+        else:
+            print("      该 mature trigger 已产出原始候选组")
+
+    if snapshot.get("finalized_matches"):
+        print(
+            "   ↳ 提示: 本次收割进入了 finalize 阶段，后续会执行 "
+            "_prune_consumed_alarm_history -> _prune_node_alarm_history_before -> "
+            "_refresh_pending_triggers_for_node，"
+            "关注站点 trigger 的变化可能来自这里，而不一定是某个 mature trigger 未产出原始候选组"
+        )
 
 
 def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
