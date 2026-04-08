@@ -490,6 +490,46 @@ def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header
     return changed
 
 
+def _print_debug_harvest_actions(snapshot, engine, debug_sites):
+    mature_items = [
+        item
+        for item in snapshot.get("mature_items", [])
+        if item.get("node") in debug_sites
+    ]
+    profiles = {
+        (profile.get("node"), profile.get("rule"), profile.get("trigger_ts"), profile.get("trigger_seq")): profile
+        for profile in snapshot.get("pending_eval_profiles", [])
+        if profile.get("node") in debug_sites
+    }
+    if not mature_items:
+        return
+
+    print("🔍 本次收割动作")
+    for idx, item in enumerate(mature_items, start=1):
+        site_id = item.get("node", "")
+        rule_name = item.get("rule", "")
+        trigger_ts = item.get("trigger_ts")
+        trigger_seq = item.get("trigger_seq")
+        trigger_time = (
+            datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S")
+            if trigger_ts is not None else "-"
+        )
+        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, (trigger_ts, trigger_seq))
+        profile = profiles.get((site_id, rule_name, trigger_ts, trigger_seq), {})
+        raw_match_count = profile.get("raw_match_count", 0)
+        print(
+            f"   ↳ [{idx}] mature_trigger: "
+            f"site={site_id}, rule={rule_name}, alarm={trigger_detail.get('alarm', '')}, "
+            f"eid={trigger_detail.get('eid', '')}, trigger_time={trigger_time}, "
+            f"trigger_seq={trigger_seq}, raw_match_count={raw_match_count}"
+        )
+        if raw_match_count == 0:
+            debug_trace = profile.get("debug_trace") or {}
+            final_reason = debug_trace.get("final_reason", "")
+            if final_reason:
+                print(f"      未产出原始候选组原因: {final_reason}")
+
+
 def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
     trigger_ts, trigger_seq = trigger_anchor
     with engine._lock:
@@ -804,6 +844,7 @@ def _run_debug_mode(
 
     def on_debug_snapshot(snapshot):
         _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine)
+        _print_debug_harvest_actions(snapshot, engine, debug_sites)
         _print_debug_trigger_changes(
             engine,
             debug_sites,
