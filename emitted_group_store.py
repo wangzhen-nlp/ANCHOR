@@ -34,7 +34,7 @@ class EmittedGroupStore:
         current_alarm_keys = self._get_alarm_keys(match_result.get("symptoms", []))
 
         if not current_alarm_keys:
-            return match_result, set(), set(), True
+            return match_result, set(), set(), True, "no_alarm_keys"
 
         for idx, item in enumerate(self.groups):
             previous_match = item["match"]
@@ -43,7 +43,7 @@ class EmittedGroupStore:
                 related_groups.append((idx, item))
 
         if not related_groups:
-            return match_result, set(), set(), True
+            return match_result, set(), set(), True, "no_related_history"
 
         merged = {
             "uuid": match_result.get("uuid"),
@@ -91,9 +91,9 @@ class EmittedGroupStore:
             merged["symptoms"] = list(symptom_map.values())
 
         if fully_containing_history_exists:
-            return merged, merged_group_indexes, related_group_uuids, False
+            return merged, merged_group_indexes, related_group_uuids, False, "suppressed_by_fully_containing_history"
 
-        return merged, merged_group_indexes, related_group_uuids, True
+        return merged, merged_group_indexes, related_group_uuids, True, "merged_with_related_history"
 
     def replace_and_store(self, merged_group_indexes, anchor_ts, match_result):
         """删除被吸收的历史组，并把当前组作为新的历史版本落库。"""

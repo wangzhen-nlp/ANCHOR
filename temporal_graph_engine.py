@@ -461,7 +461,14 @@ class TemporalGraphEngine:
             self._prune_expired_state_locked(self.latest_arrived_event_ts)
             current_watermark = self.current_watermark
             effective_harvest_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
-            finalized_matches = self._finalize_matches_with_history(expanded_matches)
+            if self.debug_observer:
+                finalized_matches, finalize_profiles = self._finalize_matches_with_history(
+                    expanded_matches,
+                    return_debug_trace=True
+                )
+            else:
+                finalized_matches = self._finalize_matches_with_history(expanded_matches)
+                finalize_profiles = []
 
         if self.debug_observer:
             self.debug_observer({
@@ -482,6 +489,7 @@ class TemporalGraphEngine:
                 "batch_merged_matches": merged_matches,
                 "expanded_matches": expanded_matches,
                 "finalized_matches": finalized_matches,
+                "finalize_profiles": finalize_profiles,
             })
 
         return finalized_matches
@@ -776,9 +784,10 @@ class TemporalGraphEngine:
 
         self._prune_cursor = (start_idx + batch_size) % max(total_nodes, 1)
 
-    def _finalize_matches_with_history(self, matches):
+    def _finalize_matches_with_history(self, matches, return_debug_trace=False):
         """把当前批次结果与历史组做最终合并并落库。"""
         finalized = []
+        finalize_profiles = []
         current_time = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else (
             self.current_watermark if hasattr(self, 'current_watermark') else time.time()
         )
@@ -786,8 +795,19 @@ class TemporalGraphEngine:
 
         for match_result in matches:
             group_anchor_ts = self.emitted_group_store.get_group_anchor_ts(match_result, current_time)
-            match_result, merged_group_indexes, related_group_uuids, should_emit = self.emitted_group_store.merge_with_related(match_result)
+            original_uuid = match_result.get("uuid", "")
+            original_rule = match_result.get("rule", "")
+            match_result, merged_group_indexes, related_group_uuids, should_emit, emit_reason = self.emitted_group_store.merge_with_related(match_result)
             if not should_emit:
+                if return_debug_trace:
+                    finalize_profiles.append({
+                        "uuid": original_uuid,
+                        "rule": original_rule,
+                        "action": "suppressed",
+                        "reason": emit_reason,
+                        "related_group_uuids": sorted(related_group_uuids),
+                        "merged_group_count": len(merged_group_indexes),
+                    })
                 self.emitted_group_store.extend_related_expire_ts(
                     merged_group_indexes,
                     match_result,
@@ -803,8 +823,19 @@ class TemporalGraphEngine:
                 match_result
             )
             finalized.append(match_result)
+            if return_debug_trace:
+                finalize_profiles.append({
+                    "uuid": original_uuid,
+                    "rule": original_rule,
+                    "action": "emitted",
+                    "reason": emit_reason,
+                    "related_group_uuids": sorted(related_group_uuids),
+                    "merged_group_count": len(merged_group_indexes),
+                })
 
         self._prune_consumed_alarm_history(finalized)
+        if return_debug_trace:
+            return finalized, finalize_profiles
         return finalized
 
     def _get_trigger_roles_for_match(self, match_result):

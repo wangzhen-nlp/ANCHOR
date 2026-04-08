@@ -498,8 +498,28 @@ def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header
     return True
 
 
+def _get_debug_match_alarm_keys(match):
+    return {
+        symptom.get("eid")
+        for symptom in match.get("symptoms", [])
+        if symptom.get("eid") not in (None, "")
+    }
+
+
+def _match_present_in_stage(raw_match, stage_matches):
+    raw_alarm_keys = _get_debug_match_alarm_keys(raw_match)
+    if not raw_alarm_keys:
+        return False
+    for stage_match in stage_matches:
+        stage_alarm_keys = _get_debug_match_alarm_keys(stage_match)
+        if raw_alarm_keys.issubset(stage_alarm_keys):
+            return True
+    return False
+
+
 def _print_debug_harvest_actions(snapshot, engine):
     mature_items = list(snapshot.get("mature_items", []))
+    finalize_profiles = list(snapshot.get("finalize_profiles", []))
     profiles = {
         (profile.get("node"), profile.get("rule"), profile.get("trigger_ts"), profile.get("trigger_seq")): profile
         for profile in snapshot.get("pending_eval_profiles", [])
@@ -546,6 +566,38 @@ def _print_debug_harvest_actions(snapshot, engine):
                 )
         else:
             print("      该 mature trigger 已产出原始候选组")
+            raw_matches = profile.get("raw_matches", [])
+            for raw_idx, raw_match in enumerate(raw_matches[:3], start=1):
+                present_in_batch = _match_present_in_stage(raw_match, snapshot.get("batch_merged_matches", []))
+                present_in_expanded = _match_present_in_stage(raw_match, snapshot.get("expanded_matches", []))
+                present_in_finalized = _match_present_in_stage(raw_match, snapshot.get("finalized_matches", []))
+                print(
+                    f"      raw_match[{raw_idx}] 去向: "
+                    f"batch_merged={present_in_batch}, "
+                    f"expanded={present_in_expanded}, "
+                    f"finalized={present_in_finalized}"
+                )
+                _print_debug_match_details(raw_match)
+
+    if finalize_profiles:
+        print("   ↳ finalize 结果")
+        for idx, profile in enumerate(finalize_profiles, start=1):
+            print(
+                f"      [{idx}] action={profile.get('action', '')}, "
+                f"rule={profile.get('rule', '')}, "
+                f"uuid={profile.get('uuid', '')}, "
+                f"merged_group_count={profile.get('merged_group_count', 0)}, "
+                f"related_group_uuids={profile.get('related_group_uuids', [])}"
+            )
+            reason = profile.get("reason", "")
+            if reason == "suppressed_by_fully_containing_history":
+                print("         - 最终未输出：当前候选组的 eid 已被历史故障组完全覆盖，只延长历史组停留时间")
+            elif reason == "merged_with_related_history":
+                print("         - 最终输出：与历史相关组做了合并后重新输出")
+            elif reason == "no_related_history":
+                print("         - 最终输出：没有命中任何历史相关组")
+            elif reason == "no_alarm_keys":
+                print("         - 最终阶段异常：候选组没有可用 eid，无法做历史合并判断")
 
     if snapshot.get("finalized_matches"):
         print(
