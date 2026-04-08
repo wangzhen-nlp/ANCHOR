@@ -20,6 +20,23 @@ from rule_config import transmission_rule, link_rule, power_rule
 from temporal_graph_engine import TemporalGraphEngine
 
 
+def _parse_datetime_text(text, field_name="时间"):
+    text = str(text).strip()
+    if not text:
+        raise ValueError(f"{field_name}为空")
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(text.replace("T", " "))
+    except ValueError as exc:
+        raise ValueError(f"{field_name}格式无法解析: {text}") from exc
+
+
 def _is_clear_alarm(alarm):
     clear_value = alarm.get("清除告警", None)
     if clear_value is None:
@@ -44,7 +61,7 @@ def _stream_alarms_by_ts(valid_alarms, speedup=1.0):
 
 
 def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_str, is_clear=False):
-    dt_obj = datetime.strptime(event_time_str, "%Y-%m-%d %H:%M:%S")
+    dt_obj = _parse_datetime_text(event_time_str, "告警时间")
     event_alarm = dict(alarm)
     event_alarm["告警首次发生时间"] = event_time_str
     if is_clear:
@@ -59,7 +76,7 @@ def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_st
     })
 
 
-def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_site):
+def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_site, start_ts=None, end_ts=None):
     processed_count = 0
     valid_alarms = []
     normal_alarm_count = 0
@@ -80,12 +97,20 @@ def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_s
         if not site_id or site_id not in valid_sites:
             continue
 
+        first_occurrence_str = str(alarm.get("告警首次发生时间", "")).strip()
+        first_occurrence_dt = _parse_datetime_text(first_occurrence_str, "告警首次发生时间")
+        first_occurrence_ts = first_occurrence_dt.timestamp()
+        if start_ts is not None and first_occurrence_ts < start_ts:
+            continue
+        if end_ts is not None and first_occurrence_ts > end_ts:
+            continue
+
         _append_alarm_event(
             valid_alarms,
             alarm,
             site_id,
             alarm_title,
-            alarm["告警首次发生时间"],
+            first_occurrence_str,
             is_clear=False
         )
         normal_alarm_count += 1
@@ -882,11 +907,22 @@ def main():
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
     parser.add_argument('--verbose-groups', action='store_true', help='打印每个故障组的详细报告；默认静默，仅输出进度与汇总')
+    parser.add_argument('--start_time', type=str, help='仅处理告警首次发生时间 >= 该时间的告警，格式如 2025-01-01 00:00:00')
+    parser.add_argument('--end_time', type=str, help='仅处理告警首次发生时间 <= 该时间的告警，格式如 2025-01-31 23:59:59')
     parser.add_argument('--compute-ticket-recall', action='store_true', help='在主故障组输出完成后额外计算工单站点召回率')
     parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
     parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
     args = parser.parse_args()
+
+    start_ts = None
+    end_ts = None
+    if args.start_time:
+        start_ts = _parse_datetime_text(args.start_time, "start_time").timestamp()
+    if args.end_time:
+        end_ts = _parse_datetime_text(args.end_time, "end_time").timestamp()
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        parser.error("start_time 不能晚于 end_time")
 
     topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
@@ -903,6 +939,12 @@ def main():
 
     valid_alarm_titles = CRITICAL_ALARMS
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
+    if args.start_time or args.end_time:
+        print(
+            "告警首次发生时间过滤: "
+            f"start_time={args.start_time or '-'}, "
+            f"end_time={args.end_time or '-'}"
+        )
 
     rules_config = {
         "transmission_rule": transmission_rule,
@@ -921,7 +963,9 @@ def main():
         alarm_file_path,
         valid_alarm_titles,
         valid_sites,
-        ne_to_site
+        ne_to_site,
+        start_ts=start_ts,
+        end_ts=end_ts,
     )
 
     print("⏳ 正在按时间排序有效告警...")
