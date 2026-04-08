@@ -446,6 +446,11 @@ def _format_debug_site_events(engine, site_id, limit=50):
 
 
 def _format_debug_trigger_index(engine, site_id):
+    entries = _snapshot_debug_trigger_index(engine, site_id)
+    return json.dumps(entries, ensure_ascii=False)
+
+
+def _snapshot_debug_trigger_index(engine, site_id):
     with engine._lock:
         trigger_specs = tuple(engine.trigger_specs_by_node.get(site_id, ()))
         trigger_index_snapshot = {
@@ -467,7 +472,22 @@ def _format_debug_trigger_index(engine, site_id):
             }
             for ts, eid, seq, alarm_type in trigger_events
         ]
-    return json.dumps(entries, ensure_ascii=False)
+    return entries
+
+
+def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header):
+    changed = False
+    for site_id in sorted(debug_sites):
+        current_snapshot = _snapshot_debug_trigger_index(engine, site_id)
+        previous_snapshot = previous_snapshots.get(site_id, {})
+        if current_snapshot == previous_snapshot:
+            continue
+        changed = True
+        print(f"{header}[{site_id}]")
+        print(f"   ↳ 变化前: {json.dumps(previous_snapshot, ensure_ascii=False)}")
+        print(f"   ↳ 变化后: {json.dumps(current_snapshot, ensure_ascii=False)}")
+        previous_snapshots[site_id] = current_snapshot
+    return changed
 
 
 def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
@@ -777,9 +797,21 @@ def _run_debug_mode(
         "所有 trigger 仍按原始逻辑正常运行"
     )
     debug_sites = {site_id for site_id, _alarm_name in debug_targets}
-    engine.debug_observer = lambda snapshot: _print_debug_collection_snapshot(
-        snapshot, debug_targets, rules_config, engine
-    )
+    last_trigger_snapshots = {
+        site_id: _snapshot_debug_trigger_index(engine, site_id)
+        for site_id in debug_sites
+    }
+
+    def on_debug_snapshot(snapshot):
+        _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine)
+        _print_debug_trigger_changes(
+            engine,
+            debug_sites,
+            last_trigger_snapshots,
+            "🔁 收割后关注站点 trigger 变化",
+        )
+
+    engine.debug_observer = on_debug_snapshot
     engine.debug_event_logger = lambda payload: _print_debug_event_removal(payload, debug_sites)
 
     def on_debug_matches(matches, source="收割"):
@@ -818,6 +850,12 @@ def _run_debug_mode(
                     item,
                     collect_matches=False,
                     register_trigger=True
+                )
+                _print_debug_trigger_changes(
+                    engine,
+                    debug_sites,
+                    last_trigger_snapshots,
+                    "🔁 告警处理后关注站点 trigger 变化",
                 )
                 if is_debug_trigger:
                     debug_site = item.get("site_id", "")
@@ -874,6 +912,12 @@ def _run_debug_mode(
                 item,
                 collect_matches=True,
                 register_trigger=True
+            )
+            _print_debug_trigger_changes(
+                engine,
+                debug_sites,
+                last_trigger_snapshots,
+                "🔁 告警处理后关注站点 trigger 变化",
             )
             if is_debug_trigger:
                 debug_site = item.get("site_id", "")
