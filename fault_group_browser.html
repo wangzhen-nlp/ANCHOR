@@ -76,53 +76,6 @@
             color: #667085;
             font-size: 13px;
         }
-        .pagination-bar {
-            margin-top: 14px;
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-        .pagination-label {
-            color: #475467;
-            font-size: 13px;
-            font-weight: 600;
-        }
-        .pagination-select {
-            padding: 9px 12px;
-            border: 1px solid #d0d5dd;
-            border-radius: 10px;
-            background: #fff;
-            color: #1f2937;
-            font-size: 14px;
-        }
-        .pagination-select:focus {
-            outline: none;
-            border-color: #0969da;
-            box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
-        }
-        .pagination-btn {
-            border: 1px solid #d0d5dd;
-            border-radius: 10px;
-            padding: 9px 14px;
-            background: #fff;
-            color: #344054;
-            cursor: pointer;
-            font-size: 13px;
-            font-weight: 600;
-        }
-        .pagination-btn:hover {
-            background: #f8fafc;
-        }
-        .pagination-btn:disabled {
-            cursor: not-allowed;
-            opacity: 0.5;
-            background: #f8fafc;
-        }
-        .pagination-info {
-            color: #667085;
-            font-size: 13px;
-        }
         .filters {
             display: flex;
             gap: 10px;
@@ -378,19 +331,6 @@
             <div class="status" id="status">尚未加载文件</div>
             <div class="file-path" id="filePath">文件路径：-</div>
             <div class="filter-summary" id="filterSummary">过滤后 0 条</div>
-            <div class="pagination-bar" id="paginationBar" style="display: none;">
-                <span class="pagination-label">每页显示</span>
-                <select id="pageSizeSelect" class="pagination-select">
-                    <option value="50">50</option>
-                    <option value="100" selected>100</option>
-                    <option value="200">200</option>
-                    <option value="500">500</option>
-                    <option value="1000">1000</option>
-                </select>
-                <button type="button" class="pagination-btn" id="prevPageBtn">上一页</button>
-                <button type="button" class="pagination-btn" id="nextPageBtn">下一页</button>
-                <span class="pagination-info" id="paginationInfo">第 1 / 1 页</span>
-            </div>
         </div>
 
         <div class="list" id="groupList"></div>
@@ -406,8 +346,6 @@
         let currentFaultGroupFileHandle = null;
         let currentFaultGroupFileName = '';
         let durationFilterSeconds = 0;
-        let currentPage = 1;
-        let pageSize = 100;
         let referenceData = null;
         let referenceIndex = {
             ticket: new Map(),
@@ -473,7 +411,6 @@
                 faultGroups = parseJsonl(content);
                 currentFaultGroupFileHandle = fileHandle || null;
                 currentFaultGroupFileName = inputPath || currentFaultGroupFileName || '';
-                currentPage = 1;
                 document.getElementById('status').textContent = `已加载 ${faultGroups.length} 个故障组`;
                 updateFaultGroupFileStatus(inputPath, !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable));
                 renderGroups();
@@ -481,7 +418,6 @@
                 faultGroups = [];
                 currentFaultGroupFileHandle = fileHandle || null;
                 currentFaultGroupFileName = inputPath || currentFaultGroupFileName || '';
-                currentPage = 1;
                 document.getElementById('status').textContent = error.message;
                 updateFaultGroupFileStatus(inputPath, !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable));
                 renderGroups();
@@ -1041,24 +977,9 @@
             const list = document.getElementById('groupList');
             const emptyState = document.getElementById('emptyState');
             const filterSummary = document.getElementById('filterSummary');
-            const paginationBar = document.getElementById('paginationBar');
-            const paginationInfo = document.getElementById('paginationInfo');
-            const prevPageBtn = document.getElementById('prevPageBtn');
-            const nextPageBtn = document.getElementById('nextPageBtn');
             const visibleGroups = filterGroups(faultGroups);
-            const totalPages = Math.max(1, Math.ceil(visibleGroups.length / pageSize));
-            if (currentPage > totalPages) {
-                currentPage = totalPages;
-            }
-            const startIndex = (currentPage - 1) * pageSize;
-            const endIndex = startIndex + pageSize;
-            const pageGroups = visibleGroups.slice(startIndex, endIndex);
 
-            filterSummary.textContent = `过滤后 ${visibleGroups.length} 条，当前显示 ${pageGroups.length} 条`;
-            paginationBar.style.display = visibleGroups.length > 0 ? 'flex' : 'none';
-            paginationInfo.textContent = `第 ${currentPage} / ${totalPages} 页`;
-            prevPageBtn.disabled = currentPage <= 1;
-            nextPageBtn.disabled = currentPage >= totalPages;
+            filterSummary.textContent = `过滤后 ${visibleGroups.length} 条`;
 
             if (visibleGroups.length === 0) {
                 list.innerHTML = '';
@@ -1068,7 +989,7 @@
             }
 
             emptyState.style.display = 'none';
-            list.innerHTML = pageGroups.map((group) => {
+            list.innerHTML = visibleGroups.map((group) => {
                 const index = faultGroups.indexOf(group);
                 return `
                 <div class="card">
@@ -1181,25 +1102,21 @@
                 const chipFilter = chip.dataset.filter || 'all';
                 chip.classList.toggle('active', activeFilters.has(chipFilter));
             });
-            currentPage = 1;
             renderGroups();
         });
 
         document.getElementById('siteFilterInput').addEventListener('input', function(event) {
             siteFilterQuery = event.target.value.trim();
-            currentPage = 1;
             renderGroups();
         });
 
         document.getElementById('ticketFilterInput').addEventListener('input', function(event) {
             ticketFilterQuery = event.target.value.trim();
-            currentPage = 1;
             renderGroups();
         });
 
         document.getElementById('noteFilterInput').addEventListener('input', function(event) {
             noteFilterQuery = event.target.value.trim();
-            currentPage = 1;
             renderGroups();
         });
 
@@ -1208,33 +1125,12 @@
             const minutes = parseInt(document.getElementById('durationMinutesInput').value || '0', 10) || 0;
             const seconds = parseInt(document.getElementById('durationSecondsInput').value || '0', 10) || 0;
             durationFilterSeconds = hours * 3600 + minutes * 60 + seconds;
-            currentPage = 1;
             renderGroups();
         }
 
         document.getElementById('durationHoursInput').addEventListener('input', updateDurationFilter);
         document.getElementById('durationMinutesInput').addEventListener('input', updateDurationFilter);
         document.getElementById('durationSecondsInput').addEventListener('input', updateDurationFilter);
-        document.getElementById('pageSizeSelect').addEventListener('change', function(event) {
-            pageSize = parseInt(event.target.value, 10) || 100;
-            currentPage = 1;
-            renderGroups();
-        });
-        document.getElementById('prevPageBtn').addEventListener('click', function() {
-            if (currentPage <= 1) {
-                return;
-            }
-            currentPage -= 1;
-            renderGroups();
-        });
-        document.getElementById('nextPageBtn').addEventListener('click', function() {
-            const totalPages = Math.max(1, Math.ceil(filterGroups(faultGroups).length / pageSize));
-            if (currentPage >= totalPages) {
-                return;
-            }
-            currentPage += 1;
-            renderGroups();
-        });
     </script>
 </body>
 </html>
