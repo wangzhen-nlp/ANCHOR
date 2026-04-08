@@ -1100,7 +1100,28 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 只要出现在当前 gold label 里，这个样本就不会被统计。
 
-### 5. `--loose`
+### 5. `--only-offline`
+
+`--only-offline` 是一个**gold 样本过滤开关**，不会改变 prediction group 的关联过程。
+
+它的语义是：
+
+- 只统计**包含离线告警**的 gold label 样本
+
+两边的判断口径是：
+
+1. `ultimate_group_as_gold`
+   - 看终极 group 的 `symptoms` 里是否出现 `OFFLINE_ALARMS`
+
+2. `alarm_group_as_gold`
+   - 看该告警故障组ID对应的原始告警里是否出现 `OFFLINE_ALARMS`
+
+所以 `only-offline` 的作用是：
+
+- 不改 `base / loose / potential / only-one`
+- 只决定当前 gold 样本是否进入最终分母
+
+### 6. `--loose`
 
 `--loose` 的语义和 `v2` 脚本一致，也是“group 间按时间窗做闭包扩张”，只是这里扩的是：
 
@@ -1120,7 +1141,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 不改变 gold label
 - 只在当前 gold 站点范围内，把 prediction group 按时间窗再扩一层
 
-### 6. `--potential`
+### 7. `--potential`
 
 `--potential` 不是按时间窗扩张，而是按**告警ID命中**来吸附额外 prediction group。
 
@@ -1134,7 +1155,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 - “如果直接用同一批告警ID做桥，另一侧还有哪些 group 可以被吸进来？”
 
-### 7. `--only-one`
+### 8. `--only-one`
 
 `--only-one` 会在：
 
@@ -1149,7 +1170,27 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 都只基于这个单 group 来计算。
 
-### 8. 两个方向的 `cases.jsonl`
+### 9. 可选项叠加顺序
+
+当前 prediction group 的组合顺序是：
+
+1. `base`
+2. `loose`
+3. `potential`
+4. `only-one`
+
+样本过滤顺序是：
+
+1. `domain` 过滤
+2. `only-offline`
+3. `min-site-num`
+
+也就是说：
+
+- `base / loose / potential / only-one` 决定“预测结果长什么样”
+- `domain / only-offline / min-site-num` 决定“当前 gold 样本算不算进分母”
+
+### 10. 两个方向的 `cases.jsonl`
 
 这份脚本会像 `v2` 一样，额外输出两份 sidecar 可视化文件：
 
@@ -1161,10 +1202,47 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 把每个未满召回样本整理成可以直接给现有 HTML 页面加载的故障组样式 JSONL
 - 便于在页面上直接查看：
   - gold 站点
-  - 预测站点
   - 已命中站点
   - 未命中站点
   - 相关告警
+
+这里要注意，当前 case 的展示口径是：
+
+1. 展示站点范围只取 **gold 站点**
+   - 不会把“只在预测里有、但不在 gold 里的站点”并进 case
+
+2. 节点范围不是只保留“有告警的设备”
+   - 会先根据 gold 站点去 `ne_graph.json` 里拉这个站点上的设备
+   - 所以同站点其它设备也会进入 `ne_info`
+   - 这些设备之间的 link 也会按 `ne_graph.json` 正常生成
+
+3. 告警展示是“命中侧看 prediction，漏召侧看 gold”
+   - `associated_site_alarms`：来自 prediction group，在已命中站点上的告警
+   - `missing_site_alarms`：来自 gold label，在未命中站点上的告警
+
+所以 case 的真实语义是：
+
+- 站点范围按 gold 来定
+- 节点和连边按 `ne_graph.json` 来补
+- 命中站点的告警证据更偏 prediction 侧
+- 漏召站点的告警证据更偏 gold 侧
+
+### 11. 输出字段补充
+
+除了两组方向性的平均指标之外，当前还会输出：
+
+- `ultimate_group_as_gold.sample_count`
+- `alarm_group_as_gold.sample_count`
+- `ultimate_group_as_gold.gold_site_count_distribution`
+- `alarm_group_as_gold.gold_site_count_distribution`
+- `ultimate_group_as_gold_case_jsonl_output`
+- `alarm_group_as_gold_case_jsonl_output`
+
+需要注意：
+
+- 顶层的 `ultimate_group_count` / `alarm_group_count`
+  代表的是原始索引规模
+- 真正进入平均值计算的样本数，要看两个方向各自的 `sample_count`
 
 **【意义】**
 
