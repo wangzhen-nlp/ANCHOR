@@ -509,10 +509,19 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     ticket_id = normalize_text(detail.get("ticket_id", ""))
     associated_sites = sorted(normalize_text(site_id) for site_id in detail.get("associated_sites", []) if normalize_text(site_id))
     missing_sites = sorted(normalize_text(site_id) for site_id in detail.get("missing_sites", []) if normalize_text(site_id))
+    context_sites = sorted(normalize_text(site_id) for site_id in detail.get("context_sites", []) if normalize_text(site_id))
     ticket_sites = sorted(normalize_text(site_id) for site_id in detail.get("ticket_sites", []) if normalize_text(site_id))
+    display_sites = sorted(
+        normalize_text(site_id)
+        for site_id in detail.get("display_sites", ticket_sites)
+        if normalize_text(site_id)
+    )
+    if not display_sites:
+        display_sites = list(ticket_sites)
 
     associated_site_alarms = detail.get("associated_site_alarms", {}) if isinstance(detail.get("associated_site_alarms", {}), dict) else {}
     missing_site_alarms = detail.get("missing_site_alarms", {}) if isinstance(detail.get("missing_site_alarms", {}), dict) else {}
+    context_site_alarms = detail.get("context_site_alarms", {}) if isinstance(detail.get("context_site_alarms", {}), dict) else {}
 
     case_uuid = f"{method}::{ticket_id}"
     ne_info = {}
@@ -521,10 +530,11 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     all_case_ne_ids = []
     per_site_alarm_records = {}
 
-    for site_id in ticket_sites:
+    for site_id in display_sites:
         site_alarm_records = []
         site_alarm_records.extend(associated_site_alarms.get(site_id, []))
         site_alarm_records.extend(missing_site_alarms.get(site_id, []))
+        site_alarm_records.extend(context_site_alarms.get(site_id, []))
         per_site_alarm_records[site_id] = [record for record in site_alarm_records if isinstance(record, dict)]
 
         source_ne_ids = {
@@ -548,6 +558,7 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     for matched_role, site_ids, site_alarm_map, site_label in (
         ("associated_site", associated_sites, associated_site_alarms, "ASSOCIATED"),
         ("missing_site", missing_sites, missing_site_alarms, "MISSING"),
+        ("context_site", context_sites, context_site_alarms, "CONTEXT"),
     ):
         for site_id in site_ids:
             site_records = [record for record in site_alarm_map.get(site_id, []) if isinstance(record, dict)]
@@ -620,10 +631,12 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
         "inferred_roots": {
             "associated_site": associated_sites,
             "missing_site": missing_sites,
+            "context_site": context_sites,
         },
         "role_mapping": {
             "associated_site": associated_sites,
             "missing_site": missing_sites,
+            "context_site": context_sites,
         },
         "symptoms": symptoms,
         "group_anchor_ts": group_anchor_ts,
@@ -641,17 +654,19 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
             "inferred_roots": {
                 "associated_site": associated_sites,
                 "missing_site": missing_sites,
+                "context_site": context_sites,
             },
             "role_mapping": {
                 "associated_site": associated_sites,
                 "missing_site": missing_sites,
+                "context_site": context_sites,
             },
         },
         "ne_info": ne_info,
         "group_info": {
             case_uuid: {
                 "ne_list": ne_list,
-                "site_list": ticket_sites,
+                "site_list": display_sites,
             }
         },
     }
