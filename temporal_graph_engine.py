@@ -425,13 +425,24 @@ class TemporalGraphEngine:
             trig_node, trig_rule_name = trigger_key
             rule = self.rules[trig_rule_name]
             trigger_ts, _trigger_seq = trigger_anchor
-            results = self._evaluate_rule(
-                trig_rule_name,
-                rule,
-                trig_node,
-                trigger_ts,
-                node_rule_helper=helper
-            )
+            debug_trace = None
+            if self.debug_observer:
+                results, debug_trace = self._evaluate_rule(
+                    trig_rule_name,
+                    rule,
+                    trig_node,
+                    trigger_ts,
+                    node_rule_helper=helper,
+                    return_debug_trace=True
+                )
+            else:
+                results = self._evaluate_rule(
+                    trig_rule_name,
+                    rule,
+                    trig_node,
+                    trigger_ts,
+                    node_rule_helper=helper
+                )
             pending_eval_profiles.append({
                 "node": trig_node,
                 "rule": trig_rule_name,
@@ -439,6 +450,7 @@ class TemporalGraphEngine:
                 "trigger_seq": trigger_anchor[1],
                 "raw_match_count": len(results),
                 "raw_matches": results,
+                "debug_trace": debug_trace,
             })
             if results:
                 raw_matches.extend(results)
@@ -859,13 +871,24 @@ class TemporalGraphEngine:
 
         return merge_match_batch(list(matches) + extra_matches)
 
-    def _evaluate_rule(self, rule_name, rule, trigger_node, trigger_ts, node_rule_helper=None):
+    def _evaluate_rule(self, rule_name, rule, trigger_node, trigger_ts, node_rule_helper=None, return_debug_trace=False):
         """
         全向动态图调度器 (State-Forking Matcher)：
         支持平行宇宙分叉、严格结构匹配、局部性能缓存。
         """
         helper = node_rule_helper or self.node_rule_helper
         nodes_cfg = rule.get("nodes", {})
+        debug_trace = None
+        if return_debug_trace:
+            debug_trace = {
+                "rule": rule_name,
+                "trigger_node": trigger_node,
+                "trigger_ts": trigger_ts,
+                "trigger_role": None,
+                "trigger_validation": None,
+                "edges": [],
+                "raw_match_count": 0,
+            }
 
         # 1. 读取规则的静态执行计划
         plan = self.rule_execution_plans.get(rule_name)
@@ -877,6 +900,8 @@ class TemporalGraphEngine:
         trigger_role = plan["trigger_role"]
         edges_to_explore = plan["edges_to_explore"]
         root_roles = plan["root_roles"]
+        if debug_trace is not None:
+            debug_trace["trigger_role"] = trigger_role
 
         # 3. 校验触发节点自身
         trigger_node_domain = self.sites_domain_map.get(trigger_node, {})
@@ -888,7 +913,21 @@ class TemporalGraphEngine:
             edge_window=0,
             exclude_consumed_trigger_rule=rule_name
         )
+        if debug_trace is not None:
+            debug_trace["trigger_validation"] = helper.explain_node_validation(
+                trigger_node,
+                trigger_node_domain,
+                nodes_cfg[trigger_role],
+                trigger_ts,
+                edge_window=0,
+                exclude_consumed_trigger_rule=rule_name
+            )
         if not is_trig_valid:
+            if debug_trace is not None:
+                debug_trace["final_reason"] = (
+                    debug_trace["trigger_validation"].get("reason", "trigger 节点未通过校验")
+                )
+                return [], debug_trace
             return []
 
         # 4. 初始化独立子图实例池与备忘录缓存
@@ -904,11 +943,24 @@ class TemporalGraphEngine:
         # 5. 核心引擎：逐边推演，触发 分叉 (Fork) 或 聚合 (Aggregate)
         for curr_role, tgt_role, edge in edges_to_explore:
             next_instances = []
+            edge_trace = None
+            if debug_trace is not None:
+                edge_trace = {
+                    "from_role": curr_role,
+                    "to_role": tgt_role,
+                    "instances_in": len(instances),
+                    "instances_out": 0,
+                    "failures": [],
+                }
 
             for inst in instances:
                 inst_roles = inst["roles"]
 
                 if curr_role not in inst_roles:
+                    if edge_trace is not None:
+                        edge_trace["failures"].append(
+                            f"实例缺少源 role {curr_role}，无法继续扩展到 {tgt_role}"
+                        )
                     next_instances.append(inst)
                     continue
 
@@ -926,6 +978,7 @@ class TemporalGraphEngine:
                 surviving_curr_phys = {}
                 curr_support_targets = {}
                 branch_survived = False
+                branch_failure_reasons = []
 
                 for curr_phys, curr_evts in curr_phys_dict['nodes'].items():
                     ref_ts = curr_evts[0]["ts"] if curr_evts else trigger_ts
@@ -938,11 +991,25 @@ class TemporalGraphEngine:
                         path_requirements=edge.get("path_requirements"),
                         node_rule_helper=helper
                     )
-                    candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
+                    raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
+                    candidates = list(raw_candidates)
                     # 先跑拓扑可达，再按 rule 里的 selector 收窄候选集
                     candidates = helper.select_candidates_by_rule(
                         candidates, candidate_hops, tgt_cfg, edge.get("candidate_selector")
                     )
+                    if edge_trace is not None and not raw_candidates:
+                        branch_failure_reasons.append(
+                            f"{curr_role}:{curr_phys} 在拓扑方向 {edge['traverse_dir']} 上找不到任何 {tgt_role} 候选节点"
+                        )
+                        continue
+                    if edge_trace is not None and raw_candidates and not candidates:
+                        selector = edge.get("candidate_selector") or {}
+                        selector_mode = selector.get("mode", "default")
+                        branch_failure_reasons.append(
+                            f"{curr_role}:{curr_phys} 的 {tgt_role} 候选在 selector(mode={selector_mode}) 后为空，"
+                            f"原始候选={raw_candidates[:8]}"
+                        )
+                        continue
 
                     curr_valid_targets = {}
                     all_passed = True
@@ -951,6 +1018,7 @@ class TemporalGraphEngine:
                         if isinstance(edge["win"], dict)
                         else edge["win"]
                     )
+                    candidate_failure_details = []
 
                     # 如果 candidates 为空，天然跳过内层循环，该源节点被淘汰
                     for cand_phys in candidates:
@@ -973,11 +1041,28 @@ class TemporalGraphEngine:
                         if is_valid:
                             curr_valid_targets[cand_phys] = evts
                         else:
+                            if edge_trace is not None:
+                                explain = helper.explain_node_validation(
+                                    cand_phys,
+                                    self.sites_domain_map.get(cand_phys, {}),
+                                    tgt_cfg,
+                                    ref_ts,
+                                    edge["win"],
+                                    exclude_consumed_trigger_rule=(rule_name if tgt_role == trigger_role else None)
+                                )
+                                candidate_failure_details.append(
+                                    f"{cand_phys}: {explain.get('reason', '节点校验失败')}"
+                                )
                             if match_mode == "ALL":
                                 all_passed = False
                                 break
 
                     if match_mode == "ALL" and not all_passed:
+                        if edge_trace is not None:
+                            detail = candidate_failure_details[0] if candidate_failure_details else "存在候选节点未通过 ALL 校验"
+                            branch_failure_reasons.append(
+                                f"{curr_role}:{curr_phys} 在 ALL 模式下失败，{detail}"
+                            )
                         continue
 
                     if curr_valid_targets:
@@ -986,13 +1071,30 @@ class TemporalGraphEngine:
                         curr_support_targets[curr_phys] = set(curr_valid_targets)
                         for key, value in curr_valid_targets.items():
                             valid_targets[key] = value
+                    elif edge_trace is not None:
+                        if candidate_failure_details:
+                            branch_failure_reasons.append(
+                                f"{curr_role}:{curr_phys} 没有满足 {tgt_role} 的节点，"
+                                f"失败原因: {candidate_failure_details[:3]}"
+                            )
+                        else:
+                            branch_failure_reasons.append(
+                                f"{curr_role}:{curr_phys} 没有满足 {tgt_role} 的节点"
+                            )
 
                 if not branch_survived:
+                    if edge_trace is not None and branch_failure_reasons:
+                        edge_trace["failures"].extend(branch_failure_reasons[:6])
                     continue
 
                 # 回溯检查数量
                 curr_cfg = nodes_cfg[curr_role]
                 if inst_roles[curr_role]["checked"] and len(surviving_curr_phys) < curr_cfg.get("min_count", 1):
+                    if edge_trace is not None:
+                        edge_trace["failures"].append(
+                            f"{curr_role} 回溯后仅剩 {len(surviving_curr_phys)} 个节点，"
+                            f"低于 min_count={curr_cfg.get('min_count', 1)}"
+                        )
                     continue
 
                 existing_targets = inst_roles.get(tgt_role, {}).get('nodes', {})
@@ -1018,6 +1120,10 @@ class TemporalGraphEngine:
                             next_instances.append(stabilized_inst)
                 else:
                     if len(merged_targets) < min_c:
+                        if edge_trace is not None:
+                            edge_trace["failures"].append(
+                                f"{tgt_role} 合并后仅有 {len(merged_targets)} 个节点，低于 min_count={min_c}"
+                            )
                         continue
 
                     new_inst = clone_instance_with_updates(
@@ -1029,8 +1135,21 @@ class TemporalGraphEngine:
                         next_instances.append(stabilized_inst)
 
             instances = next_instances
+            if edge_trace is not None:
+                edge_trace["instances_out"] = len(instances)
+                edge_trace["failures"] = edge_trace["failures"][:8]
+                debug_trace["edges"].append(edge_trace)
 
             if not instances:
+                if debug_trace is not None:
+                    if edge_trace and edge_trace["failures"]:
+                        debug_trace["final_reason"] = (
+                            f"在边 {curr_role} -> {tgt_role} 上全部分支失效；"
+                            f"主要原因: {edge_trace['failures'][:3]}"
+                        )
+                        return [], debug_trace
+                    debug_trace["final_reason"] = f"在边 {curr_role} -> {tgt_role} 上全部分支失效"
+                    return [], debug_trace
                 return []
 
         # 6. 提取结果：把一次结构匹配结果整理成候选故障组。
@@ -1081,7 +1200,11 @@ class TemporalGraphEngine:
                 )
             }
             results.append(match_result)
-
+        if debug_trace is not None:
+            debug_trace["raw_match_count"] = len(results)
+            if not results and "final_reason" not in debug_trace:
+                debug_trace["final_reason"] = "规则评估完成，但未产出原始候选组"
+            return results, debug_trace
         return results
 
     def _traverse_graph(self, start_node, direction, max_hops=None,

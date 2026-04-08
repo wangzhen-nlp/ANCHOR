@@ -129,6 +129,150 @@ class NodeRuleHelper:
             return None
         return None
 
+    @staticmethod
+    def format_expected_alarms_for_reason(expected):
+        if expected is None:
+            return "未命中任何 site_rule 的 expected_alarms"
+        if expected == "ANY":
+            return "ANY"
+        if expected == "NONE":
+            return "NONE"
+        if isinstance(expected, dict):
+            forbidden_alarms = expected.get("forbidden_alarms")
+            if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
+                return f"forbidden={sorted(str(alarm) for alarm in forbidden_alarms)}"
+            return str(expected)
+        if isinstance(expected, Iterable) and not isinstance(expected, str):
+            return str(sorted(str(alarm) for alarm in expected))
+        return str(expected)
+
+    def explain_node_validation(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
+        """返回节点校验的可读诊断信息，仅用于 debug 解释。"""
+        if not self.matches_node_structure(physical_node_domain, node_config):
+            return {
+                "valid": False,
+                "reason": f"节点 {physical_node} 的站点画像不满足 role 结构约束",
+            }
+
+        node_type = node_config.get("type", "primitive")
+        if node_type == "primitive":
+            expected = self.resolve_expected_alarms(physical_node_domain, node_config)
+            if expected is None:
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"节点 {physical_node} 未命中任何 site_rule，无法解析 expected_alarms"
+                    ),
+                }
+
+            events_in_win = self.events_in_window(
+                physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule
+            )
+            window_text = self.format_window_for_reason(reference_ts, edge_window)
+            event_timeline = self.format_events_for_reason(events_in_win)
+
+            if expected == "NONE":
+                critical_events = [e for e in events_in_win if e["alarm"] in self.critical_alarms]
+                if critical_events:
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"窗口 {window_text} 内要求 NONE，但出现 critical 告警: "
+                            f"{self.format_events_for_reason(critical_events)}"
+                        ),
+                    }
+                return {
+                    "valid": True,
+                    "reason": f"窗口 {window_text} 内未出现 critical 告警，满足 NONE",
+                }
+
+            if isinstance(expected, dict):
+                forbidden_alarms = expected.get("forbidden_alarms")
+                if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
+                    forbidden_events = [e for e in events_in_win if e["alarm"] in forbidden_alarms]
+                    if forbidden_events:
+                        return {
+                            "valid": False,
+                            "reason": (
+                                f"窗口 {window_text} 内命中 forbidden alarms: "
+                                f"{self.format_events_for_reason(forbidden_events)}"
+                            ),
+                        }
+                    return {
+                        "valid": True,
+                        "reason": f"窗口 {window_text} 内未命中 forbidden alarms，满足约束",
+                    }
+                return {
+                    "valid": False,
+                    "reason": f"expected_alarms 配置无法识别: {expected}",
+                }
+
+            if expected == "ANY":
+                return {
+                    "valid": True,
+                    "reason": (
+                        f"ANY 不限制告警类型，窗口 {window_text} 内事件数={len(events_in_win)}"
+                    ),
+                }
+
+            if isinstance(expected, Iterable) and not isinstance(expected, str):
+                valid = [e for e in events_in_win if e["alarm"] in expected]
+                if valid:
+                    return {
+                        "valid": True,
+                        "reason": (
+                            f"窗口 {window_text} 内命中期望告警: {self.format_events_for_reason(valid)}"
+                        ),
+                    }
+                if event_timeline:
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"窗口 {window_text} 内未命中期望告警 {self.format_expected_alarms_for_reason(expected)}；"
+                            f" 实际事件: {event_timeline}"
+                        ),
+                    }
+                return {
+                    "valid": False,
+                    "reason": (
+                        f"窗口 {window_text} 内没有任何事件，未命中期望告警 "
+                        f"{self.format_expected_alarms_for_reason(expected)}"
+                    ),
+                }
+
+            return {
+                "valid": False,
+                "reason": f"expected_alarms 配置无法识别: {expected}",
+            }
+
+        if node_type == "compound":
+            pattern_reasons = []
+            patterns = node_config.get("patterns", [])
+            for idx, pattern in enumerate(patterns, start=1):
+                pattern_result = self.explain_node_validation(
+                    physical_node,
+                    physical_node_domain,
+                    pattern,
+                    reference_ts,
+                    edge_window,
+                    exclude_consumed_trigger_rule
+                )
+                if pattern_result.get("valid"):
+                    return {
+                        "valid": True,
+                        "reason": f"compound pattern[{idx}] 满足: {pattern_result.get('reason', '')}",
+                    }
+                pattern_reasons.append(f"pattern[{idx}]: {pattern_result.get('reason', '')}")
+            return {
+                "valid": False,
+                "reason": "compound 所有 pattern 都不满足: " + "; ".join(pattern_reasons),
+            }
+
+        return {
+            "valid": False,
+            "reason": f"未知节点类型: {node_type}",
+        }
+
     def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
         """按结构与时间窗口告警共同校验一个节点是否满足规则定义。"""
         if not self.matches_node_structure(physical_node_domain, node_config):

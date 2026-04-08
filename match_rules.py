@@ -582,6 +582,27 @@ def _print_debug_pending_eval_profiles(snapshot, debug_sites):
     if not profiles:
         return
 
+    def print_debug_trace(trace):
+        if not trace:
+            return
+        trigger_validation = trace.get("trigger_validation") or {}
+        if trigger_validation:
+            print(
+                "      trigger校验: "
+                f"{'通过' if trigger_validation.get('valid') else '失败'}; "
+                f"{trigger_validation.get('reason', '')}"
+            )
+        for edge_trace in trace.get("edges", []):
+            print(
+                f"      边 {edge_trace.get('from_role')} -> {edge_trace.get('to_role')}: "
+                f"instances_in={edge_trace.get('instances_in', 0)}, "
+                f"instances_out={edge_trace.get('instances_out', 0)}"
+            )
+            for failure in edge_trace.get("failures", [])[:5]:
+                print(f"         - {failure}")
+        if trace.get("final_reason"):
+            print(f"      最终失败原因: {trace.get('final_reason')}")
+
     for idx, profile in enumerate(profiles, start=1):
         trigger_ts = profile.get("trigger_ts")
         trigger_time = (
@@ -599,6 +620,7 @@ def _print_debug_pending_eval_profiles(snapshot, debug_sites):
         raw_matches = profile.get("raw_matches", [])
         if not raw_matches:
             print("      ↳ 未产出原始候选组")
+            print_debug_trace(profile.get("debug_trace"))
             continue
         for match in raw_matches:
             _print_debug_match_details(match)
