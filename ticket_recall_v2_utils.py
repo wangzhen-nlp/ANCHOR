@@ -522,6 +522,7 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     associated_site_alarms = detail.get("associated_site_alarms", {}) if isinstance(detail.get("associated_site_alarms", {}), dict) else {}
     missing_site_alarms = detail.get("missing_site_alarms", {}) if isinstance(detail.get("missing_site_alarms", {}), dict) else {}
     context_site_alarms = detail.get("context_site_alarms", {}) if isinstance(detail.get("context_site_alarms", {}), dict) else {}
+    note = normalize_text(detail.get("note", ""))
 
     case_uuid = f"{method}::{ticket_id}"
     ne_info = {}
@@ -625,6 +626,7 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
 
     return {
         "uuid": case_uuid,
+        "note": note,
         "rule": f"{method}_unrecalled_case",
         "merged_rules": [f"{method}_unrecalled_case"],
         "related_group_uuids": list(detail.get("fault_groups", [])),
@@ -648,6 +650,7 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
         "missing_site_count": detail.get("missing_site_count", 0),
         "match_info": {
             "uuid": case_uuid,
+            "note": note,
             "rule": f"{method}_unrecalled_case",
             "merged_rules": [f"{method}_unrecalled_case"],
             "related_group_uuids": list(detail.get("fault_groups", [])),

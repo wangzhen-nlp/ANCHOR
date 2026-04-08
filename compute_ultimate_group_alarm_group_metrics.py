@@ -276,6 +276,17 @@ def _derive_case_output_path(output_file, suffix):
     return f"{base}.{suffix}.cases.jsonl"
 
 
+def _format_recalled_sites_note(site_ids):
+    normalized_sites = [
+        _normalize_text(site_id)
+        for site_id in site_ids
+        if _normalize_text(site_id)
+    ]
+    if not normalized_sites:
+        return "召回的站点列表：无"
+    return f"召回的站点列表：{'，'.join(normalized_sites)}"
+
+
 def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_group_to_site_alarms):
     case_details = []
     for item in details:
@@ -309,6 +320,7 @@ def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_g
             "missing_sites": missing_sites,
             "missing_site_alarms": missing_site_alarms,
             "recall": item.get("recall", 0.0),
+            "note": _format_recalled_sites_note(matched_sites),
         })
     return case_details
 
