@@ -71,13 +71,13 @@ transmission_rule = {
           "mode": "nearest_matching"
         }
       },
-      "time_window_sec": 600
+      "time_window_sec": 900
     },
     {
       "source": "parent_microwave_node",
       "target": "downstream_compound_node",
       "direction": "downstream",
-      "time_window_sec": 600,
+      "time_window_sec": 900,
       "constraints": {
         "path_node_requirements": {
           "site_rules": TRANSMISSION_SITE_RULES
@@ -118,7 +118,7 @@ link_rule = {
       "target": "link_child_offline_node",
       "direction": "downstream",
       "max_hops": 1,
-      "time_window_sec": 600
+      "time_window_sec": 900
     }
   ]
 }
@@ -154,7 +154,7 @@ power_rule = {
       "target": "offline_node",
       "direction": "self",
       "time_window_sec": {
-        "before_sec": 600,
+        "before_sec": 900,
         "after_sec": 10800
       }
     }

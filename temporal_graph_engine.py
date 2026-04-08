@@ -258,8 +258,12 @@ class TemporalGraphEngine:
             if is_clear:
                 # 清除事件只按 event_id 删除对应实例，并联动修正 trigger / pending 状态。
                 self._remove_cleared_events(node, event_id)
-                self._remove_cleared_trigger_events(node, event_id)
-                self._refresh_pending_triggers_for_node(node)
+                affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
+                if affected_rule_names:
+                    self._refresh_pending_triggers_for_node(
+                        node,
+                        affected_rule_names=affected_rule_names
+                    )
             else:
                 q.append((ts, event_id, alarm_type, alarm_source, frozenset()))
 
@@ -698,19 +702,28 @@ class TemporalGraphEngine:
             self.trigger_event_index.pop(trigger_key, None)
 
     def _remove_cleared_trigger_events(self, node, event_id):
-        """按 event_id 从 trigger 索引中移除已清除的触发事件。"""
-        if not event_id:
-            return
+        """按 event_id 从 trigger 索引中移除已清除的触发事件。
 
+        返回值是“当前 pending anchor 也被清掉”的 rule 名集合。只有这些 rule
+        需要把 pending 起点推进到下一条 trigger；如果删掉的只是后续候选，
+        pending 应保持不变。
+        """
+        if not event_id:
+            return set()
+
+        affected_rule_names = set()
         for rule_name, _ in self.trigger_specs_by_node.get(node, ()):
             trigger_key = (node, rule_name)
             trigger_events = self.trigger_event_index.get(trigger_key)
             if not trigger_events:
                 continue
 
+            current_pending_anchor = self.pending_triggers.get(trigger_key)
             kept = collections.deque()
             for event_ts, indexed_event_id, indexed_seq, indexed_alarm_type in trigger_events:
                 if indexed_event_id == event_id:
+                    if current_pending_anchor == (event_ts, indexed_seq):
+                        affected_rule_names.add(rule_name)
                     continue
                 kept.append((event_ts, indexed_event_id, indexed_seq, indexed_alarm_type))
 
@@ -718,6 +731,8 @@ class TemporalGraphEngine:
                 self.trigger_event_index[trigger_key] = kept
             else:
                 self.trigger_event_index.pop(trigger_key, None)
+
+        return affected_rule_names
 
     def _refresh_pending_triggers_for_node(self, node, affected_rule_names=None):
         """在 trigger 候选被删除后，重新校正该节点对应 rule 的 pending 起点。"""
