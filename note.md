@@ -1121,7 +1121,32 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 不改 `base / loose / potential / only-one`
 - 只决定当前 gold 样本是否进入最终分母
 
-### 6. `--loose`
+### 6. `--require-transmission-per-site`
+
+`--require-transmission-per-site` 不是直接整条过滤 gold label，
+而是先对 gold label 的站点做一次**按站点裁剪**：
+
+- 只保留在 `ne_graph.json` 中至少存在一个 `domain=Transmission` 设备的站点
+
+裁剪之后：
+
+- 如果 gold 站点集合变空，则该样本跳过
+- 如果裁剪后的 gold 站点数 `< min-site-num`，则该样本跳过
+
+所以这个开关的真实语义是：
+
+- 先把 gold label 收成“有 Transmission 设备支撑的站点子集”
+- 再用这个收缩后的 gold 站点集合去计算后续指标与 case
+
+这会影响：
+
+- `gold_sites`
+- `gold_site_count`
+- `gold_site_count_distribution`
+- `recall / precision / f1`
+- cases 里的 gold 站点范围
+
+### 7. `--loose`
 
 `--loose` 的语义和 `v2` 脚本一致，也是“group 间按时间窗做闭包扩张”，只是这里扩的是：
 
@@ -1141,7 +1166,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 不改变 gold label
 - 只在当前 gold 站点范围内，把 prediction group 按时间窗再扩一层
 
-### 7. `--potential`
+### 8. `--potential`
 
 `--potential` 不是按时间窗扩张，而是按**告警ID命中**来吸附额外 prediction group。
 
@@ -1155,7 +1180,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 - “如果直接用同一批告警ID做桥，另一侧还有哪些 group 可以被吸进来？”
 
-### 8. `--only-one`
+### 9. `--only-one`
 
 `--only-one` 会在：
 
@@ -1170,7 +1195,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 都只基于这个单 group 来计算。
 
-### 9. 可选项叠加顺序
+### 10. 可选项叠加顺序
 
 当前 prediction group 的组合顺序是：
 
@@ -1183,14 +1208,15 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 1. `domain` 过滤
 2. `only-offline`
-3. `min-site-num`
+3. `require-transmission-per-site` 对 gold 站点做裁剪
+4. `min-site-num`
 
 也就是说：
 
 - `base / loose / potential / only-one` 决定“预测结果长什么样”
-- `domain / only-offline / min-site-num` 决定“当前 gold 样本算不算进分母”
+- `domain / only-offline / require-transmission-per-site / min-site-num` 决定“当前 gold 样本算不算进分母，以及 gold 站点集合会不会先被收缩”
 
-### 10. 两个方向的 `cases.jsonl`
+### 11. 两个方向的 `cases.jsonl`
 
 这份脚本会像 `v2` 一样，额外输出两份 sidecar 可视化文件：
 
@@ -1227,7 +1253,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 命中站点的告警证据更偏 prediction 侧
 - 漏召站点的告警证据更偏 gold 侧
 
-### 11. 输出字段补充
+### 12. 输出字段补充
 
 除了两组方向性的平均指标之外，当前还会输出：
 

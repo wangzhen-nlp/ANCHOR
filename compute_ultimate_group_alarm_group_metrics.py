@@ -52,6 +52,23 @@ def _is_allowed_gold_domain(domain):
     return domain in ALLOWED_GOLD_DOMAINS
 
 
+def _build_site_has_transmission(ne_graph_data):
+    site_has_transmission = defaultdict(bool)
+    if not isinstance(ne_graph_data, dict):
+        return {}
+
+    for ne_info in ne_graph_data.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            continue
+        if _extract_domain(ne_info) == "TRANSMISSION":
+            site_has_transmission[site_id] = True
+
+    return dict(site_has_transmission)
+
+
 def _is_offline_alarm_record(record):
     if not isinstance(record, dict):
         return False
@@ -334,6 +351,8 @@ def _compute_direction_metrics(
     min_site_num,
     gold_domain_allowed=None,
     gold_has_offline=None,
+    site_has_transmission=None,
+    require_transmission_per_site=False,
     only_offline=False,
     only_one=False,
     loose_gold_to_pred_groups=None,
@@ -345,6 +364,7 @@ def _compute_direction_metrics(
     total_f1 = 0.0
     gold_domain_allowed = gold_domain_allowed or {}
     gold_has_offline = gold_has_offline or {}
+    site_has_transmission = site_has_transmission or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
 
@@ -354,6 +374,12 @@ def _compute_direction_metrics(
         if only_offline and not gold_has_offline.get(gold_id, False):
             continue
         gold_sites = set(gold_to_sites.get(gold_id, set()))
+        if require_transmission_per_site:
+            gold_sites = {
+                site_id
+                for site_id in gold_sites
+                if site_has_transmission.get(site_id, False)
+            }
         if not gold_sites:
             continue
         if min_site_num > 0 and len(gold_sites) < min_site_num:
@@ -429,6 +455,7 @@ def compute_ultimate_group_alarm_group_metrics(
     group_field="故障组ID",
     ne_graph_file=None,
     min_site_num=0,
+    require_transmission_per_site=False,
     only_offline=False,
     only_one=False,
     loose=False,
@@ -440,6 +467,8 @@ def compute_ultimate_group_alarm_group_metrics(
 ):
     stage_total = 3 + int(bool(loose)) + int(bool(potential))
     current_stage = 1
+    ne_graph_data = load_ne_graph_data(ne_graph_file)
+    site_has_transmission = _build_site_has_transmission(ne_graph_data)
     print(f"阶段 {current_stage}/{stage_total}：加载 group output 最新版本并提取终极 group...")
     group_records = _load_latest_group_records(group_output_input)
     (
@@ -515,6 +544,8 @@ def compute_ultimate_group_alarm_group_metrics(
         min_site_num=min_site_num,
         gold_domain_allowed=ultimate_group_domain_allowed,
         gold_has_offline=ultimate_group_has_offline,
+        site_has_transmission=site_has_transmission,
+        require_transmission_per_site=require_transmission_per_site,
         only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=ultimate_group_to_loose_alarm_groups,
@@ -527,6 +558,8 @@ def compute_ultimate_group_alarm_group_metrics(
         min_site_num=min_site_num,
         gold_domain_allowed=alarm_group_domain_allowed,
         gold_has_offline=alarm_group_has_offline,
+        site_has_transmission=site_has_transmission,
+        require_transmission_per_site=require_transmission_per_site,
         only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=alarm_group_to_loose_ultimate_groups,
@@ -536,6 +569,7 @@ def compute_ultimate_group_alarm_group_metrics(
     result = {
         "group_field": group_field,
         "min_site_num": min_site_num,
+        "require_transmission_per_site_mode": require_transmission_per_site,
         "only_offline_mode": only_offline,
         "only_one_mode": only_one,
         "loose_mode": loose,
@@ -547,7 +581,6 @@ def compute_ultimate_group_alarm_group_metrics(
         "alarm_group_as_gold": alarm_group_as_gold,
     }
 
-    ne_graph_data = load_ne_graph_data(ne_graph_file)
     ultimate_case_details = _build_case_details_for_direction(
         ultimate_as_gold["details"],
         ultimate_group_to_site_alarms,
@@ -620,6 +653,11 @@ def main():
         help="仅统计 gold label 站点数 >= 该值的样本；默认: 0（不过滤）",
     )
     parser.add_argument(
+        "--require-transmission-per-site",
+        action="store_true",
+        help="仅保留 gold label 中包含 Transmission 设备的站点；过滤后站点数不足 min-site-num 的样本会被跳过",
+    )
+    parser.add_argument(
         "--only-offline",
         action="store_true",
         help="仅统计包含 OFFLINE_ALARMS 的 gold label 样本",
@@ -668,6 +706,7 @@ def main():
         group_field=args.group_field,
         ne_graph_file=args.ne_graph,
         min_site_num=args.min_site_num,
+        require_transmission_per_site=args.require_transmission_per_site,
         only_offline=args.only_offline,
         only_one=args.only_one,
         loose=args.loose,

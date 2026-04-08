@@ -463,7 +463,7 @@ def _build_visual_symptom(record, site_id, ticket_id, matched_role):
         "alarm_source": normalize_text(record.get("alarm_source", "")) or normalize_text(record.get("告警源", "")) or f"CASE_NE::{site_id}",
         "matched_role": matched_role,
         "time_str": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts is not None else "",
-        "工单号": normalize_text(record.get("工单号", "")) or ticket_id,
+        "工单号": normalize_text(record.get("工单号", "")),
         "故障组ID": normalize_text(record.get("故障组ID", "")),
         "告警清除时间": normalize_text(record.get("alarm_clear_time", "")) or normalize_text(record.get("告警清除时间", "")),
     }
