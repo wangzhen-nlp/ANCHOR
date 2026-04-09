@@ -69,6 +69,23 @@ def _build_site_has_transmission(ne_graph_data):
     return dict(site_has_transmission)
 
 
+def _build_site_has_data(ne_graph_data):
+    site_has_data = defaultdict(bool)
+    if not isinstance(ne_graph_data, dict):
+        return {}
+
+    for ne_info in ne_graph_data.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            continue
+        if _extract_domain(ne_info) == "DATA":
+            site_has_data[site_id] = True
+
+    return dict(site_has_data)
+
+
 def _is_offline_alarm_record(record):
     if not isinstance(record, dict):
         return False
@@ -271,6 +288,34 @@ def _merge_group_site_alarms(group_ids, group_to_site_alarms):
     return dict(merged)
 
 
+def _nonempty_alarm_sites(site_alarm_map):
+    return sorted(
+        _normalize_text(site_id)
+        for site_id, alarms in site_alarm_map.items()
+        if _normalize_text(site_id) and isinstance(alarms, list) and alarms
+    )
+
+
+def _restrict_gold_sites_to_alarm_sites(gold_to_sites, gold_group_to_site_alarms):
+    filtered = {}
+    for gold_id, site_ids in gold_to_sites.items():
+        alarm_site_ids = {
+            _normalize_text(site_id)
+            for site_id, alarms in gold_group_to_site_alarms.get(gold_id, {}).items()
+            if _normalize_text(site_id) and isinstance(alarms, list) and alarms
+        }
+        if not alarm_site_ids:
+            continue
+        filtered_sites = {
+            _normalize_text(site_id)
+            for site_id in site_ids
+            if _normalize_text(site_id) and _normalize_text(site_id) in alarm_site_ids
+        }
+        if filtered_sites:
+            filtered[gold_id] = filtered_sites
+    return filtered
+
+
 def _derive_case_output_path(output_file, suffix):
     base, _ext = os.path.splitext(output_file)
     return f"{base}.{suffix}.cases.jsonl"
@@ -306,21 +351,24 @@ def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_g
             gold_group_to_site_alarms.get(item.get("gold_id", ""), {}),
             missing_sites,
         )
+        case_associated_sites = _nonempty_alarm_sites(associated_site_alarms)
+        case_missing_sites = _nonempty_alarm_sites(missing_site_alarms)
+        case_ticket_sites = sorted(set(case_associated_sites) | set(case_missing_sites))
         case_details.append({
             "ticket_id": item.get("gold_id", ""),
-            "ticket_site_count": item.get("gold_site_count", 0),
-            "ticket_sites": gold_sites,
+            "ticket_site_count": len(case_ticket_sites),
+            "ticket_sites": case_ticket_sites,
             "fault_groups": effective_predicted_groups,
             "effective_fault_groups": effective_predicted_groups,
             "selected_fault_group": item.get("selected_predicted_group", ""),
-            "associated_site_count": len(matched_sites),
-            "associated_sites": matched_sites,
+            "associated_site_count": len(case_associated_sites),
+            "associated_sites": case_associated_sites,
             "associated_site_alarms": associated_site_alarms,
-            "missing_site_count": len(missing_sites),
-            "missing_sites": missing_sites,
+            "missing_site_count": len(case_missing_sites),
+            "missing_sites": case_missing_sites,
             "missing_site_alarms": missing_site_alarms,
             "recall": item.get("recall", 0.0),
-            "note": _format_recalled_sites_note(matched_sites),
+            "note": _format_recalled_sites_note(case_associated_sites),
         })
     return case_details
 
@@ -364,7 +412,9 @@ def _compute_direction_metrics(
     gold_domain_allowed=None,
     gold_has_offline=None,
     site_has_transmission=None,
+    site_has_data=None,
     require_transmission_per_site=False,
+    no_data=False,
     only_offline=False,
     only_one=False,
     loose_gold_to_pred_groups=None,
@@ -377,6 +427,7 @@ def _compute_direction_metrics(
     gold_domain_allowed = gold_domain_allowed or {}
     gold_has_offline = gold_has_offline or {}
     site_has_transmission = site_has_transmission or {}
+    site_has_data = site_has_data or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
 
@@ -386,6 +437,8 @@ def _compute_direction_metrics(
         if only_offline and not gold_has_offline.get(gold_id, False):
             continue
         gold_sites = set(gold_to_sites.get(gold_id, set()))
+        if no_data and any(site_has_data.get(site_id, False) for site_id in gold_sites):
+            continue
         if require_transmission_per_site:
             gold_sites = {
                 site_id
@@ -468,6 +521,7 @@ def compute_ultimate_group_alarm_group_metrics(
     ne_graph_file=None,
     min_site_num=0,
     require_transmission_per_site=False,
+    no_data=False,
     only_offline=False,
     only_one=False,
     loose=False,
@@ -481,6 +535,7 @@ def compute_ultimate_group_alarm_group_metrics(
     current_stage = 1
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     site_has_transmission = _build_site_has_transmission(ne_graph_data)
+    site_has_data = _build_site_has_data(ne_graph_data)
     print(f"阶段 {current_stage}/{stage_total}：加载 group output 最新版本并提取终极 group...")
     group_records = _load_latest_group_records(group_output_input)
     (
@@ -496,6 +551,10 @@ def compute_ultimate_group_alarm_group_metrics(
         group_records,
         group_field=group_field,
     )
+    ultimate_group_to_sites = _restrict_gold_sites_to_alarm_sites(
+        ultimate_group_to_sites,
+        ultimate_group_to_site_alarms,
+    )
     current_stage += 1
 
     print(f"阶段 {current_stage}/{stage_total}：从原始告警流提取告警故障组ID覆盖站点...")
@@ -503,6 +562,10 @@ def compute_ultimate_group_alarm_group_metrics(
         alarm_input,
         ne_graph_file=ne_graph_file,
         group_field=group_field,
+    )
+    alarm_group_to_sites = _restrict_gold_sites_to_alarm_sites(
+        alarm_group_to_sites,
+        alarm_group_to_site_alarms,
     )
     current_stage += 1
 
@@ -557,7 +620,9 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_domain_allowed=ultimate_group_domain_allowed,
         gold_has_offline=ultimate_group_has_offline,
         site_has_transmission=site_has_transmission,
+        site_has_data=site_has_data,
         require_transmission_per_site=require_transmission_per_site,
+        no_data=no_data,
         only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=ultimate_group_to_loose_alarm_groups,
@@ -571,7 +636,9 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_domain_allowed=alarm_group_domain_allowed,
         gold_has_offline=alarm_group_has_offline,
         site_has_transmission=site_has_transmission,
+        site_has_data=site_has_data,
         require_transmission_per_site=require_transmission_per_site,
+        no_data=no_data,
         only_offline=only_offline,
         only_one=only_one,
         loose_gold_to_pred_groups=alarm_group_to_loose_ultimate_groups,
@@ -582,6 +649,7 @@ def compute_ultimate_group_alarm_group_metrics(
         "group_field": group_field,
         "min_site_num": min_site_num,
         "require_transmission_per_site_mode": require_transmission_per_site,
+        "no_data_mode": no_data,
         "only_offline_mode": only_offline,
         "only_one_mode": only_one,
         "loose_mode": loose,
@@ -670,6 +738,11 @@ def main():
         help="仅保留 gold label 中包含 Transmission 设备的站点；过滤后站点数不足 min-site-num 的样本会被跳过",
     )
     parser.add_argument(
+        "--no-data",
+        action="store_true",
+        help="如果当前 gold label 的任一站点在 ne_graph.json 中包含 Data 设备，则直接跳过该样本",
+    )
+    parser.add_argument(
         "--only-offline",
         action="store_true",
         help="仅统计包含 OFFLINE_ALARMS 的 gold label 样本",
@@ -719,6 +792,7 @@ def main():
         ne_graph_file=args.ne_graph,
         min_site_num=args.min_site_num,
         require_transmission_per_site=args.require_transmission_per_site,
+        no_data=args.no_data,
         only_offline=args.only_offline,
         only_one=args.only_one,
         loose=args.loose,
