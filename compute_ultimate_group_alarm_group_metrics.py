@@ -15,10 +15,10 @@ from compute_ticket_site_recall import (
 )
 from ticket_recall_v2_utils import (
     build_site_alarm_map_for_sites,
+    build_site_has_domain_map,
     build_group_site_time_index,
     build_site_to_group_index,
     build_unrecalled_visualization_cases,
-    build_site_invalid_for_no_data_map,
     load_ne_graph_data,
     expand_groups_by_time_window,
     select_best_group_by_target_sites,
@@ -26,7 +26,6 @@ from ticket_recall_v2_utils import (
 )
 
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
-ALLOWED_ALARM_DOMAINS = {"RAN", "TRANSMISSION"}
 
 
 def _extract_alarm_id(record):
@@ -108,7 +107,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
     ultimate_group_to_alarm_groups = defaultdict(set)
     ultimate_group_to_alarm_ids = defaultdict(set)
     ultimate_group_to_site_alarms = defaultdict(lambda: defaultdict(list))
-    ultimate_group_has_non_ran_transmission_alarm = defaultdict(bool)
+    ultimate_group_has_data_alarm = defaultdict(bool)
     ultimate_group_has_offline = defaultdict(bool)
     alarm_group_to_ultimate_groups = defaultdict(set)
     alarm_id_to_ultimate_groups = defaultdict(set)
@@ -131,19 +130,17 @@ def _build_ultimate_group_indexes(group_records, group_field):
                 if not isinstance(ne_entry, dict):
                     continue
                 for alarm in ne_entry.get("alarm", []):
-                    domain = _extract_domain(alarm)
-                    if domain and domain not in ALLOWED_ALARM_DOMAINS:
-                        ultimate_group_has_non_ran_transmission_alarm[group_id] = True
+                    if _extract_domain(alarm) == "DATA":
+                        ultimate_group_has_data_alarm[group_id] = True
                         break
-                if ultimate_group_has_non_ran_transmission_alarm[group_id]:
+                if ultimate_group_has_data_alarm[group_id]:
                     break
 
         for symptom in group_record.get("symptoms", []):
             if not isinstance(symptom, dict):
                 continue
-            domain = _extract_domain(symptom)
-            if domain and domain not in ALLOWED_ALARM_DOMAINS:
-                ultimate_group_has_non_ran_transmission_alarm[group_id] = True
+            if _extract_domain(symptom) == "DATA":
+                ultimate_group_has_data_alarm[group_id] = True
             if _is_offline_alarm_record(symptom):
                 ultimate_group_has_offline[group_id] = True
             site_id = _normalize_text(symptom.get("node", ""))
@@ -166,7 +163,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
         alarm_group_to_ultimate_groups,
         ultimate_group_to_alarm_ids,
         ultimate_group_to_site_alarms,
-        dict(ultimate_group_has_non_ran_transmission_alarm),
+        dict(ultimate_group_has_data_alarm),
         dict(ultimate_group_has_offline),
         dict(alarm_id_to_ultimate_groups),
     )
@@ -189,7 +186,7 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     alarm_group_to_sites = defaultdict(set)
     alarm_group_to_alarm_ids = defaultdict(set)
     alarm_group_to_site_alarms = defaultdict(lambda: defaultdict(list))
-    alarm_group_has_non_ran_transmission_alarm = defaultdict(bool)
+    alarm_group_has_data_alarm = defaultdict(bool)
     alarm_group_has_offline = defaultdict(bool)
     alarm_id_to_alarm_groups = defaultdict(set)
     for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
@@ -206,8 +203,8 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
         site_id = _resolve_alarm_site_id(alarm, ne_to_site)
 
         for group_id in group_ids:
-            if domain and domain not in ALLOWED_ALARM_DOMAINS:
-                alarm_group_has_non_ran_transmission_alarm[group_id] = True
+            if domain == "DATA":
+                alarm_group_has_data_alarm[group_id] = True
             if _is_offline_alarm_record(alarm):
                 alarm_group_has_offline[group_id] = True
             if site_id:
@@ -223,7 +220,7 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
         dict(alarm_group_to_sites),
         dict(alarm_group_to_alarm_ids),
         alarm_group_to_site_alarms,
-        dict(alarm_group_has_non_ran_transmission_alarm),
+        dict(alarm_group_has_data_alarm),
         dict(alarm_group_has_offline),
         dict(alarm_id_to_alarm_groups),
     )
@@ -386,10 +383,10 @@ def _compute_direction_metrics(
     gold_to_pred_groups,
     pred_group_to_sites,
     min_site_num,
-    gold_has_non_ran_transmission_alarm=None,
+    gold_has_data_alarm=None,
     gold_has_offline=None,
     site_has_transmission=None,
-    site_invalid_for_no_data=None,
+    site_has_data=None,
     require_transmission_per_site=False,
     no_data_site=False,
     no_data_alarm=False,
@@ -402,18 +399,18 @@ def _compute_direction_metrics(
     total_recall = 0.0
     total_precision = 0.0
     total_f1 = 0.0
-    gold_has_non_ran_transmission_alarm = gold_has_non_ran_transmission_alarm or {}
+    gold_has_data_alarm = gold_has_data_alarm or {}
     gold_has_offline = gold_has_offline or {}
     site_has_transmission = site_has_transmission or {}
-    site_invalid_for_no_data = site_invalid_for_no_data or {}
+    site_has_data = site_has_data or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
 
     for gold_id in sorted(gold_to_sites.keys()):
-        if no_data_alarm and gold_has_non_ran_transmission_alarm.get(gold_id, False):
+        if no_data_alarm and gold_has_data_alarm.get(gold_id, False):
             continue
         gold_sites = set(gold_to_sites.get(gold_id, set()))
-        if no_data_site and any(site_invalid_for_no_data.get(site_id, True) for site_id in gold_sites):
+        if no_data_site and any(site_has_data.get(site_id, False) for site_id in gold_sites):
             continue
         if require_transmission_per_site:
             gold_sites = {
@@ -514,7 +511,7 @@ def compute_ultimate_group_alarm_group_metrics(
     current_stage = 1
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     site_has_transmission = _build_site_has_transmission(ne_graph_data)
-    site_invalid_for_no_data = build_site_invalid_for_no_data_map(ne_graph_data)
+    site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
     print(f"阶段 {current_stage}/{stage_total}：加载 group output 最新版本并提取终极 group...")
     group_records = _load_latest_group_records(group_output_input)
     (
@@ -523,7 +520,7 @@ def compute_ultimate_group_alarm_group_metrics(
         alarm_group_to_ultimate_groups,
         ultimate_group_to_alarm_ids,
         ultimate_group_to_site_alarms,
-        ultimate_group_has_non_ran_transmission_alarm,
+        ultimate_group_has_data_alarm,
         ultimate_group_has_offline,
         alarm_id_to_ultimate_groups,
     ) = _build_ultimate_group_indexes(
@@ -537,7 +534,7 @@ def compute_ultimate_group_alarm_group_metrics(
     current_stage += 1
 
     print(f"阶段 {current_stage}/{stage_total}：从原始告警流提取告警故障组ID覆盖站点...")
-    alarm_group_to_sites, alarm_group_to_alarm_ids, alarm_group_to_site_alarms, alarm_group_has_non_ran_transmission_alarm, alarm_group_has_offline, alarm_id_to_alarm_groups = _build_alarm_group_site_index(
+    alarm_group_to_sites, alarm_group_to_alarm_ids, alarm_group_to_site_alarms, alarm_group_has_data_alarm, alarm_group_has_offline, alarm_id_to_alarm_groups = _build_alarm_group_site_index(
         alarm_input,
         ne_graph_file=ne_graph_file,
         group_field=group_field,
@@ -596,10 +593,10 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_to_pred_groups=ultimate_group_to_alarm_groups,
         pred_group_to_sites=alarm_group_to_sites,
         min_site_num=min_site_num,
-        gold_has_non_ran_transmission_alarm=ultimate_group_has_non_ran_transmission_alarm,
+        gold_has_data_alarm=ultimate_group_has_data_alarm,
         gold_has_offline=ultimate_group_has_offline,
         site_has_transmission=site_has_transmission,
-        site_invalid_for_no_data=site_invalid_for_no_data,
+        site_has_data=site_has_data,
         require_transmission_per_site=require_transmission_per_site,
         no_data_site=no_data_site,
         no_data_alarm=no_data_alarm,
@@ -613,10 +610,10 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_to_pred_groups=alarm_group_to_ultimate_groups,
         pred_group_to_sites=ultimate_group_to_sites,
         min_site_num=min_site_num,
-        gold_has_non_ran_transmission_alarm=alarm_group_has_non_ran_transmission_alarm,
+        gold_has_data_alarm=alarm_group_has_data_alarm,
         gold_has_offline=alarm_group_has_offline,
         site_has_transmission=site_has_transmission,
-        site_invalid_for_no_data=site_invalid_for_no_data,
+        site_has_data=site_has_data,
         require_transmission_per_site=require_transmission_per_site,
         no_data_site=no_data_site,
         no_data_alarm=no_data_alarm,
@@ -722,12 +719,12 @@ def main():
     parser.add_argument(
         "--no-data-site",
         action="store_true",
-        help="如果当前 gold label 的任一站点在 ne_graph.json 中 domain 缺失/为空或包含 Data 设备，则直接跳过该样本",
+        help="如果当前 gold label 的任一站点在 ne_graph.json 中包含 Data 设备，则直接跳过该样本",
     )
     parser.add_argument(
         "--no-data-alarm",
         action="store_true",
-        help="如果当前 gold label 中出现来自非 Ran/Transmission 设备的告警，则直接跳过该样本",
+        help="如果当前 gold label 中出现来自 Data 设备的告警，则直接跳过该样本",
     )
     parser.add_argument(
         "--only-offline",

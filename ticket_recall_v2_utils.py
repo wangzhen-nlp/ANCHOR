@@ -430,29 +430,6 @@ def build_site_has_domain_map(ne_graph_data, target_domain):
 
     return dict(site_has_domain)
 
-
-def build_site_invalid_for_no_data_map(ne_graph_data):
-    if not isinstance(ne_graph_data, dict):
-        return {}
-
-    site_invalid = {}
-    for ne_info in ne_graph_data.values():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = normalize_text(ne_info.get("site_id", ""))
-        if not site_id:
-            continue
-        domain = (
-            normalize_text(ne_info.get("domain", ""))
-            or normalize_text(ne_info.get("Domain", ""))
-            or normalize_text(ne_info.get("DOMAIN", ""))
-        ).upper()
-        current_invalid = site_invalid.get(site_id, False)
-        site_invalid[site_id] = current_invalid or (not domain) or domain == "DATA"
-
-    return site_invalid
-
-
 def filter_ticket_sites_by_site_flag(ticket_sites, site_flag_map):
     filtered_ticket_sites = {}
     site_flag_map = site_flag_map or {}
@@ -491,28 +468,6 @@ def site_alarm_map_contains_domain(site_alarm_map, ne_to_domain, target_domain):
                 or normalize_text(record.get("告警源", ""))
             )
             if alarm_source and ne_to_domain.get(alarm_source, "") == normalized_target_domain:
-                return True
-    return False
-
-
-def site_alarm_map_contains_non_ran_transmission_domain(site_alarm_map, ne_to_domain):
-    allowed_domains = {"RAN", "TRANSMISSION"}
-    if not isinstance(site_alarm_map, dict) or not site_alarm_map:
-        return False
-    for alarms in site_alarm_map.values():
-        if not isinstance(alarms, list):
-            continue
-        for record in alarms:
-            if not isinstance(record, dict):
-                continue
-            alarm_source = (
-                normalize_text(record.get("alarm_source", ""))
-                or normalize_text(record.get("告警源", ""))
-            )
-            if not alarm_source:
-                continue
-            domain = ne_to_domain.get(alarm_source, "")
-            if domain and domain not in allowed_domains:
                 return True
     return False
 

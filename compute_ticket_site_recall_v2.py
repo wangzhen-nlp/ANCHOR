@@ -18,7 +18,6 @@ from ticket_recall_v2_utils import (
     build_alarm_to_group_index,
     build_ne_to_domain_map,
     build_site_has_domain_map,
-    build_site_invalid_for_no_data_map,
     build_group_site_time_index,
     build_site_alarm_map_for_sites,
     build_site_to_group_index,
@@ -34,7 +33,6 @@ from ticket_recall_v2_utils import (
     load_ne_graph_data,
     select_best_group_by_target_sites,
     site_alarm_map_contains_domain,
-    site_alarm_map_contains_non_ran_transmission_domain,
     write_jsonl_records,
 )
 
@@ -205,11 +203,11 @@ def compute_ticket_site_recall_v2(
     if no_data_site:
         if not ne_graph_data:
             raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
-        site_invalid_for_no_data = build_site_invalid_for_no_data_map(ne_graph_data)
+        site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
         ticket_sites = {
             ticket_id: site_list
             for ticket_id, site_list in ticket_sites.items()
-            if not any(site_invalid_for_no_data.get(_normalize_text(site_id), True) for site_id in site_list)
+            if not any(site_has_data.get(_normalize_text(site_id), False) for site_id in site_list)
         }
     if require_transmission_per_site:
         if not ne_graph_data:
@@ -346,7 +344,7 @@ def compute_ticket_site_recall_v2(
 
         if only_offline and not _site_alarm_map_contains_offline(upper_site_evidence):
             continue
-        if no_data_alarm and site_alarm_map_contains_non_ran_transmission_domain(upper_site_evidence, ne_to_domain):
+        if no_data_alarm and site_alarm_map_contains_domain(upper_site_evidence, ne_to_domain, "DATA"):
             continue
 
         total_recall += recall
@@ -474,12 +472,12 @@ def main():
     parser.add_argument(
         "--no-data-alarm",
         action="store_true",
-        help="如果 upper bound evidence 中存在来自非 Ran/Transmission 设备的告警，则跳过该工单样本",
+        help="如果 upper bound evidence 中存在来自 Data 设备的告警，则跳过该工单样本",
     )
     parser.add_argument(
         "--no-data-site",
         action="store_true",
-        help="如果当前工单站点里存在 domain 缺失/为空或包含 Data 设备的站点，则跳过该工单样本",
+        help="如果当前工单站点里存在包含 Data 设备的站点，则跳过该工单样本",
     )
     parser.add_argument(
         "--require-transmission-per-site",

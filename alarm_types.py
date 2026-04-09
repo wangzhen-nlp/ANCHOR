@@ -24,7 +24,6 @@ OFFLINE_ALARMS = {
     "Nokia 2G NE Down",
     "Nokia 4G NE Down",
     "Nokia 4G S1 NE Down",
-    "PMS Communication Failure",
     "ReachabilityProblem",
     "SWT_SWITCH_DOWN",
     "The Device is offline",
@@ -48,7 +47,8 @@ POWER_ALARMS = {
     "The voltage of the power supply is abnormal.",
     "cseShutDownNotify",
     "DC Low Voltage",
-    "Genset Stop"
+    "Genset Stop",
+    "PMS Communication Failure",
 }
 
 LINK_ALARMS = {
