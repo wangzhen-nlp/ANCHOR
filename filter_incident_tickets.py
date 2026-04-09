@@ -2,7 +2,7 @@
 """
 筛选Incident Ticket记录：
 1. 行的内容包含至少两个站点ID
-2. 涉及的站点只有Ran、Transmission设备，不能有Data设备
+2. 涉及的每个站点都必须包含Transmission设备
 """
 import argparse
 import json
@@ -96,7 +96,7 @@ def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
     """
     检查站点列表是否满足条件：
     - 至少2个站点
-    - 所有站点只有Ran和Transmission设备（没有Data设备）
+    - 所有站点都必须包含Transmission设备
     返回: (是否满足条件, 涉及的设备类型)
     """
     if len(site_ids) < 2:
@@ -107,16 +107,14 @@ def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
 
     for site_id in site_ids:
         if site_id not in site_device_mapping:
-            # 如果站点不在映射中，暂时跳过（可能有数据问题）
+            valid = False
             continue
 
         devices = site_device_mapping[site_id]
         all_devices.update(devices)
 
-        # 检查是否有Data设备
-        if 'Data' in devices:
+        if 'Transmission' not in devices:
             valid = False
-            break
 
     return valid, all_devices
 
@@ -155,7 +153,7 @@ def _print_stats(title: str, stats: dict):
         ("总记录数", stats['total']),
         ("命中记录数", stats['valid']),
         ("不足 2 个站点", stats['only_one_site']),
-        ("包含 Data 设备", stats['has_data_device']),
+        ("站点缺少 Transmission 设备", stats['missing_transmission_device']),
     ])
 
 
@@ -203,7 +201,7 @@ def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_devic
     filtered_indices = []
     filtered_rows = []
     matched_sites_by_row = []
-    stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'has_data_device': 0}
+    stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}
     row_progress = ProgressBar(total_rows, progress_label or "处理工单记录", min_interval=0.05)
 
     try:
@@ -226,7 +224,7 @@ def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_devic
             valid, devices = check_site_devices(site_ids, site_device_mapping)
 
             if not valid:
-                stats['has_data_device'] += 1
+                stats['missing_transmission_device'] += 1
                 row_progress.update()
                 continue
 
@@ -272,7 +270,7 @@ def _filter_incident_tickets_xlsx_stream(input_file: str, site_device_mapping: d
         row_iter = worksheet.iter_rows(values_only=True)
         header_row = next(row_iter, None)
         if header_row is None:
-            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'has_data_device': 0}, []
+            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}, []
 
         columns = _normalize_header_row(header_row)
         total_rows = max((worksheet.max_row or 1) - 1, 0)
@@ -416,7 +414,7 @@ def main():
         return
 
     if os.path.isdir(args.input):
-        aggregate_stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'has_data_device': 0}
+        aggregate_stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}
         processed_files = 0
         aggregated_result_dfs = []
         aggregated_json = {}
@@ -451,7 +449,7 @@ def main():
             ("总记录数", aggregate_stats['total']),
             ("命中记录数", aggregate_stats['valid']),
             ("不足 2 个站点", aggregate_stats['only_one_site']),
-            ("包含 Data 设备", aggregate_stats['has_data_device']),
+            ("站点缺少 Transmission 设备", aggregate_stats['missing_transmission_device']),
         ])
 
         if aggregated_result_dfs:

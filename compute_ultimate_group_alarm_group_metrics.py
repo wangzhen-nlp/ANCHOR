@@ -14,6 +14,7 @@ from compute_ticket_site_recall import (
     _resolve_alarm_site_id,
 )
 from ticket_recall_v2_utils import (
+    build_ne_to_domain_map,
     build_site_alarm_map_for_sites,
     build_site_has_domain_map,
     build_group_site_time_index,
@@ -46,6 +47,22 @@ def _extract_domain(record):
         or _normalize_text(record.get("Domain", ""))
         or _normalize_text(record.get("DOMAIN", ""))
     ).upper()
+
+
+def _resolve_record_domain(record, ne_to_domain=None):
+    domain = _extract_domain(record)
+    if domain:
+        return domain
+    if not isinstance(record, dict):
+        return ""
+    alarm_source = (
+        _normalize_text(record.get("alarm_source", ""))
+        or _normalize_text(record.get("告警源", ""))
+    )
+    if not alarm_source:
+        return ""
+    return _normalize_text((ne_to_domain or {}).get(alarm_source, "")).upper()
+
 
 def _build_site_has_transmission(ne_graph_data):
     site_has_transmission = defaultdict(bool)
@@ -101,7 +118,7 @@ def _collect_referenced_group_ids(group_records):
     return referenced_group_ids
 
 
-def _build_ultimate_group_indexes(group_records, group_field):
+def _build_ultimate_group_indexes(group_records, group_field, ne_to_domain=None):
     referenced_group_ids = _collect_referenced_group_ids(group_records)
     ultimate_group_to_sites = {}
     ultimate_group_to_alarm_groups = defaultdict(set)
@@ -130,7 +147,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
                 if not isinstance(ne_entry, dict):
                     continue
                 for alarm in ne_entry.get("alarm", []):
-                    if _extract_domain(alarm) == "DATA":
+                    if _resolve_record_domain(alarm, ne_to_domain) == "DATA":
                         ultimate_group_has_data_alarm[group_id] = True
                         break
                 if ultimate_group_has_data_alarm[group_id]:
@@ -139,7 +156,7 @@ def _build_ultimate_group_indexes(group_records, group_field):
         for symptom in group_record.get("symptoms", []):
             if not isinstance(symptom, dict):
                 continue
-            if _extract_domain(symptom) == "DATA":
+            if _resolve_record_domain(symptom, ne_to_domain) == "DATA":
                 ultimate_group_has_data_alarm[group_id] = True
             if _is_offline_alarm_record(symptom):
                 ultimate_group_has_offline[group_id] = True
@@ -510,6 +527,7 @@ def compute_ultimate_group_alarm_group_metrics(
     stage_total = 3 + int(bool(loose)) + int(bool(potential))
     current_stage = 1
     ne_graph_data = load_ne_graph_data(ne_graph_file)
+    ne_to_domain = build_ne_to_domain_map(ne_graph_data)
     site_has_transmission = _build_site_has_transmission(ne_graph_data)
     site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
     print(f"阶段 {current_stage}/{stage_total}：加载 group output 最新版本并提取终极 group...")
@@ -526,6 +544,7 @@ def compute_ultimate_group_alarm_group_metrics(
     ) = _build_ultimate_group_indexes(
         group_records,
         group_field=group_field,
+        ne_to_domain=ne_to_domain,
     )
     ultimate_group_to_sites = _restrict_gold_sites_to_alarm_sites(
         ultimate_group_to_sites,
