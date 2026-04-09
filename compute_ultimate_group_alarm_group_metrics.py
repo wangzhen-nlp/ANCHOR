@@ -18,6 +18,7 @@ from ticket_recall_v2_utils import (
     build_group_site_time_index,
     build_site_to_group_index,
     build_unrecalled_visualization_cases,
+    build_site_invalid_for_no_data_map,
     load_ne_graph_data,
     expand_groups_by_time_window,
     select_best_group_by_target_sites,
@@ -62,23 +63,6 @@ def _build_site_has_transmission(ne_graph_data):
             site_has_transmission[site_id] = True
 
     return dict(site_has_transmission)
-
-
-def _build_site_has_data(ne_graph_data):
-    site_has_data = defaultdict(bool)
-    if not isinstance(ne_graph_data, dict):
-        return {}
-
-    for ne_info in ne_graph_data.values():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = _normalize_text(ne_info.get("site_id", ""))
-        if not site_id:
-            continue
-        if _extract_domain(ne_info) == "DATA":
-            site_has_data[site_id] = True
-
-    return dict(site_has_data)
 
 
 def _is_offline_alarm_record(record):
@@ -405,7 +389,7 @@ def _compute_direction_metrics(
     gold_has_non_ran_transmission_alarm=None,
     gold_has_offline=None,
     site_has_transmission=None,
-    site_has_data=None,
+    site_invalid_for_no_data=None,
     require_transmission_per_site=False,
     no_data_site=False,
     no_data_alarm=False,
@@ -421,7 +405,7 @@ def _compute_direction_metrics(
     gold_has_non_ran_transmission_alarm = gold_has_non_ran_transmission_alarm or {}
     gold_has_offline = gold_has_offline or {}
     site_has_transmission = site_has_transmission or {}
-    site_has_data = site_has_data or {}
+    site_invalid_for_no_data = site_invalid_for_no_data or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
 
@@ -429,7 +413,7 @@ def _compute_direction_metrics(
         if no_data_alarm and gold_has_non_ran_transmission_alarm.get(gold_id, False):
             continue
         gold_sites = set(gold_to_sites.get(gold_id, set()))
-        if no_data_site and any(site_has_data.get(site_id, False) for site_id in gold_sites):
+        if no_data_site and any(site_invalid_for_no_data.get(site_id, True) for site_id in gold_sites):
             continue
         if require_transmission_per_site:
             gold_sites = {
@@ -530,7 +514,7 @@ def compute_ultimate_group_alarm_group_metrics(
     current_stage = 1
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     site_has_transmission = _build_site_has_transmission(ne_graph_data)
-    site_has_data = _build_site_has_data(ne_graph_data)
+    site_invalid_for_no_data = build_site_invalid_for_no_data_map(ne_graph_data)
     print(f"阶段 {current_stage}/{stage_total}：加载 group output 最新版本并提取终极 group...")
     group_records = _load_latest_group_records(group_output_input)
     (
@@ -615,7 +599,7 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_has_non_ran_transmission_alarm=ultimate_group_has_non_ran_transmission_alarm,
         gold_has_offline=ultimate_group_has_offline,
         site_has_transmission=site_has_transmission,
-        site_has_data=site_has_data,
+        site_invalid_for_no_data=site_invalid_for_no_data,
         require_transmission_per_site=require_transmission_per_site,
         no_data_site=no_data_site,
         no_data_alarm=no_data_alarm,
@@ -632,7 +616,7 @@ def compute_ultimate_group_alarm_group_metrics(
         gold_has_non_ran_transmission_alarm=alarm_group_has_non_ran_transmission_alarm,
         gold_has_offline=alarm_group_has_offline,
         site_has_transmission=site_has_transmission,
-        site_has_data=site_has_data,
+        site_invalid_for_no_data=site_invalid_for_no_data,
         require_transmission_per_site=require_transmission_per_site,
         no_data_site=no_data_site,
         no_data_alarm=no_data_alarm,
@@ -738,7 +722,7 @@ def main():
     parser.add_argument(
         "--no-data-site",
         action="store_true",
-        help="如果当前 gold label 的任一站点在 ne_graph.json 中包含 Data 设备，则直接跳过该样本",
+        help="如果当前 gold label 的任一站点在 ne_graph.json 中 domain 缺失/为空或包含 Data 设备，则直接跳过该样本",
     )
     parser.add_argument(
         "--no-data-alarm",

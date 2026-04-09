@@ -18,6 +18,7 @@ from ticket_recall_v2_utils import (
     build_alarm_to_group_index,
     build_ne_to_domain_map,
     build_site_has_domain_map,
+    build_site_invalid_for_no_data_map,
     build_group_site_time_index,
     build_site_alarm_map_for_sites,
     build_site_to_group_index,
@@ -204,11 +205,11 @@ def compute_ticket_site_recall_v2(
     if no_data_site:
         if not ne_graph_data:
             raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
-        site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
+        site_invalid_for_no_data = build_site_invalid_for_no_data_map(ne_graph_data)
         ticket_sites = {
             ticket_id: site_list
             for ticket_id, site_list in ticket_sites.items()
-            if not any(site_has_data.get(_normalize_text(site_id), False) for site_id in site_list)
+            if not any(site_invalid_for_no_data.get(_normalize_text(site_id), True) for site_id in site_list)
         }
     if require_transmission_per_site:
         if not ne_graph_data:
@@ -478,7 +479,7 @@ def main():
     parser.add_argument(
         "--no-data-site",
         action="store_true",
-        help="如果当前工单站点里存在包含 Data 设备的站点，则跳过该工单样本",
+        help="如果当前工单站点里存在 domain 缺失/为空或包含 Data 设备的站点，则跳过该工单样本",
     )
     parser.add_argument(
         "--require-transmission-per-site",

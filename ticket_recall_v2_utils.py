@@ -431,6 +431,28 @@ def build_site_has_domain_map(ne_graph_data, target_domain):
     return dict(site_has_domain)
 
 
+def build_site_invalid_for_no_data_map(ne_graph_data):
+    if not isinstance(ne_graph_data, dict):
+        return {}
+
+    site_invalid = {}
+    for ne_info in ne_graph_data.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            continue
+        domain = (
+            normalize_text(ne_info.get("domain", ""))
+            or normalize_text(ne_info.get("Domain", ""))
+            or normalize_text(ne_info.get("DOMAIN", ""))
+        ).upper()
+        current_invalid = site_invalid.get(site_id, False)
+        site_invalid[site_id] = current_invalid or (not domain) or domain == "DATA"
+
+    return site_invalid
+
+
 def filter_ticket_sites_by_site_flag(ticket_sites, site_flag_map):
     filtered_ticket_sites = {}
     site_flag_map = site_flag_map or {}
