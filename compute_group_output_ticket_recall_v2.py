@@ -20,6 +20,8 @@ from compute_ticket_site_recall import (
 from compute_ticket_site_recall_upper_bound import _should_skip_alarm
 from ticket_recall_v2_utils import (
     build_alarm_to_group_index,
+    build_ne_to_domain_map,
+    build_site_has_domain_map,
     build_group_site_time_index,
     build_site_alarm_map_for_sites,
     build_site_to_group_index,
@@ -29,10 +31,13 @@ from ticket_recall_v2_utils import (
     dedupe_alarm_records,
     derive_case_jsonl_output_path,
     expand_groups_by_time_window,
+    filter_ticket_sites_by_site_flag,
     load_upper_bound_index,
     load_upper_bound_settings,
     load_ne_graph_data,
     select_best_group_by_target_sites,
+    site_alarm_map_contains_domain,
+    site_alarm_map_contains_non_ran_transmission_domain,
     write_jsonl_records,
 )
 
@@ -194,6 +199,9 @@ def compute_group_output_ticket_recall_v2(
     output_file=None,
     case_jsonl_output_file=None,
     only_offline=False,
+    no_data_alarm=False,
+    no_data_site=False,
+    require_transmission_per_site=False,
     loose=False,
     potential=False,
     only_one=False,
@@ -219,11 +227,26 @@ def compute_group_output_ticket_recall_v2(
         ticket_sites = _build_ticket_sites_from_alarms(alarms_input, ticket_field, ne_graph_file)
         ticket_site_source = "alarms"
 
+    ne_graph_data = load_ne_graph_data(ne_graph_file)
     ticket_sites = {
         ticket_id: site_list
         for ticket_id, site_list in ticket_sites.items()
         if ticket_id in eligible_ticket_ids
     }
+    if no_data_site:
+        if not ne_graph_data:
+            raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
+        site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
+        ticket_sites = {
+            ticket_id: site_list
+            for ticket_id, site_list in ticket_sites.items()
+            if not any(site_has_data.get(_normalize_text(site_id), False) for site_id in site_list)
+        }
+    if require_transmission_per_site:
+        if not ne_graph_data:
+            raise ValueError("开启 require-transmission-per-site 时，必须提供有效的 ne_graph 文件")
+        site_has_transmission = build_site_has_domain_map(ne_graph_data, "TRANSMISSION")
+        ticket_sites = filter_ticket_sites_by_site_flag(ticket_sites, site_has_transmission)
     if min_site_num > 0:
         ticket_sites = {
             ticket_id: site_list
@@ -317,6 +340,7 @@ def compute_group_output_ticket_recall_v2(
     total_recall = 0.0
     total_precision = 0.0
     total_f1 = 0.0
+    ne_to_domain = build_ne_to_domain_map(ne_graph_data)
 
     for ticket_id in sorted(ticket_sites.keys()):
         if ticket_alarm_counts.get(ticket_id, 0) <= 0:
@@ -356,6 +380,8 @@ def compute_group_output_ticket_recall_v2(
         }
 
         if only_offline and not _site_alarm_map_contains_offline(upper_site_evidence):
+            continue
+        if no_data_alarm and site_alarm_map_contains_non_ran_transmission_domain(upper_site_evidence, ne_to_domain):
             continue
 
         total_recall += recall
@@ -411,6 +437,9 @@ def compute_group_output_ticket_recall_v2(
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
         "only_offline_mode": only_offline,
+        "no_data_alarm_mode": no_data_alarm,
+        "no_data_site_mode": no_data_site,
+        "require_transmission_per_site_mode": require_transmission_per_site,
         "loose_mode": loose,
         "potential_mode": potential,
         "only_one_mode": only_one,
@@ -419,7 +448,6 @@ def compute_group_output_ticket_recall_v2(
         "details": details,
     }
 
-    ne_graph_data = load_ne_graph_data(ne_graph_file)
     case_records = build_unrecalled_visualization_cases(details, result["method"], ne_graph_data=ne_graph_data)
     if output_file and not case_jsonl_output_file:
         case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
@@ -482,6 +510,21 @@ def main():
         help="仅保留 upper bound evidence 中出现过 OFFLINE_ALARMS 的工单样本",
     )
     parser.add_argument(
+        "--no-data-alarm",
+        action="store_true",
+        help="如果 upper bound evidence 中存在来自非 Ran/Transmission 设备的告警，则跳过该工单样本",
+    )
+    parser.add_argument(
+        "--no-data-site",
+        action="store_true",
+        help="如果当前工单站点里存在包含 Data 设备的站点，则跳过该工单样本",
+    )
+    parser.add_argument(
+        "--require-transmission-per-site",
+        action="store_true",
+        help="先从工单站点里剔除不包含 Transmission 设备的站点；过滤后若站点数不足 min-site-num，则跳过该工单",
+    )
+    parser.add_argument(
         "--loose",
         action="store_true",
         help="允许用 upper bound 同口径时间窗，在工单站点上的其它 group 进一步扩充关联",
@@ -521,6 +564,9 @@ def main():
             output_file=args.output,
             case_jsonl_output_file=args.case_jsonl_output,
             only_offline=args.only_offline,
+            no_data_alarm=args.no_data_alarm,
+            no_data_site=args.no_data_site,
+            require_transmission_per_site=args.require_transmission_per_site,
             loose=args.loose,
             potential=args.potential,
             only_one=args.only_one,

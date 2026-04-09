@@ -390,6 +390,111 @@ def load_ne_graph_data(ne_graph_file):
     return data if isinstance(data, dict) else {}
 
 
+def build_ne_to_domain_map(ne_graph_data):
+    ne_to_domain = {}
+    for ne_id, ne_info in ne_graph_data.items():
+        if not isinstance(ne_info, dict):
+            continue
+        normalized_ne_id = normalize_text(ne_id)
+        if not normalized_ne_id:
+            continue
+        domain = (
+            normalize_text(ne_info.get("domain", ""))
+            or normalize_text(ne_info.get("Domain", ""))
+            or normalize_text(ne_info.get("DOMAIN", ""))
+        ).upper()
+        if domain:
+            ne_to_domain[normalized_ne_id] = domain
+    return ne_to_domain
+
+
+def build_site_has_domain_map(ne_graph_data, target_domain):
+    normalized_target_domain = normalize_text(target_domain).upper()
+    if not normalized_target_domain or not isinstance(ne_graph_data, dict):
+        return {}
+
+    site_has_domain = defaultdict(bool)
+    for ne_info in ne_graph_data.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            continue
+        domain = (
+            normalize_text(ne_info.get("domain", ""))
+            or normalize_text(ne_info.get("Domain", ""))
+            or normalize_text(ne_info.get("DOMAIN", ""))
+        ).upper()
+        if domain == normalized_target_domain:
+            site_has_domain[site_id] = True
+
+    return dict(site_has_domain)
+
+
+def filter_ticket_sites_by_site_flag(ticket_sites, site_flag_map):
+    filtered_ticket_sites = {}
+    site_flag_map = site_flag_map or {}
+
+    for ticket_id, site_list in ticket_sites.items():
+        filtered_site_list = []
+        seen_sites = set()
+        for site_id in site_list:
+            normalized_site_id = normalize_text(site_id)
+            if (
+                not normalized_site_id
+                or normalized_site_id in seen_sites
+                or not site_flag_map.get(normalized_site_id, False)
+            ):
+                continue
+            filtered_site_list.append(normalized_site_id)
+            seen_sites.add(normalized_site_id)
+        if filtered_site_list:
+            filtered_ticket_sites[ticket_id] = filtered_site_list
+
+    return filtered_ticket_sites
+
+
+def site_alarm_map_contains_domain(site_alarm_map, ne_to_domain, target_domain):
+    normalized_target_domain = normalize_text(target_domain).upper()
+    if not normalized_target_domain or not isinstance(site_alarm_map, dict) or not site_alarm_map:
+        return False
+    for alarms in site_alarm_map.values():
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if not isinstance(record, dict):
+                continue
+            alarm_source = (
+                normalize_text(record.get("alarm_source", ""))
+                or normalize_text(record.get("告警源", ""))
+            )
+            if alarm_source and ne_to_domain.get(alarm_source, "") == normalized_target_domain:
+                return True
+    return False
+
+
+def site_alarm_map_contains_non_ran_transmission_domain(site_alarm_map, ne_to_domain):
+    allowed_domains = {"RAN", "TRANSMISSION"}
+    if not isinstance(site_alarm_map, dict) or not site_alarm_map:
+        return False
+    for alarms in site_alarm_map.values():
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if not isinstance(record, dict):
+                continue
+            alarm_source = (
+                normalize_text(record.get("alarm_source", ""))
+                or normalize_text(record.get("告警源", ""))
+            )
+            if not alarm_source:
+                continue
+            domain = ne_to_domain.get(alarm_source, "")
+            if domain and domain not in allowed_domains:
+                return True
+    return False
+
+
 def build_site_to_ne_ids(ne_graph_data):
     site_to_ne_ids = defaultdict(list)
     for ne_id, ne_info in ne_graph_data.items():
