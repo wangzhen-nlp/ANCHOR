@@ -37,7 +37,7 @@ def collect_transmission_isolated_sites(ne_graph_data):
     site_to_name = {}
     site_to_transmission_external_neighbor_sites = defaultdict(set)
     site_to_data_external_neighbor_sites = defaultdict(set)
-    site_to_unknown_neighbor_nes = defaultdict(set)
+    site_has_unknown_neighbors = defaultdict(bool)
 
     if not isinstance(ne_graph_data, dict):
         return []
@@ -79,7 +79,7 @@ def collect_transmission_isolated_sites(ne_graph_data):
             neighbor_site_id = _extract_site_id(neighbor_info)
 
             if not neighbor_site_id:
-                site_to_unknown_neighbor_nes[site_id].add(neighbor_id)
+                site_has_unknown_neighbors[site_id] = True
                 continue
 
             if neighbor_site_id != site_id:
@@ -96,7 +96,11 @@ def collect_transmission_isolated_sites(ne_graph_data):
         data_external_neighbor_sites = sorted(
             site_to_data_external_neighbor_sites.get(site_id, set())
         )
-        if transmission_external_neighbor_sites or data_external_neighbor_sites:
+        if (
+            transmission_external_neighbor_sites
+            or data_external_neighbor_sites
+            or site_has_unknown_neighbors.get(site_id, False)
+        ):
             continue
 
         isolated_sites.append(
@@ -111,8 +115,6 @@ def collect_transmission_isolated_sites(ne_graph_data):
                 "transmission_external_neighbor_sites": [],
                 "data_external_neighbor_site_count": 0,
                 "data_external_neighbor_sites": [],
-                "unknown_neighbor_ne_count": len(site_to_unknown_neighbor_nes.get(site_id, set())),
-                "unknown_neighbor_ne_ids": sorted(site_to_unknown_neighbor_nes.get(site_id, set())),
             }
         )
 
