@@ -354,16 +354,16 @@ def _write_match_cache(match_cache_file: str, ticket_match_cache: dict, expand_s
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _get_ticket_column_index(df: pd.DataFrame) -> int:
+def _get_ticket_column_index(df: pd.DataFrame, ticket_field: str) -> int:
     try:
-        return df.columns.get_loc('工单ID')
+        return df.columns.get_loc(ticket_field)
     except KeyError as exc:
-        raise KeyError("输入文件缺少 '工单ID' 列") from exc
+        raise KeyError(f"输入文件缺少 '{ticket_field}' 列") from exc
 
 
-def _build_ticket_site_json(result_df, matched_sites_by_row):
+def _build_ticket_site_json(result_df, matched_sites_by_row, ticket_field: str):
     json_data = {}
-    ticket_col_idx = _get_ticket_column_index(result_df)
+    ticket_col_idx = _get_ticket_column_index(result_df, ticket_field)
     for row_idx, row in enumerate(result_df.itertuples(index=False, name=None)):
         ticket_id = row[ticket_col_idx]
         site_ids = matched_sites_by_row[row_idx]
@@ -410,6 +410,7 @@ def _filter_incident_tickets_rows(
     expand_sites_by_device: bool = False,
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
+    ticket_field: str = "工单ID",
     progress_label: str = None,
 ):
     """筛选流式行数据，并仅保留命中的记录。"""
@@ -420,7 +421,7 @@ def _filter_incident_tickets_rows(
     row_progress = ProgressBar(total_rows, progress_label or "处理工单记录", min_interval=0.05)
     ticket_col_idx = None
     try:
-        ticket_col_idx = columns.index('工单ID')
+        ticket_col_idx = columns.index(ticket_field)
     except ValueError:
         ticket_col_idx = None
 
@@ -500,6 +501,7 @@ def _filter_incident_tickets_df(
     expand_sites_by_device: bool = False,
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
+    ticket_field: str = "工单ID",
     progress_label: str = None,
 ):
     """筛选单个 DataFrame。"""
@@ -515,6 +517,7 @@ def _filter_incident_tickets_df(
         expand_sites_by_device=expand_sites_by_device,
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
+        ticket_field=ticket_field,
         progress_label=progress_label,
     )
 
@@ -528,6 +531,7 @@ def _filter_incident_tickets_xlsx_stream(
     expand_sites_by_device: bool = False,
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
+    ticket_field: str = "工单ID",
     progress_label: str = None,
 ):
     """使用 openpyxl 只读模式流式读取 xlsx，避免一次性把整表读入内存。"""
@@ -561,6 +565,7 @@ def _filter_incident_tickets_xlsx_stream(
             expand_sites_by_device=expand_sites_by_device,
             ticket_match_cache_input=ticket_match_cache_input,
             ticket_match_cache_output=ticket_match_cache_output,
+            ticket_field=ticket_field,
             progress_label=progress_label,
         )
     finally:
@@ -576,6 +581,7 @@ def _filter_incident_tickets_excel(
     expand_sites_by_device: bool = False,
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
+    ticket_field: str = "工单ID",
     progress_label: str = None,
 ):
     """按文件类型选择合适的 Excel 读取方式。"""
@@ -590,6 +596,7 @@ def _filter_incident_tickets_excel(
             expand_sites_by_device=expand_sites_by_device,
             ticket_match_cache_input=ticket_match_cache_input,
             ticket_match_cache_output=ticket_match_cache_output,
+            ticket_field=ticket_field,
             progress_label=progress_label,
         )
 
@@ -604,15 +611,16 @@ def _filter_incident_tickets_excel(
         expand_sites_by_device=expand_sites_by_device,
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
+        ticket_field=ticket_field,
         progress_label=progress_label,
     )
 
 
-def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row):
+def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row, ticket_field: str):
     if result_df is None:
         return
 
-    ticket_col_idx = _get_ticket_column_index(result_df)
+    ticket_col_idx = _get_ticket_column_index(result_df, ticket_field)
     for row_idx, row in enumerate(result_df.itertuples(index=False, name=None)):
         ticket_id = row[ticket_col_idx]
         site_ids = matched_sites_by_row[row_idx]
@@ -637,6 +645,7 @@ def _filter_incident_tickets_file(
     device_matcher: dict = None,
     expand_sites_by_device: bool = False,
     json_only: bool = False,
+    ticket_field: str = "工单ID",
 ):
     """筛选单个 Excel 文件。"""
     _print_file_start(input_file)
@@ -650,6 +659,7 @@ def _filter_incident_tickets_file(
         expand_sites_by_device=expand_sites_by_device,
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
+        ticket_field=ticket_field,
         progress_label=f"处理记录 {os.path.basename(input_file)}",
     )
 
@@ -663,7 +673,7 @@ def _filter_incident_tickets_file(
 
         if json_output_file:
             os.makedirs(os.path.dirname(json_output_file) or '.', exist_ok=True)
-            json_data = _build_ticket_site_json(result_df, matched_sites_by_row)
+            json_data = _build_ticket_site_json(result_df, matched_sites_by_row, ticket_field)
             with open(json_output_file, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
         _print_section("处理结果")
@@ -694,6 +704,7 @@ def filter_incident_tickets(
     ne_graph_file: str = None,
     expand_sites_by_device: bool = False,
     json_only: bool = False,
+    ticket_field: str = "工单ID",
 ):
     """筛选满足条件的Incident Ticket记录"""
     # 加载站点设备映射
@@ -722,6 +733,7 @@ def filter_incident_tickets(
         init_items.append(("匹配中间结果输入", match_cache_input_file))
     if match_cache_output_file:
         init_items.append(("匹配中间结果输出", match_cache_output_file))
+    init_items.append(("工单字段", ticket_field))
     _print_key_values(init_items)
     return _filter_incident_tickets_file(
         input_file,
@@ -736,6 +748,7 @@ def filter_incident_tickets(
         device_matcher=device_matcher,
         expand_sites_by_device=expand_sites_by_device,
         json_only=json_only,
+        ticket_field=ticket_field,
     )
 
 
@@ -769,7 +782,12 @@ def main():
     )
     parser.add_argument(
         '-j', '--json-output',
-        help='JSON输出文件（可选），格式：{工单号: [站点列表]}'
+        help='JSON输出文件（可选），格式：{工单字段值: [站点列表]}'
+    )
+    parser.add_argument(
+        '--ticket-field',
+        default='工单ID',
+        help='输入 Excel 中的工单字段列名，默认: 工单ID'
     )
     parser.add_argument(
         '--ne-graph',
@@ -821,6 +839,7 @@ def main():
     if args.match_cache_input:
         init_items.append(("匹配中间结果输入", args.match_cache_input))
     init_items.append(("匹配中间结果输出", match_cache_output_file))
+    init_items.append(("工单字段", args.ticket_field))
     _print_key_values(init_items)
 
     input_files = list(_iter_incident_input_files(args.input))
@@ -849,6 +868,7 @@ def main():
                     expand_sites_by_device=args.expand_sites_by_device,
                     ticket_match_cache_input=aggregated_match_cache,
                     ticket_match_cache_output=aggregated_match_cache,
+                    ticket_field=args.ticket_field,
                     progress_label=f"处理记录 {os.path.basename(input_file)}",
                 )
 
@@ -859,7 +879,7 @@ def main():
                     aggregate_stats[key] += stats.get(key, 0)
                 if result_df is not None:
                     aggregated_result_dfs.append(result_df)
-                    _merge_ticket_site_json(aggregated_json, result_df, matched_sites_by_row)
+                    _merge_ticket_site_json(aggregated_json, result_df, matched_sites_by_row, args.ticket_field)
                 file_progress.update()
         finally:
             file_progress.close()
@@ -903,6 +923,7 @@ def main():
         ne_graph_file=args.ne_graph,
         expand_sites_by_device=args.expand_sites_by_device,
         json_only=args.json_only,
+        ticket_field=args.ticket_field,
     )
 
 
