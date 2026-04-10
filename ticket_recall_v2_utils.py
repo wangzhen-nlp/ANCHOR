@@ -100,6 +100,16 @@ def load_upper_bound_index(filepath):
 
         ticket_site_count = int(item.get("ticket_site_count", 0) or 0)
         associated_site_count = int(item.get("associated_site_count", 0) or 0)
+        associated_sites = sorted(
+            {
+                normalized_site_id
+                for normalized_site_id in (
+                    normalize_text(site_id)
+                    for site_id in item.get("associated_sites", [])
+                )
+                if normalized_site_id
+            }
+        )
 
         merged_site_evidence = defaultdict(list)
         direct_anchor_times = []
@@ -130,6 +140,7 @@ def load_upper_bound_index(filepath):
         ticket_index[ticket_id] = {
             "ticket_site_count": ticket_site_count,
             "associated_site_count": associated_site_count,
+            "associated_sites": associated_sites,
             "fully_associable": ticket_site_count > 0 and associated_site_count == ticket_site_count,
             "window_seconds": window_seconds,
             "ticket_windows": ticket_windows,

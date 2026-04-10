@@ -12,9 +12,7 @@ from compute_group_output_ticket_recall import (
     _extract_ticket_ids,
 )
 from compute_ticket_site_recall import (
-    _build_ticket_sites_from_alarms,
     _compute_site_metrics,
-    _load_ticket_sites,
     _normalize_text,
 )
 from compute_ticket_site_recall_upper_bound import _should_skip_alarm
@@ -210,29 +208,21 @@ def compute_group_output_ticket_recall_v2(
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
-    eligible_ticket_ids = {
+    ticket_sites = {
         ticket_id
         for ticket_id, item in upper_bound_index.items()
-        if item.get("fully_associable")
+        if int(item.get("associated_site_count", 0) or 0) > 0
     }
-    if not eligible_ticket_ids:
-        raise ValueError("召回率上限结果里没有“可完整关联”的工单")
+    if not ticket_sites:
+        raise ValueError("召回率上限结果里没有“已关联站点”的工单")
 
-    if ticket_sites_file:
-        ticket_sites = _load_ticket_sites(ticket_sites_file)
-        ticket_site_source = "ticket_sites"
-    else:
-        if not alarms_input:
-            raise ValueError("未提供 ticket-sites 时，必须提供 alarms 以便从告警中回推工单站点")
-        ticket_sites = _build_ticket_sites_from_alarms(alarms_input, ticket_field, ne_graph_file)
-        ticket_site_source = "alarms"
+    ticket_sites = {
+        ticket_id: list(upper_bound_index[ticket_id].get("associated_sites", []))
+        for ticket_id in sorted(ticket_sites)
+    }
+    ticket_site_source = "upper_bound_associated_sites"
 
     ne_graph_data = load_ne_graph_data(ne_graph_file)
-    ticket_sites = {
-        ticket_id: site_list
-        for ticket_id, site_list in ticket_sites.items()
-        if ticket_id in eligible_ticket_ids
-    }
     if no_data_site:
         if not ne_graph_data:
             raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
@@ -254,7 +244,7 @@ def compute_group_output_ticket_recall_v2(
             if len(site_list) >= min_site_num
         }
     if not ticket_sites:
-        raise ValueError("没有可用于计算的工单站点映射")
+        raise ValueError("没有可用于计算的 gold 站点映射")
 
     referenced_group_ids = set()
     if ultimate_only:
@@ -486,7 +476,7 @@ def compute_group_output_ticket_recall_v2(
 
 def main():
     parser = ArgumentParser(
-        description="v2：只针对上限结果里可完整关联的工单，输出故障组方法召回到的站点/告警和未召回站点/告警"
+        description="v2：以上限结果里的 associated_sites 作为 gold，输出故障组方法召回到的站点/告警和未召回站点/告警"
     )
     parser.add_argument(
         "group_output",
@@ -499,7 +489,7 @@ def main():
     )
     parser.add_argument(
         "--ticket-sites",
-        help="工单站点映射 JSON；不提供时会退化为从 alarms 中回推工单站点",
+        help="兼容保留参数；当前 v2 的 gold 站点固定使用 upper bound 的 associated_sites",
     )
     parser.add_argument(
         "--ticket-field",
@@ -508,12 +498,12 @@ def main():
     )
     parser.add_argument(
         "--alarms",
-        help="原始告警输入。未提供 ticket-sites 时必填；提供后，分母口径也按原始告警来判断。",
+        help="原始告警输入。提供后，分母口径按原始告警来判断；不提供时退化为按 group output 判断。",
     )
     parser.add_argument(
         "--ne-graph",
         default="ne_graph.json",
-        help="未提供 ticket-sites 时，用于通过告警源回推 site_id 的 ne_graph 文件，默认: ne_graph.json",
+        help="用于 site/domain 过滤的 ne_graph 文件，默认: ne_graph.json",
     )
     parser.add_argument(
         "-o",
