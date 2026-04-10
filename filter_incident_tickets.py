@@ -225,12 +225,11 @@ def _print_stats(title: str, stats: dict):
     ])
 
 
-def _print_output_result(row_count: int, output_file: str, json_output_file: str = None, aggregated: bool = False):
+def _print_output_result(row_count: int, output_file: str = None, json_output_file: str = None, aggregated: bool = False):
     action = "汇总输出" if aggregated else "输出"
-    items = [
-        (f"{action}记录数", row_count),
-        (f"{action}Excel", output_file),
-    ]
+    items = [(f"{action}记录数", row_count)]
+    if output_file:
+        items.append((f"{action}Excel", output_file))
     if json_output_file:
         items.append((f"{action}JSON", json_output_file))
     _print_key_values(items)
@@ -637,6 +636,7 @@ def _filter_incident_tickets_file(
     device_site_mapping: dict = None,
     device_matcher: dict = None,
     expand_sites_by_device: bool = False,
+    json_only: bool = False,
 ):
     """筛选单个 Excel 文件。"""
     _print_file_start(input_file)
@@ -657,8 +657,9 @@ def _filter_incident_tickets_file(
 
     # 输出结果
     if result_df is not None:
-        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
-        result_df.to_excel(output_file, index=False)
+        if not json_only:
+            os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+            result_df.to_excel(output_file, index=False)
 
         if json_output_file:
             os.makedirs(os.path.dirname(json_output_file) or '.', exist_ok=True)
@@ -666,7 +667,7 @@ def _filter_incident_tickets_file(
             with open(json_output_file, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
         _print_section("处理结果")
-        _print_output_result(len(result_df), output_file, json_output_file)
+        _print_output_result(len(result_df), None if json_only else output_file, json_output_file)
         _print_key_values([("输出记录关联站点总数", _count_total_sites(matched_sites_by_row))])
         if match_cache_output_file and ticket_match_cache_output is not None:
             _write_match_cache(match_cache_output_file, ticket_match_cache_output, expand_sites_by_device)
@@ -692,6 +693,7 @@ def filter_incident_tickets(
     match_cache_output_file: str = None,
     ne_graph_file: str = None,
     expand_sites_by_device: bool = False,
+    json_only: bool = False,
 ):
     """筛选满足条件的Incident Ticket记录"""
     # 加载站点设备映射
@@ -733,6 +735,7 @@ def filter_incident_tickets(
         device_site_mapping=device_site_mapping,
         device_matcher=device_matcher,
         expand_sites_by_device=expand_sites_by_device,
+        json_only=json_only,
     )
 
 
@@ -786,6 +789,11 @@ def main():
         '--match-cache-output',
         help='输出工单匹配中间结果 JSON；默认随 Excel 输出生成同名 .match_cache.json'
     )
+    parser.add_argument(
+        '--json-only',
+        action='store_true',
+        help='只输出 JSON 和匹配中间结果，不生成 Excel'
+    )
 
     args = parser.parse_args()
 
@@ -808,6 +816,8 @@ def main():
             ("设备补站点", "开启"),
             ("设备关键词数", len(device_site_mapping)),
         ])
+    if args.json_only:
+        init_items.append(("仅输出 JSON", "开启"))
     if args.match_cache_input:
         init_items.append(("匹配中间结果输入", args.match_cache_input))
     init_items.append(("匹配中间结果输出", match_cache_output_file))
@@ -866,10 +876,11 @@ def main():
 
         if aggregated_result_dfs:
             final_result_df = pd.concat(aggregated_result_dfs, ignore_index=True)
-            os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-            final_result_df.to_excel(args.output, index=False)
             _print_section("汇总结果")
-            _print_output_result(len(final_result_df), args.output, args.json_output, aggregated=True)
+            if not args.json_only:
+                os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+                final_result_df.to_excel(args.output, index=False)
+            _print_output_result(len(final_result_df), None if args.json_only else args.output, args.json_output, aggregated=True)
         else:
             _print_section("汇总结果")
             print("没有满足条件的记录")
@@ -891,6 +902,7 @@ def main():
         match_cache_output_file=match_cache_output_file,
         ne_graph_file=args.ne_graph,
         expand_sites_by_device=args.expand_sites_by_device,
+        json_only=args.json_only,
     )
 
 
