@@ -770,7 +770,8 @@ def main():
     )
     parser.add_argument(
         '--ne-graph',
-        help='ne_graph.json 文件；开启设备补站点时必填'
+        default='ne_graph.json',
+        help='ne_graph.json 文件；默认: ne_graph.json；开启设备补站点时需要可用'
     )
     parser.add_argument(
         '--expand-sites-by-device',
