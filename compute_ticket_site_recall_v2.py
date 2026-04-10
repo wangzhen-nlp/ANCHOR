@@ -7,7 +7,9 @@ from collections import defaultdict
 from alarm_types import OFFLINE_ALARMS
 from alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from compute_ticket_site_recall import (
+    _build_ticket_sites_from_alarms,
     _compute_site_metrics,
+    _load_ticket_sites,
     _normalize_text,
     _parse_group_ids,
     _resolve_alarm_site_id,
@@ -175,22 +177,45 @@ def compute_ticket_site_recall_v2(
     potential=False,
     only_one=False,
     min_site_num=0,
+    upper_bound_associated_as_gold=False,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
-    ticket_sites = {
-        ticket_id
-        for ticket_id, item in upper_bound_index.items()
-        if int(item.get("associated_site_count", 0) or 0) > 0
-    }
-    if not ticket_sites:
-        raise ValueError("召回率上限结果里没有“已关联站点”的工单")
+    if upper_bound_associated_as_gold:
+        eligible_ticket_ids = {
+            ticket_id
+            for ticket_id, item in upper_bound_index.items()
+            if int(item.get("associated_site_count", 0) or 0) > 0
+        }
+        if not eligible_ticket_ids:
+            raise ValueError("召回率上限结果里没有“已关联站点”的工单")
 
-    ticket_sites = {
-        ticket_id: list(upper_bound_index[ticket_id].get("associated_sites", []))
-        for ticket_id in sorted(ticket_sites)
-    }
-    ticket_site_source = "upper_bound_associated_sites"
+        ticket_sites = {
+            ticket_id: list(upper_bound_index[ticket_id].get("associated_sites", []))
+            for ticket_id in sorted(eligible_ticket_ids)
+        }
+        ticket_site_source = "upper_bound_associated_sites"
+    else:
+        eligible_ticket_ids = {
+            ticket_id
+            for ticket_id, item in upper_bound_index.items()
+            if item.get("fully_associable")
+        }
+        if not eligible_ticket_ids:
+            raise ValueError("召回率上限结果里没有“可完整关联”的工单")
+
+        if ticket_sites_file:
+            ticket_sites = _load_ticket_sites(ticket_sites_file)
+            ticket_site_source = "ticket_sites"
+        else:
+            ticket_sites = _build_ticket_sites_from_alarms(alarm_input, ticket_field, ne_graph_file)
+            ticket_site_source = "alarms"
+
+        ticket_sites = {
+            ticket_id: site_list
+            for ticket_id, site_list in ticket_sites.items()
+            if ticket_id in eligible_ticket_ids
+        }
 
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     if no_data_site:
@@ -214,7 +239,7 @@ def compute_ticket_site_recall_v2(
             if len(site_list) >= min_site_num
         }
     if not ticket_sites:
-        raise ValueError("没有可用于计算的 gold 站点映射")
+        raise ValueError("没有可用于计算的工单站点映射")
 
     ne_to_site = {}
     if ne_graph_file and os.path.exists(ne_graph_file):
@@ -422,6 +447,7 @@ def compute_ticket_site_recall_v2(
         "potential_mode": potential,
         "only_one_mode": only_one,
         "min_site_num": min_site_num,
+        "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
         "details": details,
     }
 
@@ -452,7 +478,7 @@ def main():
     )
     parser.add_argument(
         "--ticket-sites",
-        help="兼容保留参数；当前 v2 的 gold 站点固定使用 upper bound 的 associated_sites",
+        help="工单站点映射 JSON；不提供时会退化为从 alarms 中回推工单站点",
     )
     parser.add_argument(
         "--ticket-field",
@@ -467,7 +493,7 @@ def main():
     parser.add_argument(
         "--ne-graph",
         default="ne_graph.json",
-        help="用于 site/domain 过滤的 ne_graph 文件，默认: ne_graph.json",
+        help="用于通过告警源回填 site_id 以及做 site/domain 过滤的 ne_graph 文件，默认: ne_graph.json",
     )
     parser.add_argument(
         "-o",
@@ -520,6 +546,11 @@ def main():
         default=0,
         help="仅统计工单站点数 >= 该值的工单；默认: 0（不过滤）",
     )
+    parser.add_argument(
+        "--upper-bound-associated-as-gold",
+        action="store_true",
+        help="改用 upper bound 的 associated_sites 作为 gold；不开时保持原来的 fully_associable + 原工单站点口径",
+    )
 
     args = parser.parse_args()
 
@@ -541,6 +572,7 @@ def main():
             potential=args.potential,
             only_one=args.only_one,
             min_site_num=args.min_site_num,
+            upper_bound_associated_as_gold=args.upper_bound_associated_as_gold,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
