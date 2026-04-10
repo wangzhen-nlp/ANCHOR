@@ -442,8 +442,8 @@ def main():
     parser.add_argument(
         "--window-seconds",
         type=int,
-        default=600,
-        help="缺失站点告警与工单告警允许的时间窗，单位秒，默认: 600",
+        default=900,
+        help="缺失站点告警与工单告警允许的时间窗，单位秒，默认: 900",
     )
     parser.add_argument(
         "--ne-graph",
