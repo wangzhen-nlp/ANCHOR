@@ -8,7 +8,7 @@ import argparse
 import json
 import os
 import warnings
-from collections import deque
+from collections import defaultdict, deque
 
 import pandas as pd
 from progress_utils import ProgressBar
@@ -27,22 +27,38 @@ def load_site_device_mapping(json_file: str) -> dict:
     # 转换为：站点ID -> 设备类型集合
     site_devices = {}
     for site_id, devices in data.items():
+        normalized_site_id = str(site_id).strip().upper()
+        if not normalized_site_id:
+            continue
         if isinstance(devices, dict):
-            site_devices[site_id] = set(devices.keys())
+            site_devices[normalized_site_id] = {
+                str(device_type).strip().upper()
+                for device_type in devices.keys()
+                if str(device_type).strip()
+            }
         else:
-            site_devices[site_id] = set()
+            site_devices[normalized_site_id] = set()
     return site_devices
 
 
-def build_site_matcher(known_site_ids: list) -> dict:
-    """基于站点全集构建 Aho-Corasick 自动机，便于按文本一次扫描匹配站点。"""
+def _normalize_match_value(value) -> str:
+    return str(value).strip().upper() if value is not None else ""
+
+
+def build_keyword_matcher(keyword_to_outputs: dict) -> dict:
+    """基于关键词全集构建 Aho-Corasick 自动机。"""
     root = {"next": {}, "fail": None, "outputs": []}
 
-    for site_id in known_site_ids:
+    for keyword, outputs in keyword_to_outputs.items():
+        normalized_keyword = _normalize_match_value(keyword)
+        if not normalized_keyword:
+            continue
         node = root
-        for char in site_id:
+        for char in normalized_keyword:
             node = node["next"].setdefault(char, {"next": {}, "fail": None, "outputs": []})
-        node["outputs"].append(site_id)
+        for output in outputs:
+            if output:
+                node["outputs"].append((len(normalized_keyword), output))
 
     queue = deque()
     for child in root["next"].values():
@@ -62,34 +78,81 @@ def build_site_matcher(known_site_ids: list) -> dict:
     return root
 
 
+def build_site_matcher(known_site_ids: list) -> dict:
+    """基于站点全集构建 Aho-Corasick 自动机，便于按文本一次扫描匹配站点。"""
+    keyword_to_outputs = {
+        _normalize_match_value(site_id): [_normalize_match_value(site_id)]
+        for site_id in known_site_ids
+        if _normalize_match_value(site_id)
+    }
+    return build_keyword_matcher(keyword_to_outputs)
+
+
+def load_device_site_mapping(ne_graph_file: str) -> dict:
+    """加载设备到站点的映射，仅使用设备ID作为匹配关键词。"""
+    with open(ne_graph_file, 'r', encoding='utf-8') as f:
+        ne_graph = json.load(f)
+
+    device_to_sites = defaultdict(set)
+    if not isinstance(ne_graph, dict):
+        return {}
+
+    for ne_id, ne_info in ne_graph.items():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _normalize_match_value(ne_info.get('site_id', ''))
+        if not site_id:
+            continue
+        normalized_token = _normalize_match_value(ne_id)
+        if normalized_token:
+            device_to_sites[normalized_token].add(site_id)
+
+    return {
+        token: sorted(site_ids)
+        for token, site_ids in device_to_sites.items()
+        if site_ids
+    }
+
+
+def build_device_matcher(device_site_mapping: dict) -> dict:
+    """基于设备关键词构建设备匹配自动机，输出其关联站点。"""
+    return build_keyword_matcher(device_site_mapping)
+
+
 def _row_to_text(row_values) -> str:
     return ' '.join(str(value) for value in row_values)
 
 
-def extract_site_ids_from_text(text: str, site_matcher: dict) -> list:
-    """从文本中提取所有站点ID（基于 Aho-Corasick 自动机，去重并按首次出现排序）"""
+def extract_outputs_from_text(text: str, matcher: dict) -> list:
+    """从文本中提取关键词关联输出（去重并按首次出现排序）。"""
     if not text:
         return []
 
+    normalized_text = _normalize_match_value(text)
     first_positions = {}
-    state = site_matcher
+    state = matcher
 
-    for idx, char in enumerate(text):
-        while state is not site_matcher and char not in state["next"]:
+    for idx, char in enumerate(normalized_text):
+        while state is not matcher and char not in state["next"]:
             state = state["fail"]
 
         if char in state["next"]:
             state = state["next"][char]
         else:
-            state = site_matcher
+            state = matcher
 
-        for site_id in state["outputs"]:
-            start = idx - len(site_id) + 1
-            if site_id not in first_positions:
-                first_positions[site_id] = start
+        for token_len, output in state["outputs"]:
+            start = idx - token_len + 1
+            if output not in first_positions:
+                first_positions[output] = start
 
-    positions = sorted((pos, site_id) for site_id, pos in first_positions.items())
-    return [site_id for pos, site_id in positions]
+    positions = sorted((pos, output) for output, pos in first_positions.items())
+    return [output for pos, output in positions]
+
+
+def extract_site_ids_from_text(text: str, site_matcher: dict) -> list:
+    """从文本中提取所有站点ID（基于 Aho-Corasick 自动机，去重并按首次出现排序）"""
+    return extract_outputs_from_text(text, site_matcher)
 
 
 def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
@@ -113,7 +176,7 @@ def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
         devices = site_device_mapping[site_id]
         all_devices.update(devices)
 
-        if 'Transmission' not in devices:
+        if 'TRANSMISSION' not in devices:
             valid = False
 
     return valid, all_devices
@@ -168,6 +231,16 @@ def _print_output_result(row_count: int, output_file: str, json_output_file: str
     _print_key_values(items)
 
 
+def _count_unique_sites(matched_sites_by_row) -> int:
+    site_ids = set()
+    for row_sites in matched_sites_by_row or []:
+        for site_id in row_sites:
+            normalized_site_id = _normalize_match_value(site_id)
+            if normalized_site_id:
+                site_ids.add(normalized_site_id)
+    return len(site_ids)
+
+
 def _get_ticket_column_index(df: pd.DataFrame) -> int:
     try:
         return df.columns.get_loc('工单ID')
@@ -181,7 +254,12 @@ def _build_ticket_site_json(result_df, matched_sites_by_row):
     for row_idx, row in enumerate(result_df.itertuples(index=False, name=None)):
         ticket_id = row[ticket_col_idx]
         site_ids = matched_sites_by_row[row_idx]
-        json_data[ticket_id] = site_ids
+        existing_sites = json_data.setdefault(ticket_id, [])
+        seen = set(existing_sites)
+        for site_id in site_ids:
+            if site_id not in seen:
+                existing_sites.append(site_id)
+                seen.add(site_id)
     return json_data
 
 
@@ -196,7 +274,28 @@ def _normalize_header_row(header_row):
     return headers
 
 
-def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+def _merge_site_lists(primary_site_ids: list, extra_site_ids: list) -> list:
+    merged = []
+    seen = set()
+    for site_id in list(primary_site_ids) + list(extra_site_ids):
+        normalized_site_id = _normalize_match_value(site_id)
+        if not normalized_site_id or normalized_site_id in seen:
+            continue
+        merged.append(normalized_site_id)
+        seen.add(normalized_site_id)
+    return merged
+
+
+def _filter_incident_tickets_rows(
+    columns,
+    row_iter,
+    total_rows: int,
+    site_device_mapping: dict,
+    site_matcher: dict,
+    device_matcher: dict = None,
+    expand_sites_by_device: bool = False,
+    progress_label: str = None,
+):
     """筛选流式行数据，并仅保留命中的记录。"""
     filtered_indices = []
     filtered_rows = []
@@ -212,8 +311,11 @@ def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_devic
             elif len(row) > len(columns):
                 row = tuple(row[:len(columns)])
 
-            # 提取站点ID
-            site_ids = extract_site_ids_from_text(_row_to_text(row), site_matcher)
+            row_text = _row_to_text(row)
+            site_ids = extract_site_ids_from_text(row_text, site_matcher)
+            if expand_sites_by_device and device_matcher:
+                device_site_ids = extract_outputs_from_text(row_text, device_matcher)
+                site_ids = _merge_site_lists(site_ids, device_site_ids)
 
             if len(site_ids) < 2:
                 stats['only_one_site'] += 1
@@ -240,7 +342,14 @@ def _filter_incident_tickets_rows(columns, row_iter, total_rows: int, site_devic
     return result_df, stats, matched_sites_by_row
 
 
-def _filter_incident_tickets_df(df, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+def _filter_incident_tickets_df(
+    df,
+    site_device_mapping: dict,
+    site_matcher: dict,
+    device_matcher: dict = None,
+    expand_sites_by_device: bool = False,
+    progress_label: str = None,
+):
     """筛选单个 DataFrame。"""
     row_iter = df.itertuples(index=False, name=None)
     return _filter_incident_tickets_rows(
@@ -249,11 +358,20 @@ def _filter_incident_tickets_df(df, site_device_mapping: dict, site_matcher: dic
         len(df),
         site_device_mapping,
         site_matcher,
+        device_matcher=device_matcher,
+        expand_sites_by_device=expand_sites_by_device,
         progress_label=progress_label,
     )
 
 
-def _filter_incident_tickets_xlsx_stream(input_file: str, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+def _filter_incident_tickets_xlsx_stream(
+    input_file: str,
+    site_device_mapping: dict,
+    site_matcher: dict,
+    device_matcher: dict = None,
+    expand_sites_by_device: bool = False,
+    progress_label: str = None,
+):
     """使用 openpyxl 只读模式流式读取 xlsx，避免一次性把整表读入内存。"""
     if load_workbook is None:
         raise ImportError("openpyxl 不可用，无法启用 xlsx 流式读取")
@@ -280,13 +398,22 @@ def _filter_incident_tickets_xlsx_stream(input_file: str, site_device_mapping: d
             total_rows,
             site_device_mapping,
             site_matcher,
+            device_matcher=device_matcher,
+            expand_sites_by_device=expand_sites_by_device,
             progress_label=progress_label,
         )
     finally:
         workbook.close()
 
 
-def _filter_incident_tickets_excel(input_file: str, site_device_mapping: dict, site_matcher: dict, progress_label: str = None):
+def _filter_incident_tickets_excel(
+    input_file: str,
+    site_device_mapping: dict,
+    site_matcher: dict,
+    device_matcher: dict = None,
+    expand_sites_by_device: bool = False,
+    progress_label: str = None,
+):
     """按文件类型选择合适的 Excel 读取方式。"""
     file_ext = os.path.splitext(input_file)[1].lower()
     if file_ext in {'.xlsx', '.xlsm', '.xltx', '.xltm'} and load_workbook is not None:
@@ -294,6 +421,8 @@ def _filter_incident_tickets_excel(input_file: str, site_device_mapping: dict, s
             input_file,
             site_device_mapping,
             site_matcher,
+            device_matcher=device_matcher,
+            expand_sites_by_device=expand_sites_by_device,
             progress_label=progress_label,
         )
 
@@ -303,6 +432,8 @@ def _filter_incident_tickets_excel(input_file: str, site_device_mapping: dict, s
         df,
         site_device_mapping,
         site_matcher,
+        device_matcher=device_matcher,
+        expand_sites_by_device=expand_sites_by_device,
         progress_label=progress_label,
     )
 
@@ -323,7 +454,15 @@ def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row):
                 seen.add(site_id)
 
 
-def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, site_matcher: dict, output_file: str, json_output_file: str = None):
+def _filter_incident_tickets_file(
+    input_file: str,
+    site_device_mapping: dict,
+    site_matcher: dict,
+    output_file: str,
+    json_output_file: str = None,
+    device_matcher: dict = None,
+    expand_sites_by_device: bool = False,
+):
     """筛选单个 Excel 文件。"""
     _print_file_start(input_file)
 
@@ -331,6 +470,8 @@ def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, si
         input_file,
         site_device_mapping,
         site_matcher,
+        device_matcher=device_matcher,
+        expand_sites_by_device=expand_sites_by_device,
         progress_label=f"处理记录 {os.path.basename(input_file)}",
     )
 
@@ -348,6 +489,7 @@ def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, si
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
         _print_section("处理结果")
         _print_output_result(len(result_df), output_file, json_output_file)
+        _print_key_values([("输出记录关联站点总数", _count_unique_sites(matched_sites_by_row))])
 
         return result_df, stats
     else:
@@ -356,15 +498,42 @@ def _filter_incident_tickets_file(input_file: str, site_device_mapping: dict, si
         return None, stats
 
 
-def filter_incident_tickets(input_file: str, site_device_file: str, output_file: str, json_output_file: str = None):
+def filter_incident_tickets(
+    input_file: str,
+    site_device_file: str,
+    output_file: str,
+    json_output_file: str = None,
+    ne_graph_file: str = None,
+    expand_sites_by_device: bool = False,
+):
     """筛选满足条件的Incident Ticket记录"""
     # 加载站点设备映射
     site_device_mapping = load_site_device_mapping(site_device_file)
     known_site_ids = build_known_site_ids(site_device_mapping)
     site_matcher = build_site_matcher(known_site_ids)
+    device_matcher = None
+    if expand_sites_by_device:
+        if not ne_graph_file:
+            raise ValueError("开启 expand-sites-by-device 时，必须提供 --ne-graph")
+        device_site_mapping = load_device_site_mapping(ne_graph_file)
+        device_matcher = build_device_matcher(device_site_mapping)
     _print_section("初始化")
-    _print_key_values([("已加载站点数", len(site_device_mapping))])
-    return _filter_incident_tickets_file(input_file, site_device_mapping, site_matcher, output_file, json_output_file)
+    init_items = [("已加载站点数", len(site_device_mapping))]
+    if expand_sites_by_device:
+        init_items.extend([
+            ("设备补站点", "开启"),
+            ("设备关键词数", len(device_site_mapping)),
+        ])
+    _print_key_values(init_items)
+    return _filter_incident_tickets_file(
+        input_file,
+        site_device_mapping,
+        site_matcher,
+        output_file,
+        json_output_file,
+        device_matcher=device_matcher,
+        expand_sites_by_device=expand_sites_by_device,
+    )
 
 
 def _iter_incident_input_files(input_path: str):
@@ -399,14 +568,36 @@ def main():
         '-j', '--json-output',
         help='JSON输出文件（可选），格式：{工单号: [站点列表]}'
     )
+    parser.add_argument(
+        '--ne-graph',
+        help='ne_graph.json 文件；开启设备补站点时必填'
+    )
+    parser.add_argument(
+        '--expand-sites-by-device',
+        action='store_true',
+        help='在直接匹配站点ID之外，再通过匹配上的设备ID关联出站点'
+    )
 
     args = parser.parse_args()
 
     site_device_mapping = load_site_device_mapping(args.site_device)
     known_site_ids = build_known_site_ids(site_device_mapping)
     site_matcher = build_site_matcher(known_site_ids)
+    device_matcher = None
+    device_site_mapping = {}
+    if args.expand_sites_by_device:
+        if not args.ne_graph:
+            raise ValueError("开启 expand-sites-by-device 时，必须提供 --ne-graph")
+        device_site_mapping = load_device_site_mapping(args.ne_graph)
+        device_matcher = build_device_matcher(device_site_mapping)
     _print_section("初始化")
-    _print_key_values([("已加载站点数", len(site_device_mapping))])
+    init_items = [("已加载站点数", len(site_device_mapping))]
+    if args.expand_sites_by_device:
+        init_items.extend([
+            ("设备补站点", "开启"),
+            ("设备关键词数", len(device_site_mapping)),
+        ])
+    _print_key_values(init_items)
 
     input_files = list(_iter_incident_input_files(args.input))
     if not input_files:
@@ -428,6 +619,8 @@ def main():
                     input_file,
                     site_device_mapping,
                     site_matcher,
+                    device_matcher=device_matcher,
+                    expand_sites_by_device=args.expand_sites_by_device,
                     progress_label=f"处理记录 {os.path.basename(input_file)}",
                 )
 
@@ -450,6 +643,7 @@ def main():
             ("命中记录数", aggregate_stats['valid']),
             ("不足 2 个站点", aggregate_stats['only_one_site']),
             ("站点缺少 Transmission 设备", aggregate_stats['missing_transmission_device']),
+            ("输出记录关联站点总数", _count_unique_sites(aggregated_json.values())),
         ])
 
         if aggregated_result_dfs:
@@ -468,7 +662,14 @@ def main():
                 json.dump(aggregated_json, f, ensure_ascii=False, indent=2)
         return
 
-    filter_incident_tickets(args.input, args.site_device, args.output, args.json_output)
+    filter_incident_tickets(
+        args.input,
+        args.site_device,
+        args.output,
+        args.json_output,
+        ne_graph_file=args.ne_graph,
+        expand_sites_by_device=args.expand_sites_by_device,
+    )
 
 
 if __name__ == '__main__':
