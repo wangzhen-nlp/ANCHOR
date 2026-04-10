@@ -89,7 +89,7 @@ def collect_transmission_isolated_sites(ne_graph_data):
                     site_to_data_external_neighbor_sites[site_id].add(neighbor_site_id)
 
     isolated_sites = []
-    for site_id, transmission_ne_ids in sorted(site_to_transmission_nes.items()):
+    for site_id, transmission_ne_ids in site_to_transmission_nes.items():
         transmission_external_neighbor_sites = sorted(
             site_to_transmission_external_neighbor_sites.get(site_id, set())
         )
@@ -118,6 +118,12 @@ def collect_transmission_isolated_sites(ne_graph_data):
             }
         )
 
+    isolated_sites.sort(
+        key=lambda item: (
+            -item.get("transmission_ne_count", 0),
+            item.get("site_id", ""),
+        )
+    )
     return isolated_sites
 
 
