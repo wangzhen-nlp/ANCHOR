@@ -227,7 +227,7 @@ def compute_ticket_site_recall_v2(
     if ne_graph_file and os.path.exists(ne_graph_file):
         ne_to_site = build_ne_to_site_map(ne_graph_file)
 
-    stage_total = 3 if (loose or potential) else 2
+    stage_total = 4 if (loose or potential) else 2
     print(f"阶段 1/{stage_total}：提取 eligible 工单的故障组索引...")
     ticket_to_groups, ticket_alarm_counts = _build_ticket_group_index_for_eligible(
         alarm_input,
@@ -255,17 +255,17 @@ def compute_ticket_site_recall_v2(
             for site_id in site_list
             if _normalize_text(site_id)
         }
-        print(f"阶段 2/{stage_total}：提取工单站点上的所有故障组ID覆盖站点和站点告警...")
-        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes_for_sites(
+        print(f"阶段 2/{stage_total}：提取工单站点上的候选故障组ID覆盖站点和站点告警...")
+        scoped_group_to_sites, scoped_group_to_site_alarms = _build_group_alarm_indexes_for_sites(
             alarm_input,
             allowed_site_ids=allowed_site_ids,
             ne_to_site=ne_to_site,
             group_field=group_field,
         )
         print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外故障组ID...")
-        site_to_groups = build_site_to_group_index(group_to_sites) if loose else {}
-        group_site_time_index = build_group_site_time_index(group_to_site_alarms) if loose else {}
-        alarm_to_groups = build_alarm_to_group_index(group_to_site_alarms) if potential else {}
+        site_to_groups = build_site_to_group_index(scoped_group_to_sites) if loose else {}
+        group_site_time_index = build_group_site_time_index(scoped_group_to_site_alarms) if loose else {}
+        alarm_to_groups = build_alarm_to_group_index(scoped_group_to_site_alarms) if potential else {}
         for ticket_id, site_list in ticket_sites.items():
             base_group_ids = ticket_to_base_groups.get(ticket_id, set())
             loose_groups = set()
@@ -290,6 +290,31 @@ def compute_ticket_site_recall_v2(
                 )
                 if potential_groups:
                     potential_ticket_to_groups[ticket_id] = potential_groups
+
+        relevant_group_ids = (
+            {
+                group_id
+                for group_ids in ticket_to_base_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in loose_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in potential_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+        )
+        print(f"阶段 4/{stage_total}：提取最终相关故障组ID的全量覆盖站点和站点告警...")
+        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
+            alarm_input,
+            relevant_group_ids=relevant_group_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
     else:
         print("阶段 2/2：提取相关故障组覆盖到的站点和站点告警...")
         group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(

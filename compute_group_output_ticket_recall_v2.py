@@ -260,7 +260,7 @@ def compute_group_output_ticket_recall_v2(
         print("预处理：提取被其它 group 引用的关联 group...")
         referenced_group_ids = _collect_referenced_group_uuids(group_output_input)
 
-    stage_total = 3 if (loose or potential) else 2
+    stage_total = 4 if (loose or potential) else 2
     print(f"阶段 1/{stage_total}：提取 eligible 工单和故障组输出的关联关系...")
     ticket_to_groups, ticket_occurrence_counts = _build_group_output_ticket_index_for_eligible(
         group_output_input,
@@ -286,16 +286,16 @@ def compute_group_output_ticket_recall_v2(
             for site_id in site_list
             if _normalize_text(site_id)
         }
-        print(f"阶段 2/{stage_total}：提取工单站点上的所有 group 覆盖站点和症状告警...")
-        group_to_sites, group_to_site_alarms = _build_group_output_alarm_indexes_for_sites(
+        print(f"阶段 2/{stage_total}：提取工单站点上的候选 group 覆盖站点和症状告警...")
+        scoped_group_to_sites, scoped_group_to_site_alarms = _build_group_output_alarm_indexes_for_sites(
             group_output_input,
             allowed_site_ids=allowed_site_ids,
             excluded_group_ids=referenced_group_ids,
         )
         print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外 group...")
-        site_to_groups = build_site_to_group_index(group_to_sites) if loose else {}
-        group_site_time_index = build_group_site_time_index(group_to_site_alarms) if loose else {}
-        alarm_to_groups = build_alarm_to_group_index(group_to_site_alarms) if potential else {}
+        site_to_groups = build_site_to_group_index(scoped_group_to_sites) if loose else {}
+        group_site_time_index = build_group_site_time_index(scoped_group_to_site_alarms) if loose else {}
+        alarm_to_groups = build_alarm_to_group_index(scoped_group_to_site_alarms) if potential else {}
         for ticket_id, site_list in ticket_sites.items():
             base_group_ids = ticket_to_base_groups.get(ticket_id, set())
             loose_groups = set()
@@ -320,6 +320,30 @@ def compute_group_output_ticket_recall_v2(
                 )
                 if potential_groups:
                     potential_ticket_to_groups[ticket_id] = potential_groups
+
+        relevant_group_ids = (
+            {
+                group_id
+                for group_ids in ticket_to_base_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in loose_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in potential_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+        )
+        print(f"阶段 4/{stage_total}：提取最终相关 group 的全量覆盖站点和症状告警...")
+        group_to_sites, group_to_site_alarms = _build_group_output_alarm_indexes(
+            group_output_input,
+            relevant_group_ids=relevant_group_ids,
+            excluded_group_ids=referenced_group_ids,
+        )
     else:
         print("阶段 2/2：提取相关故障组覆盖到的站点和症状告警...")
         group_to_sites, group_to_site_alarms = _build_group_output_alarm_indexes(
