@@ -31,6 +31,7 @@ from ticket_recall_v2_utils import (
     dedupe_alarm_records,
     derive_case_jsonl_output_path,
     expand_groups_by_time_window,
+    extract_nonempty_alarm_sites,
     filter_ticket_sites_by_site_flag,
     load_upper_bound_index,
     load_upper_bound_settings,
@@ -386,10 +387,7 @@ def compute_group_output_ticket_recall_v2(
             effective_fault_groups = list(fault_groups)
 
         merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
-
-        predicted_sites = set()
-        for group_id in effective_fault_groups:
-            predicted_sites.update(group_to_sites.get(group_id, set()))
+        predicted_sites = extract_nonempty_alarm_sites(merged_site_alarms)
         true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
         recalled_sites = set(true_positive_sites)
 

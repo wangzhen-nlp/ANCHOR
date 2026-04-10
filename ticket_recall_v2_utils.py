@@ -169,6 +169,20 @@ def build_site_alarm_map_for_sites(site_alarm_map, site_ids):
     return result
 
 
+def extract_nonempty_alarm_sites(site_alarm_map):
+    if not isinstance(site_alarm_map, dict):
+        return set()
+
+    result = set()
+    for site_id, alarms in site_alarm_map.items():
+        normalized_site_id = normalize_text(site_id)
+        if not normalized_site_id or not isinstance(alarms, list):
+            continue
+        if any(isinstance(record, dict) for record in alarms):
+            result.add(normalized_site_id)
+    return result
+
+
 def build_ticket_site_count_distribution(details):
     counts = defaultdict(int)
     for item in details:
