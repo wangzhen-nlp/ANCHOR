@@ -33,8 +33,10 @@ def _extract_site_name(ne_info):
 
 def collect_transmission_isolated_sites(ne_graph_data):
     site_to_transmission_nes = defaultdict(list)
+    site_to_data_nes = defaultdict(list)
     site_to_name = {}
-    site_to_external_neighbor_sites = defaultdict(set)
+    site_to_transmission_external_neighbor_sites = defaultdict(set)
+    site_to_data_external_neighbor_sites = defaultdict(set)
     site_to_unknown_neighbor_nes = defaultdict(set)
 
     if not isinstance(ne_graph_data, dict):
@@ -49,10 +51,14 @@ def collect_transmission_isolated_sites(ne_graph_data):
         if not ne_id or not site_id:
             continue
 
-        if _extract_domain(ne_info) != "TRANSMISSION":
+        domain = _extract_domain(ne_info)
+        if domain not in {"TRANSMISSION", "DATA"}:
             continue
 
-        site_to_transmission_nes[site_id].append(ne_id)
+        if domain == "TRANSMISSION":
+            site_to_transmission_nes[site_id].append(ne_id)
+        else:
+            site_to_data_nes[site_id].append(ne_id)
         if site_id not in site_to_name:
             site_name = _extract_site_name(ne_info)
             if site_name:
@@ -77,12 +83,20 @@ def collect_transmission_isolated_sites(ne_graph_data):
                 continue
 
             if neighbor_site_id != site_id:
-                site_to_external_neighbor_sites[site_id].add(neighbor_site_id)
+                if domain == "TRANSMISSION":
+                    site_to_transmission_external_neighbor_sites[site_id].add(neighbor_site_id)
+                else:
+                    site_to_data_external_neighbor_sites[site_id].add(neighbor_site_id)
 
     isolated_sites = []
     for site_id, transmission_ne_ids in sorted(site_to_transmission_nes.items()):
-        external_neighbor_sites = sorted(site_to_external_neighbor_sites.get(site_id, set()))
-        if external_neighbor_sites:
+        transmission_external_neighbor_sites = sorted(
+            site_to_transmission_external_neighbor_sites.get(site_id, set())
+        )
+        data_external_neighbor_sites = sorted(
+            site_to_data_external_neighbor_sites.get(site_id, set())
+        )
+        if transmission_external_neighbor_sites or data_external_neighbor_sites:
             continue
 
         isolated_sites.append(
@@ -91,8 +105,12 @@ def collect_transmission_isolated_sites(ne_graph_data):
                 "site_name": site_to_name.get(site_id, ""),
                 "transmission_ne_count": len(transmission_ne_ids),
                 "transmission_ne_ids": sorted(transmission_ne_ids),
-                "external_neighbor_site_count": 0,
-                "external_neighbor_sites": [],
+                "data_ne_count": len(site_to_data_nes.get(site_id, [])),
+                "data_ne_ids": sorted(site_to_data_nes.get(site_id, [])),
+                "transmission_external_neighbor_site_count": 0,
+                "transmission_external_neighbor_sites": [],
+                "data_external_neighbor_site_count": 0,
+                "data_external_neighbor_sites": [],
                 "unknown_neighbor_ne_count": len(site_to_unknown_neighbor_nes.get(site_id, set())),
                 "unknown_neighbor_ne_ids": sorted(site_to_unknown_neighbor_nes.get(site_id, set())),
             }
@@ -103,7 +121,7 @@ def collect_transmission_isolated_sites(ne_graph_data):
 
 def main():
     parser = ArgumentParser(
-        description="从 ne_graph.json 中筛出：站点内有 Transmission 设备，但这些 Transmission 设备没有和其它站点连接的站点"
+        description="从 ne_graph.json 中筛出：站点内有 Transmission 设备，且这些 Transmission 设备不跨站连接；如果站内有 Data 设备，这些 Data 设备也不跨站连接的站点"
     )
     parser.add_argument(
         "ne_graph",
