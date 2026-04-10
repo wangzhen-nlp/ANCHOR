@@ -231,14 +231,13 @@ def _print_output_result(row_count: int, output_file: str, json_output_file: str
     _print_key_values(items)
 
 
-def _count_unique_sites(matched_sites_by_row) -> int:
-    site_ids = set()
+def _count_total_sites(matched_sites_by_row) -> int:
+    total = 0
     for row_sites in matched_sites_by_row or []:
         for site_id in row_sites:
-            normalized_site_id = _normalize_match_value(site_id)
-            if normalized_site_id:
-                site_ids.add(normalized_site_id)
-    return len(site_ids)
+            if _normalize_match_value(site_id):
+                total += 1
+    return total
 
 
 def _get_ticket_column_index(df: pd.DataFrame) -> int:
@@ -489,7 +488,7 @@ def _filter_incident_tickets_file(
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
         _print_section("处理结果")
         _print_output_result(len(result_df), output_file, json_output_file)
-        _print_key_values([("输出记录关联站点总数", _count_unique_sites(matched_sites_by_row))])
+        _print_key_values([("输出记录关联站点总数", _count_total_sites(matched_sites_by_row))])
 
         return result_df, stats
     else:
@@ -643,7 +642,7 @@ def main():
             ("命中记录数", aggregate_stats['valid']),
             ("不足 2 个站点", aggregate_stats['only_one_site']),
             ("站点缺少 Transmission 设备", aggregate_stats['missing_transmission_device']),
-            ("输出记录关联站点总数", _count_unique_sites(aggregated_json.values())),
+            ("输出记录关联站点总数", _count_total_sites(aggregated_json.values())),
         ])
 
         if aggregated_result_dfs:
