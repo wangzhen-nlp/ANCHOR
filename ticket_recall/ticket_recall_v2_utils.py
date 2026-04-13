@@ -11,6 +11,13 @@ def normalize_text(value):
     return _normalize_text(value)
 
 
+UPPER_BOUND_EVIDENCE_BUCKETS = (
+    "direct_site_alarms",
+    "inferred_site_alarms",
+    "ticket_recorded_range_site_alarms",
+)
+
+
 def dedupe_alarm_records(records):
     seen = set()
     result = []
@@ -116,7 +123,7 @@ def load_upper_bound_index(filepath):
         merged_evidence_times = []
         evidence = item.get("evidence", {})
         if isinstance(evidence, dict):
-            for bucket_name in ("direct_site_alarms", "inferred_site_alarms"):
+            for bucket_name in UPPER_BOUND_EVIDENCE_BUCKETS:
                 bucket = evidence.get(bucket_name, {})
                 if not isinstance(bucket, dict):
                     continue

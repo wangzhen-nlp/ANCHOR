@@ -659,8 +659,12 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 这份脚本不是算当前方法的真实召回，而是算“基于原始告警流与时间窗关系，工单站点召回率的上限”。
 当前逻辑是：
 
-1. 输入 `{工单: [站点列表]}` 和原始告警流  
-   先确定每个工单的目标站点集合。
+1. 输入工单站点映射和原始告警流  
+   当前 `--ticket-sites` 支持两种格式：
+   - 旧格式：`{工单: [站点列表]}`
+   - 新格式：`filter_incident_tickets.py` 输出的
+     `{工单: {site_ids, extracted_times, time_details}}`
+   脚本会统一读取其中的 `site_ids` 作为该工单的目标站点集合。
 
 2. 第一遍流式扫描告警  
    - 过滤掉 `FAN FAIL`；
@@ -685,11 +689,29 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
      - `f1_upper_bound`
      作为与其它评测脚本一致的补充指标。
 
-6. 第三遍流式扫描告警，补证据  
+6. 从 `--ticket-sites` 里的 `extracted_times` 解析工单记录时间  
+   - 如果是新格式输入，脚本会读取 `extracted_times`；
+   - 解析成功后，按时间排序，取：
+     - `min_time`
+     - `max_time`
+     作为该工单的 `ticket_recorded_time_range`；
+   - 如果 `extracted_times` 为空，或都无法解析，则这一块为空；
+   - 如果只有一项，则 `min_time == max_time`，形成单点闭区间。
+
+7. 第三遍流式扫描告警，补证据  
    输出：
    - `direct_site_alarms`
    - `inferred_site_alarms`
+   - `ticket_recorded_range_site_alarms`
    作为“这些站点为什么能被关联上”的证据。
+
+8. 可选地把 `ticket_recorded_range_site_alarms` 命中的站点并入 recall 计算  
+   - 默认不开启时：
+     `associated_sites` 仍然只来自 `direct_sites + inferred_sites`
+   - 开启 `--include-ticket-recorded-range-sites` 后：
+     会把 `ticket_recorded_range_site_alarms` 命中的站点也并入 `associated_sites`
+   - 但并入时仍然只保留目标站点范围内的站点，
+     不会把工单 `ticket_sites` 之外的站点算进 recall。
 
 **【意义】**
 
@@ -703,12 +725,13 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 **【逻辑】**
 
-当前 upper bound 里的 `evidence` 不是随便把工单相关告警都存下来，而是分成两桶：
+当前 upper bound 里的 `evidence` 不是随便把工单相关告警都存下来，而是分成三桶：
 
 - `direct_site_alarms`
 - `inferred_site_alarms`
+- `ticket_recorded_range_site_alarms`
 
-它们都依赖前面先算好的“工单时间窗”。
+其中前两桶依赖“工单 anchor 时间窗”，第三桶依赖“工单记录时间范围”。
 
 ### 1. 工单时间窗怎么计算
 
@@ -787,19 +810,95 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 - `direct_site_alarms`：证明“这个站点为什么能直接算到这个工单头上”
 - `inferred_site_alarms`：证明“这个站点为什么能通过时间窗被补到这个工单头上”
+- `ticket_recorded_range_site_alarms`：
+  证明“这个站点在工单记录出来的时间范围内，本身确实有告警出现”
 
 它不是“工单相关的所有告警全集”，而是：
 
-- 只保留 direct / inferred 两类已关联站点上的证据告警
+- 只保留上述三类已关联站点/目标站点上的证据告警
 - 并且仍然会过滤掉 `FAN FAIL`
 
 **【意义】**
 
-把 evidence 拆成 direct / inferred 两桶之后，后续分析会更清楚：
+把 evidence 拆成这三桶之后，后续分析会更清楚：
 
 - 如果一个站点出现在 `direct_site_alarms`，说明它本来就被工单字段显式标出来了；
 - 如果一个站点只出现在 `inferred_site_alarms`，说明它完全依赖时间窗补关联；
-- 后面的 `only-offline`、`potential` 等逻辑，本质上都是建立在这两桶 evidence 的统一读取之上。
+- 如果一个站点只出现在 `ticket_recorded_range_site_alarms`，
+  说明它未必被当前 upper bound 主逻辑补到，
+  但在工单记录时间范围内，这个目标站点确实有告警证据；
+- 后面的 `only-offline`、`potential` 等逻辑，本质上都是建立在这些 evidence 的统一读取之上。
+
+### 5.1 `ticket_recorded_time_range` 与 `ticket_recorded_range_site_alarms`
+
+如果 `--ticket-sites` 使用的是 `filter_incident_tickets.py` 的新输出格式，
+则每个工单还会额外带出：
+
+- `ticket_recorded_time_count`
+- `ticket_recorded_times`
+- `ticket_recorded_time_range`
+
+其中：
+
+- `ticket_recorded_times` 是 `extracted_times` 里成功解析出的时间，按时间升序保存；
+- `ticket_recorded_time_range = [min_time, max_time]`；
+- `evidence.ticket_recorded_time_range` 会把同样的区间再放一份，方便只看 evidence 时直接读取。
+
+`ticket_recorded_range_site_alarms` 的收集条件是：
+
+- 该告警所在站点属于当前工单的 `ticket_sites`
+- 告警时间落在 `ticket_recorded_time_range` 的闭区间内
+
+这里不要求这条告警带当前工单号。
+它反映的是：
+
+- “按工单记录出来的时间范围看，这个目标站点在那段时间里确实有告警”
+
+如果：
+
+- `extracted_times` 为空
+- 或全部无法解析
+
+则：
+
+- `ticket_recorded_time_count = 0`
+- `ticket_recorded_times = []`
+- `ticket_recorded_time_range = {}`
+- `ticket_recorded_range_site_alarms = {}`
+
+如果只有一个可解析时间，则：
+
+- `min_time == max_time`
+- 只会命中“时间恰好等于这一秒”的告警
+
+### 5.2 `--include-ticket-recorded-range-sites` 对 recall 的影响
+
+默认情况下，`ticket_recorded_range_site_alarms` 只是附加证据，
+不参与 `associated_sites` 和 `recall_upper_bound` 的计算。
+
+开启 `--include-ticket-recorded-range-sites` 后：
+
+- 会先取 `ticket_recorded_range_site_alarms` 里命中的站点
+- 再与原来的 `associated_sites` 做并集
+- 并把结果限制在 `ticket_sites` 范围内
+- 最终用这个并集结果重新计算：
+  - `associated_site_count`
+  - `associated_sites`
+  - `recall_upper_bound`
+  - `precision_upper_bound`
+  - `f1_upper_bound`
+
+同时输出里还会额外给出：
+
+- `ticket_recorded_range_site_count`
+- `ticket_recorded_range_sites`
+- `ticket_recorded_range_added_site_count`
+- `ticket_recorded_range_added_sites`
+
+其中 `added` 表示：
+
+- 相比原始 `direct + inferred` 逻辑，
+  真正因为 `ticket_recorded_range` 而新增并入 recall 计算的站点。
 
 ### 6. 为什么 `precision_upper_bound` 往往是 `1`
 
@@ -879,6 +978,10 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 4. 同时输出两类站点对应的告警证据  
    - `associated_site_alarms`：当前方法已经真正关联到的站点告警；
    - `missing_site_alarms`：上限里明明可以补出来、但当前方法仍未关联的站点告警。
+   这里读取的是 `upper bound -> site_evidence`，而当前 `site_evidence` 已经统一合并了：
+   - `direct_site_alarms`
+   - `inferred_site_alarms`
+   - `ticket_recorded_range_site_alarms`
 
 5. 两份脚本统一输出字段  
    包括：
@@ -970,6 +1073,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 2. 把其中：
    - `direct_site_alarms`
    - `inferred_site_alarms`
+   - `ticket_recorded_range_site_alarms`
    合并成统一的 `site_evidence`
 3. 如果这个工单的整份 `site_evidence` 里没有出现 `OFFLINE_ALARMS`
 4. 就把这个工单样本直接跳过：
@@ -990,6 +1094,12 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 这些告警分别出现在哪些 group / 故障组ID
 - 命中的 group 就直接和当前工单建立关联
 
+这里读取的也是统一后的 `site_evidence`，因此当前会同时感知：
+
+- `direct_site_alarms`
+- `inferred_site_alarms`
+- `ticket_recorded_range_site_alarms`
+
 也就是说，`potential` 当前只回答一个问题：
 
 - “upper bound 里已经出现过的这些证据告警，本身属于哪些 group？”
@@ -1006,6 +1116,10 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
     去反查
 
 这里不会再额外做时间窗判断。
+
+同理，`--no-data-alarm` 也是基于这份合并后的 `site_evidence` 做判断，
+所以如果 Data 设备上的告警只出现在 `ticket_recorded_range_site_alarms` 里，
+现在也会被这个过滤开关感知到。
 
 ### 5. 这些模式如何叠加
 

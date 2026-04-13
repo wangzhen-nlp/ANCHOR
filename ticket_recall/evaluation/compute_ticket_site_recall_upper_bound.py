@@ -49,14 +49,29 @@ def _load_ticket_sites(ticket_sites_file):
         raise ValueError("工单站点映射 JSON 顶层必须是对象")
 
     ticket_sites = {}
-    for ticket_id, sites in data.items():
+    ticket_recorded_times = {}
+    for ticket_id, payload in data.items():
         normalized_ticket_id = _normalize_text(ticket_id)
-        if not normalized_ticket_id or not isinstance(sites, list):
+        if not normalized_ticket_id:
             continue
-        normalized_sites = _normalize_site_list(sites)
+
+        normalized_sites = []
+        normalized_times = []
+        if isinstance(payload, list):
+            normalized_sites = _normalize_site_list(payload)
+        elif isinstance(payload, dict):
+            normalized_sites = _normalize_site_list(payload.get("site_ids", []))
+            raw_times = payload.get("extracted_times", [])
+            if isinstance(raw_times, list):
+                normalized_times = _normalize_site_list(raw_times)
+        else:
+            continue
+
         if normalized_sites:
             ticket_sites[normalized_ticket_id] = normalized_sites
-    return ticket_sites
+        if normalized_times:
+            ticket_recorded_times[normalized_ticket_id] = normalized_times
+    return ticket_sites, ticket_recorded_times
 
 
 def _build_ticket_site_sets(ticket_sites):
@@ -64,6 +79,45 @@ def _build_ticket_site_sets(ticket_sites):
         ticket_id: set(site_list)
         for ticket_id, site_list in ticket_sites.items()
     }
+
+
+def _build_effective_associated_sites(base_associated_sites, extra_site_sets, ticket_site_sets):
+    effective_associated_sites = {}
+    for ticket_id, target_sites in ticket_site_sets.items():
+        merged_sites = set(base_associated_sites.get(ticket_id, set())) & target_sites
+        merged_sites.update(set(extra_site_sets.get(ticket_id, set())) & target_sites)
+        effective_associated_sites[ticket_id] = merged_sites
+    return effective_associated_sites
+
+
+def _build_ticket_recorded_time_ranges(ticket_recorded_times):
+    ticket_time_ranges = {}
+    normalized_recorded_times = {}
+
+    for ticket_id, raw_times in ticket_recorded_times.items():
+        parsed_times = []
+        for raw_time in raw_times:
+            normalized_time = _normalize_text(raw_time)
+            if not normalized_time:
+                continue
+            ts = _parse_time_to_ts(normalized_time)
+            if ts is None:
+                continue
+            parsed_times.append((ts, normalized_time))
+
+        if not parsed_times:
+            continue
+
+        parsed_times.sort(key=lambda item: (item[0], item[1]))
+        normalized_recorded_times[ticket_id] = [time_text for _, time_text in parsed_times]
+        ticket_time_ranges[ticket_id] = {
+            "min_ts": parsed_times[0][0],
+            "max_ts": parsed_times[-1][0],
+            "min_time": parsed_times[0][1],
+            "max_time": parsed_times[-1][1],
+        }
+
+    return normalized_recorded_times, ticket_time_ranges
 
 
 def _parse_time_to_ts(value):
@@ -330,9 +384,11 @@ def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_co
 def _collect_association_evidence(
     alarm_input,
     ticket_sites,
+    ticket_site_sets,
     direct_sites,
     inferred_sites,
     ticket_windows,
+    ticket_recorded_time_ranges,
     ticket_field,
     site_field,
     source_field,
@@ -347,6 +403,7 @@ def _collect_association_evidence(
         evidence[ticket_id] = {
             "direct_site_alarms": defaultdict(list),
             "inferred_site_alarms": defaultdict(list),
+            "ticket_recorded_range_site_alarms": defaultdict(list),
         }
 
     for ticket_id, site_ids in direct_sites.items():
@@ -356,6 +413,13 @@ def _collect_association_evidence(
     for ticket_id, site_ids in inferred_sites.items():
         for site_id in site_ids:
             inferred_site_tickets[site_id].add(ticket_id)
+
+    recorded_range_site_tickets = defaultdict(set)
+    for ticket_id, site_ids in ticket_site_sets.items():
+        if ticket_id not in ticket_recorded_time_ranges:
+            continue
+        for site_id in site_ids:
+            recorded_range_site_tickets[site_id].add(ticket_id)
 
     for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         if _should_skip_alarm(alarm):
@@ -397,9 +461,31 @@ def _collect_association_evidence(
                     )
                 evidence[ticket_id]["inferred_site_alarms"][resolved_site_id].append(evidence_record)
 
+        recorded_range_ticket_candidates = recorded_range_site_tickets.get(resolved_site_id)
+        if recorded_range_ticket_candidates and ts is not None:
+            for ticket_id in recorded_range_ticket_candidates:
+                time_range = ticket_recorded_time_ranges.get(ticket_id)
+                if not time_range:
+                    continue
+                if ts < time_range["min_ts"] or ts > time_range["max_ts"]:
+                    continue
+                if evidence_record is None:
+                    evidence_record = _build_alarm_evidence_record(
+                        alarm,
+                        resolved_site_id,
+                        ticket_field,
+                        source_field,
+                    )
+                evidence[ticket_id]["ticket_recorded_range_site_alarms"][resolved_site_id].append(evidence_record)
+
     normalized_evidence = {}
     for ticket_id, payload in evidence.items():
+        time_range = ticket_recorded_time_ranges.get(ticket_id)
         normalized_evidence[ticket_id] = {
+            "ticket_recorded_time_range": {
+                "min_time": time_range["min_time"],
+                "max_time": time_range["max_time"],
+            } if time_range else {},
             "direct_site_alarms": {
                 site_id: alarms
                 for site_id, alarms in sorted(payload["direct_site_alarms"].items())
@@ -408,8 +494,20 @@ def _collect_association_evidence(
                 site_id: alarms
                 for site_id, alarms in sorted(payload["inferred_site_alarms"].items())
             },
+            "ticket_recorded_range_site_alarms": {
+                site_id: alarms
+                for site_id, alarms in sorted(payload["ticket_recorded_range_site_alarms"].items())
+            },
         }
     return normalized_evidence
+
+
+def _build_recorded_range_site_sets(association_evidence):
+    recorded_range_site_sets = {}
+    for ticket_id, payload in (association_evidence or {}).items():
+        recorded_range_sites = payload.get("ticket_recorded_range_site_alarms", {})
+        recorded_range_site_sets[ticket_id] = set(recorded_range_sites.keys())
+    return recorded_range_site_sets
 
 
 def main():
@@ -423,7 +521,7 @@ def main():
     parser.add_argument(
         "--ticket-sites",
         required=True,
-        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}",
+        help="工单站点映射 JSON，支持旧格式 {工单号: [站点列表]}，也支持 filter_incident_tickets.py 输出的 {工单号: {site_ids, extracted_times, ...}}",
     )
     parser.add_argument(
         "--ticket-field",
@@ -457,6 +555,11 @@ def main():
         help=f"用于通过告警源回填站点ID的 ne_graph 文件，默认: {resource_display('ne_graph.json')}",
     )
     parser.add_argument(
+        "--include-ticket-recorded-range-sites",
+        action="store_true",
+        help="将工单记录时间范围内命中的站点也并入可关联站点，并据此计算 recall_upper_bound",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default="ticket_site_recall_upper_bound.json",
@@ -465,11 +568,12 @@ def main():
 
     args = parser.parse_args()
 
-    ticket_sites = _load_ticket_sites(args.ticket_sites)
+    ticket_sites, ticket_recorded_times = _load_ticket_sites(args.ticket_sites)
     if not ticket_sites:
         print("❌ 工单站点映射为空，无法计算召回率上限")
         return
     ticket_site_sets = _build_ticket_site_sets(ticket_sites)
+    normalized_recorded_times, ticket_recorded_time_ranges = _build_ticket_recorded_time_ranges(ticket_recorded_times)
 
     ne_to_site = {}
     if args.ne_graph and os.path.exists(args.ne_graph):
@@ -520,9 +624,11 @@ def main():
     association_evidence = _collect_association_evidence(
         alarm_input=args.alarms,
         ticket_sites=ticket_sites,
+        ticket_site_sets=ticket_site_sets,
         direct_sites=direct_sites,
         inferred_sites=inferred_sites,
         ticket_windows=ticket_windows,
+        ticket_recorded_time_ranges=ticket_recorded_time_ranges,
         ticket_field=args.ticket_field,
         site_field=args.site_field,
         source_field=args.source_field,
@@ -530,19 +636,49 @@ def main():
         ne_to_site=ne_to_site,
     )
 
+    base_associated_sites = {
+        ticket_id: set(site_ids)
+        for ticket_id, site_ids in associated_sites.items()
+    }
+    recorded_range_site_sets = _build_recorded_range_site_sets(association_evidence)
+    effective_associated_sites = base_associated_sites
+    if args.include_ticket_recorded_range_sites:
+        effective_associated_sites = _build_effective_associated_sites(
+            base_associated_sites=base_associated_sites,
+            extra_site_sets=recorded_range_site_sets,
+            ticket_site_sets=ticket_site_sets,
+        )
+
     details, average_recall, average_precision, average_f1 = _compute_upper_bound_recalls(
         ticket_sites=ticket_sites,
         ticket_site_sets=ticket_site_sets,
         ticket_alarm_counts=ticket_alarm_counts,
         direct_sites=direct_sites,
         inferred_sites=inferred_sites,
-        associated_sites=associated_sites,
+        associated_sites=effective_associated_sites,
     )
 
     for item in details:
+        ticket_id = item["ticket_id"]
+        time_range = ticket_recorded_time_ranges.get(ticket_id)
+        base_associated_site_set = set(base_associated_sites.get(ticket_id, set())) & ticket_site_sets.get(ticket_id, set())
+        recorded_range_site_set = set(recorded_range_site_sets.get(ticket_id, set())) & ticket_site_sets.get(ticket_id, set())
+        recorded_range_added_site_set = recorded_range_site_set - base_associated_site_set
+        item["ticket_recorded_time_count"] = len(normalized_recorded_times.get(ticket_id, []))
+        item["ticket_recorded_times"] = normalized_recorded_times.get(ticket_id, [])
+        item["ticket_recorded_time_range"] = {
+            "min_time": time_range["min_time"],
+            "max_time": time_range["max_time"],
+        } if time_range else {}
+        item["ticket_recorded_range_site_count"] = len(recorded_range_site_set)
+        item["ticket_recorded_range_sites"] = sorted(recorded_range_site_set)
+        item["ticket_recorded_range_added_site_count"] = len(recorded_range_added_site_set)
+        item["ticket_recorded_range_added_sites"] = sorted(recorded_range_added_site_set)
         item["evidence"] = association_evidence.get(item["ticket_id"], {
+            "ticket_recorded_time_range": {},
             "direct_site_alarms": {},
             "inferred_site_alarms": {},
+            "ticket_recorded_range_site_alarms": {},
         })
 
     result = {
@@ -551,6 +687,7 @@ def main():
         "time_field": args.time_field,
         "site_field": args.site_field,
         "source_field": args.source_field,
+        "include_ticket_recorded_range_sites_for_recall": args.include_ticket_recorded_range_sites,
         "average_recall_upper_bound": average_recall,
         "average_precision_upper_bound": average_precision,
         "average_f1_upper_bound": average_f1,
