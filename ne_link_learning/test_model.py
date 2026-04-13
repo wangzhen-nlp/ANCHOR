@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from argparse import ArgumentParser
+from pathlib import Path
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
@@ -19,20 +20,20 @@ from ne_link_learning.core import (
 )
 
 
+def _derive_output_base(model_file, test_file):
+    model_path = Path(model_file)
+    model_dir = model_path.parent
+    model_stem = model_path.stem
+    test_stem = Path(test_file).stem
+    return model_dir / f"{model_stem}.{test_stem}"
+
+
 def _derive_eval_path(model_file, test_file):
-    base = model_file[:-5] if model_file.endswith(".json") else model_file
-    test_name = test_file.rsplit("/", 1)[-1]
-    if test_name.endswith(".jsonl"):
-        test_name = test_name[:-6]
-    return f"{base}.{test_name}.eval.json"
+    return str(_derive_output_base(model_file, test_file)) + ".eval.json"
 
 
 def _derive_prediction_path(model_file, test_file):
-    base = model_file[:-5] if model_file.endswith(".json") else model_file
-    test_name = test_file.rsplit("/", 1)[-1]
-    if test_name.endswith(".jsonl"):
-        test_name = test_name[:-6]
-    return f"{base}.{test_name}.predictions.jsonl"
+    return str(_derive_output_base(model_file, test_file)) + ".predictions.jsonl"
 
 
 def main():
