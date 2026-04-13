@@ -6,6 +6,7 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+from alarm_tools.progress_utils import ProgressBar
 from ne_link_learning.core import (
     DOMAIN_BUCKETS,
     _adamic_adar_score,
@@ -43,6 +44,18 @@ class SitePairContext:
     dominant_domain_bucket_to_sites: dict
     site_peer_group_keys: dict
     peer_groups: dict
+
+
+def _create_progress_bar(total, label, show_progress):
+    if not show_progress:
+        return None
+    print(f"⏳ {label}...")
+    return ProgressBar(total, label)
+
+
+def _close_progress_bar(progress):
+    if progress is not None:
+        progress.close()
 
 
 def _pick_counter_mode(counter, default_value="MISSING"):
@@ -532,117 +545,125 @@ def _generate_site_negative_pool(
     two_hop_source_negatives,
     reverse_direction_negatives,
     rng,
+    show_progress=False,
 ):
     positive_edge_set = set(positive_edges)
     negative_reason_map = defaultdict(set)
+    progress = _create_progress_bar(len(positive_edges), "构造站点负样本候选", show_progress)
+    try:
+        for index, (left_site_id, right_site_id) in enumerate(positive_edges, start=1):
+            left_info = context.site_infos[left_site_id]
+            right_info = context.site_infos[right_site_id]
 
-    for left_site_id, right_site_id in positive_edges:
-        left_info = context.site_infos[left_site_id]
-        right_info = context.site_infos[right_site_id]
-
-        if reverse_direction_negatives > 0:
-            _try_add_negative_site_pair(
-                context,
-                negative_reason_map,
-                positive_edge_set,
-                right_site_id,
-                left_site_id,
-                "reverse_direction_missing",
-            )
-
-        if same_target_region_negatives > 0 and right_info.region_id != "MISSING":
-            candidate_targets = [
-                site_id
-                for site_id in context.region_to_sites.get(right_info.region_id, [])
-                if site_id != right_site_id
-            ]
-            for candidate_site_id in deterministic_sample(candidate_targets, same_target_region_negatives, rng):
+            if reverse_direction_negatives > 0:
                 _try_add_negative_site_pair(
                     context,
                     negative_reason_map,
                     positive_edge_set,
-                    left_site_id,
-                    candidate_site_id,
-                    "same_target_region",
-                )
-
-        if same_source_region_negatives > 0 and left_info.region_id != "MISSING":
-            candidate_sources = [
-                site_id
-                for site_id in context.region_to_sites.get(left_info.region_id, [])
-                if site_id != left_site_id
-            ]
-            for candidate_site_id in deterministic_sample(candidate_sources, same_source_region_negatives, rng):
-                _try_add_negative_site_pair(
-                    context,
-                    negative_reason_map,
-                    positive_edge_set,
-                    candidate_site_id,
                     right_site_id,
-                    "same_source_region",
-                )
-
-        if same_target_domain_negatives > 0 and right_info.dominant_domain_bucket != "MISSING":
-            candidate_targets = [
-                site_id
-                for site_id in context.dominant_domain_bucket_to_sites.get(right_info.dominant_domain_bucket, [])
-                if site_id != right_site_id
-            ]
-            for candidate_site_id in deterministic_sample(candidate_targets, same_target_domain_negatives, rng):
-                _try_add_negative_site_pair(
-                    context,
-                    negative_reason_map,
-                    positive_edge_set,
                     left_site_id,
-                    candidate_site_id,
-                    "same_target_domain",
+                    "reverse_direction_missing",
                 )
 
-        if same_source_domain_negatives > 0 and left_info.dominant_domain_bucket != "MISSING":
-            candidate_sources = [
-                site_id
-                for site_id in context.dominant_domain_bucket_to_sites.get(left_info.dominant_domain_bucket, [])
-                if site_id != left_site_id
-            ]
-            for candidate_site_id in deterministic_sample(candidate_sources, same_source_domain_negatives, rng):
-                _try_add_negative_site_pair(
-                    context,
-                    negative_reason_map,
-                    positive_edge_set,
-                    candidate_site_id,
-                    right_site_id,
-                    "same_source_domain",
-                )
+            if same_target_region_negatives > 0 and right_info.region_id != "MISSING":
+                candidate_targets = [
+                    site_id
+                    for site_id in context.region_to_sites.get(right_info.region_id, [])
+                    if site_id != right_site_id
+                ]
+                for candidate_site_id in deterministic_sample(candidate_targets, same_target_region_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        left_site_id,
+                        candidate_site_id,
+                        "same_target_region",
+                    )
 
-        if two_hop_target_negatives > 0:
-            candidate_targets = set()
-            for mid_site_id in context.site_out_sites.get(left_site_id, set()):
-                candidate_targets.update(context.site_out_sites.get(mid_site_id, set()))
-            candidate_targets.discard(left_site_id)
-            for candidate_site_id in deterministic_sample(sorted(candidate_targets), two_hop_target_negatives, rng):
-                _try_add_negative_site_pair(
-                    context,
-                    negative_reason_map,
-                    positive_edge_set,
-                    left_site_id,
-                    candidate_site_id,
-                    "two_hop_target",
-                )
+            if same_source_region_negatives > 0 and left_info.region_id != "MISSING":
+                candidate_sources = [
+                    site_id
+                    for site_id in context.region_to_sites.get(left_info.region_id, [])
+                    if site_id != left_site_id
+                ]
+                for candidate_site_id in deterministic_sample(candidate_sources, same_source_region_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        candidate_site_id,
+                        right_site_id,
+                        "same_source_region",
+                    )
 
-        if two_hop_source_negatives > 0:
-            candidate_sources = set()
-            for mid_site_id in context.site_in_sites.get(right_site_id, set()):
-                candidate_sources.update(context.site_in_sites.get(mid_site_id, set()))
-            candidate_sources.discard(right_site_id)
-            for candidate_site_id in deterministic_sample(sorted(candidate_sources), two_hop_source_negatives, rng):
-                _try_add_negative_site_pair(
-                    context,
-                    negative_reason_map,
-                    positive_edge_set,
-                    candidate_site_id,
-                    right_site_id,
-                    "two_hop_source",
-                )
+            if same_target_domain_negatives > 0 and right_info.dominant_domain_bucket != "MISSING":
+                candidate_targets = [
+                    site_id
+                    for site_id in context.dominant_domain_bucket_to_sites.get(right_info.dominant_domain_bucket, [])
+                    if site_id != right_site_id
+                ]
+                for candidate_site_id in deterministic_sample(candidate_targets, same_target_domain_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        left_site_id,
+                        candidate_site_id,
+                        "same_target_domain",
+                    )
+
+            if same_source_domain_negatives > 0 and left_info.dominant_domain_bucket != "MISSING":
+                candidate_sources = [
+                    site_id
+                    for site_id in context.dominant_domain_bucket_to_sites.get(left_info.dominant_domain_bucket, [])
+                    if site_id != left_site_id
+                ]
+                for candidate_site_id in deterministic_sample(candidate_sources, same_source_domain_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        candidate_site_id,
+                        right_site_id,
+                        "same_source_domain",
+                    )
+
+            if two_hop_target_negatives > 0:
+                candidate_targets = set()
+                for mid_site_id in context.site_out_sites.get(left_site_id, set()):
+                    candidate_targets.update(context.site_out_sites.get(mid_site_id, set()))
+                candidate_targets.discard(left_site_id)
+                for candidate_site_id in deterministic_sample(sorted(candidate_targets), two_hop_target_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        left_site_id,
+                        candidate_site_id,
+                        "two_hop_target",
+                    )
+
+            if two_hop_source_negatives > 0:
+                candidate_sources = set()
+                for mid_site_id in context.site_in_sites.get(right_site_id, set()):
+                    candidate_sources.update(context.site_in_sites.get(mid_site_id, set()))
+                candidate_sources.discard(right_site_id)
+                for candidate_site_id in deterministic_sample(sorted(candidate_sources), two_hop_source_negatives, rng):
+                    _try_add_negative_site_pair(
+                        context,
+                        negative_reason_map,
+                        positive_edge_set,
+                        candidate_site_id,
+                        right_site_id,
+                        "two_hop_source",
+                    )
+
+            if progress is not None:
+                progress.set(index)
+                progress.set_extra_text(f"已收集 {len(negative_reason_map)} 条候选")
+    finally:
+        _close_progress_bar(progress)
 
     return negative_reason_map
 
@@ -688,6 +709,7 @@ def generate_site_link_learning_samples(
     two_hop_source_negatives=1,
     reverse_direction_negatives=1,
     random_hard_negative_ratio=1.0,
+    show_progress=False,
 ):
     rng = random.Random(seed)
     positive_edges = collect_positive_site_edges(context)
@@ -703,6 +725,7 @@ def generate_site_link_learning_samples(
         two_hop_source_negatives=two_hop_source_negatives,
         reverse_direction_negatives=reverse_direction_negatives,
         rng=rng,
+        show_progress=show_progress,
     )
 
     target_negative_count = int(math.ceil(len(positive_edges) * max(0.0, float(max_negative_per_positive))))
@@ -714,6 +737,16 @@ def generate_site_link_learning_samples(
 
     random_negative_attempts = 0
     max_random_attempts = max(2000, extra_random_target * 50)
+    random_target_total = target_negative_count + extra_random_target
+    random_progress = None
+    if show_progress and context.site_ids and len(negative_reason_map) < random_target_total:
+        random_progress = _create_progress_bar(
+            random_target_total,
+            "补充随机硬负样本",
+            show_progress,
+        )
+        random_progress.set(len(negative_reason_map))
+        random_progress.set_extra_text(f"attempts={random_negative_attempts}")
     while (
         len(negative_reason_map) < target_negative_count + extra_random_target
         and random_negative_attempts < max_random_attempts
@@ -732,6 +765,10 @@ def generate_site_link_learning_samples(
             right_site_id,
             "random_hard_negative",
         )
+        if random_progress is not None:
+            random_progress.set(min(len(negative_reason_map), random_target_total))
+            random_progress.set_extra_text(f"attempts={random_negative_attempts}")
+    _close_progress_bar(random_progress)
 
     negative_items = list(negative_reason_map.items())
     if target_negative_count <= 0:
@@ -739,14 +776,43 @@ def generate_site_link_learning_samples(
     elif len(negative_items) > target_negative_count:
         negative_items = rng.sample(negative_items, target_negative_count)
 
-    positive_samples = [
-        _build_site_sample(context, left_site_id, right_site_id, 1, {"observed_site_edge"}, "positive")
-        for left_site_id, right_site_id in positive_edges
-    ]
-    negative_samples = [
-        _build_site_sample(context, left_site_id, right_site_id, 0, reasons, "negative")
-        for (left_site_id, right_site_id), reasons in negative_items
-    ]
+    positive_samples = []
+    positive_progress = _create_progress_bar(len(positive_edges), "构造正样本特征", show_progress)
+    try:
+        for index, (left_site_id, right_site_id) in enumerate(positive_edges, start=1):
+            positive_samples.append(
+                _build_site_sample(
+                    context,
+                    left_site_id,
+                    right_site_id,
+                    1,
+                    {"observed_site_edge"},
+                    "positive",
+                )
+            )
+            if positive_progress is not None:
+                positive_progress.set(index)
+    finally:
+        _close_progress_bar(positive_progress)
+
+    negative_samples = []
+    negative_progress = _create_progress_bar(len(negative_items), "构造负样本特征", show_progress)
+    try:
+        for index, ((left_site_id, right_site_id), reasons) in enumerate(negative_items, start=1):
+            negative_samples.append(
+                _build_site_sample(
+                    context,
+                    left_site_id,
+                    right_site_id,
+                    0,
+                    reasons,
+                    "negative",
+                )
+            )
+            if negative_progress is not None:
+                negative_progress.set(index)
+    finally:
+        _close_progress_bar(negative_progress)
 
     samples = positive_samples + negative_samples
     rng.shuffle(samples)

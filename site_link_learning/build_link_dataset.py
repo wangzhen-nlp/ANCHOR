@@ -97,8 +97,11 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"加载 ne_graph: {args.ne_graph}")
     ne_graph_data = load_ne_graph(args.ne_graph)
+    print("构建站点上下文...")
     context = build_site_pair_context(ne_graph_data)
+    print("生成站点对学习样本...")
     samples = generate_site_link_learning_samples(
         context=context,
         max_negative_per_positive=args.max_negative_per_positive,
@@ -111,8 +114,10 @@ def main():
         two_hop_source_negatives=args.two_hop_source_negatives,
         reverse_direction_negatives=args.reverse_direction_negatives,
         random_hard_negative_ratio=args.random_hard_negative_ratio,
+        show_progress=True,
     )
 
+    print(f"写出样本文件: {args.output}")
     write_jsonl(args.output, samples)
 
     summary_output = args.summary_output or _derive_summary_path(args.output)
@@ -138,6 +143,7 @@ def main():
             },
         }
     )
+    print(f"写出统计文件: {summary_output}")
     write_json(summary_output, summary)
 
     print(f"NE 节点数: {len(context.base_context.node_infos)}")
