@@ -8,6 +8,7 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+from alarm_tools.progress_utils import ProgressBar
 
 DOMAIN_BUCKETS = ("RAN", "TRANSMISSION", "DATA", "OTHER", "MISSING")
 
@@ -34,6 +35,18 @@ def stable_hash_fraction(text, seed=42):
     payload = f"{seed}::{text}".encode("utf-8")
     digest = hashlib.md5(payload).hexdigest()
     return int(digest[:12], 16) / float(0xFFFFFFFFFFFF)
+
+
+def _create_progress_bar(total, label, show_progress):
+    if not show_progress:
+        return None
+    print(f"⏳ {label}...")
+    return ProgressBar(total, label)
+
+
+def _close_progress_bar(progress):
+    if progress is not None:
+        progress.close()
 
 
 def deterministic_sample(seq, k, rng):
@@ -1011,6 +1024,8 @@ def split_samples_by_group(
     valid_ratio=0.1,
     test_ratio=0.1,
     seed=42,
+    show_progress=False,
+    progress_label="拆分样本",
 ):
     total_ratio = float(train_ratio) + float(valid_ratio) + float(test_ratio)
     if total_ratio <= 0:
@@ -1024,15 +1039,25 @@ def split_samples_by_group(
         "valid": [],
         "test": [],
     }
-    for sample in samples:
-        group_key = normalize_text(sample.get(group_field, "")) or sample.get("sample_id", "")
-        bucket_value = stable_hash_fraction(group_key, seed=seed)
-        if bucket_value < train_boundary:
-            split_buckets["train"].append(sample)
-        elif bucket_value < valid_boundary:
-            split_buckets["valid"].append(sample)
-        else:
-            split_buckets["test"].append(sample)
+    progress = _create_progress_bar(len(samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(samples, start=1):
+            group_key = normalize_text(sample.get(group_field, "")) or sample.get("sample_id", "")
+            bucket_value = stable_hash_fraction(group_key, seed=seed)
+            if bucket_value < train_boundary:
+                split_buckets["train"].append(sample)
+            elif bucket_value < valid_boundary:
+                split_buckets["valid"].append(sample)
+            else:
+                split_buckets["test"].append(sample)
+
+            if progress is not None:
+                progress.set(index)
+                progress.set_extra_text(
+                    f"train={len(split_buckets['train'])}, valid={len(split_buckets['valid'])}, test={len(split_buckets['test'])}"
+                )
+    finally:
+        _close_progress_bar(progress)
 
     return split_buckets
 
@@ -1092,23 +1117,29 @@ def fit_standardizer(samples, feature_names):
     }
 
 
-def vectorize_samples(samples, feature_names, standardizer):
+def vectorize_samples(samples, feature_names, standardizer, show_progress=False, progress_label="向量化样本"):
     means = standardizer["means"]
     stds = standardizer["stds"]
     dense_samples = []
-    for sample in samples:
-        dense_vector = [
-            (sample["features"].get(feature_name, 0.0) - means[feature_name]) / stds[feature_name]
-            for feature_name in feature_names
-        ]
-        dense_samples.append(
-            {
-                "sample_id": sample["sample_id"],
-                "label": sample["label"],
-                "x": dense_vector,
-                "meta": sample["meta"],
-            }
-        )
+    progress = _create_progress_bar(len(samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(samples, start=1):
+            dense_vector = [
+                (sample["features"].get(feature_name, 0.0) - means[feature_name]) / stds[feature_name]
+                for feature_name in feature_names
+            ]
+            dense_samples.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "label": sample["label"],
+                    "x": dense_vector,
+                    "meta": sample["meta"],
+                }
+            )
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
     return dense_samples
 
 
@@ -1211,38 +1242,68 @@ def compute_average_precision(labels, probabilities):
     return precision_sum / float(positive_count)
 
 
-def evaluate_dense_samples(dense_samples, weights, bias, threshold=0.5):
+def evaluate_dense_samples(
+    dense_samples,
+    weights,
+    bias,
+    threshold=0.5,
+    show_progress=False,
+    progress_label="评估样本",
+):
     labels = [sample["label"] for sample in dense_samples]
-    probabilities = [predict_probability(weights, bias, sample["x"]) for sample in dense_samples]
+    probabilities = []
+    progress = _create_progress_bar(len(dense_samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(dense_samples, start=1):
+            probabilities.append(predict_probability(weights, bias, sample["x"]))
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
     metrics = compute_binary_metrics(labels, probabilities, threshold=threshold)
     metrics["roc_auc"] = compute_roc_auc(labels, probabilities)
     metrics["average_precision"] = compute_average_precision(labels, probabilities)
     return metrics, probabilities
 
 
-def choose_best_threshold(dense_samples, weights, bias, thresholds=None):
+def choose_best_threshold(
+    dense_samples,
+    weights,
+    bias,
+    thresholds=None,
+    show_progress=False,
+    progress_label="搜索最佳阈值",
+):
     if thresholds is None:
         thresholds = [step / 100.0 for step in range(10, 91)]
 
     best_threshold = 0.5
     best_metrics = None
     best_probabilities = None
-    for threshold in thresholds:
-        metrics, probabilities = evaluate_dense_samples(dense_samples, weights, bias, threshold=threshold)
-        if best_metrics is None:
-            best_threshold = threshold
-            best_metrics = metrics
-            best_probabilities = probabilities
-            continue
-        if metrics["f1"] > best_metrics["f1"] + 1e-12:
-            best_threshold = threshold
-            best_metrics = metrics
-            best_probabilities = probabilities
-            continue
-        if abs(metrics["f1"] - best_metrics["f1"]) <= 1e-12 and metrics["recall"] > best_metrics["recall"]:
-            best_threshold = threshold
-            best_metrics = metrics
-            best_probabilities = probabilities
+    progress = _create_progress_bar(len(thresholds), progress_label, show_progress)
+    try:
+        for index, threshold in enumerate(thresholds, start=1):
+            metrics, probabilities = evaluate_dense_samples(dense_samples, weights, bias, threshold=threshold)
+            if best_metrics is None:
+                best_threshold = threshold
+                best_metrics = metrics
+                best_probabilities = probabilities
+            elif metrics["f1"] > best_metrics["f1"] + 1e-12:
+                best_threshold = threshold
+                best_metrics = metrics
+                best_probabilities = probabilities
+            elif abs(metrics["f1"] - best_metrics["f1"]) <= 1e-12 and metrics["recall"] > best_metrics["recall"]:
+                best_threshold = threshold
+                best_metrics = metrics
+                best_probabilities = probabilities
+
+            if progress is not None and best_metrics is not None:
+                progress.set(index)
+                progress.set_extra_text(
+                    f"best={best_threshold:.2f}, best_f1={best_metrics['f1']:.4f}"
+                )
+    finally:
+        _close_progress_bar(progress)
 
     return best_threshold, best_metrics, best_probabilities
 
@@ -1256,6 +1317,8 @@ def train_logistic_regression(
     positive_weight=None,
     seed=42,
     early_stop_patience=5,
+    show_progress=False,
+    progress_label="训练模型",
 ):
     if not train_dense_samples:
         raise ValueError("训练集为空")
@@ -1276,50 +1339,68 @@ def train_logistic_regression(
     best_score = None
     stale_epochs = 0
 
-    for epoch in range(1, int(epochs) + 1):
-        epoch_samples = list(train_dense_samples)
-        rng.shuffle(epoch_samples)
+    progress = _create_progress_bar(int(epochs), progress_label, show_progress)
+    try:
+        for epoch in range(1, int(epochs) + 1):
+            epoch_samples = list(train_dense_samples)
+            rng.shuffle(epoch_samples)
 
-        for sample in epoch_samples:
-            label = sample["label"]
-            dense_vector = sample["x"]
-            probability = predict_probability(weights, bias, dense_vector)
-            sample_weight = positive_weight if label == 1 else 1.0
-            error = (probability - label) * sample_weight
+            for sample in epoch_samples:
+                label = sample["label"]
+                dense_vector = sample["x"]
+                probability = predict_probability(weights, bias, dense_vector)
+                sample_weight = positive_weight if label == 1 else 1.0
+                error = (probability - label) * sample_weight
 
-            for index, feature_value in enumerate(dense_vector):
-                gradient = error * feature_value + l2 * weights[index]
-                weights[index] -= learning_rate * gradient
-            bias -= learning_rate * error
+                for index, feature_value in enumerate(dense_vector):
+                    gradient = error * feature_value + l2 * weights[index]
+                    weights[index] -= learning_rate * gradient
+                bias -= learning_rate * error
 
-        train_metrics, _ = evaluate_dense_samples(train_dense_samples, weights, bias, threshold=0.5)
-        epoch_record = {
-            "epoch": epoch,
-            "train": train_metrics,
-        }
-
-        if valid_dense_samples:
-            valid_threshold, valid_metrics, _ = choose_best_threshold(valid_dense_samples, weights, bias)
-            epoch_record["valid"] = valid_metrics
-            epoch_record["valid"]["best_threshold"] = valid_threshold
-            current_score = (valid_metrics["f1"], valid_metrics["average_precision"], -valid_metrics["log_loss"])
-        else:
-            current_score = (train_metrics["f1"], train_metrics["average_precision"], -train_metrics["log_loss"])
-
-        history.append(epoch_record)
-
-        if best_score is None or current_score > best_score:
-            best_score = current_score
-            best_state = {
-                "weights": list(weights),
-                "bias": bias,
+            train_metrics, _ = evaluate_dense_samples(train_dense_samples, weights, bias, threshold=0.5)
+            epoch_record = {
                 "epoch": epoch,
+                "train": train_metrics,
             }
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-            if valid_dense_samples and stale_epochs >= int(early_stop_patience):
-                break
+
+            valid_metrics = None
+            valid_threshold = None
+            if valid_dense_samples:
+                valid_threshold, valid_metrics, _ = choose_best_threshold(valid_dense_samples, weights, bias)
+                epoch_record["valid"] = valid_metrics
+                epoch_record["valid"]["best_threshold"] = valid_threshold
+                current_score = (valid_metrics["f1"], valid_metrics["average_precision"], -valid_metrics["log_loss"])
+            else:
+                current_score = (train_metrics["f1"], train_metrics["average_precision"], -train_metrics["log_loss"])
+
+            history.append(epoch_record)
+
+            if best_score is None or current_score > best_score:
+                best_score = current_score
+                best_state = {
+                    "weights": list(weights),
+                    "bias": bias,
+                    "epoch": epoch,
+                }
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+                if valid_dense_samples and stale_epochs >= int(early_stop_patience):
+                    if progress is not None:
+                        progress.set(epoch)
+                        progress.set_extra_text(
+                            f"train_f1={train_metrics['f1']:.4f}, valid_f1={valid_metrics['f1']:.4f}, early_stop"
+                        )
+                    break
+
+            if progress is not None:
+                progress.set(epoch)
+                extra_text = f"train_f1={train_metrics['f1']:.4f}"
+                if valid_metrics is not None:
+                    extra_text += f", valid_f1={valid_metrics['f1']:.4f}, best_thr={valid_threshold:.2f}"
+                progress.set_extra_text(extra_text)
+    finally:
+        _close_progress_bar(progress)
 
     if best_state is None:
         best_state = {
@@ -1350,25 +1431,37 @@ def build_feature_importance(feature_names, weights, top_k=50):
     return importance[:top_k]
 
 
-def build_prediction_rows(dense_samples, probabilities, threshold):
+def build_prediction_rows(
+    dense_samples,
+    probabilities,
+    threshold,
+    show_progress=False,
+    progress_label="生成预测结果",
+):
     prediction_rows = []
-    for sample, probability in zip(dense_samples, probabilities):
-        label = sample["label"]
-        predicted = 1 if probability >= threshold else 0
-        if predicted == label:
-            error_type = ""
-        elif predicted == 1:
-            error_type = "false_positive"
-        else:
-            error_type = "false_negative"
-        prediction_rows.append(
-            {
-                "sample_id": sample["sample_id"],
-                "label": label,
-                "probability": probability,
-                "predicted_label": predicted,
-                "error_type": error_type,
-                **sample["meta"],
-            }
-        )
+    progress = _create_progress_bar(len(dense_samples), progress_label, show_progress)
+    try:
+        for index, (sample, probability) in enumerate(zip(dense_samples, probabilities), start=1):
+            label = sample["label"]
+            predicted = 1 if probability >= threshold else 0
+            if predicted == label:
+                error_type = ""
+            elif predicted == 1:
+                error_type = "false_positive"
+            else:
+                error_type = "false_negative"
+            prediction_rows.append(
+                {
+                    "sample_id": sample["sample_id"],
+                    "label": label,
+                    "probability": probability,
+                    "predicted_label": predicted,
+                    "error_type": error_type,
+                    **sample["meta"],
+                }
+            )
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
     return prediction_rows

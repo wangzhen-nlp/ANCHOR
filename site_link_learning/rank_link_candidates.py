@@ -10,6 +10,7 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
+from alarm_tools.progress_utils import ProgressBar
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ne_link_learning.core import load_json, load_ne_graph, vectorize_samples, write_json, write_jsonl
 from site_link_learning.core import build_site_pair_context, generate_candidate_site_link_samples_for_scoring
@@ -102,14 +103,18 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"加载模型: {args.model}")
     model_payload = load_json(args.model)
     feature_names = model_payload["feature_names"]
     standardizer = model_payload["standardizer"]
     weights = [model_payload["weights"].get(feature_name, 0.0) for feature_name in feature_names]
     bias = float(model_payload.get("bias", 0.0))
 
+    print(f"加载 ne_graph: {args.ne_graph}")
     ne_graph_data = load_ne_graph(args.ne_graph)
+    print("构建站点上下文...")
     context = build_site_pair_context(ne_graph_data)
+    print("生成候选站点对...")
     candidate_samples_raw = generate_candidate_site_link_samples_for_scoring(
         context=context,
         max_candidate_count=args.max_candidate_count,
@@ -122,29 +127,51 @@ def main():
         two_hop_source_negatives=args.two_hop_source_negatives,
         reverse_direction_negatives=args.reverse_direction_negatives,
         random_hard_negative_ratio=args.random_hard_negative_ratio,
+        show_progress=True,
     )
 
-    candidate_samples = [
-        {
-            "sample_id": item["sample_id"],
-            "label": 0,
-            "features": item["features"],
-            "meta": {
-                key: value
-                for key, value in item.items()
-                if key not in {"sample_id", "label", "features"}
-            },
-        }
-        for item in candidate_samples_raw
-    ]
-    dense_samples = vectorize_samples(candidate_samples, feature_names, standardizer)
+    print("整理候选样本元数据...")
+    candidate_samples = []
+    candidate_progress = ProgressBar(len(candidate_samples_raw), "整理候选样本")
+    try:
+        for index, item in enumerate(candidate_samples_raw, start=1):
+            candidate_samples.append(
+                {
+                    "sample_id": item["sample_id"],
+                    "label": 0,
+                    "features": item["features"],
+                    "meta": {
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"sample_id", "label", "features"}
+                    },
+                }
+            )
+            candidate_progress.set(index)
+    finally:
+        candidate_progress.close()
+
+    print("向量化候选样本...")
+    dense_samples = vectorize_samples(
+        candidate_samples,
+        feature_names,
+        standardizer,
+        show_progress=True,
+        progress_label="向量化候选样本",
+    )
 
     scored_rows = []
-    for raw_item, dense_item in zip(candidate_samples_raw, dense_samples):
-        probability = _predict_probability(weights, bias, dense_item["x"])
-        if probability < args.min_score:
-            continue
-        scored_rows.append({**raw_item, "score": probability})
+    print("候选样本打分...")
+    score_progress = ProgressBar(len(candidate_samples_raw), "候选样本打分")
+    try:
+        for index, (raw_item, dense_item) in enumerate(zip(candidate_samples_raw, dense_samples), start=1):
+            probability = _predict_probability(weights, bias, dense_item["x"])
+            if probability >= args.min_score:
+                scored_rows.append({**raw_item, "score": probability})
+            score_progress.set(index)
+            score_progress.set_extra_text(f"保留 {len(scored_rows)} 条")
+    finally:
+        score_progress.close()
 
     scored_rows.sort(key=lambda item: (-item["score"], item["sample_id"]))
     if args.top_k > 0:
@@ -152,7 +179,9 @@ def main():
 
     output_file = args.output or _derive_output_path(args.model)
     summary_output = args.summary_output or _derive_summary_path(args.model)
+    print(f"写出排序结果: {output_file}")
     write_jsonl(output_file, scored_rows)
+    print(f"写出摘要: {summary_output}")
     write_json(
         summary_output,
         {

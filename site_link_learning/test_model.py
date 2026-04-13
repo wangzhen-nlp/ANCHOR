@@ -49,6 +49,7 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"加载模型: {args.model}")
     model_payload = load_json(args.model)
     feature_names = model_payload["feature_names"]
     standardizer = model_payload["standardizer"]
@@ -56,14 +57,38 @@ def main():
     bias = float(model_payload.get("bias", 0.0))
     threshold = args.threshold if args.threshold >= 0 else float(model_payload.get("threshold", 0.5))
 
+    print(f"加载测试集: {args.test}")
     test_samples = load_dataset_samples(args.test)
-    test_dense = vectorize_samples(test_samples, feature_names, standardizer)
-    metrics, probabilities = evaluate_dense_samples(test_dense, weights, bias, threshold=threshold)
-    prediction_rows = build_prediction_rows(test_dense, probabilities, threshold)
+    print("向量化测试集...")
+    test_dense = vectorize_samples(
+        test_samples,
+        feature_names,
+        standardizer,
+        show_progress=True,
+        progress_label="向量化测试样本",
+    )
+    print("评估测试集...")
+    metrics, probabilities = evaluate_dense_samples(
+        test_dense,
+        weights,
+        bias,
+        threshold=threshold,
+        show_progress=True,
+        progress_label="评估测试样本",
+    )
+    print("生成逐样本预测结果...")
+    prediction_rows = build_prediction_rows(
+        test_dense,
+        probabilities,
+        threshold,
+        show_progress=True,
+        progress_label="生成预测结果",
+    )
 
     output_file = args.output or _derive_eval_path(args.model, args.test)
     predictions_output = args.predictions_output or _derive_prediction_path(args.model, args.test)
 
+    print(f"写出评估结果: {output_file}")
     write_json(
         output_file,
         {
@@ -73,6 +98,7 @@ def main():
             "metrics": metrics,
         },
     )
+    print(f"写出逐样本预测: {predictions_output}")
     write_jsonl(predictions_output, prediction_rows)
 
     print(

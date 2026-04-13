@@ -831,6 +831,7 @@ def generate_candidate_site_link_samples_for_scoring(
     two_hop_source_negatives=2,
     reverse_direction_negatives=1,
     random_hard_negative_ratio=2.0,
+    show_progress=False,
 ):
     rng = random.Random(seed)
     positive_edges = collect_positive_site_edges(context)
@@ -846,6 +847,7 @@ def generate_candidate_site_link_samples_for_scoring(
         two_hop_source_negatives=two_hop_source_negatives,
         reverse_direction_negatives=reverse_direction_negatives,
         rng=rng,
+        show_progress=show_progress,
     )
 
     extra_random_target = (
@@ -855,6 +857,15 @@ def generate_candidate_site_link_samples_for_scoring(
     )
     random_negative_attempts = 0
     max_random_attempts = max(2000, extra_random_target * 50)
+    random_progress = None
+    if show_progress and context.site_ids and len(negative_reason_map) < extra_random_target:
+        random_progress = _create_progress_bar(
+            extra_random_target,
+            "补充随机候选站点对",
+            show_progress,
+        )
+        random_progress.set(len(negative_reason_map))
+        random_progress.set_extra_text(f"attempts={random_negative_attempts}")
     while (
         len(negative_reason_map) < extra_random_target
         and random_negative_attempts < max_random_attempts
@@ -873,14 +884,25 @@ def generate_candidate_site_link_samples_for_scoring(
             right_site_id,
             "random_hard_negative",
         )
+        if random_progress is not None:
+            random_progress.set(min(len(negative_reason_map), extra_random_target))
+            random_progress.set_extra_text(f"attempts={random_negative_attempts}")
+    _close_progress_bar(random_progress)
 
     candidate_items = list(negative_reason_map.items())
     if max_candidate_count > 0 and len(candidate_items) > max_candidate_count:
         candidate_items = rng.sample(candidate_items, max_candidate_count)
 
-    candidate_samples = [
-        _build_site_sample(context, left_site_id, right_site_id, 0, reasons, "candidate")
-        for (left_site_id, right_site_id), reasons in candidate_items
-    ]
+    candidate_samples = []
+    candidate_progress = _create_progress_bar(len(candidate_items), "构造候选样本特征", show_progress)
+    try:
+        for index, ((left_site_id, right_site_id), reasons) in enumerate(candidate_items, start=1):
+            candidate_samples.append(
+                _build_site_sample(context, left_site_id, right_site_id, 0, reasons, "candidate")
+            )
+            if candidate_progress is not None:
+                candidate_progress.set(index)
+    finally:
+        _close_progress_bar(candidate_progress)
     candidate_samples.sort(key=lambda item: item["sample_id"])
     return candidate_samples

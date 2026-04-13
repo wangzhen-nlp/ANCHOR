@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 from argparse import ArgumentParser
 
 if __package__ in (None, ""):
@@ -8,7 +9,8 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
-from ne_link_learning.core import read_jsonl, split_samples_by_group, summarize_samples, write_json, write_jsonl
+from alarm_tools.progress_utils import ProgressBar
+from ne_link_learning.core import read_jsonl, split_samples_by_group, summarize_samples, write_json
 
 
 def _derive_split_path(input_file, split_name):
@@ -21,6 +23,18 @@ def _derive_summary_path(input_file):
     if input_file.endswith(".jsonl"):
         return input_file[:-6] + ".split_summary.json"
     return input_file + ".split_summary.json"
+
+
+def _write_jsonl_with_progress(filepath, items, label):
+    print(f"⏳ {label}...")
+    progress = ProgressBar(len(items), label)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            for index, item in enumerate(items, start=1):
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                progress.set(index)
+    finally:
+        progress.close()
 
 
 def main():
@@ -46,7 +60,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     args = parser.parse_args()
 
+    print(f"加载样本文件: {args.dataset}")
     samples = read_jsonl(args.dataset)
+    print("按 group key 拆分样本...")
     split_buckets = split_samples_by_group(
         samples=samples,
         group_field=args.group_field,
@@ -54,6 +70,8 @@ def main():
         valid_ratio=args.valid_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
+        show_progress=True,
+        progress_label="拆分样本",
     )
 
     train_output = args.train_output or _derive_split_path(args.dataset, "train")
@@ -61,9 +79,9 @@ def main():
     test_output = args.test_output or _derive_split_path(args.dataset, "test")
     summary_output = args.summary_output or _derive_summary_path(args.dataset)
 
-    write_jsonl(train_output, split_buckets["train"])
-    write_jsonl(valid_output, split_buckets["valid"])
-    write_jsonl(test_output, split_buckets["test"])
+    _write_jsonl_with_progress(train_output, split_buckets["train"], "写出训练集")
+    _write_jsonl_with_progress(valid_output, split_buckets["valid"], "写出验证集")
+    _write_jsonl_with_progress(test_output, split_buckets["test"], "写出测试集")
 
     summary = {
         "dataset": args.dataset,
@@ -80,6 +98,7 @@ def main():
             "test": test_output,
         },
     }
+    print(f"写出拆分统计: {summary_output}")
     write_json(summary_output, summary)
 
     for split_name in ("train", "valid", "test"):

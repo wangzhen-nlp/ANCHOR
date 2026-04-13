@@ -60,16 +60,38 @@ def main():
     )
     args = parser.parse_args()
 
+    print(f"加载训练集: {args.train}")
     train_samples = load_dataset_samples(args.train)
     if not train_samples:
         raise ValueError("训练集为空")
 
+    if args.valid:
+        print(f"加载验证集: {args.valid}")
     valid_samples = load_dataset_samples(args.valid) if args.valid else []
+    print("推断特征集合...")
     feature_names = infer_feature_names(train_samples)
+    print("拟合标准化参数...")
     standardizer = fit_standardizer(train_samples, feature_names)
-    train_dense = vectorize_samples(train_samples, feature_names, standardizer)
-    valid_dense = vectorize_samples(valid_samples, feature_names, standardizer) if valid_samples else []
+    print("向量化训练集...")
+    train_dense = vectorize_samples(
+        train_samples,
+        feature_names,
+        standardizer,
+        show_progress=True,
+        progress_label="向量化训练样本",
+    )
+    valid_dense = []
+    if valid_samples:
+        print("向量化验证集...")
+        valid_dense = vectorize_samples(
+            valid_samples,
+            feature_names,
+            standardizer,
+            show_progress=True,
+            progress_label="向量化验证样本",
+        )
 
+    print("训练模型...")
     model_state = train_logistic_regression(
         train_dense_samples=train_dense,
         valid_dense_samples=valid_dense,
@@ -79,30 +101,41 @@ def main():
         positive_weight=(args.positive_weight if args.positive_weight > 0 else None),
         seed=args.seed,
         early_stop_patience=args.early_stop_patience,
+        show_progress=True,
+        progress_label="训练轮次",
     )
 
     if valid_dense:
+        print("搜索最佳阈值...")
         threshold, valid_metrics, _ = choose_best_threshold(
             valid_dense,
             model_state["weights"],
             model_state["bias"],
+            show_progress=True,
+            progress_label="搜索最佳阈值",
         )
     else:
         threshold = 0.5
         valid_metrics = None
 
+    print("评估训练集...")
     train_metrics, _ = evaluate_dense_samples(
         train_dense,
         model_state["weights"],
         model_state["bias"],
         threshold=threshold,
+        show_progress=True,
+        progress_label="评估训练样本",
     )
     if valid_dense:
+        print("评估验证集...")
         valid_metrics, _ = evaluate_dense_samples(
             valid_dense,
             model_state["weights"],
             model_state["bias"],
             threshold=threshold,
+            show_progress=True,
+            progress_label="评估验证样本",
         )
 
     model_payload = {
@@ -131,9 +164,11 @@ def main():
         "feature_importance": build_feature_importance(feature_names, model_state["weights"]),
         "training_history": model_state["history"],
     }
+    print(f"写出模型文件: {args.output}")
     write_json(args.output, model_payload)
 
     metrics_output = args.metrics_output or _derive_metrics_path(args.output)
+    print(f"写出指标文件: {metrics_output}")
     write_json(
         metrics_output,
         {
