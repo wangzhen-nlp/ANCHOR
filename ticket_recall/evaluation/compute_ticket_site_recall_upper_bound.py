@@ -331,15 +331,24 @@ def _associate_missing_sites_by_time_window(
             site_window_bounds.pop(site_id, None)
 
 
-def _compute_upper_bound_recalls(ticket_sites, ticket_site_sets, ticket_alarm_counts, direct_sites, inferred_sites, associated_sites):
+def _compute_upper_bound_recalls(
+    ticket_sites,
+    ticket_site_sets,
+    ticket_alarm_counts,
+    direct_sites,
+    inferred_sites,
+    associated_sites,
+    output_ticket_ids=None,
+):
     details = []
     total_recall = 0.0
     total_precision = 0.0
     total_f1 = 0.0
     ticket_count = 0
+    normalized_output_ticket_ids = None if output_ticket_ids is None else set(output_ticket_ids)
 
     for ticket_id in sorted(ticket_sites.keys()):
-        if ticket_alarm_counts.get(ticket_id, 0) <= 0:
+        if normalized_output_ticket_ids is not None and ticket_id not in normalized_output_ticket_ids:
             continue
 
         target_sites = ticket_site_sets[ticket_id]
@@ -547,6 +556,7 @@ def _build_recorded_range_debug_info(
     base_associated_sites,
     recorded_range_site_sets,
     effective_associated_sites,
+    output_ticket_ids,
     include_ticket_recorded_range_sites,
     ticket_field,
     site_field,
@@ -597,7 +607,7 @@ def _build_recorded_range_debug_info(
                 "max_time": time_range["max_time"],
             } if time_range else {},
             "ticket_alarm_count": int(ticket_alarm_counts.get(ticket_id, 0) or 0),
-            "valid_for_output": ticket_alarm_counts.get(ticket_id, 0) > 0,
+            "valid_for_output": ticket_id in set(output_ticket_ids or ()),
             "include_ticket_recorded_range_sites_for_recall": include_ticket_recorded_range_sites,
             "direct_sites": sorted(set(direct_sites.get(ticket_id, set())) & target_sites),
             "inferred_sites": sorted(set(inferred_sites.get(ticket_id, set())) & target_sites),
@@ -611,6 +621,12 @@ def _build_recorded_range_debug_info(
         recorded_range_sites = set(payload["recorded_range_sites"])
         base_sites = set(payload["base_associated_sites"])
         payload["recorded_range_added_sites"] = sorted(recorded_range_sites - base_sites)
+        output_reasons = []
+        if payload["ticket_alarm_count"] > 0:
+            output_reasons.append("ticket_alarm_count>0")
+        if payload["effective_associated_sites"]:
+            output_reasons.append("effective_associated_sites_nonempty")
+        payload["output_reasons"] = output_reasons
 
     if not site_to_debug_tickets:
         return debug_info
@@ -688,10 +704,12 @@ def _print_debug_summary(
     base_associated_sites,
     recorded_range_site_sets,
     effective_associated_sites,
+    output_ticket_ids,
 ):
     total_ticket_count = len(ticket_sites)
     recorded_range_ticket_count = len(ticket_recorded_time_ranges)
     valid_ticket_count = len(valid_ticket_ids)
+    output_ticket_count = len(set(output_ticket_ids or ()))
     recorded_range_hit_ticket_count = 0
     recorded_range_added_ticket_count = 0
     total_added_site_count = 0
@@ -713,6 +731,7 @@ def _print_debug_summary(
     print(f"- 工单站点映射数: {total_ticket_count}")
     print(f"- 有可解析记录时间范围的工单数: {recorded_range_ticket_count}")
     print(f"- 在告警流中真实出现过的工单数: {valid_ticket_count}")
+    print(f"- 最终进入结果输出的工单数: {output_ticket_count}")
     print(f"- 命中过记录时间范围站点告警的工单数: {recorded_range_hit_ticket_count}")
     print(f"- 因记录时间范围而新增 associated_sites 的工单数: {recorded_range_added_ticket_count}")
     print(f"- 因记录时间范围新增的站点总数: {total_added_site_count}")
@@ -733,6 +752,7 @@ def _print_recorded_range_debug_info(debug_info):
         print(f"- 记录时间范围: {item['ticket_recorded_time_range']}")
         print(f"- 工单号命中告警数: {item['ticket_alarm_count']}")
         print(f"- 会进入详情输出: {'是' if item['valid_for_output'] else '否'}")
+        print(f"- 进入输出原因: {item['output_reasons']}")
         print(f"- direct_sites: {item['direct_sites']}")
         print(f"- inferred_sites: {item['inferred_sites']}")
         print(f"- 原 associated_sites: {item['base_associated_sites']}")
@@ -917,6 +937,12 @@ def main():
             extra_site_sets=recorded_range_site_sets,
             ticket_site_sets=ticket_site_sets,
         )
+    output_ticket_ids = {
+        ticket_id
+        for ticket_id in ticket_sites
+        if ticket_alarm_counts.get(ticket_id, 0) > 0
+        or bool(effective_associated_sites.get(ticket_id, set()))
+    }
 
     details, average_recall, average_precision, average_f1 = _compute_upper_bound_recalls(
         ticket_sites=ticket_sites,
@@ -925,6 +951,7 @@ def main():
         direct_sites=direct_sites,
         inferred_sites=inferred_sites,
         associated_sites=effective_associated_sites,
+        output_ticket_ids=output_ticket_ids,
     )
 
     for item in details:
@@ -972,6 +999,7 @@ def main():
             base_associated_sites=base_associated_sites,
             recorded_range_site_sets=recorded_range_site_sets,
             effective_associated_sites=effective_associated_sites,
+            output_ticket_ids=output_ticket_ids,
         )
         debug_info = _build_recorded_range_debug_info(
             alarm_input=args.alarms,
@@ -986,6 +1014,7 @@ def main():
             base_associated_sites=base_associated_sites,
             recorded_range_site_sets=recorded_range_site_sets,
             effective_associated_sites=effective_associated_sites,
+            output_ticket_ids=output_ticket_ids,
             include_ticket_recorded_range_sites=args.include_ticket_recorded_range_sites,
             ticket_field=args.ticket_field,
             site_field=args.site_field,
