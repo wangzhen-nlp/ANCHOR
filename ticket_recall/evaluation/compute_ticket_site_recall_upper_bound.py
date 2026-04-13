@@ -41,6 +41,12 @@ def _normalize_site_list(values):
     return result
 
 
+def _truncate_debug_samples(records, sample_limit):
+    if sample_limit <= 0:
+        return []
+    return records[:sample_limit]
+
+
 def _load_ticket_sites(ticket_sites_file):
     with open(ticket_sites_file, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -510,6 +516,252 @@ def _build_recorded_range_site_sets(association_evidence):
     return recorded_range_site_sets
 
 
+def _build_debug_alarm_brief(alarm, resolved_site_id, ticket_field, source_field, time_field):
+    record = {
+        "告警编码ID": _normalize_text(alarm.get("告警编码ID", "")),
+        "告警标题": _normalize_text(alarm.get("告警标题", "")),
+        "工单号": _normalize_text(alarm.get(ticket_field, "")),
+        "关联站点ID": resolved_site_id,
+        "告警源": _normalize_text(alarm.get(source_field, "")),
+        time_field: _normalize_text(alarm.get(time_field, "")),
+    }
+    return {key: value for key, value in record.items() if value}
+
+
+def _append_debug_sample(samples, record, sample_limit):
+    if sample_limit <= 0 or len(samples) >= sample_limit:
+        return
+    samples.append(record)
+
+
+def _build_recorded_range_debug_info(
+    alarm_input,
+    debug_ticket_ids,
+    ticket_site_sets,
+    ticket_recorded_times,
+    normalized_recorded_times,
+    ticket_recorded_time_ranges,
+    ticket_alarm_counts,
+    direct_sites,
+    inferred_sites,
+    base_associated_sites,
+    recorded_range_site_sets,
+    effective_associated_sites,
+    include_ticket_recorded_range_sites,
+    ticket_field,
+    site_field,
+    source_field,
+    time_field,
+    ne_to_site,
+    sample_limit,
+):
+    selected_ticket_ids = sorted({
+        _normalize_text(ticket_id)
+        for ticket_id in (debug_ticket_ids or [])
+        if _normalize_text(ticket_id)
+    })
+    if not selected_ticket_ids:
+        return {}
+
+    debug_info = {}
+    site_to_debug_tickets = defaultdict(set)
+    for ticket_id in selected_ticket_ids:
+        target_sites = set(ticket_site_sets.get(ticket_id, set()))
+        for site_id in target_sites:
+            site_to_debug_tickets[site_id].add(ticket_id)
+
+        time_range = ticket_recorded_time_ranges.get(ticket_id)
+        site_debug = {}
+        for site_id in sorted(target_sites):
+            site_debug[site_id] = {
+                "in_range_count": 0,
+                "before_range_count": 0,
+                "after_range_count": 0,
+                "unparsable_time_count": 0,
+                "no_recorded_range_count": 0,
+                "in_range_samples": [],
+                "before_range_samples": [],
+                "after_range_samples": [],
+                "unparsable_time_samples": [],
+                "no_recorded_range_samples": [],
+            }
+
+        debug_info[ticket_id] = {
+            "present_in_ticket_sites": ticket_id in ticket_site_sets,
+            "ticket_site_count": len(target_sites),
+            "ticket_sites": sorted(target_sites),
+            "raw_recorded_times": list(ticket_recorded_times.get(ticket_id, [])),
+            "parsed_recorded_times": list(normalized_recorded_times.get(ticket_id, [])),
+            "ticket_recorded_time_range": {
+                "min_time": time_range["min_time"],
+                "max_time": time_range["max_time"],
+            } if time_range else {},
+            "ticket_alarm_count": int(ticket_alarm_counts.get(ticket_id, 0) or 0),
+            "valid_for_output": ticket_alarm_counts.get(ticket_id, 0) > 0,
+            "include_ticket_recorded_range_sites_for_recall": include_ticket_recorded_range_sites,
+            "direct_sites": sorted(set(direct_sites.get(ticket_id, set())) & target_sites),
+            "inferred_sites": sorted(set(inferred_sites.get(ticket_id, set())) & target_sites),
+            "base_associated_sites": sorted(set(base_associated_sites.get(ticket_id, set())) & target_sites),
+            "recorded_range_sites": sorted(set(recorded_range_site_sets.get(ticket_id, set())) & target_sites),
+            "effective_associated_sites": sorted(set(effective_associated_sites.get(ticket_id, set())) & target_sites),
+            "site_debug": site_debug,
+        }
+
+    for ticket_id, payload in debug_info.items():
+        recorded_range_sites = set(payload["recorded_range_sites"])
+        base_sites = set(payload["base_associated_sites"])
+        payload["recorded_range_added_sites"] = sorted(recorded_range_sites - base_sites)
+
+    if not site_to_debug_tickets:
+        return debug_info
+
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        if _should_skip_alarm(alarm):
+            continue
+
+        resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site, site_field, source_field)
+        if not resolved_site_id:
+            continue
+
+        candidate_tickets = site_to_debug_tickets.get(resolved_site_id)
+        if not candidate_tickets:
+            continue
+
+        alarm_ts = _parse_time_to_ts(alarm.get(time_field, ""))
+        alarm_brief = _build_debug_alarm_brief(
+            alarm,
+            resolved_site_id,
+            ticket_field,
+            source_field,
+            time_field,
+        )
+
+        for ticket_id in candidate_tickets:
+            ticket_entry = debug_info[ticket_id]
+            site_entry = ticket_entry["site_debug"].setdefault(
+                resolved_site_id,
+                {
+                    "in_range_count": 0,
+                    "before_range_count": 0,
+                    "after_range_count": 0,
+                    "unparsable_time_count": 0,
+                    "no_recorded_range_count": 0,
+                    "in_range_samples": [],
+                    "before_range_samples": [],
+                    "after_range_samples": [],
+                    "unparsable_time_samples": [],
+                    "no_recorded_range_samples": [],
+                },
+            )
+
+            time_range = ticket_recorded_time_ranges.get(ticket_id)
+            if not time_range:
+                site_entry["no_recorded_range_count"] += 1
+                _append_debug_sample(site_entry["no_recorded_range_samples"], alarm_brief, sample_limit)
+                continue
+
+            if alarm_ts is None:
+                site_entry["unparsable_time_count"] += 1
+                _append_debug_sample(site_entry["unparsable_time_samples"], alarm_brief, sample_limit)
+                continue
+
+            if alarm_ts < time_range["min_ts"]:
+                site_entry["before_range_count"] += 1
+                _append_debug_sample(site_entry["before_range_samples"], alarm_brief, sample_limit)
+                continue
+
+            if alarm_ts > time_range["max_ts"]:
+                site_entry["after_range_count"] += 1
+                _append_debug_sample(site_entry["after_range_samples"], alarm_brief, sample_limit)
+                continue
+
+            site_entry["in_range_count"] += 1
+            _append_debug_sample(site_entry["in_range_samples"], alarm_brief, sample_limit)
+
+    return debug_info
+
+
+def _print_debug_summary(
+    ticket_sites,
+    ticket_recorded_time_ranges,
+    valid_ticket_ids,
+    base_associated_sites,
+    recorded_range_site_sets,
+    effective_associated_sites,
+):
+    total_ticket_count = len(ticket_sites)
+    recorded_range_ticket_count = len(ticket_recorded_time_ranges)
+    valid_ticket_count = len(valid_ticket_ids)
+    recorded_range_hit_ticket_count = 0
+    recorded_range_added_ticket_count = 0
+    total_added_site_count = 0
+
+    for ticket_id, target_site_list in ticket_sites.items():
+        target_sites = set(target_site_list)
+        base_sites = set(base_associated_sites.get(ticket_id, set())) & target_sites
+        recorded_sites = set(recorded_range_site_sets.get(ticket_id, set())) & target_sites
+        effective_sites = set(effective_associated_sites.get(ticket_id, set())) & target_sites
+        added_sites = effective_sites - base_sites
+
+        if recorded_sites:
+            recorded_range_hit_ticket_count += 1
+        if added_sites:
+            recorded_range_added_ticket_count += 1
+            total_added_site_count += len(added_sites)
+
+    print("=== DEBUG SUMMARY ===")
+    print(f"- 工单站点映射数: {total_ticket_count}")
+    print(f"- 有可解析记录时间范围的工单数: {recorded_range_ticket_count}")
+    print(f"- 在告警流中真实出现过的工单数: {valid_ticket_count}")
+    print(f"- 命中过记录时间范围站点告警的工单数: {recorded_range_hit_ticket_count}")
+    print(f"- 因记录时间范围而新增 associated_sites 的工单数: {recorded_range_added_ticket_count}")
+    print(f"- 因记录时间范围新增的站点总数: {total_added_site_count}")
+
+
+def _print_recorded_range_debug_info(debug_info):
+    if not debug_info:
+        return
+
+    for ticket_id in sorted(debug_info):
+        item = debug_info[ticket_id]
+        print(f"=== DEBUG TICKET {ticket_id} ===")
+        print(f"- 在 ticket-sites 中: {'是' if item['present_in_ticket_sites'] else '否'}")
+        print(f"- 目标站点数: {item['ticket_site_count']}")
+        print(f"- 目标站点: {item['ticket_sites']}")
+        print(f"- 原始 extracted_times: {item['raw_recorded_times']}")
+        print(f"- 成功解析时间: {item['parsed_recorded_times']}")
+        print(f"- 记录时间范围: {item['ticket_recorded_time_range']}")
+        print(f"- 工单号命中告警数: {item['ticket_alarm_count']}")
+        print(f"- 会进入详情输出: {'是' if item['valid_for_output'] else '否'}")
+        print(f"- direct_sites: {item['direct_sites']}")
+        print(f"- inferred_sites: {item['inferred_sites']}")
+        print(f"- 原 associated_sites: {item['base_associated_sites']}")
+        print(f"- recorded_range_sites: {item['recorded_range_sites']}")
+        print(f"- recorded_range_added_sites: {item['recorded_range_added_sites']}")
+        print(f"- 最终 associated_sites: {item['effective_associated_sites']}")
+
+        for site_id in item["ticket_sites"]:
+            site_debug = item["site_debug"].get(site_id, {})
+            print(
+                f"  * 站点 {site_id}: "
+                f"in_range={site_debug.get('in_range_count', 0)}, "
+                f"before={site_debug.get('before_range_count', 0)}, "
+                f"after={site_debug.get('after_range_count', 0)}, "
+                f"unparsable={site_debug.get('unparsable_time_count', 0)}, "
+                f"no_range={site_debug.get('no_recorded_range_count', 0)}"
+            )
+            for label, key in (
+                ("命中范围样例", "in_range_samples"),
+                ("早于范围样例", "before_range_samples"),
+                ("晚于范围样例", "after_range_samples"),
+                ("时间解析失败样例", "unparsable_time_samples"),
+                ("无记录时间范围样例", "no_recorded_range_samples"),
+            ):
+                samples = site_debug.get(key, [])
+                if samples:
+                    print(f"    - {label}: {samples}")
+
+
 def main():
     parser = ArgumentParser(
         description="基于工单标注告警和站点时间窗，估算工单站点召回率的理论上限"
@@ -558,6 +810,23 @@ def main():
         "--include-ticket-recorded-range-sites",
         action="store_true",
         help="将工单记录时间范围内命中的站点也并入可关联站点，并据此计算 recall_upper_bound",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="打印记录时间范围扩站点相关的调试摘要",
+    )
+    parser.add_argument(
+        "--debug-ticket",
+        action="append",
+        default=[],
+        help="打印指定工单的详细调试信息；可重复传入多个工单号",
+    )
+    parser.add_argument(
+        "--debug-sample-limit",
+        type=int,
+        default=5,
+        help="每类调试样例最多打印多少条，默认: 5",
     )
     parser.add_argument(
         "-o",
@@ -693,6 +962,39 @@ def main():
         "average_f1_upper_bound": average_f1,
         "details": details,
     }
+
+    debug_enabled = args.debug or bool(args.debug_ticket)
+    if debug_enabled:
+        _print_debug_summary(
+            ticket_sites=ticket_sites,
+            ticket_recorded_time_ranges=ticket_recorded_time_ranges,
+            valid_ticket_ids=valid_ticket_ids,
+            base_associated_sites=base_associated_sites,
+            recorded_range_site_sets=recorded_range_site_sets,
+            effective_associated_sites=effective_associated_sites,
+        )
+        debug_info = _build_recorded_range_debug_info(
+            alarm_input=args.alarms,
+            debug_ticket_ids=args.debug_ticket,
+            ticket_site_sets=ticket_site_sets,
+            ticket_recorded_times=ticket_recorded_times,
+            normalized_recorded_times=normalized_recorded_times,
+            ticket_recorded_time_ranges=ticket_recorded_time_ranges,
+            ticket_alarm_counts=ticket_alarm_counts,
+            direct_sites=direct_sites,
+            inferred_sites=inferred_sites,
+            base_associated_sites=base_associated_sites,
+            recorded_range_site_sets=recorded_range_site_sets,
+            effective_associated_sites=effective_associated_sites,
+            include_ticket_recorded_range_sites=args.include_ticket_recorded_range_sites,
+            ticket_field=args.ticket_field,
+            site_field=args.site_field,
+            source_field=args.source_field,
+            time_field=args.time_field,
+            ne_to_site=ne_to_site,
+            sample_limit=args.debug_sample_limit,
+        )
+        _print_recorded_range_debug_info(debug_info)
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
