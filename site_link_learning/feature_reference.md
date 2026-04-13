@@ -8,6 +8,7 @@
 - 正样本定义：`u_site -> v_site` 至少存在一条已观测跨站 NE 有向边
 - 当前文档只描述 `features` 字段
 - `candidate_reasons`、`supporting_ne_edge_count`、`supporting_link_types` 等属于样本元信息，不属于模型输入特征
+- 为尽量降低标注泄漏，凡是直接依赖站点间图结构的特征，都会先把当前候选站点对 `(u_site_id, v_site_id)` 从本地站点图里临时拿掉，再计算特征值；负样本在这一步通常不变，正样本则不会直接“看到自己这条边”
 
 ## 1. 站点基础关系
 
@@ -101,7 +102,14 @@ peer group 级别 one-hot：
 - `right_peer_level_is__domain_only`
 - `right_peer_level_is__none`
 
+补充说明：
+
+- peer 模板统计本身仍然来自同类站点集合
+- 但如果同类站点里恰好包含当前候选 pair 的对端站点，那么在统计该 peer 的入度 / 出度时，也会暂时剔除这条 pair 关系，避免中位数被当前标签直接抬高
+
 ## 6. 站点级图结构
+
+这一组现在也统一基于“排除当前候选站点对后的局部图”计算，而不是直接用完整站点图。
 
 - `left_site_out_degree`
 - `left_site_in_degree`
@@ -119,6 +127,12 @@ peer group 级别 one-hot：
 - `two_hop_right_to_left_count`
 
 ## 7. 候选方向和邻居 domain 的匹配程度
+
+其中：
+
+- `left_neighbor_target_domain_match_count` 和 `right_neighbor_source_domain_match_count` 会在排除当前候选 pair 后统计
+- `left_site_sends_to_right_domain_count` 与 `right_site_receives_from_left_domain_count` 也会扣掉当前 `left -> right` 这条候选方向自身带来的 domain 流量
+- 反方向计数 `left_site_receives_from_right_domain_count`、`right_site_sends_to_left_domain_count` 仍保留，因为它们描述的是已观测到的反向关系，不属于当前待预测方向自身
 
 - `left_neighbor_target_domain_match_count`
 - `right_neighbor_source_domain_match_count`
@@ -152,6 +166,8 @@ peer group 级别 one-hot：
 - `manufacturer_ratio_cosine_similarity`
 
 ## 9. 图相似性分数
+
+这里的共享邻居 / 两跳中继集合，同样使用排除当前候选 pair 后的集合。
 
 - `adamic_adar_neighbor`
 - `resource_allocation_neighbor`

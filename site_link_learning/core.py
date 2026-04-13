@@ -4,7 +4,7 @@
 import math
 import random
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from alarm_tools.progress_utils import ProgressBar
 from ne_link_learning.core import (
@@ -35,6 +35,7 @@ class SiteInfo:
 @dataclass
 class SitePairContext:
     base_context: object
+    feature_base_context: object
     site_infos: dict
     site_ids: list
     site_out_sites: dict
@@ -134,8 +135,99 @@ def _resolve_peer_sites(context, site_id):
     return [], "none"
 
 
-def build_site_pair_context(ne_graph_data):
+def _site_degree_excluding_neighbor(site_neighbor_map, site_id, excluded_site_id=""):
+    neighbor_sites = set(site_neighbor_map.get(site_id, set()))
+    if excluded_site_id:
+        neighbor_sites.discard(excluded_site_id)
+    return len(neighbor_sites)
+
+
+def _sum_pair_domain_edges(site_pair_domain_counter, source_domain_bucket=None, target_domain_bucket=None):
+    total = 0
+    for (pair_source_domain_bucket, pair_target_domain_bucket), count in site_pair_domain_counter.items():
+        if source_domain_bucket is not None and pair_source_domain_bucket != source_domain_bucket:
+            continue
+        if target_domain_bucket is not None and pair_target_domain_bucket != target_domain_bucket:
+            continue
+        total += count
+    return total
+
+
+def _normalize_allowed_site_pairs(allowed_site_pairs):
+    normalized_pairs = set()
+    if not allowed_site_pairs:
+        return normalized_pairs
+    for left_site_id, right_site_id in allowed_site_pairs:
+        normalized_left_site_id = normalize_text(left_site_id)
+        normalized_right_site_id = normalize_text(right_site_id)
+        if not normalized_left_site_id or not normalized_right_site_id:
+            continue
+        if normalized_left_site_id == normalized_right_site_id:
+            continue
+        normalized_pairs.add((normalized_left_site_id, normalized_right_site_id))
+    return normalized_pairs
+
+
+def _build_feature_base_context(base_context, allowed_site_pairs=None):
+    if allowed_site_pairs is None:
+        return base_context
+
+    allowed_site_pairs = _normalize_allowed_site_pairs(allowed_site_pairs)
+    site_out_sites = defaultdict(set)
+    site_in_sites = defaultdict(set)
+    site_pair_forward_edge_count = {}
+    site_pair_link_type_counts = {}
+    site_pair_domain_forward_count = {}
+    site_incoming_source_domain_counts = defaultdict(Counter)
+    site_outgoing_target_domain_counts = defaultdict(Counter)
+
+    for site_pair_key, edge_count in base_context.site_pair_forward_edge_count.items():
+        if site_pair_key not in allowed_site_pairs:
+            continue
+
+        left_site_id, right_site_id = site_pair_key
+        site_out_sites[left_site_id].add(right_site_id)
+        site_in_sites[right_site_id].add(left_site_id)
+        site_pair_forward_edge_count[site_pair_key] = edge_count
+
+        link_type_counter = base_context.site_pair_link_type_counts.get(site_pair_key, Counter())
+        if link_type_counter:
+            site_pair_link_type_counts[site_pair_key] = Counter(link_type_counter)
+
+        domain_counter = Counter(base_context.site_pair_domain_forward_count.get(site_pair_key, Counter()))
+        if domain_counter:
+            site_pair_domain_forward_count[site_pair_key] = domain_counter
+            for (source_domain_bucket, target_domain_bucket), domain_edge_count in domain_counter.items():
+                site_incoming_source_domain_counts[right_site_id][source_domain_bucket] += domain_edge_count
+                site_outgoing_target_domain_counts[left_site_id][target_domain_bucket] += domain_edge_count
+
+    return replace(
+        base_context,
+        site_out_sites={site_id: set(value) for site_id, value in site_out_sites.items()},
+        site_in_sites={site_id: set(value) for site_id, value in site_in_sites.items()},
+        site_pair_forward_edge_count=dict(site_pair_forward_edge_count),
+        site_pair_link_type_counts={
+            site_pair_key: Counter(counter)
+            for site_pair_key, counter in site_pair_link_type_counts.items()
+        },
+        site_pair_domain_forward_count={
+            site_pair_key: Counter(counter)
+            for site_pair_key, counter in site_pair_domain_forward_count.items()
+        },
+        site_incoming_source_domain_counts={
+            site_id: Counter(counter)
+            for site_id, counter in site_incoming_source_domain_counts.items()
+        },
+        site_outgoing_target_domain_counts={
+            site_id: Counter(counter)
+            for site_id, counter in site_outgoing_target_domain_counts.items()
+        },
+    )
+
+
+def build_site_pair_context(ne_graph_data, allowed_site_pairs=None):
     base_context = build_graph_context(ne_graph_data)
+    feature_base_context = _build_feature_base_context(base_context, allowed_site_pairs)
 
     site_infos = {}
     region_to_sites = defaultdict(set)
@@ -196,16 +288,17 @@ def build_site_pair_context(ne_graph_data):
             peer_groups[level_name][level_key].add(site_id)
 
     for site_id in site_infos:
-        site_undirected_sites[site_id] = set(base_context.site_out_sites.get(site_id, set())) | set(
-            base_context.site_in_sites.get(site_id, set())
+        site_undirected_sites[site_id] = set(feature_base_context.site_out_sites.get(site_id, set())) | set(
+            feature_base_context.site_in_sites.get(site_id, set())
         )
 
     return SitePairContext(
         base_context=base_context,
+        feature_base_context=feature_base_context,
         site_infos=site_infos,
         site_ids=sorted(site_infos),
-        site_out_sites={site_id: set(value) for site_id, value in base_context.site_out_sites.items()},
-        site_in_sites={site_id: set(value) for site_id, value in base_context.site_in_sites.items()},
+        site_out_sites={site_id: set(value) for site_id, value in feature_base_context.site_out_sites.items()},
+        site_in_sites={site_id: set(value) for site_id, value in feature_base_context.site_in_sites.items()},
         site_undirected_sites=site_undirected_sites,
         region_to_sites={key: sorted(value) for key, value in region_to_sites.items()},
         dominant_domain_bucket_to_sites={key: sorted(value) for key, value in dominant_domain_bucket_to_sites.items()},
@@ -219,7 +312,7 @@ def build_site_pair_context(ne_graph_data):
 
 def collect_positive_site_edges(context):
     positive_edges = []
-    for left_site_id, right_site_id in sorted(context.base_context.site_pair_forward_edge_count):
+    for left_site_id, right_site_id in sorted(context.feature_base_context.site_pair_forward_edge_count):
         if left_site_id == right_site_id:
             continue
         positive_edges.append((left_site_id, right_site_id))
@@ -249,19 +342,18 @@ def extract_site_pair_features(context, left_site_id, right_site_id):
     left_in_sites = context.site_in_sites.get(left_site_id, set())
     right_out_sites = context.site_out_sites.get(right_site_id, set())
     right_in_sites = context.site_in_sites.get(right_site_id, set())
-    left_undirected_sites = context.site_undirected_sites.get(left_site_id, set())
-    right_undirected_sites = context.site_undirected_sites.get(right_site_id, set())
-
     left_out_sites_excl_pair = set(left_out_sites) - {right_site_id}
     left_in_sites_excl_pair = set(left_in_sites) - {right_site_id}
     right_out_sites_excl_pair = set(right_out_sites) - {left_site_id}
     right_in_sites_excl_pair = set(right_in_sites) - {left_site_id}
+    left_undirected_sites_excl_pair = left_out_sites_excl_pair | left_in_sites_excl_pair
+    right_undirected_sites_excl_pair = right_out_sites_excl_pair | right_in_sites_excl_pair
 
-    common_out = left_out_sites & right_out_sites
-    common_in = left_in_sites & right_in_sites
-    common_undirected = left_undirected_sites & right_undirected_sites
-    mids_left_to_right = left_out_sites & right_in_sites
-    mids_right_to_left = right_out_sites & left_in_sites
+    common_out_excl_pair = left_out_sites_excl_pair & right_out_sites_excl_pair
+    common_in_excl_pair = left_in_sites_excl_pair & right_in_sites_excl_pair
+    common_undirected_excl_pair = left_undirected_sites_excl_pair & right_undirected_sites_excl_pair
+    mids_left_to_right_excl_pair = left_out_sites_excl_pair & right_in_sites_excl_pair
+    mids_right_to_left_excl_pair = right_out_sites_excl_pair & left_in_sites_excl_pair
 
     geo_distance_km = None
     if (
@@ -277,7 +369,7 @@ def extract_site_pair_features(context, left_site_id, right_site_id):
             right_info.longitude,
         )
 
-    base_context = context.base_context
+    base_context = context.feature_base_context
     left_type_counts = base_context.site_type_counts.get(left_site_id, Counter())
     right_type_counts = base_context.site_type_counts.get(right_site_id, Counter())
     left_network_type_counts = base_context.site_network_type_counts.get(left_site_id, Counter())
@@ -293,21 +385,53 @@ def extract_site_pair_features(context, left_site_id, right_site_id):
     left_in_degree_excl_pair = len(left_in_sites_excl_pair)
     right_out_degree_excl_pair = len(right_out_sites_excl_pair)
     right_in_degree_excl_pair = len(right_in_sites_excl_pair)
+    forward_site_pair_domain_counter = base_context.site_pair_domain_forward_count.get(
+        (left_site_id, right_site_id),
+        Counter(),
+    )
+    forward_pair_target_domain_edge_count = _sum_pair_domain_edges(
+        forward_site_pair_domain_counter,
+        target_domain_bucket=right_domain_bucket,
+    )
+    forward_pair_source_domain_edge_count = _sum_pair_domain_edges(
+        forward_site_pair_domain_counter,
+        source_domain_bucket=left_domain_bucket,
+    )
 
     left_peer_sites, left_peer_level = _resolve_peer_sites(context, left_site_id)
     right_peer_sites, right_peer_level = _resolve_peer_sites(context, right_site_id)
 
     left_peer_out_median = _median(
-        len(context.site_out_sites.get(peer_site_id, set())) for peer_site_id in left_peer_sites
+        _site_degree_excluding_neighbor(
+            context.site_out_sites,
+            peer_site_id,
+            excluded_site_id=left_site_id if peer_site_id == right_site_id else "",
+        )
+        for peer_site_id in left_peer_sites
     )
     left_peer_in_median = _median(
-        len(context.site_in_sites.get(peer_site_id, set())) for peer_site_id in left_peer_sites
+        _site_degree_excluding_neighbor(
+            context.site_in_sites,
+            peer_site_id,
+            excluded_site_id=left_site_id if peer_site_id == right_site_id else "",
+        )
+        for peer_site_id in left_peer_sites
     )
     right_peer_out_median = _median(
-        len(context.site_out_sites.get(peer_site_id, set())) for peer_site_id in right_peer_sites
+        _site_degree_excluding_neighbor(
+            context.site_out_sites,
+            peer_site_id,
+            excluded_site_id=right_site_id if peer_site_id == left_site_id else "",
+        )
+        for peer_site_id in right_peer_sites
     )
     right_peer_in_median = _median(
-        len(context.site_in_sites.get(peer_site_id, set())) for peer_site_id in right_peer_sites
+        _site_degree_excluding_neighbor(
+            context.site_in_sites,
+            peer_site_id,
+            excluded_site_id=right_site_id if peer_site_id == left_site_id else "",
+        )
+        for peer_site_id in right_peer_sites
     )
 
     left_out_gap_to_peer_median = max(0.0, left_peer_out_median - left_out_degree_excl_pair)
@@ -394,25 +518,28 @@ def extract_site_pair_features(context, left_site_id, right_site_id):
         "forward_gap_fill_score": float(forward_gap_fill_score),
         "reverse_gap_fill_score": float(reverse_gap_fill_score),
         "forward_minus_reverse_gap_fill_score": float(forward_gap_fill_score - reverse_gap_fill_score),
-        "left_site_out_degree": float(len(left_out_sites)),
-        "left_site_in_degree": float(len(left_in_sites)),
-        "left_site_undirected_degree": float(len(left_undirected_sites)),
-        "right_site_out_degree": float(len(right_out_sites)),
-        "right_site_in_degree": float(len(right_in_sites)),
-        "right_site_undirected_degree": float(len(right_undirected_sites)),
-        "common_out_count": float(len(common_out)),
-        "common_in_count": float(len(common_in)),
-        "common_neighbor_count": float(len(common_undirected)),
-        "jaccard_out": _jaccard(left_out_sites, right_out_sites),
-        "jaccard_in": _jaccard(left_in_sites, right_in_sites),
-        "jaccard_neighbor": _jaccard(left_undirected_sites, right_undirected_sites),
-        "two_hop_left_to_right_count": float(len(mids_left_to_right)),
-        "two_hop_right_to_left_count": float(len(mids_right_to_left)),
+        # To reduce label leakage, graph-structure features are evaluated after
+        # temporarily removing the current candidate site pair from the local
+        # site-site adjacency view.
+        "left_site_out_degree": float(left_out_degree_excl_pair),
+        "left_site_in_degree": float(left_in_degree_excl_pair),
+        "left_site_undirected_degree": float(len(left_undirected_sites_excl_pair)),
+        "right_site_out_degree": float(right_out_degree_excl_pair),
+        "right_site_in_degree": float(right_in_degree_excl_pair),
+        "right_site_undirected_degree": float(len(right_undirected_sites_excl_pair)),
+        "common_out_count": float(len(common_out_excl_pair)),
+        "common_in_count": float(len(common_in_excl_pair)),
+        "common_neighbor_count": float(len(common_undirected_excl_pair)),
+        "jaccard_out": _jaccard(left_out_sites_excl_pair, right_out_sites_excl_pair),
+        "jaccard_in": _jaccard(left_in_sites_excl_pair, right_in_sites_excl_pair),
+        "jaccard_neighbor": _jaccard(left_undirected_sites_excl_pair, right_undirected_sites_excl_pair),
+        "two_hop_left_to_right_count": float(len(mids_left_to_right_excl_pair)),
+        "two_hop_right_to_left_count": float(len(mids_right_to_left_excl_pair)),
         "left_neighbor_target_domain_match_count": float(
-            _count_domain_neighbor_targets(left_out_sites, context, right_domain_bucket)
+            _count_domain_neighbor_targets(left_out_sites_excl_pair, context, right_domain_bucket)
         ),
         "right_neighbor_source_domain_match_count": float(
-            _count_domain_neighbor_targets(right_in_sites, context, left_domain_bucket)
+            _count_domain_neighbor_targets(right_in_sites_excl_pair, context, left_domain_bucket)
         ),
         "left_site_type_diversity": float(len(_counter_key_set(left_type_counts))),
         "right_site_type_diversity": float(len(_counter_key_set(right_type_counts))),
@@ -439,19 +566,41 @@ def extract_site_pair_features(context, left_site_id, right_site_id):
             base_context.site_incoming_source_domain_counts.get(left_site_id, Counter()).get(right_domain_bucket, 0)
         ),
         "right_site_receives_from_left_domain_count": float(
-            base_context.site_incoming_source_domain_counts.get(right_site_id, Counter()).get(left_domain_bucket, 0)
+            max(
+                0,
+                base_context.site_incoming_source_domain_counts.get(right_site_id, Counter()).get(
+                    left_domain_bucket, 0
+                )
+                - forward_pair_source_domain_edge_count,
+            )
         ),
         "left_site_sends_to_right_domain_count": float(
-            base_context.site_outgoing_target_domain_counts.get(left_site_id, Counter()).get(right_domain_bucket, 0)
+            max(
+                0,
+                base_context.site_outgoing_target_domain_counts.get(left_site_id, Counter()).get(
+                    right_domain_bucket, 0
+                )
+                - forward_pair_target_domain_edge_count,
+            )
         ),
         "right_site_sends_to_left_domain_count": float(
             base_context.site_outgoing_target_domain_counts.get(right_site_id, Counter()).get(left_domain_bucket, 0)
         ),
-        "adamic_adar_neighbor": _adamic_adar_score(common_undirected, context.site_undirected_sites),
-        "resource_allocation_neighbor": _resource_allocation_score(common_undirected, context.site_undirected_sites),
-        "adamic_adar_two_hop_left_to_right": _adamic_adar_score(mids_left_to_right, context.site_undirected_sites),
+        "adamic_adar_neighbor": _adamic_adar_score(
+            common_undirected_excl_pair,
+            context.site_undirected_sites,
+        ),
+        "resource_allocation_neighbor": _resource_allocation_score(
+            common_undirected_excl_pair,
+            context.site_undirected_sites,
+        ),
+        "adamic_adar_two_hop_left_to_right": _adamic_adar_score(
+            mids_left_to_right_excl_pair,
+            context.site_undirected_sites,
+        ),
         "resource_allocation_two_hop_left_to_right": _resource_allocation_score(
-            mids_left_to_right, context.site_undirected_sites
+            mids_left_to_right_excl_pair,
+            context.site_undirected_sites,
         ),
         "left_region_missing": float(left_info.region_id == "MISSING"),
         "right_region_missing": float(right_info.region_id == "MISSING"),
@@ -537,6 +686,7 @@ def _try_add_negative_site_pair(context, negative_reason_map, positive_edge_set,
 def _generate_site_negative_pool(
     context,
     positive_edges,
+    blocked_positive_edge_set,
     same_source_region_negatives,
     same_target_region_negatives,
     same_source_domain_negatives,
@@ -547,7 +697,6 @@ def _generate_site_negative_pool(
     rng,
     show_progress=False,
 ):
-    positive_edge_set = set(positive_edges)
     negative_reason_map = defaultdict(set)
     progress = _create_progress_bar(len(positive_edges), "构造站点负样本候选", show_progress)
     try:
@@ -559,7 +708,7 @@ def _generate_site_negative_pool(
                 _try_add_negative_site_pair(
                     context,
                     negative_reason_map,
-                    positive_edge_set,
+                    blocked_positive_edge_set,
                     right_site_id,
                     left_site_id,
                     "reverse_direction_missing",
@@ -575,7 +724,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         left_site_id,
                         candidate_site_id,
                         "same_target_region",
@@ -591,7 +740,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         candidate_site_id,
                         right_site_id,
                         "same_source_region",
@@ -607,7 +756,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         left_site_id,
                         candidate_site_id,
                         "same_target_domain",
@@ -623,7 +772,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         candidate_site_id,
                         right_site_id,
                         "same_source_domain",
@@ -638,7 +787,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         left_site_id,
                         candidate_site_id,
                         "two_hop_target",
@@ -653,7 +802,7 @@ def _generate_site_negative_pool(
                     _try_add_negative_site_pair(
                         context,
                         negative_reason_map,
-                        positive_edge_set,
+                        blocked_positive_edge_set,
                         candidate_site_id,
                         right_site_id,
                         "two_hop_source",
@@ -699,6 +848,8 @@ def _pick_random_hard_target_site(context, left_site_id, rng):
 
 def generate_site_link_learning_samples(
     context,
+    positive_edges=None,
+    blocked_positive_edges=None,
     max_negative_per_positive=4.0,
     seed=42,
     same_source_region_negatives=1,
@@ -712,11 +863,19 @@ def generate_site_link_learning_samples(
     show_progress=False,
 ):
     rng = random.Random(seed)
-    positive_edges = collect_positive_site_edges(context)
-    positive_edge_set = set(positive_edges)
+    if positive_edges is None:
+        positive_edges = collect_positive_site_edges(context)
+    else:
+        positive_edges = sorted(_normalize_allowed_site_pairs(positive_edges))
+    positive_edge_set = set(
+        _normalize_allowed_site_pairs(blocked_positive_edges)
+        if blocked_positive_edges is not None
+        else positive_edges
+    )
     negative_reason_map = _generate_site_negative_pool(
         context=context,
         positive_edges=positive_edges,
+        blocked_positive_edge_set=positive_edge_set,
         same_source_region_negatives=same_source_region_negatives,
         same_target_region_negatives=same_target_region_negatives,
         same_source_domain_negatives=same_source_domain_negatives,
@@ -819,6 +978,41 @@ def generate_site_link_learning_samples(
     return samples
 
 
+def rebuild_site_pair_sample_features(
+    samples,
+    context,
+    show_progress=False,
+    progress_label="重算站点对特征",
+    feature_topology_scope="",
+):
+    rebuilt_samples = []
+    progress = _create_progress_bar(len(samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(samples, start=1):
+            if sample.get("sample_granularity") != "site_pair":
+                rebuilt_samples.append(dict(sample))
+            else:
+                left_site_id = normalize_text(sample.get("u_site_id", ""))
+                right_site_id = normalize_text(sample.get("v_site_id", ""))
+                if left_site_id not in context.site_infos or right_site_id not in context.site_infos:
+                    raise ValueError(
+                        f"样本 {sample.get('sample_id', '')} 的站点对 ({left_site_id}, {right_site_id}) 不在上下文中"
+                    )
+
+                rebuilt_sample = dict(sample)
+                rebuilt_sample["features"] = extract_site_pair_features(context, left_site_id, right_site_id)
+                if feature_topology_scope:
+                    rebuilt_sample["feature_topology_scope"] = feature_topology_scope
+                rebuilt_samples.append(rebuilt_sample)
+
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
+
+    return rebuilt_samples
+
+
 def generate_candidate_site_link_samples_for_scoring(
     context,
     max_candidate_count=20000,
@@ -839,6 +1033,7 @@ def generate_candidate_site_link_samples_for_scoring(
     negative_reason_map = _generate_site_negative_pool(
         context=context,
         positive_edges=positive_edges,
+        blocked_positive_edge_set=positive_edge_set,
         same_source_region_negatives=same_source_region_negatives,
         same_target_region_negatives=same_target_region_negatives,
         same_source_domain_negatives=same_source_domain_negatives,
