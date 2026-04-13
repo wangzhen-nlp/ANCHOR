@@ -7,6 +7,7 @@
 import argparse
 import json
 import os
+import re
 import warnings
 from collections import defaultdict, deque
 
@@ -27,6 +28,10 @@ try:
     from openpyxl import load_workbook
 except ImportError:  # pragma: no cover - fallback for environments without openpyxl
     load_workbook = None
+
+
+DATETIME_TEXT_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+DATETIME_FULLMATCH_PATTERN = re.compile(r"^\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$")
 
 
 def load_site_device_mapping(json_file: str) -> dict:
@@ -371,18 +376,27 @@ def _get_ticket_column_index(df: pd.DataFrame, ticket_field: str) -> int:
         raise KeyError(f"输入文件缺少 '{ticket_field}' 列") from exc
 
 
-def _build_ticket_site_json(result_df, matched_sites_by_row, ticket_field: str):
+def _build_ticket_site_json(result_df, matched_sites_by_row, matched_time_entries_by_row, ticket_field: str):
     json_data = {}
     ticket_col_idx = _get_ticket_column_index(result_df, ticket_field)
     for row_idx, row in enumerate(result_df.itertuples(index=False, name=None)):
         ticket_id = row[ticket_col_idx]
         site_ids = matched_sites_by_row[row_idx]
-        existing_sites = json_data.setdefault(ticket_id, [])
-        seen = set(existing_sites)
-        for site_id in site_ids:
-            if site_id not in seen:
-                existing_sites.append(site_id)
-                seen.add(site_id)
+        time_entries = matched_time_entries_by_row[row_idx] if row_idx < len(matched_time_entries_by_row) else []
+        output_entry = json_data.setdefault(
+            ticket_id,
+            {
+                "site_ids": [],
+                "extracted_times": [],
+                "time_details": [],
+            },
+        )
+        output_entry["site_ids"] = _merge_exact_values(output_entry["site_ids"], site_ids)
+        output_entry["extracted_times"] = _merge_exact_values(
+            output_entry["extracted_times"],
+            _collect_matched_times(time_entries),
+        )
+        _merge_time_detail_entries(output_entry["time_details"], time_entries)
     return json_data
 
 
@@ -409,6 +423,114 @@ def _merge_site_lists(primary_site_ids: list, extra_site_ids: list) -> list:
     return merged
 
 
+def _merge_exact_values(existing_values: list, new_values: list) -> list:
+    merged = []
+    seen = set()
+    for value in list(existing_values) + list(new_values):
+        exact_value = str(value).strip()
+        if not exact_value or exact_value in seen:
+            continue
+        merged.append(exact_value)
+        seen.add(exact_value)
+    return merged
+
+
+def _extract_time_entries_from_row(columns, row) -> list:
+    time_entries = []
+    seen_entries = set()
+
+    for col_idx, value in enumerate(row):
+        if value is None:
+            continue
+
+        cell_text = str(value).strip()
+        if not cell_text:
+            continue
+        if DATETIME_FULLMATCH_PATTERN.fullmatch(cell_text):
+            continue
+
+        matched_times = DATETIME_TEXT_PATTERN.findall(cell_text)
+        if not matched_times:
+            continue
+
+        deduped_times = _merge_exact_values([], matched_times)
+        column_name = columns[col_idx] if col_idx < len(columns) else f"Unnamed:{col_idx}"
+        entry_key = (column_name, cell_text)
+        if entry_key in seen_entries:
+            continue
+        seen_entries.add(entry_key)
+        time_entries.append(
+            {
+                "column": column_name,
+                "cell_text": cell_text,
+                "matched_times": deduped_times,
+            }
+        )
+
+    return time_entries
+
+
+def _collect_matched_times(time_entries: list) -> list:
+    matched_times = []
+    for time_entry in time_entries or []:
+        if not isinstance(time_entry, dict):
+            continue
+        matched_times.extend(time_entry.get("matched_times", []))
+    return _merge_exact_values([], matched_times)
+
+
+def _merge_time_detail_entries(existing_entries: list, new_entries: list) -> None:
+    existing_entry_map = {
+        (str(entry.get("column", "")), str(entry.get("cell_text", ""))): entry
+        for entry in existing_entries
+        if isinstance(entry, dict)
+    }
+
+    for new_entry in new_entries or []:
+        if not isinstance(new_entry, dict):
+            continue
+
+        column_name = str(new_entry.get("column", "")).strip()
+        cell_text = str(new_entry.get("cell_text", "")).strip()
+        if not column_name or not cell_text:
+            continue
+
+        entry_key = (column_name, cell_text)
+        matched_times = _merge_exact_values([], new_entry.get("matched_times", []))
+        if entry_key not in existing_entry_map:
+            merged_entry = {
+                "column": column_name,
+                "cell_text": cell_text,
+                "matched_times": matched_times,
+            }
+            existing_entries.append(merged_entry)
+            existing_entry_map[entry_key] = merged_entry
+            continue
+
+        existing_entry_map[entry_key]["matched_times"] = _merge_exact_values(
+            existing_entry_map[entry_key].get("matched_times", []),
+            matched_times,
+        )
+
+
+def _attach_time_columns(result_df, matched_time_entries_by_row):
+    if result_df is None:
+        return None
+
+    enriched_df = result_df.copy()
+    extracted_time_lists = []
+    extracted_time_details = []
+
+    for row_idx in range(len(enriched_df)):
+        time_entries = matched_time_entries_by_row[row_idx] if row_idx < len(matched_time_entries_by_row) else []
+        extracted_time_lists.append("; ".join(_collect_matched_times(time_entries)))
+        extracted_time_details.append(json.dumps(time_entries, ensure_ascii=False))
+
+    enriched_df["提取时间列表"] = extracted_time_lists
+    enriched_df["提取时间详情"] = extracted_time_details
+    return enriched_df
+
+
 def _filter_incident_tickets_rows(
     columns,
     row_iter,
@@ -427,6 +549,7 @@ def _filter_incident_tickets_rows(
     filtered_indices = []
     filtered_rows = []
     matched_sites_by_row = []
+    matched_time_entries_by_row = []
     stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}
     row_progress = ProgressBar(total_rows, progress_label or "处理工单记录", min_interval=0.05)
     ticket_col_idx = None
@@ -494,12 +617,13 @@ def _filter_incident_tickets_rows(
             filtered_indices.append(idx)
             filtered_rows.append(row)
             matched_sites_by_row.append(site_ids)
+            matched_time_entries_by_row.append(_extract_time_entries_from_row(columns, row))
             row_progress.update()
     finally:
         row_progress.close()
 
     result_df = pd.DataFrame(filtered_rows, columns=columns) if filtered_rows else None
-    return result_df, stats, matched_sites_by_row
+    return result_df, stats, matched_sites_by_row, matched_time_entries_by_row
 
 
 def _filter_incident_tickets_df(
@@ -560,7 +684,7 @@ def _filter_incident_tickets_xlsx_stream(
         row_iter = worksheet.iter_rows(values_only=True)
         header_row = next(row_iter, None)
         if header_row is None:
-            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}, []
+            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}, [], []
 
         columns = _normalize_header_row(header_row)
         total_rows = max((worksheet.max_row or 1) - 1, 0)
@@ -626,7 +750,7 @@ def _filter_incident_tickets_excel(
     )
 
 
-def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row, ticket_field: str):
+def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row, matched_time_entries_by_row, ticket_field: str):
     if result_df is None:
         return
 
@@ -634,12 +758,29 @@ def _merge_ticket_site_json(existing_json, result_df, matched_sites_by_row, tick
     for row_idx, row in enumerate(result_df.itertuples(index=False, name=None)):
         ticket_id = row[ticket_col_idx]
         site_ids = matched_sites_by_row[row_idx]
-        existing_sites = existing_json.setdefault(ticket_id, [])
-        seen = set(existing_sites)
-        for site_id in site_ids:
-            if site_id not in seen:
-                existing_sites.append(site_id)
-                seen.add(site_id)
+        time_entries = matched_time_entries_by_row[row_idx] if row_idx < len(matched_time_entries_by_row) else []
+        output_entry = existing_json.setdefault(
+            ticket_id,
+            {
+                "site_ids": [],
+                "extracted_times": [],
+                "time_details": [],
+            },
+        )
+        output_entry["site_ids"] = _merge_exact_values(output_entry["site_ids"], site_ids)
+        output_entry["extracted_times"] = _merge_exact_values(
+            output_entry["extracted_times"],
+            _collect_matched_times(time_entries),
+        )
+        _merge_time_detail_entries(output_entry["time_details"], time_entries)
+
+
+def _count_total_sites_from_ticket_json(ticket_json: dict) -> int:
+    total = 0
+    for payload in (ticket_json or {}).values():
+        if isinstance(payload, dict):
+            total += len(payload.get("site_ids", []))
+    return total
 
 
 def _filter_incident_tickets_file(
@@ -660,7 +801,7 @@ def _filter_incident_tickets_file(
     """筛选单个 Excel 文件。"""
     _print_file_start(input_file)
 
-    result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
+    result_df, stats, matched_sites_by_row, matched_time_entries_by_row = _filter_incident_tickets_excel(
         input_file,
         site_device_mapping,
         site_matcher,
@@ -677,13 +818,19 @@ def _filter_incident_tickets_file(
 
     # 输出结果
     if result_df is not None:
+        result_df = _attach_time_columns(result_df, matched_time_entries_by_row)
         if not json_only:
             os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
             result_df.to_excel(output_file, index=False)
 
         if json_output_file:
             os.makedirs(os.path.dirname(json_output_file) or '.', exist_ok=True)
-            json_data = _build_ticket_site_json(result_df, matched_sites_by_row, ticket_field)
+            json_data = _build_ticket_site_json(
+                result_df,
+                matched_sites_by_row,
+                matched_time_entries_by_row,
+                ticket_field,
+            )
             with open(json_output_file, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
         _print_section("处理结果")
@@ -792,7 +939,7 @@ def main():
     )
     parser.add_argument(
         '-j', '--json-output',
-        help='JSON输出文件（可选），格式：{工单字段值: [站点列表]}'
+        help='JSON输出文件（可选），格式：{工单字段值: {site_ids, extracted_times, time_details}}'
     )
     parser.add_argument(
         '--ticket-field',
@@ -869,7 +1016,7 @@ def main():
             for input_file in input_files:
                 _print_file_start(input_file)
 
-                result_df, stats, matched_sites_by_row = _filter_incident_tickets_excel(
+                result_df, stats, matched_sites_by_row, matched_time_entries_by_row = _filter_incident_tickets_excel(
                     input_file,
                     site_device_mapping,
                     site_matcher,
@@ -888,8 +1035,15 @@ def main():
                 for key in aggregate_stats:
                     aggregate_stats[key] += stats.get(key, 0)
                 if result_df is not None:
+                    result_df = _attach_time_columns(result_df, matched_time_entries_by_row)
                     aggregated_result_dfs.append(result_df)
-                    _merge_ticket_site_json(aggregated_json, result_df, matched_sites_by_row, args.ticket_field)
+                    _merge_ticket_site_json(
+                        aggregated_json,
+                        result_df,
+                        matched_sites_by_row,
+                        matched_time_entries_by_row,
+                        args.ticket_field,
+                    )
                 file_progress.update()
         finally:
             file_progress.close()
@@ -901,7 +1055,7 @@ def main():
             ("命中记录数", aggregate_stats['valid']),
             ("不足 2 个站点", aggregate_stats['only_one_site']),
             ("具备 Transmission 的站点不足 2 个", aggregate_stats['missing_transmission_device']),
-            ("输出记录关联站点总数", _count_total_sites(aggregated_json.values())),
+            ("输出记录关联站点总数", _count_total_sites_from_ticket_json(aggregated_json)),
         ])
 
         if aggregated_result_dfs:
