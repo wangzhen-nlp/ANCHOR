@@ -390,9 +390,6 @@ def compute_group_output_ticket_recall_v2(
     ne_to_domain = build_ne_to_domain_map(ne_graph_data)
 
     for ticket_id in sorted(ticket_sites.keys()):
-        if ticket_alarm_counts.get(ticket_id, 0) <= 0:
-            continue
-
         target_sites = set(ticket_sites[ticket_id])
         base_fault_groups = sorted(ticket_to_base_groups.get(ticket_id, set()))
         loose_fault_groups = sorted(loose_ticket_to_groups.get(ticket_id, set()))
