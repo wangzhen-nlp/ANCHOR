@@ -32,6 +32,8 @@ except ImportError:  # pragma: no cover - fallback for environments without open
 
 DATETIME_TEXT_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 DATETIME_FULLMATCH_PATTERN = re.compile(r"^\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$")
+TICKET_DATE_PATTERN = re.compile(r"-(\d{8})-")
+FALLBACK_TICKET_DATE_PATTERN = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 
 
 def load_site_device_mapping(json_file: str) -> dict:
@@ -435,9 +437,42 @@ def _merge_exact_values(existing_values: list, new_values: list) -> list:
     return merged
 
 
-def _extract_time_entries_from_row(columns, row) -> list:
+def _extract_ticket_date_from_key(ticket_id) -> str:
+    ticket_text = str(ticket_id).strip() if ticket_id is not None else ""
+    if not ticket_text:
+        return ""
+
+    matched = TICKET_DATE_PATTERN.search(ticket_text)
+    if matched:
+        return matched.group(1)
+
+    matched = FALLBACK_TICKET_DATE_PATTERN.search(ticket_text)
+    if matched:
+        return matched.group(1)
+
+    return ""
+
+
+def _filter_times_by_ticket_date(matched_times: list, ticket_date_yyyymmdd: str) -> list:
+    if not ticket_date_yyyymmdd:
+        return _merge_exact_values([], matched_times)
+
+    filtered_times = []
+    for matched_time in matched_times or []:
+        matched_time_text = str(matched_time).strip()
+        if len(matched_time_text) < 10:
+            continue
+        matched_date = matched_time_text[:10].replace("-", "")
+        if matched_date != ticket_date_yyyymmdd:
+            continue
+        filtered_times.append(matched_time_text)
+    return _merge_exact_values([], filtered_times)
+
+
+def _extract_time_entries_from_row(columns, row, ticket_id=None) -> list:
     time_entries = []
     seen_entries = set()
+    ticket_date_yyyymmdd = _extract_ticket_date_from_key(ticket_id)
 
     for col_idx, value in enumerate(row):
         if value is None:
@@ -453,7 +488,9 @@ def _extract_time_entries_from_row(columns, row) -> list:
         if not matched_times:
             continue
 
-        deduped_times = _merge_exact_values([], matched_times)
+        deduped_times = _filter_times_by_ticket_date(matched_times, ticket_date_yyyymmdd)
+        if not deduped_times:
+            continue
         column_name = columns[col_idx] if col_idx < len(columns) else f"Unnamed:{col_idx}"
         entry_key = (column_name, cell_text)
         if entry_key in seen_entries:
@@ -617,7 +654,7 @@ def _filter_incident_tickets_rows(
             filtered_indices.append(idx)
             filtered_rows.append(row)
             matched_sites_by_row.append(site_ids)
-            matched_time_entries_by_row.append(_extract_time_entries_from_row(columns, row))
+            matched_time_entries_by_row.append(_extract_time_entries_from_row(columns, row, ticket_id=ticket_id))
             row_progress.update()
     finally:
         row_progress.close()
