@@ -42,6 +42,7 @@ from ticket_recall.ticket_recall_v2_utils import (
     load_upper_bound_index,
     load_upper_bound_settings,
     load_ne_graph_data,
+    extract_alarm_record_id,
     select_best_group_by_target_sites,
     site_alarm_map_contains_domain,
     write_jsonl_records,
@@ -226,6 +227,41 @@ def _build_group_site_union(group_ids, group_to_sites):
     })
 
 
+def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, excluded_group_ids):
+    excluded_groups = set(excluded_group_ids or ())
+    matched_groups = set()
+    evidence_alarm_hits = []
+    if not isinstance(site_evidence, dict):
+        return [], []
+
+    for site_id in sorted(site_evidence):
+        alarms = site_evidence.get(site_id, [])
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if not isinstance(record, dict):
+                continue
+            alarm_id = extract_alarm_record_id(record)
+            if not alarm_id:
+                continue
+            raw_groups = sorted({
+                _normalize_text(group_id)
+                for group_id in alarm_to_groups.get(alarm_id, ())
+                if _normalize_text(group_id) and _normalize_text(group_id) not in excluded_groups
+            })
+            if not raw_groups:
+                continue
+            matched_groups.update(raw_groups)
+            evidence_alarm_hits.append({
+                "site_id": _normalize_text(site_id),
+                "alarm_id": alarm_id,
+                "alarm_title": _normalize_text(record.get("告警标题", "")) or _normalize_text(record.get("alarm", "")),
+                "matched_groups": raw_groups,
+            })
+
+    return sorted(matched_groups), evidence_alarm_hits
+
+
 def _print_v2_debug_summary(debug_summary):
     if not debug_summary:
         return
@@ -307,6 +343,8 @@ def _print_v2_debug_tickets(debug_ticket_details, count_field_name, count_label)
         print(f"- base_fault_groups: {item.get('base_fault_groups', [])}")
         print(f"- loose_fault_groups: {item.get('loose_fault_groups', [])}")
         print(f"- potential_fault_groups: {item.get('potential_fault_groups', [])}")
+        print(f"- potential_evidence_groups: {item.get('potential_evidence_groups', [])}")
+        print(f"- potential_evidence_alarm_hits: {item.get('potential_evidence_alarm_hits', [])}")
         print(f"- fault_groups: {item.get('fault_groups', [])}")
         print(f"- effective_fault_groups: {item.get('effective_fault_groups', [])}")
         print(f"- selected_fault_group: {item.get('selected_fault_group', '')}")
@@ -443,6 +481,8 @@ def compute_group_output_ticket_recall_v2(
                 "base_fault_groups": [],
                 "loose_fault_groups": [],
                 "potential_fault_groups": [],
+                "potential_evidence_groups": [],
+                "potential_evidence_alarm_hits": [],
                 "fault_groups": [],
                 "effective_fault_groups": [],
                 "selected_fault_group": "",
@@ -616,6 +656,16 @@ def compute_group_output_ticket_recall_v2(
             if potential:
                 upper_info = upper_bound_index.get(ticket_id, {})
                 upper_site_evidence = upper_info.get("site_evidence", {})
+                potential_evidence_groups = []
+                potential_evidence_alarm_hits = []
+                if ticket_id in debug_ticket_details:
+                    potential_evidence_groups, potential_evidence_alarm_hits = _build_potential_evidence_debug_info(
+                        site_evidence=upper_site_evidence,
+                        alarm_to_groups=alarm_to_groups,
+                        excluded_group_ids=set(base_group_ids) | set(loose_groups),
+                    )
+                    debug_ticket_details[ticket_id]["potential_evidence_groups"] = potential_evidence_groups
+                    debug_ticket_details[ticket_id]["potential_evidence_alarm_hits"] = potential_evidence_alarm_hits
                 potential_groups = collect_groups_by_evidence(
                     site_evidence=upper_site_evidence,
                     alarm_to_groups=alarm_to_groups,
