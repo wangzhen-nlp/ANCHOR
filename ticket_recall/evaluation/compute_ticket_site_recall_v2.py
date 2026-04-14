@@ -233,6 +233,61 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
     return sorted(matched_groups), evidence_alarm_hits
 
 
+def _normalize_debug_alarm_ids(values):
+    return {
+        normalized_alarm_id
+        for normalized_alarm_id in (_normalize_text(value) for value in (values or []))
+        if normalized_alarm_id
+    }
+
+
+def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_index, alarm_to_groups):
+    if not debug_alarm_ids:
+        return {}
+
+    alarm_presence = {alarm_id: [] for alarm_id in sorted(debug_alarm_ids)}
+    for ticket_id in sorted(ticket_sites):
+        upper_site_evidence = upper_bound_index.get(ticket_id, {}).get("site_evidence", {})
+        if not isinstance(upper_site_evidence, dict):
+            continue
+        for site_id in sorted(upper_site_evidence):
+            alarms = upper_site_evidence.get(site_id, [])
+            if not isinstance(alarms, list):
+                continue
+            for record in alarms:
+                alarm_id = extract_alarm_record_id(record)
+                if alarm_id not in debug_alarm_ids:
+                    continue
+                alarm_presence[alarm_id].append({
+                    "ticket_id": ticket_id,
+                    "site_id": _normalize_text(site_id),
+                    "alarm_title": _normalize_text(record.get("告警标题", "")) or _normalize_text(record.get("alarm", "")),
+                })
+
+    result = {}
+    for alarm_id in sorted(debug_alarm_ids):
+        result[alarm_id] = {
+            "matched_groups": sorted({
+                _normalize_text(group_id)
+                for group_id in alarm_to_groups.get(alarm_id, ())
+                if _normalize_text(group_id)
+            }),
+            "evidence_hits": alarm_presence.get(alarm_id, []),
+        }
+    return result
+
+
+def _print_debug_alarm_group_lookup(debug_alarm_group_lookup):
+    if not debug_alarm_group_lookup:
+        return
+
+    for alarm_id in sorted(debug_alarm_group_lookup):
+        item = debug_alarm_group_lookup[alarm_id]
+        print(f"=== DEBUG EVIDENCE ALARM {alarm_id} ===")
+        print(f"- matched_groups: {item.get('matched_groups', [])}")
+        print(f"- evidence_hits: {item.get('evidence_hits', [])}")
+
+
 def _print_v2_debug_summary(debug_summary):
     if not debug_summary:
         return
@@ -353,13 +408,16 @@ def compute_ticket_site_recall_v2(
     debug=False,
     debug_ticket_ids=None,
     debug_sample_limit=5,
+    debug_evidence_alarm_ids=None,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
     debug_ticket_id_set = _normalize_debug_ticket_ids(debug_ticket_ids)
-    debug_enabled = bool(debug or debug_ticket_id_set)
+    debug_alarm_id_set = _normalize_debug_alarm_ids(debug_evidence_alarm_ids)
+    debug_enabled = bool(debug or debug_ticket_id_set or debug_alarm_id_set)
     debug_summary = None
     debug_ticket_details = {}
+    debug_alarm_group_lookup = {}
 
     if upper_bound_associated_as_gold:
         eligible_ticket_ids = {
@@ -604,6 +662,13 @@ def compute_ticket_site_recall_v2(
         site_to_groups = build_site_to_group_index(scoped_group_to_sites) if loose else {}
         group_site_time_index = build_group_site_time_index(scoped_group_to_site_alarms) if loose else {}
         alarm_to_groups = build_alarm_to_group_index(scoped_group_to_site_alarms) if potential else {}
+        if debug_alarm_id_set:
+            debug_alarm_group_lookup = _build_debug_alarm_group_lookup(
+                debug_alarm_ids=debug_alarm_id_set,
+                ticket_sites=ticket_sites,
+                upper_bound_index=upper_bound_index,
+                alarm_to_groups=alarm_to_groups,
+            )
         for ticket_id, site_list in ticket_sites.items():
             base_group_ids = ticket_to_base_groups.get(ticket_id, set())
             loose_groups = set()
@@ -874,6 +939,8 @@ def compute_ticket_site_recall_v2(
             ticket_id: debug_ticket_details[ticket_id]
             for ticket_id in sorted(debug_ticket_details)
         }
+    if debug_alarm_group_lookup:
+        result["debug_evidence_alarm_groups"] = debug_alarm_group_lookup
 
     case_records = build_unrecalled_visualization_cases(details, result["method"], ne_graph_data=ne_graph_data)
     if output_file and not case_jsonl_output_file:
@@ -992,6 +1059,12 @@ def main():
         default=5,
         help="每类调试样例最多打印多少个工单号，默认: 5",
     )
+    parser.add_argument(
+        "--debug-evidence-alarm-id",
+        action="append",
+        default=[],
+        help="直接查看指定 upper_site_evidence 告警ID 在当前 potential 索引下能关联到哪些 group；可重复传入多个",
+    )
 
     args = parser.parse_args()
 
@@ -1017,6 +1090,7 @@ def main():
             debug=args.debug,
             debug_ticket_ids=args.debug_ticket,
             debug_sample_limit=args.debug_sample_limit,
+            debug_evidence_alarm_ids=args.debug_evidence_alarm_id,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
@@ -1032,6 +1106,8 @@ def main():
             )
         else:
             print("如需单工单明细，请追加 --debug-ticket 工单号")
+    if args.debug_evidence_alarm_id:
+        _print_debug_alarm_group_lookup(result.get("debug_evidence_alarm_groups", {}))
 
     print(f"工单数: {result['ticket_count']}")
     print(f"最终统计样本数: {result['final_sample_count']}")
