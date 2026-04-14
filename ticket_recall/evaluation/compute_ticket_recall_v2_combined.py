@@ -399,6 +399,18 @@ def main():
         return
 
     print(f"整合工单数: {result['ticket_count']}")
+    print(
+        "告警流 v2 指标: "
+        f"平均召回率={result['alarm_stream_summary']['average_recall']:.6f}, "
+        f"平均准确率={result['alarm_stream_summary']['average_precision']:.6f}, "
+        f"平均F1={result['alarm_stream_summary']['average_f1']:.6f}"
+    )
+    print(
+        "故障组输出 v2 指标: "
+        f"平均召回率={result['group_output_summary']['average_recall']:.6f}, "
+        f"平均准确率={result['group_output_summary']['average_precision']:.6f}, "
+        f"平均F1={result['group_output_summary']['average_f1']:.6f}"
+    )
     print(f"整合汇总 JSON: {args.output}")
     print(f"combined cases: {result['combined_case_jsonl_output']}")
 
