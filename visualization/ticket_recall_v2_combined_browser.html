@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ticket Recall V2 总览</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background: #f4f7fb;
+            color: #1f2937;
+        }
+        .page {
+            max-width: 1360px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .hero {
+            background: linear-gradient(135deg, #fff 0%, #eef8f2 100%);
+            border: 1px solid #d8e4dd;
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: 0 16px 36px rgba(15, 23, 42, 0.06);
+        }
+        h1 {
+            margin: 0 0 10px;
+            font-size: 28px;
+        }
+        .sub {
+            color: #5f6b7a;
+            margin-bottom: 18px;
+        }
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            border: none;
+            border-radius: 10px;
+            padding: 10px 16px;
+            background: #17663a;
+            color: #fff;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        .btn:hover { background: #12512e; }
+        .status, .file-path, .summary {
+            margin-top: 10px;
+            color: #5f6b7a;
+            font-size: 13px;
+            word-break: break-all;
+        }
+        .filters {
+            margin-top: 18px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .input, .select {
+            padding: 10px 14px;
+            border: 1px solid #cfd8e3;
+            border-radius: 10px;
+            background: #fff;
+            font-size: 14px;
+            color: #1f2937;
+        }
+        .input {
+            min-width: 260px;
+        }
+        .list {
+            margin-top: 22px;
+            display: grid;
+            gap: 16px;
+        }
+        .ticket-card {
+            background: #fff;
+            border: 1px solid #e3e8ef;
+            border-radius: 18px;
+            padding: 18px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.04);
+        }
+        .ticket-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 14px;
+        }
+        .ticket-title {
+            font-size: 20px;
+            font-weight: 700;
+        }
+        .ticket-meta {
+            color: #5f6b7a;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+        .ticket-note {
+            white-space: pre-wrap;
+            color: #7c4a03;
+            background: #fffbeb;
+            border: 1px solid #f6d68a;
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-size: 13px;
+        }
+        .method-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+            margin-top: 14px;
+        }
+        @media (max-width: 900px) {
+            .method-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .method-card {
+            border-radius: 16px;
+            padding: 16px;
+            border: 1px solid #dfe7f1;
+            background: #f9fbff;
+        }
+        .method-card.group-output {
+            background: #f8fbf8;
+            border-color: #d8e8da;
+        }
+        .method-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .method-title {
+            font-size: 16px;
+            font-weight: 700;
+        }
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 5px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            background: #e6f4ea;
+            color: #17663a;
+        }
+        .pill.warn {
+            background: #fff3e0;
+            color: #9a4d00;
+        }
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+        @media (max-width: 700px) {
+            .metric-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .metric {
+            background: rgba(255,255,255,0.8);
+            border-radius: 12px;
+            padding: 10px 12px;
+            border: 1px solid #e7edf5;
+        }
+        .metric-label {
+            color: #6b7280;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        .metric-value {
+            font-size: 14px;
+            font-weight: 700;
+            word-break: break-word;
+        }
+        .field {
+            margin-top: 10px;
+        }
+        .field-label {
+            color: #6b7280;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        .field-value {
+            font-size: 13px;
+            line-height: 1.6;
+            word-break: break-word;
+        }
+        .method-actions {
+            margin-top: 14px;
+        }
+        .open-btn {
+            border: none;
+            border-radius: 10px;
+            padding: 10px 14px;
+            background: #111827;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        .open-btn:hover { background: #0b1220; }
+        .empty {
+            margin-top: 22px;
+            padding: 28px;
+            text-align: center;
+            color: #667085;
+            border: 1px dashed #cfd8e3;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.7);
+        }
+        .pager {
+            margin-top: 18px;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .pager button {
+            border: none;
+            border-radius: 10px;
+            padding: 8px 12px;
+            background: #1f2937;
+            color: #fff;
+            cursor: pointer;
+        }
+        .pager button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="hero">
+            <h1>Ticket Recall V2 总览</h1>
+            <div class="sub">加载 combined cases.jsonl 后，每个卡片对应一个工单，下面并排展示“告警流 v2”和“故障组输出 v2”的召回结果、召回率，并支持分别打开传播图详情。</div>
+            <div class="toolbar">
+                <input id="fileInput" type="file" accept=".jsonl,.json,.txt">
+                <button class="btn" onclick="document.getElementById('fileInput').click()">选择 Combined Cases</button>
+            </div>
+            <div class="status" id="status">请选择一个 combined cases.jsonl 文件</div>
+            <div class="file-path" id="filePath"></div>
+            <div class="summary" id="summary"></div>
+            <div class="filters">
+                <input id="searchInput" class="input" type="text" placeholder="按工单号或站点搜索">
+                <select id="pageSizeSelect" class="select">
+                    <option value="50">每页 50</option>
+                    <option value="100" selected>每页 100</option>
+                    <option value="200">每页 200</option>
+                    <option value="500">每页 500</option>
+                    <option value="1000">每页 1000</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="empty" id="emptyState">请选择一个 `combined cases.jsonl` 文件</div>
+        <div class="list" id="list"></div>
+        <div class="pager" id="pager" style="display:none;"></div>
+    </div>
+
+    <script>
+        let records = [];
+        let filteredRecords = [];
+        let currentPage = 1;
+        let pageSize = 100;
+        let searchQuery = '';
+
+        function parseJsonl(text) {
+            return text
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean)
+                .map((line, index) => {
+                    try {
+                        return JSON.parse(line);
+                    } catch (error) {
+                        throw new Error(`第 ${index + 1} 行解析失败: ${error.message}`);
+                    }
+                });
+        }
+
+        function escapeHtml(value) {
+            return String(value || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function formatSites(values) {
+            if (!Array.isArray(values) || values.length === 0) return '-';
+            return values.join(', ');
+        }
+
+        function filterRecords() {
+            const query = searchQuery.trim().toLowerCase();
+            if (!query) {
+                filteredRecords = records.slice();
+                return;
+            }
+
+            filteredRecords = records.filter((item) => {
+                const haystacks = [
+                    item.ticket_id || '',
+                    ...(item.ticket_sites || []),
+                    ...((item.alarm_stream && item.alarm_stream.associated_sites) || []),
+                    ...((item.group_output && item.group_output.associated_sites) || []),
+                ].map(v => String(v || '').toLowerCase());
+                return haystacks.some(v => v.includes(query));
+            });
+        }
+
+        function openCase(caseRecord) {
+            if (!caseRecord) return;
+            const sessionKey = `combined_ticket_recall_case_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+            localStorage.setItem(sessionKey, JSON.stringify({ group: caseRecord }));
+            window.open(`ne_propagation_visualizer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+        }
+
+        function renderMethodCard(methodKey, payload) {
+            const cardClass = methodKey === 'group_output' ? 'method-card group-output' : 'method-card';
+            if (!payload || !payload.present) {
+                return `
+                    <div class="${cardClass}">
+                        <div class="method-head">
+                            <div class="method-title">${escapeHtml((payload && payload.method_label) || methodKey)}</div>
+                            <span class="pill warn">无结果</span>
+                        </div>
+                        <div class="field">
+                            <div class="field-value">当前工单在该评测结果中不存在。</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            const recallPercent = `${(Number(payload.recall || 0) * 100).toFixed(2)}%`;
+            const precisionPercent = `${(Number(payload.precision || 0) * 100).toFixed(2)}%`;
+            const f1Percent = `${(Number(payload.f1 || 0) * 100).toFixed(2)}%`;
+            const pillClass = Number(payload.recall || 0) >= 1 ? 'pill' : 'pill warn';
+            const pillText = Number(payload.recall || 0) >= 1 ? '满召回' : '未满召回';
+
+            return `
+                <div class="${cardClass}">
+                    <div class="method-head">
+                        <div class="method-title">${escapeHtml(payload.method_label || methodKey)}</div>
+                        <span class="${pillClass}">${pillText}</span>
+                    </div>
+                    <div class="metric-grid">
+                        <div class="metric">
+                            <div class="metric-label">召回率</div>
+                            <div class="metric-value">${escapeHtml(payload.recall_text || recallPercent)}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">准确率</div>
+                            <div class="metric-value">${escapeHtml(precisionPercent)}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">F1</div>
+                            <div class="metric-value">${escapeHtml(f1Percent)}</div>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <div class="field-label">召回站点</div>
+                        <div class="field-value">${escapeHtml(formatSites(payload.associated_sites))}</div>
+                    </div>
+                    <div class="field">
+                        <div class="field-label">未召回站点</div>
+                        <div class="field-value">${escapeHtml(formatSites(payload.missing_sites))}</div>
+                    </div>
+                    <div class="field">
+                        <div class="field-label">命中 group / 故障组</div>
+                        <div class="field-value">${escapeHtml(formatSites(payload.fault_groups))}</div>
+                    </div>
+                    <div class="method-actions">
+                        <button class="open-btn" onclick="openCombinedDetail('${escapeHtml(payload.method_key)}', '${escapeHtml(payload.detail.ticket_id || '')}')">查看传播图</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderPager() {
+            const pager = document.getElementById('pager');
+            const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+            pager.style.display = filteredRecords.length > 0 ? 'flex' : 'none';
+            pager.innerHTML = `
+                <button onclick="changePage(-1)" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>
+                <span>第 ${currentPage} / ${totalPages} 页</span>
+                <button onclick="changePage(1)" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>
+            `;
+        }
+
+        function renderRecords() {
+            const list = document.getElementById('list');
+            const emptyState = document.getElementById('emptyState');
+            const summary = document.getElementById('summary');
+
+            filterRecords();
+            const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+            if (currentPage > totalPages) currentPage = totalPages;
+            const start = (currentPage - 1) * pageSize;
+            const end = start + pageSize;
+            const pageItems = filteredRecords.slice(start, end);
+
+            summary.textContent = records.length
+                ? `总工单 ${records.length} 条，过滤后 ${filteredRecords.length} 条，当前展示 ${start + 1}-${Math.min(end, filteredRecords.length)}`
+                : '';
+
+            if (pageItems.length === 0) {
+                list.innerHTML = '';
+                emptyState.style.display = 'block';
+                emptyState.textContent = records.length === 0 ? '请选择一个 `combined cases.jsonl` 文件' : '当前筛选条件下没有工单';
+                renderPager();
+                return;
+            }
+
+            emptyState.style.display = 'none';
+            list.innerHTML = pageItems.map((item) => `
+                <div class="ticket-card">
+                    <div class="ticket-head">
+                        <div>
+                            <div class="ticket-title">${escapeHtml(item.ticket_id || '')}</div>
+                            <div class="ticket-meta">gold 站点数：${escapeHtml(item.ticket_site_count || 0)} | gold 站点：${escapeHtml(formatSites(item.ticket_sites))}</div>
+                        </div>
+                        <div class="ticket-note">${escapeHtml(item.note || '')}</div>
+                    </div>
+                    <div class="method-grid">
+                        ${renderMethodCard('alarm_stream', item.alarm_stream || {})}
+                        ${renderMethodCard('group_output', item.group_output || {})}
+                    </div>
+                </div>
+            `).join('');
+
+            renderPager();
+        }
+
+        function changePage(delta) {
+            const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+            currentPage = Math.min(totalPages, Math.max(1, currentPage + delta));
+            renderRecords();
+        }
+
+        function openCombinedDetail(methodKey, ticketId) {
+            const item = records.find(record => String(record.ticket_id || '') === String(ticketId || ''));
+            if (!item) return;
+            const payload = item[methodKey];
+            if (!payload || !payload.viewer_case) return;
+            openCase(payload.viewer_case);
+        }
+
+        function loadText(text, pathLabel) {
+            records = parseJsonl(text);
+            currentPage = 1;
+            document.getElementById('status').textContent = `已加载 ${records.length} 条工单`;
+            document.getElementById('filePath').textContent = pathLabel ? `文件: ${pathLabel}` : '';
+            renderRecords();
+        }
+
+        document.getElementById('fileInput').addEventListener('change', function(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const pathLabel = event.target.value || file.name || '';
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    loadText(e.target.result, pathLabel);
+                } catch (error) {
+                    records = [];
+                    filteredRecords = [];
+                    document.getElementById('status').textContent = `加载失败: ${error.message}`;
+                    document.getElementById('filePath').textContent = '';
+                    document.getElementById('summary').textContent = '';
+                    document.getElementById('list').innerHTML = '';
+                    document.getElementById('emptyState').style.display = 'block';
+                    document.getElementById('emptyState').textContent = '文件解析失败';
+                    document.getElementById('pager').style.display = 'none';
+                }
+            };
+            reader.readAsText(file, 'utf-8');
+        });
+
+        document.getElementById('searchInput').addEventListener('input', function(event) {
+            searchQuery = event.target.value || '';
+            currentPage = 1;
+            renderRecords();
+        });
+
+        document.getElementById('pageSizeSelect').addEventListener('change', function(event) {
+            pageSize = Number(event.target.value || 100);
+            currentPage = 1;
+            renderRecords();
+        });
+    </script>
+</body>
+</html>
