@@ -28,7 +28,7 @@ from topology_resources import (
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
 from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.reports import generate_incident_report
-from fault_grouping.rule_config import transmission_rule, link_rule, power_rule
+from fault_grouping.rule_config import transmission_rule, link_rule, power_rule, data_rule
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
 
 
@@ -1145,7 +1145,8 @@ def main():
     rules_config = {
         "transmission_rule": transmission_rule,
         "link_rule": link_rule,
-        "power_rule": power_rule
+        "power_rule": power_rule,
+        "data_rule": data_rule,
     }
 
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
