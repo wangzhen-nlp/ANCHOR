@@ -647,7 +647,8 @@ def _build_visual_link_info(ne_id, group_ne_ids, ne_graph_data):
 
 def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_ne_ids=None, site_coord_index=None):
     ne_graph_data = ne_graph_data or {}
-    site_to_ne_ids = site_to_ne_ids or {}
+    if site_to_ne_ids is None:
+        site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
     if site_coord_index is None:
         site_coord_index = build_site_coord_index(ne_graph_data)
         site_coord_index.update(build_site_coord_index_from_site_graph(load_site_graph_data()))
