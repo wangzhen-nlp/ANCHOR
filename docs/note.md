@@ -668,7 +668,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 2. 第一遍流式扫描告警  
    - 过滤掉 `FAN FAIL`；
-   - 只把真实在告警里出现过的工单纳入分母；
+   - 统计每个工单通过 `ticket_field` 直接命中的告警数；
    - 收集每个工单自己的 anchor 告警时间；
    - 收集这些工单已经显式命中的站点。
 
@@ -712,6 +712,16 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
      会把 `ticket_recorded_range_site_alarms` 命中的站点也并入 `associated_sites`
    - 但并入时仍然只保留目标站点范围内的站点，
      不会把工单 `ticket_sites` 之外的站点算进 recall。
+
+9. 最终哪些工单会进入结果  
+   当前不再要求“必须存在带工单号的原始告警”。
+   一个工单只要满足下面任一条件，就会进入最终 `details / ticket_count`：
+   - `ticket_alarm_count > 0`
+   - 最终 `associated_sites` 非空
+
+   也就是说，如果某个工单虽然没有直接带工单号的告警，
+   但通过 `ticket_recorded_range_site_alarms` 或其它上限逻辑，最终确实把站点拉进了 `associated_sites`，
+   现在也会被 upper bound 结果保留下来。
 
 **【意义】**
 
@@ -963,7 +973,9 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 它们共同的思路是：
 
 1. 先读取 `compute_ticket_site_recall_upper_bound.py` 的输出  
-   只保留“上限里能把全部站点关联出来”的工单。
+   以 upper bound 结果作为样本入口：
+   - 默认口径下，只保留 `fully_associable` 的工单
+   - 开 `--upper-bound-associated-as-gold` 时，则保留 `associated_site_count > 0` 的工单
 
 2. 再跑各自的真实方法  
    - `compute_ticket_site_recall_v2.py`：
@@ -989,6 +1001,20 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - `missing_site_count / missing_sites / missing_site_alarms`
    - `group_site_count / group_sites`
    - `recall / precision / f1`
+
+6. 当前不会再额外要求“工单必须在原始告警里带工单号出现过”  
+   也就是说，只要这个工单已经通过上一步 upper bound 口径进入样本，
+   两份 `v2` 脚本就不会再因为 `ticket_alarm_count = 0` 或 `ticket_occurrence_count = 0`
+   把它二次过滤掉。
+
+   因此现在有可能出现一种情况：
+   - 这个工单在 `v2` 里会被统计
+   - 但它的 `ticket_alarm_count / ticket_occurrence_count` 是 `0`
+   - 当前方法预测到的 `fault_groups` 也可能为空
+
+   这代表的是：
+   - upper bound 侧已经能把站点拉进样本
+   - 但当前真实方法并没有利用这些证据把站点召回出来
 
 **【意义】**
 
@@ -1041,6 +1067,18 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - `recall / precision / f1`
 
 此时不会引入任何额外的 group。
+
+需要注意的是，默认模式现在仍然可能保留一些：
+
+- `ticket_alarm_count = 0`
+- 或 `ticket_occurrence_count = 0`
+
+的样本。
+
+这些样本之所以还能进入 `v2`，
+是因为它们已经通过 upper bound 口径进入了评测分母；
+只是当前默认模式下，往往拿不到任何 `base groups`，
+因此这类样本的预测结果可能为空，召回率也可能直接是 `0`。
 
 ### 2. `--loose`
 
