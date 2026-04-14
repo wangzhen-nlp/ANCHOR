@@ -615,6 +615,41 @@ def _build_visual_link_info(ne_id, group_ne_ids, ne_graph_data):
     return link_info
 
 
+def _build_same_site_context_links(ne_info):
+    same_site_links = defaultdict(dict)
+    site_to_ne_ids = defaultdict(list)
+
+    for ne_id, item in ne_info.items():
+        if not isinstance(item, dict):
+            continue
+        site_id = normalize_text(item.get("site_id", ""))
+        if not site_id:
+            continue
+        site_to_ne_ids[site_id].append(ne_id)
+
+    for site_id, ne_ids in site_to_ne_ids.items():
+        unique_ne_ids = sorted(dict.fromkeys(ne_ids))
+        if len(unique_ne_ids) <= 1:
+            continue
+
+        for ne_id in unique_ne_ids:
+            for neighbor_id in unique_ne_ids:
+                if neighbor_id == ne_id:
+                    continue
+                if neighbor_id in same_site_links[ne_id]:
+                    continue
+                same_site_links[ne_id][neighbor_id] = {
+                    "connection_type": "same_site_context",
+                    "distance": "",
+                    "topology": "same_site",
+                    "time_window": "",
+                    "left_alarm": {},
+                    "right_alarm": {},
+                }
+
+    return same_site_links
+
+
 def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_ne_ids=None, site_coord_index=None):
     ne_graph_data = ne_graph_data or {}
     site_to_ne_ids = site_to_ne_ids or {}
@@ -644,6 +679,7 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     ne_list = []
     all_case_ne_ids = []
     per_site_alarm_records = {}
+    display_site_set = set(display_sites)
 
     for site_id in display_sites:
         site_alarm_records = []
@@ -670,6 +706,69 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
 
     group_ne_ids = sorted(dict.fromkeys(all_case_ne_ids))
 
+    for site_id in display_sites:
+        site_records = per_site_alarm_records.get(site_id, [])
+        site_ne_ids = [
+            ne_id for ne_id in group_ne_ids
+            if normalize_text(ne_graph_data.get(ne_id, {}).get("site_id", "")) == site_id
+            or ne_id == f"SITE::{site_id}"
+        ]
+        if not site_ne_ids:
+            site_ne_ids = [f"SITE::{site_id}"]
+
+        source_to_records = defaultdict(list)
+        for record in site_records:
+            source_ne_id = normalize_text(record.get("alarm_source", "")) or normalize_text(record.get("告警源", ""))
+            if source_ne_id and source_ne_id in site_ne_ids:
+                source_to_records[source_ne_id].append(record)
+            else:
+                source_to_records[f"SITE::{site_id}"].append(record)
+
+        if source_to_records.get(f"SITE::{site_id}") and f"SITE::{site_id}" not in site_ne_ids:
+            site_ne_ids.append(f"SITE::{site_id}")
+
+        for ne_id in site_ne_ids:
+            if ne_id in ne_info:
+                continue
+
+            ne_entry = ne_graph_data.get(ne_id, {})
+            latitude = ne_entry.get("latitude", ne_entry.get("lat"))
+            longitude = ne_entry.get("longitude", ne_entry.get("lon", ne_entry.get("lng")))
+            if (latitude in (None, "") or longitude in (None, "")) and site_id in site_coord_index:
+                latitude, longitude = site_coord_index[site_id]
+
+            role_tags = []
+            if site_id in associated_sites:
+                role_tags.append("ASSOCIATED_SITE")
+            if site_id in missing_sites:
+                role_tags.append("MISSING_SITE")
+            if site_id in context_sites:
+                role_tags.append("CONTEXT_SITE")
+            if not role_tags and site_id in display_site_set:
+                role_tags.append("DISPLAY_SITE")
+
+            visual_alarms = [
+                _build_visual_alarm_entry(record, site_id)
+                for record in source_to_records.get(ne_id, [])
+            ]
+
+            ne_info[ne_id] = {
+                "alarm": visual_alarms,
+                "link": {},
+                "group": case_uuid,
+                "name": normalize_text(ne_entry.get("name", "")) or ne_id,
+                "site_id": site_id,
+                "site_name": normalize_text(ne_entry.get("site_name", "")) or site_id,
+                "type": normalize_text(ne_entry.get("type", "")) or ",".join(role_tags),
+                "network_type": normalize_text(ne_entry.get("network_type", "")),
+                "manufacturer": normalize_text(ne_entry.get("manufacturer", "")),
+                "running_status": normalize_text(ne_entry.get("running_status", "")) or normalize_text(ne_entry.get("status", "")),
+                "domain": normalize_text(ne_entry.get("domain", "")) or "RECALL_CASE",
+                "region_id": normalize_text(ne_entry.get("region_id", "")),
+                "longitude": longitude if longitude is not None else "",
+                "latitude": latitude if latitude is not None else "",
+            }
+
     for matched_role, site_ids, site_alarm_map, site_label in (
         ("associated_site", associated_sites, associated_site_alarms, "ASSOCIATED"),
         ("missing_site", missing_sites, missing_site_alarms, "MISSING"),
@@ -691,48 +790,31 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
                 else:
                     unmapped_records.append(record)
 
-            if unmapped_records and f"SITE::{site_id}" not in site_ne_ids:
-                site_ne_ids.append(f"SITE::{site_id}")
-            if unmapped_records:
-                source_to_records[f"SITE::{site_id}"].extend(unmapped_records)
+                if unmapped_records and f"SITE::{site_id}" not in site_ne_ids:
+                    site_ne_ids.append(f"SITE::{site_id}")
+                if unmapped_records:
+                    source_to_records[f"SITE::{site_id}"].extend(unmapped_records)
 
-            for ne_id in site_ne_ids:
-                if ne_id in ne_info:
-                    continue
-
-                ne_entry = ne_graph_data.get(ne_id, {})
-                latitude = ne_entry.get("latitude", ne_entry.get("lat"))
-                longitude = ne_entry.get("longitude", ne_entry.get("lon", ne_entry.get("lng")))
-                if (latitude in (None, "") or longitude in (None, "")) and site_id in site_coord_index:
-                    latitude, longitude = site_coord_index[site_id]
-
-                visual_alarms = [
-                    _build_visual_alarm_entry(record, site_id)
-                    for record in source_to_records.get(ne_id, [])
-                ]
-                for record in source_to_records.get(ne_id, []):
-                    symptoms.append(_build_visual_symptom(record, site_id, ticket_id, matched_role))
-
-                ne_info[ne_id] = {
-                    "alarm": visual_alarms,
-                    "link": {},
-                    "group": case_uuid,
-                    "name": normalize_text(ne_entry.get("name", "")) or ne_id,
-                    "site_id": site_id,
-                    "site_name": normalize_text(ne_entry.get("site_name", "")) or site_id,
-                    "type": normalize_text(ne_entry.get("type", "")) or f"{site_label}_SITE",
-                    "network_type": normalize_text(ne_entry.get("network_type", "")),
-                    "manufacturer": normalize_text(ne_entry.get("manufacturer", "")),
-                    "running_status": normalize_text(ne_entry.get("running_status", "")) or normalize_text(ne_entry.get("status", "")),
-                    "domain": normalize_text(ne_entry.get("domain", "")) or "RECALL_CASE",
-                    "region_id": normalize_text(ne_entry.get("region_id", "")),
-                    "longitude": longitude if longitude is not None else "",
-                    "latitude": latitude if latitude is not None else "",
-                }
+                for ne_id in site_ne_ids:
+                    for record in source_to_records.get(ne_id, []):
+                        symptoms.append(_build_visual_symptom(record, site_id, ticket_id, matched_role))
+                    if ne_id in ne_info:
+                        existing_alarms = ne_info[ne_id].setdefault("alarm", [])
+                        existing_alarms.extend(
+                            _build_visual_alarm_entry(record, site_id)
+                            for record in source_to_records.get(ne_id, [])
+                        )
+                        ne_info[ne_id]["alarm"] = dedupe_alarm_records(existing_alarms)
 
     ne_list = sorted(ne_info.keys())
+    inferred_same_site_links = _build_same_site_context_links(ne_info)
     for ne_id in ne_list:
-        ne_info[ne_id]["link"] = _build_visual_link_info(ne_id, ne_list, ne_graph_data)
+        explicit_links = _build_visual_link_info(ne_id, ne_list, ne_graph_data)
+        merged_links = dict(explicit_links)
+        for neighbor_id, link_meta in inferred_same_site_links.get(ne_id, {}).items():
+            if neighbor_id not in merged_links:
+                merged_links[neighbor_id] = link_meta
+        ne_info[ne_id]["link"] = merged_links
 
     timestamps = [symptom["ts"] for symptom in symptoms if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
