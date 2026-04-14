@@ -15,8 +15,12 @@ from ticket_recall.evaluation.compute_ticket_site_recall_v2 import (
 )
 from ticket_recall.ticket_recall_v2_utils import (
     build_visualization_case_record,
+    build_site_coord_index,
+    build_site_coord_index_from_site_graph,
+    build_site_to_ne_ids,
     derive_case_jsonl_output_path,
     load_ne_graph_data,
+    load_site_graph_data,
     write_jsonl_records,
 )
 
@@ -43,7 +47,15 @@ def _format_sites(site_list):
     return ", ".join(values) if values else "-"
 
 
-def _build_method_case_payload(method_key, method_label, detail, original_case, ne_graph_data):
+def _build_method_case_payload(
+    method_key,
+    method_label,
+    detail,
+    original_case,
+    ne_graph_data,
+    site_to_ne_ids,
+    site_coord_index,
+):
     if not detail:
         return {
             "method_key": method_key,
@@ -55,6 +67,8 @@ def _build_method_case_payload(method_key, method_label, detail, original_case, 
         detail,
         method=method_key,
         ne_graph_data=ne_graph_data,
+        site_to_ne_ids=site_to_ne_ids,
+        site_coord_index=site_coord_index,
     )
     associated_sites = detail.get("associated_sites", [])
     missing_sites = detail.get("missing_sites", [])
@@ -179,6 +193,11 @@ def compute_ticket_recall_v2_combined(
 
     print("步骤 3/3：整合两个 v2 结果并生成 combined cases...")
     ne_graph_data = load_ne_graph_data(ne_graph_file)
+    site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
+    site_coord_index = build_site_coord_index(ne_graph_data)
+    site_coord_index.update(
+        build_site_coord_index_from_site_graph(load_site_graph_data())
+    )
 
     alarm_stream_details = _index_details_by_ticket_id(alarm_stream_result)
     group_output_details = _index_details_by_ticket_id(group_output_result)
@@ -192,6 +211,8 @@ def compute_ticket_recall_v2_combined(
             detail=alarm_stream_details.get(ticket_id),
             original_case=None,
             ne_graph_data=ne_graph_data,
+            site_to_ne_ids=site_to_ne_ids,
+            site_coord_index=site_coord_index,
         )
         group_output_payload = _build_method_case_payload(
             method_key="group_output",
@@ -199,6 +220,8 @@ def compute_ticket_recall_v2_combined(
             detail=group_output_details.get(ticket_id),
             original_case=None,
             ne_graph_data=ne_graph_data,
+            site_to_ne_ids=site_to_ne_ids,
+            site_coord_index=site_coord_index,
         )
         combined_case_records.append(
             _build_combined_case_record(ticket_id, alarm_stream_payload, group_output_payload)

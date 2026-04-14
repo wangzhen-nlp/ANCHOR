@@ -614,14 +614,15 @@ def _build_visual_symptom(record, site_id, ticket_id, matched_role):
     return symptom
 
 
-def _build_visual_link_info(ne_id, group_ne_ids, ne_graph_data):
+def _build_visual_link_info(ne_id, group_ne_ids, ne_graph_data, group_ne_set=None):
     link_info = {}
     ne_graph_entry = ne_graph_data.get(ne_id, {})
     raw_links = ne_graph_entry.get("link", {})
     if not isinstance(raw_links, dict):
         return link_info
 
-    group_ne_set = set(group_ne_ids)
+    if group_ne_set is None:
+        group_ne_set = set(group_ne_ids)
     for neighbor_id, link_meta in raw_links.items():
         if neighbor_id not in group_ne_set or neighbor_id == ne_id:
             continue
@@ -657,6 +658,9 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
     associated_sites = sorted(normalize_text(site_id) for site_id in detail.get("associated_sites", []) if normalize_text(site_id))
     missing_sites = sorted(normalize_text(site_id) for site_id in detail.get("missing_sites", []) if normalize_text(site_id))
     context_sites = sorted(normalize_text(site_id) for site_id in detail.get("context_sites", []) if normalize_text(site_id))
+    associated_site_set = set(associated_sites)
+    missing_site_set = set(missing_sites)
+    context_site_set = set(context_sites)
     ticket_sites = sorted(normalize_text(site_id) for site_id in detail.get("ticket_sites", []) if normalize_text(site_id))
     display_sites = sorted(
         normalize_text(site_id)
@@ -736,11 +740,11 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
                 latitude, longitude = site_coord_index[site_id]
 
             role_tags = []
-            if site_id in associated_sites:
+            if site_id in associated_site_set:
                 role_tags.append("ASSOCIATED_SITE")
-            if site_id in missing_sites:
+            if site_id in missing_site_set:
                 role_tags.append("MISSING_SITE")
-            if site_id in context_sites:
+            if site_id in context_site_set:
                 role_tags.append("CONTEXT_SITE")
             if not role_tags and site_id in display_site_set:
                 role_tags.append("DISPLAY_SITE")
@@ -814,8 +818,14 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
                     ne_info[ne_id]["alarm"] = dedupe_alarm_records(existing_alarms)
 
     ne_list = sorted(ne_info.keys())
+    group_ne_set = set(ne_list)
     for ne_id in ne_list:
-        ne_info[ne_id]["link"] = _build_visual_link_info(ne_id, ne_list, ne_graph_data)
+        ne_info[ne_id]["link"] = _build_visual_link_info(
+            ne_id,
+            ne_list,
+            ne_graph_data,
+            group_ne_set=group_ne_set,
+        )
 
     timestamps = [symptom["ts"] for symptom in symptoms if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
