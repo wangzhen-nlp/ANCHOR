@@ -4,6 +4,7 @@ from bisect import bisect_right
 from datetime import datetime
 from collections import defaultdict
 
+from topology_resources import SITE_GRAPH_JSON
 from ticket_recall.evaluation.compute_ticket_site_recall import _normalize_text
 
 
@@ -540,6 +541,35 @@ def build_site_coord_index(ne_graph_data):
     return site_coords
 
 
+def load_site_graph_data(site_graph_file=SITE_GRAPH_JSON):
+    if not site_graph_file or not os.path.exists(site_graph_file):
+        return {}
+    with open(site_graph_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def build_site_coord_index_from_site_graph(site_graph_data):
+    site_coords = {}
+    for site_id, site_info in (site_graph_data or {}).items():
+        if not isinstance(site_info, dict):
+            continue
+        normalized_site_id = normalize_text(site_id)
+        if not normalized_site_id:
+            continue
+        latitude = site_info.get("latitude", site_info.get("lat"))
+        longitude = site_info.get("longitude", site_info.get("lon", site_info.get("lng")))
+        if latitude in (None, "") or longitude in (None, ""):
+            continue
+        try:
+            float(latitude)
+            float(longitude)
+        except (TypeError, ValueError):
+            continue
+        site_coords[normalized_site_id] = (latitude, longitude)
+    return site_coords
+
+
 def _build_visual_alarm_entry(record, site_id):
     alarm_type = normalize_text(record.get("alarm", "")) or normalize_text(record.get("alarm_type", "")) or normalize_text(record.get("告警标题", ""))
     alarm_time = (
@@ -653,7 +683,9 @@ def _build_same_site_context_links(ne_info):
 def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_ne_ids=None, site_coord_index=None):
     ne_graph_data = ne_graph_data or {}
     site_to_ne_ids = site_to_ne_ids or {}
-    site_coord_index = site_coord_index or {}
+    if site_coord_index is None:
+        site_coord_index = build_site_coord_index(ne_graph_data)
+        site_coord_index.update(build_site_coord_index_from_site_graph(load_site_graph_data()))
 
     ticket_id = normalize_text(detail.get("ticket_id", ""))
     associated_sites = sorted(normalize_text(site_id) for site_id in detail.get("associated_sites", []) if normalize_text(site_id))
@@ -875,6 +907,7 @@ def build_unrecalled_visualization_cases(details, method, ne_graph_data=None):
     ne_graph_data = ne_graph_data or {}
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
     site_coord_index = build_site_coord_index(ne_graph_data)
+    site_coord_index.update(build_site_coord_index_from_site_graph(load_site_graph_data()))
     return [
         build_visualization_case_record(
             detail,
