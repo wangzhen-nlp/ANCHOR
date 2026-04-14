@@ -382,32 +382,92 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
     result = {
         group_id: {
             "present_in_output": False,
+            "present_in_top_level_uuid": False,
+            "present_in_match_info_uuid": False,
+            "present_in_related_group_uuids": False,
             "is_referenced_group": group_id in referenced_group_ids,
             "group_sites": [],
             "matched_allowed_sites": [],
             "symptom_nodes": [],
+            "related_group_carriers": [],
+            "matched_records": [],
         }
         for group_id in sorted(normalized_group_ids)
     }
 
     for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
-        group_id = _extract_group_id(group_record)
-        if group_id not in normalized_group_ids:
+        top_level_uuid = _normalize_text(group_record.get("uuid", ""))
+        match_info = group_record.get("match_info", {})
+        match_info_uuid = ""
+        related_group_uuids = []
+        if isinstance(match_info, dict):
+            match_info_uuid = _normalize_text(match_info.get("uuid", ""))
+            raw_related_group_uuids = match_info.get("related_group_uuids", [])
+            if isinstance(raw_related_group_uuids, list):
+                related_group_uuids = sorted({
+                    _normalize_text(group_id)
+                    for group_id in raw_related_group_uuids
+                    if _normalize_text(group_id)
+                })
+
+        effective_group_id = _extract_group_id(group_record)
+        matched_group_ids = {
+            group_id
+            for group_id in normalized_group_ids
+            if group_id in {top_level_uuid, match_info_uuid}
+        }
+        related_only_group_ids = {
+            group_id
+            for group_id in normalized_group_ids
+            if group_id in related_group_uuids
+        }
+        if not matched_group_ids and not related_only_group_ids:
             continue
 
-        group_sites = _extract_group_sites(group_record, group_id)
-        symptom_nodes = sorted({
+        group_sites = _extract_group_sites(group_record, effective_group_id)
+        symptom_nodes = {
             _normalize_text(symptom.get("node", ""))
             for symptom in group_record.get("symptoms", [])
             if isinstance(symptom, dict) and _normalize_text(symptom.get("node", ""))
-        })
-        result[group_id] = {
-            "present_in_output": True,
-            "is_referenced_group": group_id in referenced_group_ids,
-            "group_sites": group_sites,
-            "matched_allowed_sites": [site_id for site_id in group_sites if site_id in allowed_site_ids],
-            "symptom_nodes": symptom_nodes,
         }
+        for group_id in sorted(related_only_group_ids):
+            result[group_id]["present_in_related_group_uuids"] = True
+            carrier = effective_group_id or top_level_uuid or match_info_uuid
+            if carrier and carrier not in result[group_id]["related_group_carriers"]:
+                result[group_id]["related_group_carriers"].append(carrier)
+
+        for group_id in sorted(matched_group_ids):
+            matched_by = []
+            if group_id == top_level_uuid:
+                matched_by.append("top_level_uuid")
+                result[group_id]["present_in_top_level_uuid"] = True
+            if group_id == match_info_uuid:
+                matched_by.append("match_info_uuid")
+                result[group_id]["present_in_match_info_uuid"] = True
+
+            result[group_id]["present_in_output"] = True
+            result[group_id]["group_sites"] = sorted({
+                _normalize_text(site_id)
+                for site_id in (result[group_id]["group_sites"] + group_sites)
+                if _normalize_text(site_id)
+            })
+            result[group_id]["matched_allowed_sites"] = sorted({
+                site_id
+                for site_id in result[group_id]["group_sites"]
+                if site_id in allowed_site_ids
+            })
+            result[group_id]["symptom_nodes"] = sorted({
+                _normalize_text(site_id)
+                for site_id in (result[group_id]["symptom_nodes"] + list(symptom_nodes))
+                if _normalize_text(site_id)
+            })
+            result[group_id]["matched_records"].append({
+                "matched_by": matched_by,
+                "top_level_uuid": top_level_uuid,
+                "match_info_uuid": match_info_uuid,
+                "effective_group_id": effective_group_id,
+                "related_group_uuids": related_group_uuids,
+            })
 
     return result
 
@@ -420,10 +480,15 @@ def _print_debug_group_site_lookup(debug_group_site_lookup):
         item = debug_group_site_lookup[group_id]
         print(f"=== DEBUG GROUP {group_id} ===")
         print(f"- present_in_output: {'是' if item.get('present_in_output') else '否'}")
+        print(f"- present_in_top_level_uuid: {'是' if item.get('present_in_top_level_uuid') else '否'}")
+        print(f"- present_in_match_info_uuid: {'是' if item.get('present_in_match_info_uuid') else '否'}")
+        print(f"- present_in_related_group_uuids: {'是' if item.get('present_in_related_group_uuids') else '否'}")
         print(f"- is_referenced_group: {'是' if item.get('is_referenced_group') else '否'}")
         print(f"- group_sites: {item.get('group_sites', [])}")
         print(f"- matched_allowed_sites: {item.get('matched_allowed_sites', [])}")
         print(f"- symptom_nodes: {item.get('symptom_nodes', [])}")
+        print(f"- related_group_carriers: {item.get('related_group_carriers', [])}")
+        print(f"- matched_records: {item.get('matched_records', [])}")
 
 
 def _print_v2_debug_summary(debug_summary):
