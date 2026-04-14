@@ -278,6 +278,14 @@ def _normalize_debug_site_ids(values):
     }
 
 
+def _normalize_debug_group_ids(values):
+    return {
+        normalized_group_id
+        for normalized_group_id in (_normalize_text(value) for value in (values or []))
+        if normalized_group_id
+    }
+
+
 def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_index, alarm_to_groups):
     if not debug_alarm_ids:
         return {}
@@ -349,6 +357,73 @@ def _print_debug_site_group_lookup(debug_site_group_lookup):
         item = debug_site_group_lookup[site_id]
         print(f"=== DEBUG SITE {site_id} ===")
         print(f"- matched_groups: {item.get('matched_groups', [])}")
+
+
+def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenced_group_ids=None, allowed_site_ids=None):
+    if not debug_group_ids:
+        return {}
+
+    normalized_group_ids = {
+        _normalize_text(group_id)
+        for group_id in debug_group_ids
+        if _normalize_text(group_id)
+    }
+    referenced_group_ids = {
+        _normalize_text(group_id)
+        for group_id in (referenced_group_ids or ())
+        if _normalize_text(group_id)
+    }
+    allowed_site_ids = {
+        _normalize_text(site_id)
+        for site_id in (allowed_site_ids or ())
+        if _normalize_text(site_id)
+    }
+
+    result = {
+        group_id: {
+            "present_in_output": False,
+            "is_referenced_group": group_id in referenced_group_ids,
+            "group_sites": [],
+            "matched_allowed_sites": [],
+            "symptom_nodes": [],
+        }
+        for group_id in sorted(normalized_group_ids)
+    }
+
+    for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
+        group_id = _extract_group_id(group_record)
+        if group_id not in normalized_group_ids:
+            continue
+
+        group_sites = _extract_group_sites(group_record, group_id)
+        symptom_nodes = sorted({
+            _normalize_text(symptom.get("node", ""))
+            for symptom in group_record.get("symptoms", [])
+            if isinstance(symptom, dict) and _normalize_text(symptom.get("node", ""))
+        })
+        result[group_id] = {
+            "present_in_output": True,
+            "is_referenced_group": group_id in referenced_group_ids,
+            "group_sites": group_sites,
+            "matched_allowed_sites": [site_id for site_id in group_sites if site_id in allowed_site_ids],
+            "symptom_nodes": symptom_nodes,
+        }
+
+    return result
+
+
+def _print_debug_group_site_lookup(debug_group_site_lookup):
+    if not debug_group_site_lookup:
+        return
+
+    for group_id in sorted(debug_group_site_lookup):
+        item = debug_group_site_lookup[group_id]
+        print(f"=== DEBUG GROUP {group_id} ===")
+        print(f"- present_in_output: {'是' if item.get('present_in_output') else '否'}")
+        print(f"- is_referenced_group: {'是' if item.get('is_referenced_group') else '否'}")
+        print(f"- group_sites: {item.get('group_sites', [])}")
+        print(f"- matched_allowed_sites: {item.get('matched_allowed_sites', [])}")
+        print(f"- symptom_nodes: {item.get('symptom_nodes', [])}")
 
 
 def _print_v2_debug_summary(debug_summary):
@@ -482,17 +557,20 @@ def compute_group_output_ticket_recall_v2(
     debug_sample_limit=5,
     debug_evidence_alarm_ids=None,
     debug_site_ids=None,
+    debug_group_ids=None,
 ):
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
     debug_ticket_id_set = _normalize_debug_ticket_ids(debug_ticket_ids)
     debug_alarm_id_set = _normalize_debug_alarm_ids(debug_evidence_alarm_ids)
     debug_site_id_set = _normalize_debug_site_ids(debug_site_ids)
-    debug_enabled = bool(debug or debug_ticket_id_set or debug_alarm_id_set or debug_site_id_set)
+    debug_group_id_set = _normalize_debug_group_ids(debug_group_ids)
+    debug_enabled = bool(debug or debug_ticket_id_set or debug_alarm_id_set or debug_site_id_set or debug_group_id_set)
     debug_summary = None
     debug_ticket_details = {}
     debug_alarm_group_lookup = {}
     debug_site_group_lookup = {}
+    debug_group_site_lookup = {}
 
     if upper_bound_associated_as_gold:
         eligible_ticket_ids = {
@@ -712,6 +790,13 @@ def compute_group_output_ticket_recall_v2(
     if debug_enabled:
         debug_summary["allowed_site_count"] = len(allowed_site_ids)
         debug_summary["allowed_site_ids"] = sorted(allowed_site_ids)
+    if debug_group_id_set:
+        debug_group_site_lookup = _build_debug_group_site_lookup(
+            group_output_input=group_output_input,
+            debug_group_ids=debug_group_id_set,
+            referenced_group_ids=referenced_group_ids,
+            allowed_site_ids=allowed_site_ids,
+        )
     print(f"阶段 1/{stage_total}：提取 eligible 工单和故障组输出的关联关系...")
     ticket_to_groups, ticket_occurrence_counts = _build_group_output_ticket_index_for_eligible(
         group_output_input,
@@ -1039,6 +1124,8 @@ def compute_group_output_ticket_recall_v2(
         result["debug_evidence_alarm_groups"] = debug_alarm_group_lookup
     if debug_site_group_lookup:
         result["debug_site_groups"] = debug_site_group_lookup
+    if debug_group_site_lookup:
+        result["debug_groups"] = debug_group_site_lookup
 
     case_records = build_unrecalled_visualization_cases(details, result["method"], ne_graph_data=ne_graph_data)
     if output_file and not case_jsonl_output_file:
@@ -1176,6 +1263,12 @@ def main():
         default=[],
         help="直接查看指定 site 在当前候选范围里能关联到哪些 group；可重复传入多个",
     )
+    parser.add_argument(
+        "--debug-group",
+        action="append",
+        default=[],
+        help="直接查看指定 group 在 match_rules 输出里关联到哪些站点；可重复传入多个",
+    )
 
     args = parser.parse_args()
 
@@ -1204,6 +1297,7 @@ def main():
             debug_sample_limit=args.debug_sample_limit,
             debug_evidence_alarm_ids=args.debug_evidence_alarm_id,
             debug_site_ids=args.debug_site,
+            debug_group_ids=args.debug_group,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
@@ -1223,6 +1317,8 @@ def main():
         _print_debug_alarm_group_lookup(result.get("debug_evidence_alarm_groups", {}))
     if args.debug_site:
         _print_debug_site_group_lookup(result.get("debug_site_groups", {}))
+    if args.debug_group:
+        _print_debug_group_site_lookup(result.get("debug_groups", {}))
 
     print(f"工单数: {result['ticket_count']}")
     print(f"最终统计样本数: {result['final_sample_count']}")
