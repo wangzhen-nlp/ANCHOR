@@ -790,21 +790,21 @@ def build_visualization_case_record(detail, method, ne_graph_data=None, site_to_
                 else:
                     unmapped_records.append(record)
 
-                if unmapped_records and f"SITE::{site_id}" not in site_ne_ids:
-                    site_ne_ids.append(f"SITE::{site_id}")
-                if unmapped_records:
-                    source_to_records[f"SITE::{site_id}"].extend(unmapped_records)
+            if unmapped_records and f"SITE::{site_id}" not in site_ne_ids:
+                site_ne_ids.append(f"SITE::{site_id}")
+            if unmapped_records:
+                source_to_records[f"SITE::{site_id}"].extend(unmapped_records)
 
-                for ne_id in site_ne_ids:
-                    for record in source_to_records.get(ne_id, []):
-                        symptoms.append(_build_visual_symptom(record, site_id, ticket_id, matched_role))
-                    if ne_id in ne_info:
-                        existing_alarms = ne_info[ne_id].setdefault("alarm", [])
-                        existing_alarms.extend(
-                            _build_visual_alarm_entry(record, site_id)
-                            for record in source_to_records.get(ne_id, [])
-                        )
-                        ne_info[ne_id]["alarm"] = dedupe_alarm_records(existing_alarms)
+            for ne_id in site_ne_ids:
+                for record in source_to_records.get(ne_id, []):
+                    symptoms.append(_build_visual_symptom(record, site_id, ticket_id, matched_role))
+                if ne_id in ne_info:
+                    existing_alarms = ne_info[ne_id].setdefault("alarm", [])
+                    existing_alarms.extend(
+                        _build_visual_alarm_entry(record, site_id)
+                        for record in source_to_records.get(ne_id, [])
+                    )
+                    ne_info[ne_id]["alarm"] = dedupe_alarm_records(existing_alarms)
 
     ne_list = sorted(ne_info.keys())
     inferred_same_site_links = _build_same_site_context_links(ne_info)
