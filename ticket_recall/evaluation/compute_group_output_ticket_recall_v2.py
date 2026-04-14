@@ -25,7 +25,6 @@ from ticket_recall.evaluation.compute_ticket_site_recall import (
 )
 from ticket_recall.evaluation.compute_ticket_site_recall_upper_bound import _should_skip_alarm
 from ticket_recall.ticket_recall_v2_utils import (
-    build_alarm_to_group_index,
     build_ne_to_domain_map,
     build_site_has_domain_map,
     build_group_site_time_index,
@@ -163,6 +162,42 @@ def _build_group_output_alarm_indexes_for_sites(group_output_input, allowed_site
             group_to_site_alarms[group_id][site_id].append(evidence_record)
 
     return group_to_sites, group_to_site_alarms
+
+
+def _build_group_output_alarm_to_group_index_for_sites(group_output_input, allowed_site_ids, excluded_group_ids=None):
+    alarm_to_groups = defaultdict(set)
+    excluded_group_ids = set(excluded_group_ids or ())
+    allowed_site_ids = {
+        _normalize_text(site_id)
+        for site_id in (allowed_site_ids or ())
+        if _normalize_text(site_id)
+    }
+    if not allowed_site_ids:
+        return alarm_to_groups
+
+    for group_record in stream_alarm_inputs(group_output_input, show_progress=True):
+        group_id = _extract_group_id(group_record)
+        if not group_id or group_id in excluded_group_ids:
+            continue
+
+        extracted_sites = {
+            _normalize_text(site_id)
+            for site_id in _extract_group_sites(group_record, group_id)
+            if _normalize_text(site_id)
+        }
+        if not (extracted_sites & allowed_site_ids):
+            continue
+
+        for symptom in group_record.get("symptoms", []):
+            if not isinstance(symptom, dict):
+                continue
+            if _should_skip_alarm({"告警标题": symptom.get("alarm", "")}):
+                continue
+            alarm_id = extract_alarm_record_id(symptom)
+            if alarm_id:
+                alarm_to_groups[alarm_id].add(group_id)
+
+    return alarm_to_groups
 
 
 def _merge_group_site_alarms(group_ids, group_to_site_alarms):
@@ -696,7 +731,14 @@ def compute_group_output_ticket_recall_v2(
         print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外 group...")
         site_to_groups = build_site_to_group_index(scoped_group_to_sites) if loose else {}
         group_site_time_index = build_group_site_time_index(scoped_group_to_site_alarms) if loose else {}
-        alarm_to_groups = build_alarm_to_group_index(scoped_group_to_site_alarms) if potential else {}
+        alarm_to_groups = (
+            _build_group_output_alarm_to_group_index_for_sites(
+                group_output_input,
+                allowed_site_ids=allowed_site_ids,
+                excluded_group_ids=referenced_group_ids,
+            )
+            if potential else {}
+        )
         if debug_alarm_id_set:
             debug_alarm_group_lookup = _build_debug_alarm_group_lookup(
                 debug_alarm_ids=debug_alarm_id_set,
