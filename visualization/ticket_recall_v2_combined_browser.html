@@ -384,7 +384,7 @@
                         <div class="field-value">${escapeHtml(formatSites(payload.fault_groups))}</div>
                     </div>
                     <div class="method-actions">
-                        <button class="open-btn" onclick="openCombinedDetail('${escapeHtml(payload.method_key)}', '${escapeHtml(payload.detail.ticket_id || '')}')">查看传播图</button>
+                        <button class="open-btn" onclick="openCombinedDetail('${escapeHtml(methodKey)}', '${escapeHtml(payload.detail.ticket_id || '')}')">查看传播图</button>
                     </div>
                 </div>
             `;
