@@ -160,3 +160,42 @@ power_rule = {
     }
   ]
 }
+
+data_rule = {
+  "pattern_name": "cross_domain_storm_under_data",
+  "description": "无断站 -> 断站",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "underneath_compound_node",
+  "nodes": {
+    "parent_data_node": {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Data"],
+          "expected_alarms": {
+            "forbidden_alarms": OFFLINE_ALARMS
+          }
+        }
+      ]
+    },
+    "underneath_compound_node": {
+      "type": "compound",
+      "min_count": 2,
+      "patterns": [
+        {
+          "type": "primitive",
+          "site_rules": TRANSMISSION_SITE_RULES
+        }
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "underneath_compound_node",
+      "target": "parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "max_hops": 1
+    }
+  ]
+}
