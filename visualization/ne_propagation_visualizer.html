@@ -569,6 +569,12 @@
             border-color: #0969da;
         }
 
+        .node-item.has-alarm {
+            border-left-color: #0891b2;
+            border-color: #0891b2;
+            box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
+        }
+
         .node-item.selected {
             border-left-color: #cf222e;
             background: #fff5f5;
@@ -1868,6 +1874,10 @@
                             <span>已选中</span>
                         </div>
                         <div class="legend-item">
+                            <div style="width: 16px; height: 16px; border: 3px solid #0891b2; border-radius: 50%;"></div>
+                            <span>组内有告警设备</span>
+                        </div>
+                        <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #ffd700; border-radius: 50%; animation: pulse 1s infinite;"></div>
                             <span>高亮站点</span>
                         </div>
@@ -3105,6 +3115,27 @@
             return alarm.time || alarm.alarm_time || alarm.time_str || '-';
         }
 
+        function nodeHasAlarm(node) {
+            if (!node || typeof node !== 'object') return false;
+            if (Array.isArray(node.alarm)) {
+                return node.alarm.length > 0;
+            }
+            return Number(node.alarm_count || 0) > 0;
+        }
+
+        function getNodeStrokeStyle(node, isSelected, isHighlighted) {
+            if (isHighlighted) {
+                return { strokeWidth: 5, strokeColor: '#ffd700' };
+            }
+            if (isSelected) {
+                return { strokeWidth: 4, strokeColor: '#cf222e' };
+            }
+            if (nodeHasAlarm(node)) {
+                return { strokeWidth: 3.5, strokeColor: '#0891b2' };
+            }
+            return { strokeWidth: 2, strokeColor: '#ffffff' };
+        }
+
         function renderSiteOverlays() {
             mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
             mapSiteOverlays = [];
@@ -3242,14 +3273,9 @@
                 
                 // 创建 SVG 图标
                 const svgSize = 28;
-                let strokeWidth = isSelected ? 4 : 2;
-                let strokeColor = isSelected ? '#cf222e' : '#ffffff';
-                
-                // 高亮时增加边框效果
-                if (isHighlighted) {
-                    strokeWidth = 5;
-                    strokeColor = '#ffd700'; // 金色边框
-                }
+                const strokeStyle = getNodeStrokeStyle(node, isSelected, isHighlighted);
+                const strokeWidth = strokeStyle.strokeWidth;
+                const strokeColor = strokeStyle.strokeColor;
                 
                 const svgHtml = '<svg width="' + svgSize + '" height="' + svgSize + '" viewBox="0 0 ' + svgSize + ' ' + svgSize + '" style="filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));">' +
                     '<path d="' + getShapePath(style.shape, svgSize) + '" fill="' + style.color + '" stroke="' + strokeColor + '" stroke-width="' + strokeWidth + '"/>' +
@@ -3387,13 +3413,9 @@
                 
                 // 直接修改现有标记的图标，不重新创建 marker
                 const svgSize = 28;
-                let strokeWidth = isSelected ? 4 : 2;
-                let strokeColor = isSelected ? '#cf222e' : '#ffffff';
-                
-                if (isHighlighted) {
-                    strokeWidth = 5;
-                    strokeColor = '#ffd700';
-                }
+                const strokeStyle = getNodeStrokeStyle(node, isSelected, isHighlighted);
+                const strokeWidth = strokeStyle.strokeWidth;
+                const strokeColor = strokeStyle.strokeColor;
                 
                 const svgHtml = '<svg width="' + svgSize + '" height="' + svgSize + '" viewBox="0 0 ' + svgSize + ' ' + svgSize + '" style="filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));">' +
                     '<path d="' + getShapePath(style.shape, svgSize) + '" fill="' + style.color + '" stroke="' + strokeColor + '" stroke-width="' + strokeWidth + '"/>' +
@@ -4388,7 +4410,8 @@
             container.innerHTML = currentNodes.map(function(n) {
                 const style = n.domainStyle || DOMAIN_STYLE['DEFAULT'];
                 const isHighlighted = highlightedNodes.has(n.id);
-                return '<div class="node-item ' + (n.id === highlightId ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
+                const hasAlarmClass = nodeHasAlarm(n) ? 'has-alarm' : '';
+                return '<div class="node-item ' + (n.id === highlightId ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
                         '<div class="ne-id">' + getRawNodeId(n) + '</div>' +

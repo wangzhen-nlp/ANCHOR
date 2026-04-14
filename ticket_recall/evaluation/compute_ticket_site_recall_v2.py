@@ -950,7 +950,11 @@ def compute_ticket_site_recall_v2(
         unrecalled_sites = target_sites - recalled_sites
         upper_info = upper_bound_index.get(ticket_id, {})
         upper_site_evidence = upper_info.get("site_evidence", {})
+        group_sites_from_index = _build_group_site_union(effective_fault_groups, group_to_sites)
+        context_sites = sorted(set(group_sites_from_index) - set(target_sites))
+        display_sites = sorted(set(target_sites) | set(group_sites_from_index))
         associated_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, recalled_sites)
+        context_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, context_sites)
         missing_site_alarms = {
             site_id: upper_site_evidence.get(site_id, [])
             for site_id in sorted(unrecalled_sites)
@@ -967,7 +971,7 @@ def compute_ticket_site_recall_v2(
                 "fault_groups": fault_groups,
                 "effective_fault_groups": effective_fault_groups,
                 "selected_fault_group": selected_fault_group,
-                "group_sites_from_index": _build_group_site_union(effective_fault_groups, group_to_sites),
+                "group_sites_from_index": group_sites_from_index,
                 "predicted_sites": sorted(predicted_sites),
                 "associated_sites": sorted(recalled_sites),
                 "missing_sites": sorted(unrecalled_sites),
@@ -1026,12 +1030,17 @@ def compute_ticket_site_recall_v2(
             "selected_fault_group": selected_fault_group,
             "group_site_count": len(predicted_sites),
             "group_sites": sorted(predicted_sites),
+            "group_sites_from_index": group_sites_from_index,
             "associated_site_count": len(recalled_sites),
             "associated_sites": sorted(recalled_sites),
             "associated_site_alarms": associated_site_alarms,
             "missing_site_count": len(unrecalled_sites),
             "missing_sites": sorted(unrecalled_sites),
             "missing_site_alarms": missing_site_alarms,
+            "context_site_count": len(context_sites),
+            "context_sites": context_sites,
+            "context_site_alarms": context_site_alarms,
+            "display_sites": display_sites,
             "recall": recall,
             "precision": precision,
             "f1": f1,
