@@ -3861,7 +3861,7 @@
         function drawMapConnections(jitteredCoords) {
             currentLinks.forEach(function(link) {
                 const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
-                const targetId = typeof link.target === 'object' ? l.target.id : link.target;
+                const targetId = typeof link.target === 'object' ? link.target.id : link.target;
                 
                 // 使用扰动后的坐标
                 const sourcePos = jitteredCoords[sourceId];
@@ -3881,12 +3881,13 @@
 
                 // 检查是否为distance类型连接
                 const isDistance = isDistanceLink(link);
+                const isNeighborExpandedEdge = !!link.isNeighborExpanded;
                 
                 const polyline = L.polyline(latlngs, {
                     color: edgeColor,
                     weight: 2.5,
                     opacity: 0.8,
-                    dashArray: isDistance ? '10, 6' : null // distance类型使用虚线
+                    dashArray: isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null)
                 }).addTo(map);
 
                 // 存储边数据到polyline以便点击时使用
@@ -3894,6 +3895,7 @@
                 polyline.sourceId = sourceId;
                 polyline.targetId = targetId;
                 polyline.isDistance = isDistance;
+                polyline.isNeighborExpandedEdge = isNeighborExpandedEdge;
 
                 polyline.bindTooltip(sourceId + ' → ' + targetId + (isDistance ? ' (Distance)' : ''), {
                     permanent: false,
@@ -3918,7 +3920,8 @@
                     this.setStyle({ 
                         weight: isDistance ? 2.5 : 2.5, 
                         opacity: isSelected ? 1 : 0.8,
-                        color: isSelected ? '#cf222e' : edgeColor
+                        color: isSelected ? '#cf222e' : edgeColor,
+                        dashArray: isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null)
                     });
                 });
 
@@ -3958,7 +3961,7 @@
                         color: '#cf222e', 
                         weight: 4, 
                         opacity: 1,
-                        dashArray: isDistanceLink(link) ? '10, 6' : null
+                        dashArray: isDistanceLink(link) ? '10, 6' : (link.isNeighborExpanded ? '6, 6' : null)
                     });
                     polyline.bringToFront();
                 } else {
@@ -3969,7 +3972,7 @@
                         color: getEdgeColorByNodes(sourceNode, targetNode), 
                         weight: 2.5, 
                         opacity: 0.8,
-                        dashArray: isDistance ? '10, 6' : null
+                        dashArray: isDistance ? '10, 6' : (polyline.linkData && polyline.linkData.isNeighborExpanded ? '6, 6' : null)
                     });
                 }
             });
@@ -4649,6 +4652,7 @@
             baseCurrentNodes.forEach(function(node) {
                 baseNodeMap.set(node.id, node);
             });
+            const baseNodeIdSet = new Set(baseCurrentNodes.map(function(node) { return node.id; }));
 
             const expandedNodeIds = [];
             Object.entries(neGraphData).forEach(function(entry) {
@@ -4660,9 +4664,16 @@
                 }
             });
 
-            currentNodes = expandedNodeIds.map(function(neId) {
+            const mergedNodeIdSet = new Set(baseNodeIdSet);
+            expandedNodeIds.forEach(function(neId) {
+                mergedNodeIdSet.add(neId);
+            });
+
+            currentNodes = Array.from(mergedNodeIdSet).map(function(neId) {
                 if (baseNodeMap.has(neId)) {
-                    return Object.assign({}, baseNodeMap.get(neId));
+                    return Object.assign({}, baseNodeMap.get(neId), {
+                        isNeighborExpanded: !baseNodeIdSet.has(neId)
+                    });
                 }
                 const neInfo = neGraphData[neId] || {};
                 const domain = neInfo.domain || '';
@@ -4682,24 +4693,40 @@
                     latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
                     longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined)),
                     isHighlight: false,
+                    isNeighborExpanded: true,
                     domainStyle: getDomainStyle(domain)
                 };
             });
 
-            const expandedNodeIdSet = new Set(expandedNodeIds);
+            const mergedNodeIdArray = Array.from(mergedNodeIdSet);
+            const mergedNodeIdLookup = new Set(mergedNodeIdArray);
+            const expandedNodeIdSet = new Set(expandedNodeIds.filter(function(neId) {
+                return !baseNodeIdSet.has(neId);
+            }));
             const linkSet = new Set();
-            currentLinks = [];
-            expandedNodeIds.forEach(function(sourceId) {
+            const baseLinkKeySet = new Set();
+            baseCurrentLinks.forEach(function(link) {
+                const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+                const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+                baseLinkKeySet.add([sourceId, targetId].sort().join('|'));
+            });
+
+            const mergedLinks = baseCurrentLinks.map(function(link) {
+                return Object.assign({}, link, { isNeighborExpanded: false });
+            });
+
+            mergedNodeIdArray.forEach(function(sourceId) {
                 const sourceInfo = neGraphData[sourceId] || {};
                 const links = sourceInfo.link || {};
                 Object.entries(links).forEach(function(entry) {
                     const targetId = entry[0];
                     const linkInfo = entry[1] || {};
-                    if (!expandedNodeIdSet.has(targetId) || targetId === sourceId) return;
+                    if (!mergedNodeIdLookup.has(targetId) || targetId === sourceId) return;
                     const key = [sourceId, targetId].sort().join('|');
-                    if (linkSet.has(key)) return;
+                    if (linkSet.has(key) || baseLinkKeySet.has(key)) return;
                     linkSet.add(key);
-                    currentLinks.push({
+                    const isExpandedEdge = expandedNodeIdSet.has(sourceId) && expandedNodeIdSet.has(targetId);
+                    mergedLinks.push({
                         source: sourceId,
                         target: targetId,
                         connection_type: linkInfo.connection_type || '',
@@ -4707,11 +4734,13 @@
                         time_window: linkInfo.time_window || '',
                         distance: linkInfo.distance || 0,
                         left_alarm: linkInfo.left_alarm || null,
-                        right_alarm: linkInfo.right_alarm || null
+                        right_alarm: linkInfo.right_alarm || null,
+                        isNeighborExpanded: isExpandedEdge
                     });
                 });
             });
 
+            currentLinks = mergedLinks;
             filteredLinks = currentLinks.slice();
             document.getElementById('currentNodes').textContent = currentNodes.length;
             return true;
