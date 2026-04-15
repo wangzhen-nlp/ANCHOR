@@ -1764,14 +1764,19 @@
                 <div class="file-select">
                     <input type="file" id="fileInput" accept=".json" style="display: none;">
                     <input type="file" id="neGraphFileInput" accept=".json" style="display: none;">
+                    <input type="file" id="siteOrderFileInput" accept=".json" style="display: none;">
                     <button onclick="document.getElementById('fileInput').click()" id="fileSelectBtn">
                         📁 选择 JSON 文件
                     </button>
                     <button onclick="document.getElementById('neGraphFileInput').click()" id="neGraphSelectBtn" style="margin-top: 8px; background: #0969da;">
                         🗺️ 选择 ne_graph.json
                     </button>
+                    <button onclick="document.getElementById('siteOrderFileInput').click()" id="siteOrderSelectBtn" style="margin-top: 8px; background: #7c3aed;">
+                        🔢 选择 site_order.json
+                    </button>
                     <p id="fileStatus">请选择 JSON 文件</p>
                     <p id="neGraphStatus" style="font-size: 11px; color: #57606a; margin-top: 6px; word-break: break-all;">ne_graph：未加载</p>
+                    <p id="siteOrderStatus" style="font-size: 11px; color: #57606a; margin-top: 6px; word-break: break-all;">site_order：未加载</p>
                 </div>
             </div>
 
@@ -2255,6 +2260,7 @@
         let currentNote = ''; // 当前备注内容
         let originalGroupUuid = ''; // 当前故障组UUID
         let neGraphData = null;
+        let siteOrderData = null;
         let referenceData = null;
         let referenceIndex = {
             ticket: new Map(),
@@ -2597,6 +2603,7 @@
             setupGroupInput();
             setupSearchInput();
             tryLoadDefaultNeGraph();
+            tryLoadDefaultSiteOrder();
             const siteNeighborModeCheckbox = document.getElementById('siteNeighborModeCheckbox');
             const siteNeighborHopInput = document.getElementById('siteNeighborHopInput');
             if (siteNeighborModeCheckbox) {
@@ -2652,6 +2659,7 @@
 
             document.getElementById('fileInput').addEventListener('change', handleFileSelect);
             document.getElementById('neGraphFileInput').addEventListener('change', handleNeGraphFileSelect);
+            document.getElementById('siteOrderFileInput').addEventListener('change', handleSiteOrderFileSelect);
         });
 
         // 显示错误提示
@@ -2684,6 +2692,58 @@
                 neGraphData = null;
                 statusEl.textContent = 'ne_graph：默认加载失败，请手动选择文件';
                 console.warn('默认加载 ne_graph.json 失败:', error);
+            }
+        }
+
+        function _extractSiteOrderValue(siteId) {
+            if (!siteOrderData || typeof siteOrderData !== 'object' || Array.isArray(siteOrderData)) {
+                return '';
+            }
+            const rawValue = siteOrderData[String(siteId)] ?? siteOrderData[siteId];
+            if (rawValue === null || rawValue === undefined) {
+                return '';
+            }
+            if (typeof rawValue === 'object' && !Array.isArray(rawValue)) {
+                const nestedValue = rawValue.order ?? rawValue.site_order ?? rawValue.value ?? '';
+                return nestedValue === null || nestedValue === undefined ? '' : String(nestedValue).trim();
+            }
+            return String(rawValue).trim();
+        }
+
+        function formatSiteLabel(siteId, siteName) {
+            const normalizedSiteId = String(siteId || '').trim();
+            const normalizedSiteName = String(siteName || '').trim();
+            const baseLabel = normalizedSiteId || normalizedSiteName || '未知站点';
+            if (!normalizedSiteId) {
+                return baseLabel;
+            }
+            const orderValue = _extractSiteOrderValue(normalizedSiteId);
+            return orderValue ? `${normalizedSiteId}(${orderValue})` : normalizedSiteId;
+        }
+
+        async function tryLoadDefaultSiteOrder() {
+            const defaultPath = '../topology_resources/site_order.json';
+            const statusEl = document.getElementById('siteOrderStatus');
+            if (!statusEl) return;
+
+            try {
+                const response = await fetch(defaultPath);
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                const data = await response.json();
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    throw new Error('site_order.json 顶层必须是对象');
+                }
+                siteOrderData = data;
+                statusEl.textContent = 'site_order：已自动加载 ../topology_resources/site_order.json，站点数 ' + Object.keys(siteOrderData).length;
+                if (map && currentNodes.length > 0) {
+                    renderSiteOverlays();
+                }
+            } catch (error) {
+                siteOrderData = null;
+                statusEl.textContent = 'site_order：默认加载失败，请手动选择文件';
+                console.warn('默认加载 site_order.json 失败:', error);
             }
         }
 
@@ -3313,6 +3373,7 @@
                 return {
                     siteId: site.siteId,
                     siteName: site.siteName,
+                    label: formatSiteLabel(site.siteId, site.siteName),
                     latitude: site.latSum / site.count,
                     longitude: site.lngSum / site.count,
                     deviceCount: site.count,
@@ -3460,7 +3521,7 @@
                     zIndexOffset: -1000,
                     icon: L.divIcon({
                         className: 'site-label-container',
-                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site' : '') + '">' + (site.siteId || site.siteName || '未知站点') + '</div>',
+                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site' : '') + '">' + (site.label || site.siteId || site.siteName || '未知站点') + '</div>',
                         iconSize: null,
                         iconAnchor: [-8, 14]
                     })
@@ -5317,6 +5378,36 @@
                     neGraphData = null;
                     document.getElementById('neGraphStatus').textContent = 'ne_graph：加载失败 - ' + error.message;
                     showError('解析 ne_graph.json 失败: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function handleSiteOrderFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (!file.name.endsWith('.json')) {
+                showError('请选择 site_order.json 文件');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                        throw new Error('site_order.json 顶层必须是对象');
+                    }
+                    siteOrderData = data;
+                    document.getElementById('siteOrderStatus').textContent = 'site_order：已加载 ' + file.name + '，站点数 ' + Object.keys(siteOrderData).length;
+                    if (map && currentNodes.length > 0) {
+                        renderSiteOverlays();
+                    }
+                } catch (error) {
+                    siteOrderData = null;
+                    document.getElementById('siteOrderStatus').textContent = 'site_order：加载失败 - ' + error.message;
+                    showError('解析 site_order.json 失败: ' + error.message);
                 }
             };
             reader.readAsText(file);
