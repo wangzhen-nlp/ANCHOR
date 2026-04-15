@@ -1194,6 +1194,7 @@ def main():
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--aggregation-wait-sec', type=float, default=420.0, help='trigger 成熟前的聚合等待时间，单位秒，默认 420')
     parser.add_argument('--clear-delay-sec', type=float, default=0.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
+    parser.add_argument('--batch-merge-site-hops', type=int, default=0, help='批内候选组额外按站点邻接合并的 hop 数；0 表示关闭，2 表示两跳内可合并')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
     parser.add_argument('--verbose-groups', action='store_true', help='打印每个故障组的详细报告；默认静默，仅输出进度与汇总')
@@ -1253,6 +1254,8 @@ def main():
         )
     if args.clear_delay_sec > 0:
         print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
+    if args.batch_merge_site_hops > 0:
+        print(f"批内站点邻接合并: 开启，hop={args.batch_merge_site_hops}")
 
     rules_config = {
         "transmission_rule": transmission_rule,
@@ -1268,6 +1271,7 @@ def main():
         rules_config,
         site_domain_map,
         aggregation_wait_sec=args.aggregation_wait_sec,
+        batch_merge_site_hops=args.batch_merge_site_hops,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
 

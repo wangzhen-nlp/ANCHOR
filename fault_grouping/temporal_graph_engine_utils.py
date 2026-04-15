@@ -64,6 +64,22 @@ def get_match_alarm_keys(match_result):
     return alarm_keys
 
 
+def get_match_site_keys(match_result):
+    site_keys = set()
+
+    for nodes in match_result.get("role_mapping", {}).values():
+        for node in nodes:
+            if node not in (None, ""):
+                site_keys.add(node)
+
+    for symptom in match_result.get("symptoms", []):
+        node = symptom.get("node")
+        if node not in (None, ""):
+            site_keys.add(node)
+
+    return site_keys
+
+
 def merge_match_component(component_matches):
     """合并一组通过 eid 连通的候选组。"""
     merged_rules = sorted({
@@ -116,7 +132,26 @@ def merge_match_component(component_matches):
     return merged
 
 
-def merge_match_batch(matches):
+def _component_is_site_adjacent(left_sites, right_sites, site_neighbor_hops, get_sites_within_hops):
+    if site_neighbor_hops <= 0 or get_sites_within_hops is None:
+        return False
+    if not left_sites or not right_sites:
+        return False
+    if left_sites & right_sites:
+        return True
+
+    if len(left_sites) > len(right_sites):
+        left_sites, right_sites = right_sites, left_sites
+
+    right_sites = set(right_sites)
+    for site in left_sites:
+        if get_sites_within_hops(site, site_neighbor_hops) & right_sites:
+            return True
+
+    return False
+
+
+def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None):
     """在同一轮收割内，先把共享 eid 的候选组合并后再输出。"""
     if len(matches) <= 1:
         return matches
@@ -135,12 +170,10 @@ def merge_match_batch(matches):
         if left_root != right_root:
             parent[right_root] = left_root
 
+    match_alarm_keys = [get_match_alarm_keys(match) for match in matches]
     eid_to_match_indexes = collections.defaultdict(list)
-    standalone_indexes = []
-    for idx, match in enumerate(matches):
-        alarm_keys = get_match_alarm_keys(match)
+    for idx, alarm_keys in enumerate(match_alarm_keys):
         if not alarm_keys:
-            standalone_indexes.append(idx)
             continue
         for alarm_key in alarm_keys:
             eid_to_match_indexes[alarm_key].append(idx)
@@ -152,15 +185,36 @@ def merge_match_batch(matches):
         for idx in indexes[1:]:
             union(head, idx)
 
-    groups = collections.defaultdict(list)
-    for idx, match in enumerate(matches):
-        alarm_keys = get_match_alarm_keys(match)
-        if not alarm_keys:
-            continue
-        groups[find(idx)].append(match)
+    if site_neighbor_hops > 0 and get_sites_within_hops is not None:
+        match_site_keys = [get_match_site_keys(match) for match in matches]
+        active_indexes = [idx for idx, site_keys in enumerate(match_site_keys) if site_keys]
+        for pos, left_idx in enumerate(active_indexes):
+            left_sites = match_site_keys[left_idx]
+            for right_idx in active_indexes[pos + 1:]:
+                if find(left_idx) == find(right_idx):
+                    continue
+                if _component_is_site_adjacent(
+                    left_sites,
+                    match_site_keys[right_idx],
+                    site_neighbor_hops,
+                    get_sites_within_hops,
+                ):
+                    union(left_idx, right_idx)
 
-    merged_matches = [merge_match_component(component_matches) for component_matches in groups.values()]
-    merged_matches.extend(matches[idx] for idx in standalone_indexes)
+    groups = collections.defaultdict(list)
+    group_indexes = collections.defaultdict(list)
+    for idx, match in enumerate(matches):
+        root_idx = find(idx)
+        groups[root_idx].append(match)
+        group_indexes[root_idx].append(idx)
+
+    merged_matches = []
+    for root_idx, component_matches in groups.items():
+        indexes = group_indexes[root_idx]
+        if len(component_matches) == 1 and not match_alarm_keys[indexes[0]]:
+            merged_matches.append(matches[indexes[0]])
+            continue
+        merged_matches.append(merge_match_component(component_matches))
     return merged_matches
 
 

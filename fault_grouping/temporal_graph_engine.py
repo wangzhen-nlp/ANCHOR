@@ -166,7 +166,14 @@ class TemporalGraphEngine:
             if not changed:
                 return stabilized_inst
 
-    def __init__(self, topo_downstream_map, rules_config, site_domain_map, aggregation_wait_sec=420):
+    def __init__(
+        self,
+        topo_downstream_map,
+        rules_config,
+        site_domain_map,
+        aggregation_wait_sec=420,
+        batch_merge_site_hops=0,
+    ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
         self.rules = rules_config
@@ -177,6 +184,12 @@ class TemporalGraphEngine:
         for up, downs in self.topo_down.items():
             for down in downs:
                 self.topo_up[down].append(up)
+        self.topo_undirected = collections.defaultdict(set)
+        for up, downs in self.topo_down.items():
+            self.topo_undirected[up]
+            for down in downs:
+                self.topo_undirected[up].add(down)
+                self.topo_undirected[down].add(up)
 
         # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]) }
         self.event_cache = collections.defaultdict(collections.deque)
@@ -191,6 +204,11 @@ class TemporalGraphEngine:
         # 全局拓扑穿透缓存
         self.global_topo_cache = collections.OrderedDict()
         self.max_topo_cache_size = 10000
+        # 站点邻接 hop 查询缓存，供批内弱合并复用
+        self.site_hop_cache = collections.OrderedDict()
+        self.max_site_hop_cache_size = 20000
+        # 批内额外按站点邻接进行合并的 hop 配置，0 表示关闭
+        self.batch_merge_site_hops = max(int(batch_merge_site_hops or 0), 0)
         # nearest_matching 在不带 path_requirements 时只依赖静态拓扑和站点画像，可跨批次复用
         self.global_nearest_match_cache = collections.OrderedDict()
         self.max_nearest_match_cache_size = 10000
@@ -481,7 +499,11 @@ class TemporalGraphEngine:
             if results:
                 raw_matches.extend(results)
 
-        merged_matches = merge_match_batch(raw_matches)
+        merged_matches = merge_match_batch(
+            raw_matches,
+            site_neighbor_hops=self.batch_merge_site_hops,
+            get_sites_within_hops=self._get_sites_within_hops,
+        )
         expanded_matches = self._expand_matches_with_pending_context(
             merged_matches,
             helper,
@@ -942,7 +964,11 @@ class TemporalGraphEngine:
         if not extra_matches:
             return matches
 
-        return merge_match_batch(list(matches) + extra_matches)
+        return merge_match_batch(
+            list(matches) + extra_matches,
+            site_neighbor_hops=self.batch_merge_site_hops,
+            get_sites_within_hops=self._get_sites_within_hops,
+        )
 
     def _evaluate_rule(
         self,
@@ -1602,3 +1628,36 @@ class TemporalGraphEngine:
         if filtered_neighbor_cache is not None:
             filtered_neighbor_cache[cache_key] = valid_neighbors
         return valid_neighbors
+
+    def _get_sites_within_hops(self, start_site, max_hops):
+        max_hops = max(int(max_hops or 0), 0)
+        cache_key = (start_site, max_hops)
+
+        with self._topo_cache_lock:
+            if cache_key in self.site_hop_cache:
+                self.site_hop_cache.move_to_end(cache_key)
+                return self.site_hop_cache[cache_key]
+
+        visited = {start_site}
+        reachable = {start_site}
+        queue = collections.deque([(start_site, 0)])
+
+        while queue:
+            curr_site, hops = queue.popleft()
+            if hops >= max_hops:
+                continue
+            for next_site in self.topo_undirected.get(curr_site, ()):
+                if next_site in visited:
+                    continue
+                visited.add(next_site)
+                reachable.add(next_site)
+                queue.append((next_site, hops + 1))
+
+        reachable = frozenset(reachable)
+        with self._topo_cache_lock:
+            self.site_hop_cache[cache_key] = reachable
+            self.site_hop_cache.move_to_end(cache_key)
+            if len(self.site_hop_cache) > self.max_site_hop_cache_size:
+                self.site_hop_cache.popitem(last=False)
+
+        return reachable
