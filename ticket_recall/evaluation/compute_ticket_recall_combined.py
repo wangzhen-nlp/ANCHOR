@@ -227,6 +227,13 @@ def compute_ticket_recall_combined(
             _build_combined_case_record(ticket_id, alarm_stream_payload, group_output_payload)
         )
 
+    combined_case_records.sort(
+        key=lambda record: (
+            float(((record.get("group_output") or {}).get("recall", 0.0) or 0.0)),
+            str(record.get("ticket_id", "")),
+        )
+    )
+
     write_jsonl_records(combined_case_jsonl_output_file, combined_case_records)
 
     combined_result = {
