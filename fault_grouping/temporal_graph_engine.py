@@ -985,6 +985,13 @@ class TemporalGraphEngine:
         if debug_trace is not None:
             debug_trace["trigger_role"] = trigger_role
 
+        caches = eval_caches or self._create_eval_caches()
+        validation_cache = caches["validation_cache"]
+        traversal_cache = caches["traversal_cache"]
+        path_validation_cache = caches["path_validation_cache"]
+        structure_match_cache = caches["structure_match_cache"]
+        filtered_neighbor_cache = caches["filtered_neighbor_cache"]
+
         # 3. 校验触发节点自身
         trigger_node_domain = self.sites_domain_map.get(trigger_node, {})
         trigger_validation_cache_key = (
@@ -1031,12 +1038,6 @@ class TemporalGraphEngine:
             "_dependencies": {}
         }
         instances = [initial_inst]
-        caches = eval_caches or self._create_eval_caches()
-        validation_cache = caches["validation_cache"]
-        traversal_cache = caches["traversal_cache"]
-        path_validation_cache = caches["path_validation_cache"]
-        structure_match_cache = caches["structure_match_cache"]
-        filtered_neighbor_cache = caches["filtered_neighbor_cache"]
 
         # 5. 核心引擎：逐边推演，触发 分叉 (Fork) 或 聚合 (Aggregate)
         for curr_role, tgt_role, edge in edges_to_explore:
