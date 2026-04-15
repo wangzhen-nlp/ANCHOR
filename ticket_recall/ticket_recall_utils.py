@@ -5,7 +5,7 @@ from datetime import datetime
 from collections import defaultdict
 
 from topology_resources import SITE_GRAPH_JSON
-from ticket_recall.evaluation.compute_ticket_site_recall import _normalize_text
+from ticket_recall.evaluation.recall_common import _normalize_text
 
 
 def normalize_text(value):
