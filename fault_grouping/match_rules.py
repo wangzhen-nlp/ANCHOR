@@ -13,15 +13,12 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_tools.alarm_inputs import (
-    build_ne_to_site_map,
-    load_site_graph,
     stream_alarm_inputs,
 )
 from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_DEVICE_COUNTS_JSON,
-    SITE_GRAPH_BY_NE_JSON,
     SITE_GRAPH_JSON,
     resource_display,
 )
@@ -192,6 +189,75 @@ def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
         collect_matches=collect_matches,
         register_trigger=register_trigger
     )
+
+
+def _extract_link_direction_values(link_meta):
+    if isinstance(link_meta, dict):
+        raw_values = link_meta.values()
+    elif isinstance(link_meta, (list, tuple, set)):
+        raw_values = link_meta
+    else:
+        raw_values = [link_meta]
+
+    direction_values = set()
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if text:
+            direction_values.add(text)
+    return direction_values
+
+
+def _build_site_topology_from_ne_graph(ne_graph_data):
+    """基于 ne_graph 原始连边构建站点级 downstream 拓扑。
+
+    约定：
+    - extract_ne_graph.py 中 a_end 表示下行设备，z_end 表示上行设备
+    - 因此 source -> target 里如果当前 source 侧记录的是:
+      - '<-' : source 是上行，target 是下行，记作 source_site -> target_site
+      - '->' : source 是下行，target 是上行，记作 target_site -> source_site
+      - '<->': 两个方向都保留
+    """
+    ne_to_site = {}
+    all_sites = set()
+
+    for ne_id, ne_info in ne_graph_data.items():
+        site_id = str(ne_info.get("site_id", "")).strip()
+        if not site_id:
+            continue
+        ne_to_site[ne_id] = site_id
+        all_sites.add(site_id)
+
+    topo_downstream_map = defaultdict(set)
+    for site_id in all_sites:
+        topo_downstream_map[site_id]
+
+    for source_ne, source_info in ne_graph_data.items():
+        source_site = ne_to_site.get(source_ne)
+        if not source_site:
+            continue
+
+        raw_links = source_info.get("link", {})
+        if not isinstance(raw_links, dict):
+            continue
+
+        for target_ne, link_meta in raw_links.items():
+            target_site = ne_to_site.get(target_ne)
+            if not target_site or target_site == source_site:
+                continue
+
+            direction_values = _extract_link_direction_values(link_meta)
+            if not direction_values:
+                continue
+
+            if any("<-" in direction for direction in direction_values):
+                topo_downstream_map[source_site].add(target_site)
+            if any("->" in direction for direction in direction_values):
+                topo_downstream_map[target_site].add(source_site)
+
+    return {
+        site_id: sorted(neighbor_sites)
+        for site_id, neighbor_sites in topo_downstream_map.items()
+    }, all_sites
 
 
 def _build_simulated_now_ts_getter(valid_alarms, speedup):
@@ -1119,7 +1185,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
-    parser.add_argument('--topo', type=str, default=SITE_GRAPH_BY_NE_JSON, help=f'站点拓扑文件，默认: {resource_display("site_graph_by_ne.json")}')
+    parser.add_argument('--topo', type=str, help='可选：显式指定站点拓扑文件；默认不再依赖 site_graph_by_ne.json，而是基于 ne_graph.json 原始连边自动构建')
     parser.add_argument('--site-domain', type=str, default=SITE_DEVICE_COUNTS_JSON, help=f'站点画像文件，默认: {resource_display("site_device_counts.json")}')
     parser.add_argument('--site-graph', type=str, default=SITE_GRAPH_JSON, help=f'site_graph.json 文件，默认: {resource_display("site_graph.json")}')
     parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
@@ -1147,17 +1213,33 @@ def main():
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         parser.error("start_time 不能晚于 end_time")
 
-    topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
+    ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
+    if args.topo:
+        print(f"加载显式站点拓扑: {args.topo}")
+        topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
+        valid_sites = set(topo_downstream_map.keys())
+        for _, connected_sites in topo_downstream_map.items():
+            if isinstance(connected_sites, list):
+                valid_sites.update(connected_sites)
+            elif isinstance(connected_sites, dict):
+                valid_sites.update(connected_sites.keys())
+    else:
+        print(f"基于 ne_graph 原始连边构建站点传播拓扑: {args.ne_graph}")
+        topo_downstream_map, valid_sites = _build_site_topology_from_ne_graph(ne_graph_data)
+
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
     site_graph_data = json.load(open(args.site_graph, 'r', encoding='utf-8'))
-    ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
 
     print("加载有效站点集合...")
-    valid_sites = load_site_graph(args.topo)
     print(f"有效站点数: {len(valid_sites)}")
+    print(f"站点拓扑起点数: {len(topo_downstream_map)}")
 
     print("构建 ne -> site 映射...")
-    ne_to_site = build_ne_to_site_map(args.ne_graph)
+    ne_to_site = {
+        ne_id: str(ne_info.get("site_id", "")).strip()
+        for ne_id, ne_info in ne_graph_data.items()
+        if str(ne_info.get("site_id", "")).strip()
+    }
     print(f"NE 数量: {len(ne_to_site)}")
 
     valid_alarm_titles = CRITICAL_ALARMS
