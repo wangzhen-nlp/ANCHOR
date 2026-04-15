@@ -21,6 +21,22 @@ logger = logging.getLogger(__name__)
 
 
 class TemporalGraphEngine:
+    @staticmethod
+    def _make_edge_window_cache_key(edge_window):
+        if isinstance(edge_window, dict):
+            return tuple(sorted(edge_window.items()))
+        return edge_window
+
+    @staticmethod
+    def _create_eval_caches():
+        return {
+            "validation_cache": {},
+            "traversal_cache": {},
+            "path_validation_cache": {},
+            "structure_match_cache": {},
+            "filtered_neighbor_cache": {},
+        }
+
     def _compile_rule_execution_plan(self, rule):
         """为单条规则预编译静态执行计划，避免每次评估重复构图和排边。"""
         nodes_cfg = rule.get("nodes", {})
@@ -175,6 +191,9 @@ class TemporalGraphEngine:
         # 全局拓扑穿透缓存
         self.global_topo_cache = collections.OrderedDict()
         self.max_topo_cache_size = 10000
+        # nearest_matching 在不带 path_requirements 时只依赖静态拓扑和站点画像，可跨批次复用
+        self.global_nearest_match_cache = collections.OrderedDict()
+        self.max_nearest_match_cache_size = 10000
 
         # 故障传播等待时间
         self.aggregation_wait_sec = aggregation_wait_sec
@@ -423,6 +442,7 @@ class TemporalGraphEngine:
             event_cache_snapshot = self._snapshot_event_cache_subset_locked(seed_nodes)
 
         helper = self._build_snapshot_helper(event_cache_snapshot)
+        batch_eval_caches = self._create_eval_caches()
         raw_matches = []
         pending_eval_profiles = []
         for trigger_key, trigger_anchor in mature_items:
@@ -437,6 +457,7 @@ class TemporalGraphEngine:
                     trig_node,
                     trigger_ts,
                     node_rule_helper=helper,
+                    eval_caches=batch_eval_caches,
                     return_debug_trace=True
                 )
             else:
@@ -445,7 +466,8 @@ class TemporalGraphEngine:
                     rule,
                     trig_node,
                     trigger_ts,
-                    node_rule_helper=helper
+                    node_rule_helper=helper,
+                    eval_caches=batch_eval_caches,
                 )
             pending_eval_profiles.append({
                 "node": trig_node,
@@ -460,7 +482,11 @@ class TemporalGraphEngine:
                 raw_matches.extend(results)
 
         merged_matches = merge_match_batch(raw_matches)
-        expanded_matches = self._expand_matches_with_pending_context(merged_matches, helper)
+        expanded_matches = self._expand_matches_with_pending_context(
+            merged_matches,
+            helper,
+            eval_caches=batch_eval_caches,
+        )
         with self._lock:
             self._prune_expired_state_locked(self.latest_arrived_event_ts)
             current_watermark = self.current_watermark
@@ -874,7 +900,7 @@ class TemporalGraphEngine:
 
         return non_trigger_nodes
 
-    def _expand_matches_with_pending_context(self, matches, node_rule_helper):
+    def _expand_matches_with_pending_context(self, matches, node_rule_helper, eval_caches=None):
         """只读扩充当前批次：汇总整批非 trigger 节点上的 pending，再和当前批统一做一次批内合并。"""
         if not matches:
             return matches
@@ -907,7 +933,8 @@ class TemporalGraphEngine:
                 rule,
                 node,
                 trigger_ts,
-                node_rule_helper=node_rule_helper
+                node_rule_helper=node_rule_helper,
+                eval_caches=eval_caches,
             )
             if results:
                 extra_matches.extend(results)
@@ -917,7 +944,16 @@ class TemporalGraphEngine:
 
         return merge_match_batch(list(matches) + extra_matches)
 
-    def _evaluate_rule(self, rule_name, rule, trigger_node, trigger_ts, node_rule_helper=None, return_debug_trace=False):
+    def _evaluate_rule(
+        self,
+        rule_name,
+        rule,
+        trigger_node,
+        trigger_ts,
+        node_rule_helper=None,
+        eval_caches=None,
+        return_debug_trace=False,
+    ):
         """
         全向动态图调度器 (State-Forking Matcher)：
         支持平行宇宙分叉、严格结构匹配、局部性能缓存。
@@ -951,14 +987,25 @@ class TemporalGraphEngine:
 
         # 3. 校验触发节点自身
         trigger_node_domain = self.sites_domain_map.get(trigger_node, {})
-        is_trig_valid, trig_evts = helper.validate_node(
+        trigger_validation_cache_key = (
             trigger_node,
-            trigger_node_domain,
-            nodes_cfg[trigger_role],
+            trigger_role,
             trigger_ts,
-            edge_window=0,
-            exclude_consumed_trigger_rule=rule_name
+            0,
+            rule_name,
         )
+        if trigger_validation_cache_key in validation_cache:
+            is_trig_valid, trig_evts = validation_cache[trigger_validation_cache_key]
+        else:
+            is_trig_valid, trig_evts = helper.validate_node(
+                trigger_node,
+                trigger_node_domain,
+                nodes_cfg[trigger_role],
+                trigger_ts,
+                edge_window=0,
+                exclude_consumed_trigger_rule=rule_name
+            )
+            validation_cache[trigger_validation_cache_key] = (is_trig_valid, trig_evts)
         if debug_trace is not None:
             debug_trace["trigger_validation"] = helper.explain_node_validation(
                 trigger_node,
@@ -984,7 +1031,12 @@ class TemporalGraphEngine:
             "_dependencies": {}
         }
         instances = [initial_inst]
-        validation_cache = {}
+        caches = eval_caches or self._create_eval_caches()
+        validation_cache = caches["validation_cache"]
+        traversal_cache = caches["traversal_cache"]
+        path_validation_cache = caches["path_validation_cache"]
+        structure_match_cache = caches["structure_match_cache"]
+        filtered_neighbor_cache = caches["filtered_neighbor_cache"]
 
         # 5. 核心引擎：逐边推演，触发 分叉 (Fork) 或 聚合 (Aggregate)
         for curr_role, tgt_role, edge in edges_to_explore:
@@ -1028,42 +1080,70 @@ class TemporalGraphEngine:
 
                 for curr_phys, curr_evts in curr_phys_dict['nodes'].items():
                     ref_ts = curr_evts[0]["ts"] if curr_evts else trigger_ts
-                    candidate_hops = self._traverse_graph(
-                        start_node=curr_phys,
-                        direction=edge["traverse_dir"],
-                        max_hops=edge["hops"],
-                        reference_ts=ref_ts,
-                        edge_window=edge["win"],
-                        path_requirements=edge.get("path_requirements"),
-                        node_rule_helper=helper
-                    )
-                    raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
-                    candidates = list(raw_candidates)
-                    # 先跑拓扑可达，再按 rule 里的 selector 收窄候选集
-                    candidates = helper.select_candidates_by_rule(
-                        candidates, candidate_hops, tgt_cfg, edge.get("candidate_selector")
-                    )
-                    if edge_trace is not None and not raw_candidates:
-                        branch_failure_reasons.append(
-                            f"{curr_role}:{curr_phys} 在拓扑方向 {edge['traverse_dir']} 上找不到任何 {tgt_role} 候选节点"
+                    selector = edge.get("candidate_selector") or {}
+                    selector_mode = selector.get("mode", "default")
+                    if selector_mode == "nearest_matching":
+                        candidate_hops, had_topology_candidate = self._traverse_graph_nearest_matching(
+                            start_node=curr_phys,
+                            direction=edge["traverse_dir"],
+                            target_node_config=tgt_cfg,
+                            max_hops=edge["hops"],
+                            reference_ts=ref_ts,
+                            edge_window=edge["win"],
+                            path_requirements=edge.get("path_requirements"),
+                            node_rule_helper=helper,
+                            traversal_cache=traversal_cache,
+                            path_validation_cache=path_validation_cache,
+                            structure_match_cache=structure_match_cache,
+                            filtered_neighbor_cache=filtered_neighbor_cache,
                         )
-                        continue
-                    if edge_trace is not None and raw_candidates and not candidates:
-                        selector = edge.get("candidate_selector") or {}
-                        selector_mode = selector.get("mode", "default")
-                        branch_failure_reasons.append(
-                            f"{curr_role}:{curr_phys} 的 {tgt_role} 候选在 selector(mode={selector_mode}) 后为空，"
-                            f"原始候选={raw_candidates[:8]}"
+                        raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
+                        candidates = list(raw_candidates)
+                        if edge_trace is not None and not raw_candidates:
+                            if had_topology_candidate:
+                                branch_failure_reasons.append(
+                                    f"{curr_role}:{curr_phys} 的 {tgt_role} 候选在 selector(mode={selector_mode}) 后为空，"
+                                    "原始拓扑候选存在，但没有结构命中"
+                                )
+                            else:
+                                branch_failure_reasons.append(
+                                    f"{curr_role}:{curr_phys} 在拓扑方向 {edge['traverse_dir']} 上找不到任何 {tgt_role} 候选节点"
+                                )
+                            continue
+                    else:
+                        candidate_hops = self._traverse_graph(
+                            start_node=curr_phys,
+                            direction=edge["traverse_dir"],
+                            max_hops=edge["hops"],
+                            reference_ts=ref_ts,
+                            edge_window=edge["win"],
+                            path_requirements=edge.get("path_requirements"),
+                            node_rule_helper=helper,
+                            traversal_cache=traversal_cache,
+                            path_validation_cache=path_validation_cache,
+                            filtered_neighbor_cache=filtered_neighbor_cache,
                         )
-                        continue
+                        raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
+                        candidates = list(raw_candidates)
+                        # 先跑拓扑可达，再按 rule 里的 selector 收窄候选集
+                        candidates = helper.select_candidates_by_rule(
+                            candidates, candidate_hops, tgt_cfg, edge.get("candidate_selector")
+                        )
+                        if edge_trace is not None and not raw_candidates:
+                            branch_failure_reasons.append(
+                                f"{curr_role}:{curr_phys} 在拓扑方向 {edge['traverse_dir']} 上找不到任何 {tgt_role} 候选节点"
+                            )
+                            continue
+                        if edge_trace is not None and raw_candidates and not candidates:
+                            branch_failure_reasons.append(
+                                f"{curr_role}:{curr_phys} 的 {tgt_role} 候选在 selector(mode={selector_mode}) 后为空，"
+                                f"原始候选={raw_candidates[:8]}"
+                            )
+                            continue
 
                     curr_valid_targets = {}
                     all_passed = True
-                    window_cache_key = (
-                        tuple(sorted(edge["win"].items()))
-                        if isinstance(edge["win"], dict)
-                        else edge["win"]
-                    )
+                    window_cache_key = self._make_edge_window_cache_key(edge["win"])
                     candidate_failure_details = []
 
                     # 如果 candidates 为空，天然跳过内层循环，该源节点被淘汰
@@ -1253,14 +1333,186 @@ class TemporalGraphEngine:
             return results, debug_trace
         return results
 
+    def _matches_node_structure_cached(self, node, node_config, helper, structure_match_cache=None):
+        if structure_match_cache is None:
+            return helper.matches_node_structure(self.sites_domain_map.get(node, {}), node_config)
+
+        cache_key = (node, id(node_config))
+        if cache_key not in structure_match_cache:
+            structure_match_cache[cache_key] = helper.matches_node_structure(
+                self.sites_domain_map.get(node, {}),
+                node_config
+            )
+        return structure_match_cache[cache_key]
+
+    def _validate_path_node_for_traversal(
+        self,
+        node,
+        path_requirements,
+        reference_ts,
+        edge_window,
+        helper,
+        path_validation_cache=None,
+    ):
+        if path_validation_cache is None:
+            node_domain = self.sites_domain_map.get(node, {})
+            is_valid_path_node, _ = helper.validate_node(
+                node, node_domain, path_requirements, reference_ts, edge_window
+            )
+            return is_valid_path_node
+
+        cache_key = (
+            node,
+            id(path_requirements),
+            reference_ts,
+            self._make_edge_window_cache_key(edge_window),
+        )
+        if cache_key not in path_validation_cache:
+            node_domain = self.sites_domain_map.get(node, {})
+            is_valid_path_node, _ = helper.validate_node(
+                node, node_domain, path_requirements, reference_ts, edge_window
+            )
+            path_validation_cache[cache_key] = is_valid_path_node
+        return path_validation_cache[cache_key]
+
+    def _traverse_graph_nearest_matching(
+        self,
+        start_node,
+        direction,
+        target_node_config,
+        max_hops=None,
+        reference_ts=None,
+        edge_window=0,
+        path_requirements=None,
+        node_rule_helper=None,
+        traversal_cache=None,
+        path_validation_cache=None,
+        structure_match_cache=None,
+        filtered_neighbor_cache=None,
+    ):
+        """nearest_matching 专用 BFS。
+
+        一旦在某个 hop 首次命中结构匹配节点，就在该 hop 层结束后停止继续向外扩张，
+        以避免在稠密图上无意义地遍历整张图。
+        """
+        helper = node_rule_helper or self.node_rule_helper
+
+        static_cache_key = None
+        if path_requirements is None:
+            static_cache_key = (
+                start_node,
+                direction,
+                max_hops,
+                id(target_node_config),
+            )
+            with self._topo_cache_lock:
+                if static_cache_key in self.global_nearest_match_cache:
+                    self.global_nearest_match_cache.move_to_end(static_cache_key)
+                    result = self.global_nearest_match_cache[static_cache_key]
+                    if traversal_cache is not None:
+                        traversal_cache[(
+                            "nearest_matching",
+                            start_node,
+                            direction,
+                            max_hops,
+                            reference_ts,
+                            self._make_edge_window_cache_key(edge_window),
+                            id(path_requirements),
+                            id(target_node_config),
+                        )] = result
+                    return result
+
+        cache_key = (
+            "nearest_matching",
+            start_node,
+            direction,
+            max_hops,
+            reference_ts,
+            self._make_edge_window_cache_key(edge_window),
+            id(path_requirements),
+            id(target_node_config),
+        )
+        if traversal_cache is not None and cache_key in traversal_cache:
+            return traversal_cache[cache_key]
+
+        visited = {start_node}
+        queue = collections.deque([(start_node, 0)])
+        topo = self.topo_up if direction == "upstream" else self.topo_down
+
+        result = {}
+        nearest_hop = None
+        had_topology_candidate = False
+
+        while queue:
+            curr, hops = queue.popleft()
+            if nearest_hop is not None and hops > nearest_hop:
+                break
+
+            if hops > 0:
+                had_topology_candidate = True
+                if self._matches_node_structure_cached(
+                    curr,
+                    target_node_config,
+                    helper,
+                    structure_match_cache=structure_match_cache,
+                ):
+                    if nearest_hop is None:
+                        nearest_hop = hops
+                    if hops == nearest_hop:
+                        result[curr] = hops
+
+            if nearest_hop is not None and hops >= nearest_hop:
+                continue
+
+            if max_hops is None or hops < max_hops:
+                for nxt in self._get_filtered_neighbors_for_traversal(
+                    curr,
+                    direction,
+                    reference_ts,
+                    edge_window,
+                    path_requirements,
+                    helper,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                ):
+                    if nxt in visited:
+                        continue
+                    visited.add(nxt)
+                    queue.append((nxt, hops + 1))
+
+        if traversal_cache is not None:
+            traversal_cache[cache_key] = (result, had_topology_candidate)
+        if static_cache_key is not None:
+            with self._topo_cache_lock:
+                self.global_nearest_match_cache[static_cache_key] = (result, had_topology_candidate)
+                self.global_nearest_match_cache.move_to_end(static_cache_key)
+                if len(self.global_nearest_match_cache) > self.max_nearest_match_cache_size:
+                    self.global_nearest_match_cache.popitem(last=False)
+
+        return result, had_topology_candidate
+
     def _traverse_graph(self, start_node, direction, max_hops=None,
                         reference_ts=None, edge_window=0, 
-                        path_requirements=None, node_rule_helper=None):
+                        path_requirements=None, node_rule_helper=None,
+                        traversal_cache=None, path_validation_cache=None,
+                        filtered_neighbor_cache=None):
         """通用的广度优先搜索，支持路径节点约束"""
         helper = node_rule_helper or self.node_rule_helper
 
         if direction == "self":
             return {start_node: 0}
+
+        local_cache_key = (
+            "full",
+            start_node,
+            direction,
+            max_hops,
+            reference_ts,
+            self._make_edge_window_cache_key(edge_window),
+            id(path_requirements),
+        )
+        if traversal_cache is not None and local_cache_key in traversal_cache:
+            return traversal_cache[local_cache_key]
 
         cache_key = (start_node, direction, max_hops)
 
@@ -1268,7 +1520,10 @@ class TemporalGraphEngine:
             with self._topo_cache_lock:
                 if cache_key in self.global_topo_cache:
                     self.global_topo_cache.move_to_end(cache_key)
-                    return self.global_topo_cache[cache_key]
+                    result = self.global_topo_cache[cache_key]
+                    if traversal_cache is not None:
+                        traversal_cache[local_cache_key] = result
+                    return result
 
         visited = {start_node}
         queue = collections.deque([(start_node, 0)])
@@ -1281,17 +1536,17 @@ class TemporalGraphEngine:
             if hops > 0:
                 result[curr] = hops
             if max_hops is None or hops < max_hops:
-                for nxt in topo.get(curr, []):
+                for nxt in self._get_filtered_neighbors_for_traversal(
+                    curr,
+                    direction,
+                    reference_ts,
+                    edge_window,
+                    path_requirements,
+                    helper,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                ):
                     if nxt not in visited:
-                        if path_requirements is not None:
-                            nxt_domain = self.sites_domain_map.get(nxt, {})
-                            # 只有路径上的每一跳都过约束，传播才允许继续向外走
-                            is_valid_path_node, _ = helper.validate_node(
-                                nxt, nxt_domain, path_requirements, reference_ts, edge_window
-                            )
-                            if not is_valid_path_node:
-                                continue
-
                         visited.add(nxt)
                         queue.append((nxt, hops + 1))
 
@@ -1302,4 +1557,47 @@ class TemporalGraphEngine:
                 self.global_topo_cache.move_to_end(cache_key)
                 if len(self.global_topo_cache) > self.max_topo_cache_size:
                     self.global_topo_cache.popitem(last=False)
+        if traversal_cache is not None:
+            traversal_cache[local_cache_key] = result
         return result
+
+    def _get_filtered_neighbors_for_traversal(
+        self,
+        node,
+        direction,
+        reference_ts,
+        edge_window,
+        path_requirements,
+        helper,
+        path_validation_cache=None,
+        filtered_neighbor_cache=None,
+    ):
+        topo = self.topo_up if direction == "upstream" else self.topo_down
+        if path_requirements is None:
+            return topo.get(node, [])
+
+        cache_key = (
+            node,
+            direction,
+            reference_ts,
+            self._make_edge_window_cache_key(edge_window),
+            id(path_requirements),
+        )
+        if filtered_neighbor_cache is not None and cache_key in filtered_neighbor_cache:
+            return filtered_neighbor_cache[cache_key]
+
+        valid_neighbors = tuple(
+            nxt
+            for nxt in topo.get(node, [])
+            if self._validate_path_node_for_traversal(
+                nxt,
+                path_requirements,
+                reference_ts,
+                edge_window,
+                helper,
+                path_validation_cache=path_validation_cache,
+            )
+        )
+        if filtered_neighbor_cache is not None:
+            filtered_neighbor_cache[cache_key] = valid_neighbors
+        return valid_neighbors
