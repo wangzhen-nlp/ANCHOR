@@ -637,6 +637,11 @@
             box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
         }
 
+        .node-item.neighbor-expanded {
+            background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
+            border-color: #fdba74;
+        }
+
         .node-item.selected {
             border-left-color: #cf222e;
             background: #fff5f5;
@@ -885,6 +890,12 @@
             filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
         }
 
+        .marker-pin.neighbor-expanded {
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(245, 158, 11, 0.22) 0%, rgba(245, 158, 11, 0.12) 45%, rgba(245, 158, 11, 0) 72%);
+            box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.14);
+        }
+
         .marker-pin.selected {
             filter: drop-shadow(0 0 8px rgba(207, 34, 46, 0.8));
             transform: scale(1.2);
@@ -961,6 +972,13 @@
             backdrop-filter: blur(4px);
             white-space: nowrap;
             pointer-events: none;
+        }
+
+        .site-label-map.expanded-site {
+            background: rgba(255, 247, 237, 0.92);
+            border-color: rgba(245, 158, 11, 0.35);
+            box-shadow: 0 2px 10px rgba(245, 158, 11, 0.18);
+            color: #9a3412;
         }
 
         .leaflet-popup-content-wrapper {
@@ -3257,13 +3275,17 @@
                     existing.latSum += lat;
                     existing.lngSum += lng;
                     existing.count += 1;
+                    existing.hasExpandedNode = existing.hasExpandedNode || !!node.isNeighborExpanded;
+                    existing.hasBaseNode = existing.hasBaseNode || !node.isNeighborExpanded;
                 } else {
                     siteMap.set(siteKey, {
                         siteId: siteId,
                         siteName: siteName || '',
                         latSum: lat,
                         lngSum: lng,
-                        count: 1
+                        count: 1,
+                        hasExpandedNode: !!node.isNeighborExpanded,
+                        hasBaseNode: !node.isNeighborExpanded
                     });
                 }
             });
@@ -3274,7 +3296,10 @@
                     siteName: site.siteName,
                     latitude: site.latSum / site.count,
                     longitude: site.lngSum / site.count,
-                    deviceCount: site.count
+                    deviceCount: site.count,
+                    isExpandedSite: !!site.hasExpandedNode && !site.hasBaseNode,
+                    hasExpandedNode: !!site.hasExpandedNode,
+                    hasBaseNode: !!site.hasBaseNode
                 };
             });
         }
@@ -3337,16 +3362,20 @@
             sites.forEach(function(site) {
                 const latlng = [site.latitude, site.longitude];
                 const radius = Math.min(36, 18 + Math.max(0, site.deviceCount - 1) * 2);
+                const isExpandedSite = !!site.isExpandedSite;
+                const overlayColor = isExpandedSite ? '#f59e0b' : '#0969da';
+                const fillOpacity = isExpandedSite ? 0.12 : 0.07;
+                const haloOpacity = isExpandedSite ? 0.4 : 0.28;
 
                 const halo = L.circleMarker(latlng, {
                     pane: 'siteOverlayPane',
                     radius: radius,
                     stroke: true,
-                    color: '#0969da',
+                    color: overlayColor,
                     weight: 1.5,
-                    opacity: 0.28,
-                    fillColor: '#0969da',
-                    fillOpacity: 0.07,
+                    opacity: haloOpacity,
+                    fillColor: overlayColor,
+                    fillOpacity: fillOpacity,
                     interactive: false
                 }).addTo(map);
 
@@ -3354,8 +3383,8 @@
                     pane: 'siteOverlayPane',
                     radius: 5,
                     stroke: false,
-                    fillColor: '#0969da',
-                    fillOpacity: 0.22,
+                    fillColor: overlayColor,
+                    fillOpacity: isExpandedSite ? 0.32 : 0.22,
                     interactive: false
                 }).addTo(map);
 
@@ -3366,7 +3395,7 @@
                     zIndexOffset: -1000,
                     icon: L.divIcon({
                         className: 'site-label-container',
-                        html: '<div class="site-label-map">' + (site.siteId || site.siteName || '未知站点') + '</div>',
+                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site' : '') + '">' + (site.siteId || site.siteName || '未知站点') + '</div>',
                         iconSize: null,
                         iconAnchor: [-8, 14]
                     })
@@ -3414,8 +3443,12 @@
         }
 
         // 渲染地图（使用扰动坐标，支持高亮，优化：点击时不重绘）
-        function renderMap() {
+        function renderMap(options) {
             if (!map) return;
+            options = options || {};
+            const preserveViewport = !!options.preserveViewport;
+            const previousCenter = preserveViewport ? map.getCenter() : null;
+            const previousZoom = preserveViewport ? map.getZoom() : null;
 
             // 清除旧标记
             Object.values(mapMarkers).forEach(function(marker) { map.removeLayer(marker); });
@@ -3473,7 +3506,7 @@
                     '</svg>';
                 
                 // 移除NE ID标签 - 只保留图标
-                const markerHtml = '<div class="marker-pin ' + (isSelected ? 'selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
+                const markerHtml = '<div class="marker-pin ' + (node.isNeighborExpanded ? 'neighbor-expanded ' : '') + (isSelected ? 'selected ' : '') + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
                 
                 const customIcon = L.divIcon({
                     className: 'custom-marker',
@@ -3586,7 +3619,9 @@
             updateDistanceStats();
 
             // 适应边界
-            if (geoNodes.length > 0 && highlightedNodes.size === 0) { // 没有高亮时才自动适应
+            if (preserveViewport && previousCenter !== null && previousZoom !== null) {
+                map.setView(previousCenter, previousZoom, { animate: false });
+            } else if (geoNodes.length > 0 && highlightedNodes.size === 0) { // 没有高亮时才自动适应
                 const group = new L.featureGroup(Object.values(mapMarkers));
                 map.fitBounds(group.getBounds().pad(0.1));
             }
@@ -3612,7 +3647,7 @@
                     '<path d="' + getShapePath(style.shape, svgSize) + '" fill="' + style.color + '" stroke="' + strokeColor + '" stroke-width="' + strokeWidth + '"/>' +
                     '</svg>';
                 
-                const markerHtml = '<div class="marker-pin ' + (isSelected ? 'selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
+                const markerHtml = '<div class="marker-pin ' + (node.isNeighborExpanded ? 'neighbor-expanded ' : '') + (isSelected ? 'selected ' : '') + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
                 
                 marker.setIcon(L.divIcon({
                     className: 'custom-marker',
@@ -3700,7 +3735,7 @@
             // 设置新的节点选择
             const expanded = expandSiteNeighborsForNode(nodeId);
             if (expanded) {
-                renderMap();
+                renderMap({ preserveViewport: true });
             }
             selectedNode = nodeId;
             updateMapSelection();
@@ -4811,11 +4846,11 @@
                 const style = n.domainStyle || DOMAIN_STYLE['DEFAULT'];
                 const isHighlighted = highlightedNodes.has(n.id);
                 const hasAlarmClass = getNodeAlarmRoleClass(n);
-                return '<div class="node-item ' + (n.id === highlightId ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
+                return '<div class="node-item ' + (n.id === highlightId ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
                         '<div class="ne-id">' + getRawNodeId(n) + '</div>' +
-                        '<div class="site-name">' + (n.site_id || '-') + ' | ' + style.label + '</div>' +
+                        '<div class="site-name">' + (n.site_id || '-') + ' | ' + style.label + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
                     '</div>' +
                     '</div>';
