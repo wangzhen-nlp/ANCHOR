@@ -3571,8 +3571,11 @@
                     autoPan: false         // 悬浮打开 popup 时不自动平移地图
                 });
 
-                // 修改：鼠标移出时关闭Popup（需求1）
+                // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
                 marker.on('mouseover', function() {
+                    if (siteNeighborModeEnabled) {
+                        return;
+                    }
                     // 修改：如果有选中的节点且不是当前这个，不要打开 popup（避免关闭选中的）
                     if (selectedNode && selectedNode !== node.id) {
                         return; // 不响应其他节点的悬浮
@@ -3580,6 +3583,9 @@
                     this.openPopup();
                 });
                 marker.on('mouseout', function() {
+                    if (siteNeighborModeEnabled) {
+                        return;
+                    }
                     // 修改：只有未选中的节点，鼠标移出才关闭popup；选中的节点保持显示
                     if (selectedNode !== node.id) {
                         this.closePopup();
@@ -3601,7 +3607,7 @@
                         // 普通模式下的无感选择（支持再次点击取消选中）
                         closeAlarmPopup();
                         selectNodeWithoutMapRefresh(node.id);
-                        if (selectedNode === node.id) {
+                        if (!siteNeighborModeEnabled && selectedNode === node.id) {
                             showNodeAlarms(node.id);
                         }
                     }
@@ -3668,10 +3674,6 @@
             if (!selectedNode) return;
 
             selectedNode = null;
-            if (siteNeighborModeEnabled) {
-                restoreBaseCurrentGraph();
-                renderMap();
-            }
             updateMapSelection(); // 恢复所有标记为未选中样式
 
             // 新增：关闭当前打开的 Popup
@@ -3742,9 +3744,9 @@
             renderNodeList(nodeId);
             showDetailPanel(nodeId);
 
-            // 新增：打开该节点的 Popup
+            // 邻居扩展模式下不弹 popup，尽量减少视觉打断。
             const marker = mapMarkers[nodeId];
-            if (marker) {
+            if (marker && !siteNeighborModeEnabled) {
                 marker.openPopup();
             }
         }
