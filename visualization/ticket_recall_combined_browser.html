@@ -614,6 +614,27 @@
             renderRecords();
         }
 
+        async function tryLoadDefaultReferenceJson() {
+            const defaultPath = '../ticket_resources/0301-0306_filtered_plus_info.json';
+            const statusEl = document.getElementById('referenceStatus');
+            try {
+                const response = await fetch(defaultPath);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    throw new Error('JSON 顶层必须是对象');
+                }
+                referenceData = data;
+                rebuildReferenceIndex();
+                statusEl.textContent = `关联明细 JSON：已自动加载 ${defaultPath}`;
+            } catch (error) {
+                console.warn('默认加载关联明细 JSON 失败:', error);
+                statusEl.textContent = `关联明细 JSON：默认加载失败，请手动选择（${defaultPath}）`;
+            }
+        }
+
         document.getElementById('fileInput').addEventListener('change', function(event) {
             const file = event.target.files[0];
             if (!file) return;
@@ -666,6 +687,8 @@
             };
             reader.readAsText(file, 'utf-8');
         });
+
+        tryLoadDefaultReferenceJson();
     </script>
 </body>
 </html>
