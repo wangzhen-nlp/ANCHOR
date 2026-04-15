@@ -9,183 +9,1011 @@ if __package__ in (None, ""):
 
     ensure_repo_root(2)
 
+from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from topology_resources import NE_GRAPH_JSON, resource_display
+from ticket_recall.evaluation.recall_common import (
+    _build_ticket_sites_from_alarms,
+    _compute_site_metrics,
+    _load_ticket_sites,
+    _normalize_text,
+    _parse_group_ids,
+    _resolve_alarm_site_id,
+)
+from ticket_recall.ticket_recall_utils import (
+    build_alarm_to_group_index,
+    build_ne_to_domain_map,
+    build_site_has_domain_map,
+    build_group_site_time_index,
+    build_site_alarm_map_for_sites,
+    build_site_to_group_index,
+    build_ticket_site_count_distribution,
+    build_unrecalled_visualization_cases,
+    collect_groups_by_evidence,
+    dedupe_alarm_records,
+    derive_case_jsonl_output_path,
+    expand_groups_by_time_window,
+    extract_nonempty_alarm_sites,
+    filter_ticket_sites_by_site_flag,
+    load_upper_bound_index,
+    load_upper_bound_settings,
+    load_ne_graph_data,
+    extract_alarm_record_id,
+    select_best_group_by_target_sites,
+    site_alarm_map_contains_domain,
+    write_jsonl_records,
+)
 
 
-def _normalize_text(value):
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if not text:
-        return ""
-    if text.lower() in {"nan", "none", "null"}:
-        return ""
-    return text
+OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 
 
-def _normalize_site_list(values):
-    seen = set()
-    normalized = []
-    for value in values:
-        site_id = _normalize_text(value)
-        if not site_id or site_id in seen:
-            continue
-        seen.add(site_id)
-        normalized.append(site_id)
-    return normalized
-
-
-def _parse_group_ids(value):
-    if value is None:
-        return []
-
-    if isinstance(value, (list, tuple, set)):
-        result = []
-        for item in value:
-            result.extend(_parse_group_ids(item))
-        return _normalize_site_list(result)
-
-    text = _normalize_text(value)
-    if not text:
-        return []
-
-    # 兼容故障组字段直接存成 JSON 字符串的情况。
-    if text.startswith("[") or text.startswith("{"):
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            parsed = None
-        if parsed is not None:
-            if isinstance(parsed, dict):
-                parsed = parsed.values()
-            return _parse_group_ids(parsed)
-
-    parts = [text]
-    for delimiter in [",", "，", ";", "；", "|"]:
-        if delimiter in text:
-            parts = [segment for segment in text.replace("，", ",").replace(";", ",").replace("；", ",").replace("|", ",").split(",")]
-            break
-
-    return _normalize_site_list(parts)
-
-
-def _load_ticket_sites(ticket_sites_file):
-    with open(ticket_sites_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    ticket_sites = {}
-    for ticket_id, sites in data.items():
-        normalized_ticket_id = _normalize_text(ticket_id)
-        if not normalized_ticket_id:
-            continue
-        if not isinstance(sites, list):
-            continue
-        normalized_sites = _normalize_site_list(sites)
-        if not normalized_sites:
-            continue
-        ticket_sites[normalized_ticket_id] = normalized_sites
-    return ticket_sites
-
-
-def _resolve_alarm_site_id(alarm, ne_to_site):
-    # 优先使用告警自带站点；没有时再尝试通过告警源映射到站点。
-    site_id = _normalize_text(alarm.get("站点ID", ""))
-    if site_id:
-        return site_id
-
-    alarm_source = _normalize_text(alarm.get("告警源", ""))
-    if not alarm_source:
-        return ""
-
-    return _normalize_text(ne_to_site.get(alarm_source, ""))
-
-
-def _build_ticket_sites_from_alarms(alarm_input, ticket_field, ne_graph_file=None):
-    ne_to_site = {}
-    if ne_graph_file and os.path.exists(ne_graph_file):
-        ne_to_site = build_ne_to_site_map(ne_graph_file)
-
-    ticket_sites = defaultdict(set)
-    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
-        ticket_id = _normalize_text(alarm.get(ticket_field, ""))
-        if not ticket_id:
-            continue
-
-        site_id = _resolve_alarm_site_id(alarm, ne_to_site)
-        if site_id:
-            ticket_sites[ticket_id].add(site_id)
-
-    return {
-        ticket_id: sorted(site_ids)
-        for ticket_id, site_ids in ticket_sites.items()
-        if site_ids
+def _build_alarm_record(alarm, resolved_site_id, group_id):
+    record = {
+        "故障组ID": group_id,
+        "告警编码ID": _normalize_text(alarm.get("告警编码ID", "")),
+        "告警标题": _normalize_text(alarm.get("告警标题", "")),
+        "工单号": _normalize_text(alarm.get("工单号", "")),
+        "站点ID": _normalize_text(alarm.get("站点ID", "")),
+        "关联站点ID": resolved_site_id,
+        "告警源": _normalize_text(alarm.get("告警源", "")),
+        "告警首次发生时间": _normalize_text(alarm.get("告警首次发生时间", "")),
+        "告警最后发生时间": _normalize_text(alarm.get("告警最后发生时间", "")),
+        "告警清除时间": _normalize_text(alarm.get("告警清除时间", "")),
     }
+    return {key: value for key, value in record.items() if value}
 
 
-def _build_ticket_group_indexes(alarm_input, ticket_field, group_field, ne_to_site):
+def _build_ticket_group_index_for_eligible(alarm_input, eligible_ticket_ids, ticket_field, group_field):
     ticket_to_groups = defaultdict(set)
-    group_to_sites = defaultdict(set)
     ticket_alarm_counts = defaultdict(int)
 
     for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         ticket_id = _normalize_text(alarm.get(ticket_field, ""))
-        if ticket_id:
-            ticket_alarm_counts[ticket_id] += 1
+        if ticket_id not in eligible_ticket_ids:
+            continue
 
+        ticket_alarm_counts[ticket_id] += 1
         group_ids = _parse_group_ids(alarm.get(group_field, ""))
-        # 第一层索引：工单通过告警字段拿到关联故障组。
-        if ticket_id and group_ids:
+        if group_ids:
             ticket_to_groups[ticket_id].update(group_ids)
 
-        site_id = _resolve_alarm_site_id(alarm, ne_to_site)
-        # 第二层索引：故障组再通过关联告警反推出覆盖到的站点集合。
-        if site_id and group_ids:
-            for group_id in group_ids:
-                group_to_sites[group_id].add(site_id)
-
-    return ticket_to_groups, group_to_sites, ticket_alarm_counts
+    return ticket_to_groups, ticket_alarm_counts
 
 
-def _compute_site_metrics(target_sites, predicted_sites):
-    target_site_set = set(target_sites)
-    predicted_site_set = set(predicted_sites)
-    true_positive_sites = target_site_set & predicted_site_set
+def _build_group_alarm_indexes(alarm_input, relevant_group_ids, ne_to_site, group_field):
+    group_to_sites = defaultdict(set)
+    group_to_site_alarms = defaultdict(lambda: defaultdict(list))
 
-    recall = len(true_positive_sites) / len(target_site_set) if target_site_set else 0.0
-    precision = len(true_positive_sites) / len(predicted_site_set) if predicted_site_set else 0.0
-    f1 = (
-        2 * precision * recall / (precision + recall)
-        if (precision + recall) > 0
-        else 0.0
+    if not relevant_group_ids:
+        return group_to_sites, group_to_site_alarms
+
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        group_ids = [
+            group_id
+            for group_id in _parse_group_ids(alarm.get(group_field, ""))
+            if group_id in relevant_group_ids
+        ]
+        if not group_ids:
+            continue
+
+        resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site)
+        if not resolved_site_id:
+            continue
+
+        for group_id in group_ids:
+            group_to_sites[group_id].add(resolved_site_id)
+            group_to_site_alarms[group_id][resolved_site_id].append(
+                _build_alarm_record(alarm, resolved_site_id, group_id)
+            )
+
+    return group_to_sites, group_to_site_alarms
+
+
+def _build_group_alarm_indexes_for_sites(alarm_input, allowed_site_ids, ne_to_site, group_field):
+    group_to_sites = defaultdict(set)
+    group_to_site_alarms = defaultdict(lambda: defaultdict(list))
+    if not allowed_site_ids:
+        return group_to_sites, group_to_site_alarms
+
+    allowed_site_ids = {_normalize_text(site_id) for site_id in allowed_site_ids if _normalize_text(site_id)}
+
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        group_ids = _parse_group_ids(alarm.get(group_field, ""))
+        if not group_ids:
+            continue
+
+        resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site)
+        if not resolved_site_id or resolved_site_id not in allowed_site_ids:
+            continue
+
+        for group_id in group_ids:
+            group_to_sites[group_id].add(resolved_site_id)
+            group_to_site_alarms[group_id][resolved_site_id].append(
+                _build_alarm_record(alarm, resolved_site_id, group_id)
+            )
+
+    return group_to_sites, group_to_site_alarms
+
+
+def _merge_group_site_alarms(group_ids, group_to_site_alarms):
+    merged = defaultdict(list)
+    for group_id in group_ids:
+        for site_id, alarms in group_to_site_alarms.get(group_id, {}).items():
+            merged[site_id].extend(alarms)
+    return {
+        site_id: dedupe_alarm_records(alarms)
+        for site_id, alarms in sorted(merged.items())
+    }
+
+
+def _alarm_record_is_offline(record):
+    if not isinstance(record, dict):
+        return False
+    alarm_name = _normalize_text(record.get("alarm", ""))
+    if alarm_name and alarm_name in OFFLINE_ALARM_SET:
+        return True
+    alarm_title = _normalize_text(record.get("告警标题", ""))
+    return bool(alarm_title and alarm_title in OFFLINE_ALARM_SET)
+
+
+def _site_alarm_map_contains_offline(site_alarm_map):
+    for alarms in site_alarm_map.values():
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if _alarm_record_is_offline(record):
+                return True
+    return False
+
+
+def _normalize_debug_ticket_ids(values):
+    return {
+        normalized_ticket_id
+        for normalized_ticket_id in (_normalize_text(value) for value in (values or []))
+        if normalized_ticket_id
+    }
+
+
+def _append_debug_example(example_map, key, ticket_id, limit):
+    if limit <= 0:
+        return
+    normalized_ticket_id = _normalize_text(ticket_id)
+    if not normalized_ticket_id:
+        return
+    bucket = example_map.setdefault(key, [])
+    if normalized_ticket_id in bucket or len(bucket) >= limit:
+        return
+    bucket.append(normalized_ticket_id)
+
+
+def _build_group_site_union(group_ids, group_to_sites):
+    merged_sites = set()
+    for group_id in group_ids:
+        merged_sites.update(group_to_sites.get(group_id, set()))
+    return sorted({
+        normalized_site_id
+        for normalized_site_id in (_normalize_text(site_id) for site_id in merged_sites)
+        if normalized_site_id
+    })
+
+
+def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, excluded_group_ids):
+    excluded_groups = set(excluded_group_ids or ())
+    matched_groups = set()
+    evidence_alarm_hits = []
+    if not isinstance(site_evidence, dict):
+        return [], []
+
+    for site_id in sorted(site_evidence):
+        alarms = site_evidence.get(site_id, [])
+        if not isinstance(alarms, list):
+            continue
+        for record in alarms:
+            if not isinstance(record, dict):
+                continue
+            alarm_id = extract_alarm_record_id(record)
+            if not alarm_id:
+                continue
+            raw_groups = sorted({
+                _normalize_text(group_id)
+                for group_id in alarm_to_groups.get(alarm_id, ())
+                if _normalize_text(group_id) and _normalize_text(group_id) not in excluded_groups
+            })
+            if not raw_groups:
+                continue
+            matched_groups.update(raw_groups)
+            evidence_alarm_hits.append({
+                "site_id": _normalize_text(site_id),
+                "alarm_id": alarm_id,
+                "alarm_title": _normalize_text(record.get("告警标题", "")) or _normalize_text(record.get("alarm", "")),
+                "matched_groups": raw_groups,
+            })
+
+    return sorted(matched_groups), evidence_alarm_hits
+
+
+def _normalize_debug_alarm_ids(values):
+    return {
+        normalized_alarm_id
+        for normalized_alarm_id in (_normalize_text(value) for value in (values or []))
+        if normalized_alarm_id
+    }
+
+
+def _normalize_debug_site_ids(values):
+    return {
+        normalized_site_id
+        for normalized_site_id in (_normalize_text(value) for value in (values or []))
+        if normalized_site_id
+    }
+
+
+def _normalize_debug_group_ids(values):
+    return {
+        normalized_group_id
+        for normalized_group_id in (_normalize_text(value) for value in (values or []))
+        if normalized_group_id
+    }
+
+
+def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_index, alarm_to_groups):
+    if not debug_alarm_ids:
+        return {}
+
+    alarm_presence = {alarm_id: [] for alarm_id in sorted(debug_alarm_ids)}
+    for ticket_id in sorted(ticket_sites):
+        upper_site_evidence = upper_bound_index.get(ticket_id, {}).get("site_evidence", {})
+        if not isinstance(upper_site_evidence, dict):
+            continue
+        for site_id in sorted(upper_site_evidence):
+            alarms = upper_site_evidence.get(site_id, [])
+            if not isinstance(alarms, list):
+                continue
+            for record in alarms:
+                alarm_id = extract_alarm_record_id(record)
+                if alarm_id not in debug_alarm_ids:
+                    continue
+                alarm_presence[alarm_id].append({
+                    "ticket_id": ticket_id,
+                    "site_id": _normalize_text(site_id),
+                    "alarm_title": _normalize_text(record.get("告警标题", "")) or _normalize_text(record.get("alarm", "")),
+                })
+
+    result = {}
+    for alarm_id in sorted(debug_alarm_ids):
+        result[alarm_id] = {
+            "matched_groups": sorted({
+                _normalize_text(group_id)
+                for group_id in alarm_to_groups.get(alarm_id, ())
+                if _normalize_text(group_id)
+            }),
+            "evidence_hits": alarm_presence.get(alarm_id, []),
+        }
+    return result
+
+
+def _print_debug_alarm_group_lookup(debug_alarm_group_lookup):
+    if not debug_alarm_group_lookup:
+        return
+
+    for alarm_id in sorted(debug_alarm_group_lookup):
+        item = debug_alarm_group_lookup[alarm_id]
+        print(f"=== DEBUG EVIDENCE ALARM {alarm_id} ===")
+        print(f"- matched_groups: {item.get('matched_groups', [])}")
+        print(f"- evidence_hits: {item.get('evidence_hits', [])}")
+
+
+def _build_debug_site_group_lookup(debug_site_ids, site_to_groups):
+    if not debug_site_ids:
+        return {}
+
+    result = {}
+    for site_id in sorted(debug_site_ids):
+        result[site_id] = {
+            "matched_groups": sorted({
+                _normalize_text(group_id)
+                for group_id in site_to_groups.get(site_id, ())
+                if _normalize_text(group_id)
+            }),
+        }
+    return result
+
+
+def _print_debug_site_group_lookup(debug_site_group_lookup):
+    if not debug_site_group_lookup:
+        return
+
+    for site_id in sorted(debug_site_group_lookup):
+        item = debug_site_group_lookup[site_id]
+        print(f"=== DEBUG SITE {site_id} ===")
+        print(f"- matched_groups: {item.get('matched_groups', [])}")
+
+
+def _build_debug_group_site_lookup(alarm_input, debug_group_ids, ne_to_site, group_field, allowed_site_ids=None):
+    if not debug_group_ids:
+        return {}
+
+    normalized_group_ids = {
+        _normalize_text(group_id)
+        for group_id in debug_group_ids
+        if _normalize_text(group_id)
+    }
+    allowed_site_ids = {
+        _normalize_text(site_id)
+        for site_id in (allowed_site_ids or ())
+        if _normalize_text(site_id)
+    }
+    result = {
+        group_id: {
+            "present_in_source": False,
+            "group_sites": [],
+            "matched_allowed_sites": [],
+            "source_alarm_count": 0,
+        }
+        for group_id in sorted(normalized_group_ids)
+    }
+
+    group_site_sets = {group_id: set() for group_id in normalized_group_ids}
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        group_ids = {
+            _normalize_text(group_id)
+            for group_id in _parse_group_ids(alarm.get(group_field, ""))
+            if _normalize_text(group_id)
+        }
+        matched_group_ids = group_ids & normalized_group_ids
+        if not matched_group_ids:
+            continue
+
+        resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site)
+        for group_id in matched_group_ids:
+            result[group_id]["present_in_source"] = True
+            result[group_id]["source_alarm_count"] += 1
+            if resolved_site_id:
+                group_site_sets[group_id].add(resolved_site_id)
+
+    for group_id in sorted(normalized_group_ids):
+        group_sites = sorted(group_site_sets[group_id])
+        result[group_id]["group_sites"] = group_sites
+        result[group_id]["matched_allowed_sites"] = [
+            site_id for site_id in group_sites if site_id in allowed_site_ids
+        ]
+
+    return result
+
+
+def _print_debug_group_site_lookup(debug_group_site_lookup):
+    if not debug_group_site_lookup:
+        return
+
+    for group_id in sorted(debug_group_site_lookup):
+        item = debug_group_site_lookup[group_id]
+        print(f"=== DEBUG GROUP {group_id} ===")
+        print(f"- present_in_source: {'是' if item.get('present_in_source') else '否'}")
+        print(f"- group_sites: {item.get('group_sites', [])}")
+        print(f"- matched_allowed_sites: {item.get('matched_allowed_sites', [])}")
+        print(f"- source_alarm_count: {item.get('source_alarm_count', 0)}")
+
+
+def _print_debug_summary(debug_summary):
+    if not debug_summary:
+        return
+
+    print("=== DEBUG SUMMARY ===")
+    if debug_summary.get("method"):
+        print(f"- 方法: {debug_summary['method']}")
+    if debug_summary.get("ticket_site_source"):
+        print(f"- ticket-sites 来源: {debug_summary['ticket_site_source']}")
+    if "upper_bound_associated_as_gold_mode" in debug_summary:
+        print(
+            "- upper-bound-associated-as-gold: "
+            f"{'开' if debug_summary['upper_bound_associated_as_gold_mode'] else '关'}"
+        )
+    if "allowed_site_count" in debug_summary:
+        print(f"- allowed_site_ids 数量: {debug_summary['allowed_site_count']}")
+    if "allowed_site_ids" in debug_summary:
+        print(f"- allowed_site_ids: {debug_summary['allowed_site_ids']}")
+
+    for label, key in (
+        ("upper bound 工单数", "upper_bound_ticket_count"),
+        ("满足 upper bound 口径的工单数", "upper_bound_eligible_ticket_count"),
+        ("ticket-sites 原始工单数", "ticket_site_source_count"),
+        ("upper bound 过滤后工单数", "after_upper_bound_filter_count"),
+        ("no-data-site 后工单数", "after_no_data_site_count"),
+        ("require-transmission-per-site 后工单数", "after_require_transmission_count"),
+        ("min-site-num 后工单数", "after_min_site_num_count"),
+        ("进入 group 评估循环的工单数", "candidate_ticket_count"),
+        ("有 base group 的工单数", "ticket_with_base_group_count"),
+        ("有任意候选 group 的工单数", "ticket_with_any_fault_group_count"),
+        ("有有效 group 的工单数", "ticket_with_effective_fault_group_count"),
+        ("预测到非空告警站点的工单数", "ticket_with_predicted_sites_count"),
+        ("有召回站点的工单数", "ticket_with_recalled_sites_count"),
+        ("被 only-offline 过滤的工单数", "filtered_by_only_offline_count"),
+        ("被 no-data-alarm 过滤的工单数", "filtered_by_no_data_alarm_count"),
+        ("最终输出工单数", "final_output_count"),
+    ):
+        if key in debug_summary:
+            print(f"- {label}: {debug_summary[key]}")
+
+    examples = debug_summary.get("example_ticket_ids", {})
+    for label, key in (
+        ("被 upper bound 过滤样例", "filtered_by_upper_bound"),
+        ("被 no-data-site 过滤样例", "filtered_by_no_data_site"),
+        ("被 require-transmission-per-site 过滤样例", "filtered_by_require_transmission"),
+        ("被 min-site-num 过滤样例", "filtered_by_min_site_num"),
+        ("没有候选 group 的样例", "no_fault_groups"),
+        ("有 group 但没有预测站点的样例", "no_predicted_sites"),
+        ("召回为 0 的样例", "zero_recall"),
+        ("被 only-offline 过滤样例", "filtered_by_only_offline"),
+        ("被 no-data-alarm 过滤样例", "filtered_by_no_data_alarm"),
+    ):
+        if examples.get(key):
+            print(f"  * {label}: {examples[key]}")
+
+
+def _print_debug_tickets(debug_ticket_details, count_field_name, count_label):
+    if not debug_ticket_details:
+        return
+
+    for ticket_id in sorted(debug_ticket_details):
+        item = debug_ticket_details[ticket_id]
+        print(f"=== DEBUG TICKET {ticket_id} ===")
+        print(f"- 在 ticket-sites 来源中: {'是' if item.get('present_in_ticket_site_source') else '否'}")
+        print(f"- 在 upper bound 中: {'是' if item.get('present_in_upper_bound') else '否'}")
+        print(f"- 满足 upper bound 口径: {'是' if item.get('upper_bound_eligible') else '否'}")
+        print(f"- upper bound fully_associable: {'是' if item.get('upper_bound_fully_associable') else '否'}")
+        print(f"- upper bound associated_sites: {item.get('upper_bound_associated_sites', [])}")
+        print(f"- upper bound evidence sites: {item.get('upper_bound_site_evidence_sites', [])}")
+        print(f"- 来源站点: {item.get('source_ticket_sites', [])}")
+        print(f"- upper bound 过滤后站点: {item.get('sites_after_upper_bound_filter', [])}")
+        print(f"- no-data-site 命中站点: {item.get('data_sites_in_ticket', [])}")
+        print(f"- no-data-site 后站点: {item.get('sites_after_no_data_site', [])}")
+        print(f"- require-transmission 去掉的站点: {item.get('transmission_removed_sites', [])}")
+        print(f"- require-transmission 后站点: {item.get('sites_after_require_transmission', [])}")
+        print(f"- min-site-num 之前站点: {item.get('sites_before_min_site_num', [])}")
+        print(f"- 最终 gold 站点: {item.get('final_ticket_sites', [])}")
+        print(f"- {count_label}: {item.get(count_field_name, 0)}")
+        print(f"- base_fault_groups: {item.get('base_fault_groups', [])}")
+        print(f"- loose_fault_groups: {item.get('loose_fault_groups', [])}")
+        print(f"- potential_fault_groups: {item.get('potential_fault_groups', [])}")
+        print(f"- potential_evidence_groups: {item.get('potential_evidence_groups', [])}")
+        print(f"- potential_evidence_alarm_hits: {item.get('potential_evidence_alarm_hits', [])}")
+        print(f"- fault_groups: {item.get('fault_groups', [])}")
+        print(f"- effective_fault_groups: {item.get('effective_fault_groups', [])}")
+        print(f"- selected_fault_group: {item.get('selected_fault_group', '')}")
+        print(f"- group_sites_from_index: {item.get('group_sites_from_index', [])}")
+        print(f"- predicted_sites_with_alarms: {item.get('predicted_sites', [])}")
+        print(f"- associated_sites: {item.get('associated_sites', [])}")
+        print(f"- missing_sites: {item.get('missing_sites', [])}")
+        print(f"- upper bound 有 offline evidence: {'是' if item.get('upper_bound_has_offline_evidence') else '否'}")
+        print(f"- upper bound 有 data alarm: {'是' if item.get('upper_bound_has_data_alarm') else '否'}")
+        print(f"- 最终进入输出: {'是' if item.get('included_in_final_output') else '否'}")
+        print(f"- 过滤原因: {item.get('excluded_reasons', [])}")
+        if "recall" in item:
+            print(
+                "- recall/precision/f1: "
+                f"{item.get('recall', 0.0):.6f} / "
+                f"{item.get('precision', 0.0):.6f} / "
+                f"{item.get('f1', 0.0):.6f}"
+            )
+
+
+def compute_ticket_site_recall(
+    alarm_input,
+    upper_bound_file,
+    ticket_sites_file=None,
+    ticket_field="工单号",
+    group_field="故障组ID",
+    ne_graph_file=None,
+    output_file=None,
+    case_jsonl_output_file=None,
+    only_offline=False,
+    no_data_alarm=False,
+    no_data_site=False,
+    require_transmission_per_site=False,
+    loose=False,
+    potential=False,
+    only_one=False,
+    min_site_num=0,
+    upper_bound_associated_as_gold=False,
+    debug=False,
+    debug_ticket_ids=None,
+    debug_sample_limit=5,
+    debug_evidence_alarm_ids=None,
+    debug_site_ids=None,
+    debug_group_ids=None,
+):
+    upper_bound_index = load_upper_bound_index(upper_bound_file)
+    upper_bound_settings = load_upper_bound_settings(upper_bound_file)
+    debug_ticket_id_set = _normalize_debug_ticket_ids(debug_ticket_ids)
+    debug_alarm_id_set = _normalize_debug_alarm_ids(debug_evidence_alarm_ids)
+    debug_site_id_set = _normalize_debug_site_ids(debug_site_ids)
+    debug_group_id_set = _normalize_debug_group_ids(debug_group_ids)
+    debug_enabled = bool(debug or debug_ticket_id_set or debug_alarm_id_set or debug_site_id_set or debug_group_id_set)
+    debug_summary = None
+    debug_ticket_details = {}
+    debug_alarm_group_lookup = {}
+    debug_site_group_lookup = {}
+    debug_group_site_lookup = {}
+
+    if upper_bound_associated_as_gold:
+        eligible_ticket_ids = {
+            ticket_id
+            for ticket_id, item in upper_bound_index.items()
+            if int(item.get("associated_site_count", 0) or 0) > 0
+        }
+        if not eligible_ticket_ids:
+            raise ValueError("召回率上限结果里没有“已关联站点”的工单")
+
+        ticket_sites = {
+            ticket_id: list(upper_bound_index[ticket_id].get("associated_sites", []))
+            for ticket_id in sorted(eligible_ticket_ids)
+        }
+        ticket_site_source = "upper_bound_associated_sites"
+        source_ticket_sites = {
+            ticket_id: list(site_list)
+            for ticket_id, site_list in ticket_sites.items()
+        }
+    else:
+        eligible_ticket_ids = {
+            ticket_id
+            for ticket_id, item in upper_bound_index.items()
+            if item.get("fully_associable")
+        }
+        if not eligible_ticket_ids:
+            raise ValueError("召回率上限结果里没有“可完整关联”的工单")
+
+        if ticket_sites_file:
+            source_ticket_sites = _load_ticket_sites(ticket_sites_file)
+            ticket_site_source = "ticket_sites"
+        else:
+            source_ticket_sites = _build_ticket_sites_from_alarms(alarm_input, ticket_field, ne_graph_file)
+            ticket_site_source = "alarms"
+
+        ticket_sites = {
+            ticket_id: site_list
+            for ticket_id, site_list in source_ticket_sites.items()
+            if ticket_id in eligible_ticket_ids
+        }
+
+    if debug_enabled:
+        debug_summary = {
+            "method": "alarm_stream_group_field",
+            "ticket_site_source": ticket_site_source,
+            "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+            "upper_bound_ticket_count": len(upper_bound_index),
+            "upper_bound_eligible_ticket_count": len(eligible_ticket_ids),
+            "ticket_site_source_count": len(source_ticket_sites),
+            "after_upper_bound_filter_count": len(ticket_sites),
+            "example_ticket_ids": {},
+        }
+        removed_by_upper_bound = set(source_ticket_sites) - set(ticket_sites)
+        for ticket_id in sorted(removed_by_upper_bound):
+            _append_debug_example(
+                debug_summary["example_ticket_ids"],
+                "filtered_by_upper_bound",
+                ticket_id,
+                debug_sample_limit,
+            )
+
+    if debug_ticket_id_set:
+        for debug_ticket_id in sorted(debug_ticket_id_set):
+            upper_info = upper_bound_index.get(debug_ticket_id, {})
+            debug_ticket_details[debug_ticket_id] = {
+                "ticket_id": debug_ticket_id,
+                "present_in_ticket_site_source": debug_ticket_id in source_ticket_sites,
+                "present_in_upper_bound": debug_ticket_id in upper_bound_index,
+                "upper_bound_eligible": debug_ticket_id in eligible_ticket_ids,
+                "upper_bound_fully_associable": bool(upper_info.get("fully_associable")),
+                "upper_bound_associated_sites": list(upper_info.get("associated_sites", [])),
+                "upper_bound_site_evidence_sites": sorted(upper_info.get("site_evidence", {}).keys()),
+                "source_ticket_sites": list(source_ticket_sites.get(debug_ticket_id, [])),
+                "sites_after_upper_bound_filter": list(ticket_sites.get(debug_ticket_id, [])),
+                "data_sites_in_ticket": [],
+                "sites_after_no_data_site": [],
+                "transmission_removed_sites": [],
+                "sites_after_require_transmission": [],
+                "sites_before_min_site_num": [],
+                "final_ticket_sites": [],
+                "ticket_alarm_count": 0,
+                "base_fault_groups": [],
+                "loose_fault_groups": [],
+                "potential_fault_groups": [],
+                "potential_evidence_groups": [],
+                "potential_evidence_alarm_hits": [],
+                "fault_groups": [],
+                "effective_fault_groups": [],
+                "selected_fault_group": "",
+                "group_sites_from_index": [],
+                "predicted_sites": [],
+                "associated_sites": [],
+                "missing_sites": [],
+                "upper_bound_has_offline_evidence": False,
+                "upper_bound_has_data_alarm": False,
+                "included_in_final_output": False,
+                "excluded_reasons": [],
+            }
+            if debug_ticket_id not in source_ticket_sites:
+                debug_ticket_details[debug_ticket_id]["excluded_reasons"].append("not_in_ticket_site_source")
+            if debug_ticket_id not in eligible_ticket_ids:
+                debug_ticket_details[debug_ticket_id]["excluded_reasons"].append(
+                    "filtered_by_upper_bound_eligibility"
+                )
+
+        def _snapshot_debug_sites(field_name, mapping):
+            for debug_ticket_id, item in debug_ticket_details.items():
+                item[field_name] = list(mapping.get(debug_ticket_id, []))
+
+        _snapshot_debug_sites("sites_after_upper_bound_filter", ticket_sites)
+
+    ne_graph_data = load_ne_graph_data(ne_graph_file)
+    if no_data_site:
+        if not ne_graph_data:
+            raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
+        site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
+        filtered_ticket_sites = {}
+        for ticket_id, site_list in ticket_sites.items():
+            data_sites = sorted({
+                normalized_site_id
+                for normalized_site_id in (_normalize_text(site_id) for site_id in site_list)
+                if normalized_site_id and site_has_data.get(normalized_site_id, False)
+            })
+            if ticket_id in debug_ticket_details:
+                debug_ticket_details[ticket_id]["data_sites_in_ticket"] = data_sites
+            if data_sites:
+                if debug_enabled:
+                    _append_debug_example(
+                        debug_summary["example_ticket_ids"],
+                        "filtered_by_no_data_site",
+                        ticket_id,
+                        debug_sample_limit,
+                    )
+                if ticket_id in debug_ticket_details:
+                    debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_data_site")
+                continue
+            filtered_ticket_sites[ticket_id] = site_list
+        ticket_sites = filtered_ticket_sites
+    if debug_enabled:
+        debug_summary["after_no_data_site_count"] = len(ticket_sites)
+    if debug_ticket_id_set:
+        _snapshot_debug_sites("sites_after_no_data_site", ticket_sites)
+
+    if require_transmission_per_site:
+        if not ne_graph_data:
+            raise ValueError("开启 require-transmission-per-site 时，必须提供有效的 ne_graph 文件")
+        site_has_transmission = build_site_has_domain_map(ne_graph_data, "TRANSMISSION")
+        filtered_ticket_sites = filter_ticket_sites_by_site_flag(ticket_sites, site_has_transmission)
+        for ticket_id, site_list in ticket_sites.items():
+            filtered_site_list = filtered_ticket_sites.get(ticket_id, [])
+            filtered_site_set = set(filtered_site_list)
+            removed_sites = [
+                normalized_site_id
+                for normalized_site_id in (_normalize_text(site_id) for site_id in site_list)
+                if normalized_site_id and normalized_site_id not in filtered_site_set
+            ]
+            if ticket_id in debug_ticket_details:
+                debug_ticket_details[ticket_id]["transmission_removed_sites"] = removed_sites
+            if not filtered_site_list:
+                if debug_enabled:
+                    _append_debug_example(
+                        debug_summary["example_ticket_ids"],
+                        "filtered_by_require_transmission",
+                        ticket_id,
+                        debug_sample_limit,
+                    )
+                if ticket_id in debug_ticket_details:
+                    debug_ticket_details[ticket_id]["excluded_reasons"].append(
+                        "filtered_by_require_transmission"
+                    )
+        ticket_sites = filtered_ticket_sites
+    if debug_enabled:
+        debug_summary["after_require_transmission_count"] = len(ticket_sites)
+    if debug_ticket_id_set:
+        _snapshot_debug_sites("sites_after_require_transmission", ticket_sites)
+        _snapshot_debug_sites("sites_before_min_site_num", ticket_sites)
+
+    if min_site_num > 0:
+        filtered_ticket_sites = {}
+        for ticket_id, site_list in ticket_sites.items():
+            if len(site_list) < min_site_num:
+                if debug_enabled:
+                    _append_debug_example(
+                        debug_summary["example_ticket_ids"],
+                        "filtered_by_min_site_num",
+                        ticket_id,
+                        debug_sample_limit,
+                    )
+                if ticket_id in debug_ticket_details:
+                    debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_min_site_num")
+                continue
+            filtered_ticket_sites[ticket_id] = site_list
+        ticket_sites = filtered_ticket_sites
+    if debug_enabled:
+        debug_summary["after_min_site_num_count"] = len(ticket_sites)
+    if debug_ticket_id_set:
+        _snapshot_debug_sites("final_ticket_sites", ticket_sites)
+
+    if not ticket_sites:
+        raise ValueError("没有可用于计算的工单站点映射")
+
+    ne_to_site = {}
+    if ne_graph_file and os.path.exists(ne_graph_file):
+        ne_to_site = build_ne_to_site_map(ne_graph_file)
+
+    stage_total = 4 if (loose or potential) else 2
+    allowed_site_ids = {
+        _normalize_text(site_id)
+        for site_list in ticket_sites.values()
+        for site_id in site_list
+        if _normalize_text(site_id)
+    }
+    if debug_enabled:
+        debug_summary["allowed_site_count"] = len(allowed_site_ids)
+        debug_summary["allowed_site_ids"] = sorted(allowed_site_ids)
+    if debug_group_id_set:
+        debug_group_site_lookup = _build_debug_group_site_lookup(
+            alarm_input=alarm_input,
+            debug_group_ids=debug_group_id_set,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+            allowed_site_ids=allowed_site_ids,
+        )
+    print(f"阶段 1/{stage_total}：提取 eligible 工单的故障组索引...")
+    ticket_to_groups, ticket_alarm_counts = _build_ticket_group_index_for_eligible(
+        alarm_input,
+        eligible_ticket_ids=set(ticket_sites.keys()),
+        ticket_field=ticket_field,
+        group_field=group_field,
     )
-    return true_positive_sites, recall, precision, f1
+    ticket_to_base_groups = {
+        ticket_id: set(group_ids)
+        for ticket_id, group_ids in ticket_to_groups.items()
+    }
 
+    loose_ticket_to_groups = defaultdict(set)
+    potential_ticket_to_groups = defaultdict(set)
+    relevant_group_ids = {
+        group_id
+        for group_ids in ticket_to_base_groups.values()
+        for group_id in group_ids
+    }
 
-def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, ticket_alarm_counts):
+    if loose or potential:
+        print(f"阶段 2/{stage_total}：提取工单站点上的候选故障组ID覆盖站点和站点告警...")
+        scoped_group_to_sites, scoped_group_to_site_alarms = _build_group_alarm_indexes_for_sites(
+            alarm_input,
+            allowed_site_ids=allowed_site_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
+        print(f"阶段 3/{stage_total}：按 upper bound 口径扩充额外故障组ID...")
+        site_to_groups = build_site_to_group_index(scoped_group_to_sites) if loose else {}
+        if debug_site_id_set:
+            debug_site_group_lookup = _build_debug_site_group_lookup(
+                debug_site_ids=debug_site_id_set,
+                site_to_groups=site_to_groups if loose else build_site_to_group_index(scoped_group_to_sites),
+            )
+        group_site_time_index = build_group_site_time_index(scoped_group_to_site_alarms) if loose else {}
+        alarm_to_groups = build_alarm_to_group_index(scoped_group_to_site_alarms) if potential else {}
+        if debug_alarm_id_set:
+            debug_alarm_group_lookup = _build_debug_alarm_group_lookup(
+                debug_alarm_ids=debug_alarm_id_set,
+                ticket_sites=ticket_sites,
+                upper_bound_index=upper_bound_index,
+                alarm_to_groups=alarm_to_groups,
+            )
+        for ticket_id, site_list in ticket_sites.items():
+            base_group_ids = ticket_to_base_groups.get(ticket_id, set())
+            loose_groups = set()
+            if loose:
+                _, loose_groups = expand_groups_by_time_window(
+                    base_group_ids=base_group_ids,
+                    target_sites=set(site_list),
+                    site_to_groups=site_to_groups,
+                    group_site_time_index=group_site_time_index,
+                    window_seconds=upper_bound_settings["window_seconds"],
+                )
+                if loose_groups:
+                    loose_ticket_to_groups[ticket_id] = loose_groups
+
+            if potential:
+                upper_info = upper_bound_index.get(ticket_id, {})
+                upper_site_evidence = upper_info.get("site_evidence", {})
+                potential_evidence_groups = []
+                potential_evidence_alarm_hits = []
+                if ticket_id in debug_ticket_details:
+                    potential_evidence_groups, potential_evidence_alarm_hits = _build_potential_evidence_debug_info(
+                        site_evidence=upper_site_evidence,
+                        alarm_to_groups=alarm_to_groups,
+                        excluded_group_ids=set(base_group_ids) | set(loose_groups),
+                    )
+                    debug_ticket_details[ticket_id]["potential_evidence_groups"] = potential_evidence_groups
+                    debug_ticket_details[ticket_id]["potential_evidence_alarm_hits"] = potential_evidence_alarm_hits
+                potential_groups = collect_groups_by_evidence(
+                    site_evidence=upper_site_evidence,
+                    alarm_to_groups=alarm_to_groups,
+                    excluded_group_ids=set(base_group_ids) | set(loose_groups),
+                )
+                if potential_groups:
+                    potential_ticket_to_groups[ticket_id] = potential_groups
+
+        relevant_group_ids = (
+            {
+                group_id
+                for group_ids in ticket_to_base_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in loose_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+            | {
+                group_id
+                for group_ids in potential_ticket_to_groups.values()
+                for group_id in group_ids
+            }
+        )
+        print(f"阶段 4/{stage_total}：提取最终相关故障组ID的全量覆盖站点和站点告警...")
+        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
+            alarm_input,
+            relevant_group_ids=relevant_group_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
+    else:
+        print("阶段 2/2：提取相关故障组覆盖到的站点和站点告警...")
+        group_to_sites, group_to_site_alarms = _build_group_alarm_indexes(
+            alarm_input,
+            relevant_group_ids=relevant_group_ids,
+            ne_to_site=ne_to_site,
+            group_field=group_field,
+        )
+        if debug_site_id_set:
+            debug_site_group_lookup = _build_debug_site_group_lookup(
+                debug_site_ids=debug_site_id_set,
+                site_to_groups=build_site_to_group_index(group_to_sites),
+            )
+
     details = []
     total_recall = 0.0
     total_precision = 0.0
     total_f1 = 0.0
-    evaluated_count = 0
+    ne_to_domain = build_ne_to_domain_map(ne_graph_data)
+    if debug_enabled:
+        debug_summary["candidate_ticket_count"] = len(ticket_sites)
+        debug_summary["ticket_with_base_group_count"] = 0
+        debug_summary["ticket_with_any_fault_group_count"] = 0
+        debug_summary["ticket_with_effective_fault_group_count"] = 0
+        debug_summary["ticket_with_predicted_sites_count"] = 0
+        debug_summary["ticket_with_recalled_sites_count"] = 0
+        debug_summary["filtered_by_only_offline_count"] = 0
+        debug_summary["filtered_by_no_data_alarm_count"] = 0
+        debug_summary["final_output_count"] = 0
 
     for ticket_id in sorted(ticket_sites.keys()):
-        # 只统计在告警数据里实际出现过的工单，避免把完全无告警的工单按 0 计入平均。
-        if ticket_alarm_counts.get(ticket_id, 0) <= 0:
-            continue
-
         target_sites = set(ticket_sites[ticket_id])
-        if not target_sites:
+        base_fault_groups = sorted(ticket_to_base_groups.get(ticket_id, set()))
+        loose_fault_groups = sorted(loose_ticket_to_groups.get(ticket_id, set()))
+        potential_fault_groups = sorted(potential_ticket_to_groups.get(ticket_id, set()))
+        fault_groups = sorted(set(base_fault_groups) | set(loose_fault_groups) | set(potential_fault_groups))
+        if debug_enabled:
+            if base_fault_groups:
+                debug_summary["ticket_with_base_group_count"] += 1
+            if fault_groups:
+                debug_summary["ticket_with_any_fault_group_count"] += 1
+            else:
+                _append_debug_example(
+                    debug_summary["example_ticket_ids"],
+                    "no_fault_groups",
+                    ticket_id,
+                    debug_sample_limit,
+                )
+        if only_one:
+            selected_fault_group = select_best_group_by_target_sites(
+                group_ids=fault_groups,
+                group_to_sites=group_to_sites,
+                target_sites=target_sites,
+            )
+            effective_fault_groups = [selected_fault_group] if selected_fault_group else []
+        else:
+            selected_fault_group = ""
+            effective_fault_groups = list(fault_groups)
+        if debug_enabled and effective_fault_groups:
+            debug_summary["ticket_with_effective_fault_group_count"] += 1
+
+        merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
+        predicted_sites = extract_nonempty_alarm_sites(merged_site_alarms)
+        if debug_enabled:
+            if predicted_sites:
+                debug_summary["ticket_with_predicted_sites_count"] += 1
+            else:
+                _append_debug_example(
+                    debug_summary["example_ticket_ids"],
+                    "no_predicted_sites",
+                    ticket_id,
+                    debug_sample_limit,
+                )
+        true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
+        recalled_sites = set(true_positive_sites)
+        if debug_enabled:
+            if recalled_sites:
+                debug_summary["ticket_with_recalled_sites_count"] += 1
+            else:
+                _append_debug_example(
+                    debug_summary["example_ticket_ids"],
+                    "zero_recall",
+                    ticket_id,
+                    debug_sample_limit,
+                )
+
+        unrecalled_sites = target_sites - recalled_sites
+        upper_info = upper_bound_index.get(ticket_id, {})
+        upper_site_evidence = upper_info.get("site_evidence", {})
+        group_sites_from_index = _build_group_site_union(effective_fault_groups, group_to_sites)
+        context_sites = sorted(set(group_sites_from_index) - set(target_sites))
+        display_sites = sorted(set(target_sites) | set(group_sites_from_index))
+        associated_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, recalled_sites)
+        context_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, context_sites)
+        missing_site_alarms = {
+            site_id: upper_site_evidence.get(site_id, [])
+            for site_id in sorted(unrecalled_sites)
+        }
+        upper_bound_has_offline_evidence = _site_alarm_map_contains_offline(upper_site_evidence)
+        upper_bound_has_data_alarm = site_alarm_map_contains_domain(upper_site_evidence, ne_to_domain, "DATA")
+
+        if ticket_id in debug_ticket_details:
+            debug_ticket_details[ticket_id].update({
+                "ticket_alarm_count": ticket_alarm_counts.get(ticket_id, 0),
+                "base_fault_groups": base_fault_groups,
+                "loose_fault_groups": loose_fault_groups,
+                "potential_fault_groups": potential_fault_groups,
+                "fault_groups": fault_groups,
+                "effective_fault_groups": effective_fault_groups,
+                "selected_fault_group": selected_fault_group,
+                "group_sites_from_index": group_sites_from_index,
+                "predicted_sites": sorted(predicted_sites),
+                "associated_sites": sorted(recalled_sites),
+                "missing_sites": sorted(unrecalled_sites),
+                "upper_bound_has_offline_evidence": upper_bound_has_offline_evidence,
+                "upper_bound_has_data_alarm": upper_bound_has_data_alarm,
+                "recall": recall,
+                "precision": precision,
+                "f1": f1,
+            })
+
+        if only_offline and not upper_bound_has_offline_evidence:
+            if debug_enabled:
+                debug_summary["filtered_by_only_offline_count"] += 1
+                _append_debug_example(
+                    debug_summary["example_ticket_ids"],
+                    "filtered_by_only_offline",
+                    ticket_id,
+                    debug_sample_limit,
+                )
+            if ticket_id in debug_ticket_details:
+                debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_only_offline")
+            continue
+        if no_data_alarm and upper_bound_has_data_alarm:
+            if debug_enabled:
+                debug_summary["filtered_by_no_data_alarm_count"] += 1
+                _append_debug_example(
+                    debug_summary["example_ticket_ids"],
+                    "filtered_by_no_data_alarm",
+                    ticket_id,
+                    debug_sample_limit,
+                )
+            if ticket_id in debug_ticket_details:
+                debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_data_alarm")
             continue
 
-        fault_groups = sorted(ticket_to_groups.get(ticket_id, set()))
-        predicted_sites = set()
-        for group_id in fault_groups:
-            predicted_sites.update(group_to_sites.get(group_id, set()))
-
-        # 召回率 / 准确率口径：预测站点来自关联故障组覆盖到的全部站点。
-        true_positive_sites, recall, precision, f1 = _compute_site_metrics(target_sites, predicted_sites)
-        recalled_target_sites = sorted(true_positive_sites)
+        total_recall += recall
+        total_precision += precision
+        total_f1 += f1
+        if debug_enabled:
+            debug_summary["final_output_count"] += 1
+        if ticket_id in debug_ticket_details:
+            debug_ticket_details[ticket_id]["included_in_final_output"] = True
 
         details.append({
             "ticket_id": ticket_id,
@@ -193,39 +1021,106 @@ def _compute_ticket_recalls(ticket_sites, ticket_to_groups, group_to_sites, tick
             "ticket_sites": sorted(target_sites),
             "ticket_alarm_count": ticket_alarm_counts.get(ticket_id, 0),
             "fault_group_count": len(fault_groups),
+            "base_fault_groups": base_fault_groups,
+            "loose_fault_groups": loose_fault_groups,
+            "potential_fault_groups": potential_fault_groups,
             "fault_groups": fault_groups,
-            "recalled_site_count": len(recalled_target_sites),
-            "recalled_sites": recalled_target_sites,
+            "effective_fault_group_count": len(effective_fault_groups),
+            "effective_fault_groups": effective_fault_groups,
+            "selected_fault_group": selected_fault_group,
             "group_site_count": len(predicted_sites),
             "group_sites": sorted(predicted_sites),
+            "group_sites_from_index": group_sites_from_index,
+            "associated_site_count": len(recalled_sites),
+            "associated_sites": sorted(recalled_sites),
+            "associated_site_alarms": associated_site_alarms,
+            "missing_site_count": len(unrecalled_sites),
+            "missing_sites": sorted(unrecalled_sites),
+            "missing_site_alarms": missing_site_alarms,
+            "context_site_count": len(context_sites),
+            "context_sites": context_sites,
+            "context_site_alarms": context_site_alarms,
+            "display_sites": display_sites,
             "recall": recall,
             "precision": precision,
             "f1": f1,
         })
 
-        total_recall += recall
-        total_precision += precision
-        total_f1 += f1
-        evaluated_count += 1
-
-    average_recall = total_recall / evaluated_count if evaluated_count else 0.0
-    average_precision = total_precision / evaluated_count if evaluated_count else 0.0
-    average_f1 = total_f1 / evaluated_count if evaluated_count else 0.0
     details.sort(
         key=lambda item: (
             -item.get("ticket_site_count", 0),
             item.get("ticket_id", ""),
         )
     )
-    return details, average_recall, average_precision, average_f1, evaluated_count
+    site_count_distribution = build_ticket_site_count_distribution(details)
+    average_recall = total_recall / len(details) if details else 0.0
+    average_precision = total_precision / len(details) if details else 0.0
+    average_f1 = total_f1 / len(details) if details else 0.0
+
+    result = {
+        "method": "alarm_stream_group_field",
+        "ticket_count": len(details),
+        "final_sample_count": len(details),
+        "ticket_site_count_distribution": site_count_distribution,
+        "average_recall": average_recall,
+        "average_precision": average_precision,
+        "average_f1": average_f1,
+        "denominator_source": "alarms",
+        "ticket_site_source": ticket_site_source,
+        "upper_bound_source": upper_bound_file,
+        "only_offline_mode": only_offline,
+        "no_data_alarm_mode": no_data_alarm,
+        "no_data_site_mode": no_data_site,
+        "require_transmission_per_site_mode": require_transmission_per_site,
+        "loose_mode": loose,
+        "potential_mode": potential,
+        "only_one_mode": only_one,
+        "min_site_num": min_site_num,
+        "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+        "details": details,
+    }
+    if debug_enabled:
+        result["debug_summary"] = debug_summary
+    if debug_ticket_details:
+        result["debug_tickets"] = {
+            ticket_id: debug_ticket_details[ticket_id]
+            for ticket_id in sorted(debug_ticket_details)
+        }
+    if debug_alarm_group_lookup:
+        result["debug_evidence_alarm_groups"] = debug_alarm_group_lookup
+    if debug_site_group_lookup:
+        result["debug_site_groups"] = debug_site_group_lookup
+    if debug_group_site_lookup:
+        result["debug_groups"] = debug_group_site_lookup
+
+    case_records = build_unrecalled_visualization_cases(details, result["method"], ne_graph_data=ne_graph_data)
+    if output_file and not case_jsonl_output_file:
+        case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
+    if case_jsonl_output_file:
+        write_jsonl_records(case_jsonl_output_file, case_records)
+        result["case_jsonl_output"] = case_jsonl_output_file
+        result["unrecalled_case_count"] = len(case_records)
+
+    if output_file:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+    return result
 
 
 def main():
-    parser = ArgumentParser(description="基于工单-站点映射和告警中的故障组字段计算工单站点召回率")
+    parser = ArgumentParser(
+        description="以上限结果里的 associated_sites 作为 gold，输出当前方法召回到的站点/告警和未召回站点/告警"
+    )
     parser.add_argument("alarms", help="告警输入，支持 jsonl/csv/zip/目录，与 match_rules.py 一致")
     parser.add_argument(
+        "--upper-bound",
+        required=True,
+        help="compute_ticket_site_recall_upper_bound.py 的输出 JSON",
+    )
+    parser.add_argument(
         "--ticket-sites",
-        help="工单站点映射 JSON，格式为 {工单号: [站点列表]}；不提供时会退化为从 alarms 中回推工单站点",
+        help="工单站点映射 JSON；不提供时会退化为从 alarms 中回推工单站点",
     )
     parser.add_argument(
         "--ticket-field",
@@ -235,69 +1130,163 @@ def main():
     parser.add_argument(
         "--group-field",
         default="故障组ID",
-        help="告警中的故障组字段名，默认: 故障ID",
+        help="告警中的故障组字段名，默认: 故障组ID",
     )
     parser.add_argument(
         "--ne-graph",
         default=NE_GRAPH_JSON,
-        help=f"用于通过告警源回填 site_id 的 ne_graph 文件，默认: {resource_display('ne_graph.json')}",
+        help=f"用于通过告警源回填 site_id 以及做 site/domain 过滤的 ne_graph 文件，默认: {resource_display('ne_graph.json')}",
     )
     parser.add_argument(
         "-o",
         "--output",
         default="ticket_site_recall.json",
-        help="输出明细 JSON 文件，默认: ticket_site_recall.json",
+        help="输出 JSON 文件，默认: ticket_site_recall.json",
+    )
+    parser.add_argument(
+        "--case-jsonl-output",
+        help="额外输出召回率 < 100%% 的样本为可视化 jsonl；默认随主输出生成同名 .cases.jsonl",
+    )
+    parser.add_argument(
+        "--only-offline",
+        action="store_true",
+        help="仅保留 upper bound evidence 中出现过 OFFLINE_ALARMS 的工单样本",
+    )
+    parser.add_argument(
+        "--no-data-alarm",
+        action="store_true",
+        help="如果 upper bound evidence 中存在来自 Data 设备的告警，则跳过该工单样本",
+    )
+    parser.add_argument(
+        "--no-data-site",
+        action="store_true",
+        help="如果当前工单站点里存在包含 Data 设备的站点，则跳过该工单样本",
+    )
+    parser.add_argument(
+        "--require-transmission-per-site",
+        action="store_true",
+        help="先从工单站点里剔除不包含 Transmission 设备的站点；过滤后若站点数不足 min-site-num，则跳过该工单",
+    )
+    parser.add_argument(
+        "--loose",
+        action="store_true",
+        help="允许用 upper bound 同口径时间窗，在工单站点上的其它故障组ID 进一步扩充关联",
+    )
+    parser.add_argument(
+        "--potential",
+        action="store_true",
+        help="允许用 upper bound evidence 中出现过的告警，直接吸附这些告警所在的额外故障组ID",
+    )
+    parser.add_argument(
+        "--only-one",
+        action="store_true",
+        help="只保留覆盖该工单目标站点最多的单个故障组ID，用它的站点计算召回率",
+    )
+    parser.add_argument(
+        "--min-site-num",
+        type=int,
+        default=0,
+        help="仅统计工单站点数 >= 该值的工单；默认: 0（不过滤）",
+    )
+    parser.add_argument(
+        "--upper-bound-associated-as-gold",
+        action="store_true",
+        help="改用 upper bound 的 associated_sites 作为 gold；不开时保持原来的 fully_associable + 原工单站点口径",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="打印评测的阶段摘要，帮助定位样本为何被过滤、为何没有召回",
+    )
+    parser.add_argument(
+        "--debug-ticket",
+        action="append",
+        default=[],
+        help="打印指定工单的详细调试信息；可重复传入多个工单号",
+    )
+    parser.add_argument(
+        "--debug-sample-limit",
+        type=int,
+        default=5,
+        help="每类调试样例最多打印多少个工单号，默认: 5",
+    )
+    parser.add_argument(
+        "--debug-evidence-alarm-id",
+        action="append",
+        default=[],
+        help="直接查看指定 upper_site_evidence 告警ID 在当前 potential 索引下能关联到哪些 group；可重复传入多个",
+    )
+    parser.add_argument(
+        "--debug-site",
+        action="append",
+        default=[],
+        help="直接查看指定 site 在当前候选范围里能关联到哪些 group；可重复传入多个",
+    )
+    parser.add_argument(
+        "--debug-group",
+        action="append",
+        default=[],
+        help="直接查看指定 group 在告警 group_field 中关联到哪些站点；可重复传入多个",
     )
 
     args = parser.parse_args()
 
-    if args.ticket_sites:
-        ticket_sites = _load_ticket_sites(args.ticket_sites)
-        ticket_site_source = "ticket_sites"
-    else:
-        ticket_sites = _build_ticket_sites_from_alarms(args.alarms, args.ticket_field, args.ne_graph)
-        ticket_site_source = "alarms"
-
-    if not ticket_sites:
-        print("❌ 工单站点映射为空，无法计算召回率")
+    try:
+        result = compute_ticket_site_recall(
+            alarm_input=args.alarms,
+            upper_bound_file=args.upper_bound,
+            ticket_sites_file=args.ticket_sites,
+            ticket_field=args.ticket_field,
+            group_field=args.group_field,
+            ne_graph_file=args.ne_graph,
+            output_file=args.output,
+            case_jsonl_output_file=args.case_jsonl_output,
+            only_offline=args.only_offline,
+            no_data_alarm=args.no_data_alarm,
+            no_data_site=args.no_data_site,
+            require_transmission_per_site=args.require_transmission_per_site,
+            loose=args.loose,
+            potential=args.potential,
+            only_one=args.only_one,
+            min_site_num=args.min_site_num,
+            upper_bound_associated_as_gold=args.upper_bound_associated_as_gold,
+            debug=args.debug,
+            debug_ticket_ids=args.debug_ticket,
+            debug_sample_limit=args.debug_sample_limit,
+            debug_evidence_alarm_ids=args.debug_evidence_alarm_id,
+            debug_site_ids=args.debug_site,
+            debug_group_ids=args.debug_group,
+        )
+    except ValueError as exc:
+        print(f"❌ {exc}")
         return
 
-    ne_to_site = {}
-    if args.ne_graph and os.path.exists(args.ne_graph):
-        ne_to_site = build_ne_to_site_map(args.ne_graph)
+    if args.debug or args.debug_ticket:
+        _print_debug_summary(result.get("debug_summary"))
+        if args.debug_ticket:
+            _print_debug_tickets(
+                result.get("debug_tickets", {}),
+                count_field_name="ticket_alarm_count",
+                count_label="ticket_alarm_count",
+            )
+        else:
+            print("如需单工单明细，请追加 --debug-ticket 工单号")
+    if args.debug_evidence_alarm_id:
+        _print_debug_alarm_group_lookup(result.get("debug_evidence_alarm_groups", {}))
+    if args.debug_site:
+        _print_debug_site_group_lookup(result.get("debug_site_groups", {}))
+    if args.debug_group:
+        _print_debug_group_site_lookup(result.get("debug_groups", {}))
 
-    ticket_to_groups, group_to_sites, ticket_alarm_counts = _build_ticket_group_indexes(
-        args.alarms,
-        args.ticket_field,
-        args.group_field,
-        ne_to_site,
-    )
-
-    details, average_recall, average_precision, average_f1, evaluated_count = _compute_ticket_recalls(
-        ticket_sites,
-        ticket_to_groups,
-        group_to_sites,
-        ticket_alarm_counts,
-    )
-
-    result = {
-        "ticket_count": evaluated_count,
-        "average_recall": average_recall,
-        "average_precision": average_precision,
-        "average_f1": average_f1,
-        "ticket_site_source": ticket_site_source,
-        "details": details,
-    }
-
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    print(f"工单数: {evaluated_count}")
-    print(f"平均召回率: {average_recall:.6f}")
-    print(f"平均准确率: {average_precision:.6f}")
-    print(f"平均F1: {average_f1:.6f}")
-    print(f"工单站点来源: {ticket_site_source}")
+    print(f"工单数: {result['ticket_count']}")
+    print(f"最终统计样本数: {result['final_sample_count']}")
+    print(f"样本 site 个数分布: {result['ticket_site_count_distribution']}")
+    print(f"平均召回率: {result['average_recall']:.6f}")
+    print(f"平均准确率: {result['average_precision']:.6f}")
+    print(f"平均F1: {result['average_f1']:.6f}")
     print(f"明细已输出到: {args.output}")
+    if result.get("case_jsonl_output"):
+        print(f"未满召回样本 jsonl: {result['case_jsonl_output']} ({result.get('unrecalled_case_count', 0)} 条)")
 
 
 if __name__ == "__main__":

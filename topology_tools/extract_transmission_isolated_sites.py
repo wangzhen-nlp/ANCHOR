@@ -8,7 +8,7 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from topology_resources import NE_GRAPH_JSON, resource_display
-from ticket_recall.ticket_recall_v2_utils import load_ne_graph_data, normalize_text
+from ticket_recall.ticket_recall_utils import load_ne_graph_data, normalize_text
 
 
 def _extract_domain(ne_info):

@@ -12,14 +12,14 @@ if __package__ in (None, ""):
 from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from topology_resources import NE_GRAPH_JSON, resource_display
-from ticket_recall.evaluation.compute_group_output_ticket_recall import _extract_group_id, _extract_group_sites
-from ticket_recall.evaluation.compute_ticket_site_recall import (
+from ticket_recall.evaluation.recall_common import _extract_group_id, _extract_group_sites
+from ticket_recall.evaluation.recall_common import (
     _compute_site_metrics,
     _normalize_text,
     _parse_group_ids,
     _resolve_alarm_site_id,
 )
-from ticket_recall.ticket_recall_v2_utils import (
+from ticket_recall.ticket_recall_utils import (
     build_ne_to_domain_map,
     build_site_alarm_map_for_sites,
     build_site_has_domain_map,

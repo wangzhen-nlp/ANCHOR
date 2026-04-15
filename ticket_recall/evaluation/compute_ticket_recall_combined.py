@@ -7,13 +7,13 @@ if __package__ in (None, ""):
     ensure_repo_root(2)
 
 from topology_resources import NE_GRAPH_JSON, resource_display
-from ticket_recall.evaluation.compute_group_output_ticket_recall_v2 import (
-    compute_group_output_ticket_recall_v2,
+from ticket_recall.evaluation.compute_group_output_ticket_recall import (
+    compute_group_output_ticket_recall,
 )
-from ticket_recall.evaluation.compute_ticket_site_recall_v2 import (
-    compute_ticket_site_recall_v2,
+from ticket_recall.evaluation.compute_ticket_site_recall import (
+    compute_ticket_site_recall,
 )
-from ticket_recall.ticket_recall_v2_utils import (
+from ticket_recall.ticket_recall_utils import (
     build_visualization_case_record,
     build_site_coord_index,
     build_site_coord_index_from_site_graph,
@@ -114,7 +114,7 @@ def _build_combined_case_record(ticket_id, alarm_stream_payload, group_output_pa
     ]
 
     return {
-        "uuid": f"combined_ticket_recall_v2::{ticket_id}",
+        "uuid": f"combined_ticket_recall::{ticket_id}",
         "ticket_id": ticket_id,
         "ticket_sites": ticket_sites,
         "ticket_site_count": ticket_site_count,
@@ -124,7 +124,7 @@ def _build_combined_case_record(ticket_id, alarm_stream_payload, group_output_pa
     }
 
 
-def compute_ticket_recall_v2_combined(
+def compute_ticket_recall_combined(
     alarms_input,
     group_output_input,
     upper_bound_file,
@@ -132,7 +132,7 @@ def compute_ticket_recall_v2_combined(
     ticket_field="工单号",
     group_field="故障组ID",
     ne_graph_file=NE_GRAPH_JSON,
-    output_file="ticket_recall_v2_combined.json",
+    output_file="ticket_recall_combined.json",
     combined_case_jsonl_output_file=None,
     only_offline=False,
     no_data_alarm=False,
@@ -148,8 +148,8 @@ def compute_ticket_recall_v2_combined(
     if combined_case_jsonl_output_file is None:
         combined_case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
 
-    print("步骤 1/3：计算告警流 v2 评测结果...")
-    alarm_stream_result = compute_ticket_site_recall_v2(
+    print("步骤 1/3：计算告警流评测结果...")
+    alarm_stream_result = compute_ticket_site_recall(
         alarm_input=alarms_input,
         upper_bound_file=upper_bound_file,
         ticket_sites_file=ticket_sites_file,
@@ -169,8 +169,8 @@ def compute_ticket_recall_v2_combined(
         upper_bound_associated_as_gold=upper_bound_associated_as_gold,
     )
 
-    print("步骤 2/3：计算故障组输出 v2 评测结果...")
-    group_output_result = compute_group_output_ticket_recall_v2(
+    print("步骤 2/3：计算故障组输出评测结果...")
+    group_output_result = compute_group_output_ticket_recall(
         group_output_input=group_output_input,
         upper_bound_file=upper_bound_file,
         ticket_sites_file=ticket_sites_file,
@@ -191,7 +191,7 @@ def compute_ticket_recall_v2_combined(
         upper_bound_associated_as_gold=upper_bound_associated_as_gold,
     )
 
-    print("步骤 3/3：整合两个 v2 结果并生成 combined cases...")
+    print("步骤 3/3：整合两个结果并生成 combined cases...")
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
     site_coord_index = build_site_coord_index(ne_graph_data)
@@ -207,7 +207,7 @@ def compute_ticket_recall_v2_combined(
     for ticket_id in all_ticket_ids:
         alarm_stream_payload = _build_method_case_payload(
             method_key="alarm_stream_group_field",
-            method_label="告警流 v2",
+            method_label="告警流",
             detail=alarm_stream_details.get(ticket_id),
             original_case=None,
             ne_graph_data=ne_graph_data,
@@ -216,7 +216,7 @@ def compute_ticket_recall_v2_combined(
         )
         group_output_payload = _build_method_case_payload(
             method_key="group_output",
-            method_label="故障组输出 v2",
+            method_label="故障组输出",
             detail=group_output_details.get(ticket_id),
             original_case=None,
             ne_graph_data=ne_graph_data,
@@ -230,7 +230,7 @@ def compute_ticket_recall_v2_combined(
     write_jsonl_records(combined_case_jsonl_output_file, combined_case_records)
 
     combined_result = {
-        "method": "ticket_recall_v2_combined",
+        "method": "ticket_recall_combined",
         "combined_case_jsonl_output": combined_case_jsonl_output_file,
         "ticket_count": len(combined_case_records),
         "alarm_stream_summary": {
@@ -303,7 +303,7 @@ def compute_ticket_recall_v2_combined(
 
 def main():
     parser = ArgumentParser(
-        description="整合两个 v2 评测脚本，分别输出原始两份结果，并额外生成一个按工单聚合的 combined cases.jsonl"
+        description="整合两个评测脚本，分别输出原始两份结果，并额外生成一个按工单聚合的 combined cases.jsonl"
     )
     parser.add_argument("alarms", help="原始告警输入，支持 jsonl/csv/zip/目录")
     parser.add_argument("group_output", help="match_rules.py 的 group 输出，支持 jsonl/zip/目录")
@@ -334,8 +334,8 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        default="ticket_recall_v2_combined.json",
-        help="整合后的汇总 JSON 输出，默认: ticket_recall_v2_combined.json",
+        default="ticket_recall_combined.json",
+        help="整合后的汇总 JSON 输出，默认: ticket_recall_combined.json",
     )
     parser.add_argument(
         "--combined-case-jsonl-output",
@@ -379,7 +379,7 @@ def main():
     parser.add_argument(
         "--ultimate-only",
         action="store_true",
-        help="只用于故障组输出 v2：只考虑不作为关联 group 出现的最终 group",
+        help="只用于故障组输出：只考虑不作为关联 group 出现的最终 group",
     )
     parser.add_argument(
         "--min-site-num",
@@ -396,7 +396,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        result = compute_ticket_recall_v2_combined(
+        result = compute_ticket_recall_combined(
             alarms_input=args.alarms,
             group_output_input=args.group_output,
             upper_bound_file=args.upper_bound,
@@ -423,13 +423,13 @@ def main():
 
     print(f"整合工单数: {result['ticket_count']}")
     print(
-        "告警流 v2 指标: "
+        "告警流指标: "
         f"平均召回率={result['alarm_stream_summary']['average_recall']:.6f}, "
         f"平均准确率={result['alarm_stream_summary']['average_precision']:.6f}, "
         f"平均F1={result['alarm_stream_summary']['average_f1']:.6f}"
     )
     print(
-        "故障组输出 v2 指标: "
+        "故障组输出指标: "
         f"平均召回率={result['group_output_summary']['average_recall']:.6f}, "
         f"平均准确率={result['group_output_summary']['average_precision']:.6f}, "
         f"平均F1={result['group_output_summary']['average_f1']:.6f}"

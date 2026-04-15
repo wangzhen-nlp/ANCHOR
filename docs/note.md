@@ -567,90 +567,16 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 把这层分开后，规则引擎本身可以保持聚焦，而前端页面又能直接复用 `jsonl` 做故障组总览和单组传播图展示。
 
-## 20. `compute_ticket_site_recall.py` 的流程与作用
+## 20. `compute_ticket_site_recall.py` 与 `compute_group_output_ticket_recall.py`
 
-**【逻辑】**
+这两个文件现在只保留当前正式版本。
 
-这份脚本是“基于原始告警流里的 `工单号 + 故障组ID`”来计算工单站点召回率。
-整体过程可以概括为：
+- `compute_ticket_site_recall.py`
+  当前按“upper bound 先筛样本，再用原始告警里的 `工单号 + 故障组ID` 做真实关联”的口径评测。
+- `compute_group_output_ticket_recall.py`
+  当前按“upper bound 先筛样本，再用 `match_rules.py` 输出故障组做真实关联”的口径评测。
 
-1. 先确定每个工单的目标站点列表  
-   - 如果显式提供了 `--ticket-sites`，就直接使用这份 `{工单号: [站点列表]}`；
-   - 如果没有提供，就从原始告警里反推出 `工单 -> 站点`。
-
-2. 流式读取告警，建立两层索引  
-   - `ticket -> fault_groups`：根据告警里的 `工单号` 和 `故障组ID` 建立；
-   - `fault_group -> sites`：根据带有该 `故障组ID` 的告警，把站点并起来。
-
-3. 过滤分母  
-   只有“在原始告警里真实出现过”的工单才会参与平均召回率计算。
-
-4. 逐工单计算召回率  
-   - 先拿到该工单的目标站点；
-   - 再把该工单关联到的所有 `故障组ID` 对应站点做并集；
-   - 最后同时计算：
-     - `recall = |ticket_sites ∩ recalled_sites| / |ticket_sites|`
-     - `precision = |ticket_sites ∩ recalled_sites| / |group_sites|`
-     - `f1 = 2PR / (P + R)`。
-
-5. 输出明细  
-   每个工单会输出：
-   - 工单站点数与站点列表；
-   - 告警数；
-   - 关联故障组数与故障组列表；
-   - 召回站点数与召回站点列表；
-   - group 覆盖到的全部站点；
-   - 最终 `recall / precision / f1`。
-
-**【意义】**
-
-这份脚本描述的是“如果只看原始告警里已经存在的 `工单号 + 故障组ID` 关系，
-理论上能把工单目标站点召回到什么程度”。
-它更像一条“原始数据口径”的基线，用来衡量：
-
-- 告警里的故障组字段本身是否已经足够把工单相关站点串起来；
-- 后续 `match_rules.py` 聚出来的故障组，相比这条原始基线是更好还是更差。
-
-## 21. `compute_group_output_ticket_recall.py` 的流程与作用
-
-**【逻辑】**
-
-这份脚本是“基于 `match_rules.py` 聚合输出的故障组”来计算工单站点召回率。
-它与上一份脚本的召回率公式相同，但构图来源不同：
-
-1. 先确定工单目标站点  
-   - 优先使用 `--ticket-sites`；
-   - 如果没有提供，就从 `--alarms` 反推出 `工单 -> 站点`。
-
-2. 读取故障组输出，建立两层索引  
-   - `ticket -> group_output groups`：从故障组 `symptoms[*].工单号` 提取；
-   - `group -> sites`：优先取故障组里的 `group_info.site_list`，没有时再退回 `symptoms[*].node`。
-
-3. 确定分母口径  
-   - 如果提供了 `--alarms`，则仍以“工单是否在原始告警里出现过”为准；
-   - 否则退化成“工单是否在故障组输出里出现过”为准。
-
-4. 复用 `compute_ticket_site_recall.py` 的同一套召回率计算函数  
-   所以最终会沿用同一套站点指标：
-   - `recall`
-   - `precision`
-   - `f1`
-
-5. 输出明细  
-   与原始告警口径类似，但这里统计的是：
-   - `ticket_occurrence_count`
-   - `fault_group_count`
-   - `recalled_sites`
-   - `group_sites`
-   - `recall / precision / f1`
-
-**【意义】**
-
-这份脚本用来评估“当前 `match_rules.py` 聚出来的故障组，对工单站点的覆盖情况到底如何”。
-它是最直接的结果评估工具之一，因为它回答的是：
-
-- 聚类后的故障组，是否真的把工单目标站点串起来了；
-- 聚合结果相比原始 `故障组ID` 字段，是提升了召回，还是损失了召回。
+它们的详细逻辑、字段含义和模式开关，统一见第 24 节。
 
 ## 22. `compute_ticket_site_recall_upper_bound.py` 的流程与作用
 
@@ -965,11 +891,11 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 - 当前方法的不足，到底是数据先天上限造成的；
 - 还是方法本身还没有把本来可以做到的部分做出来。
 
-## 24. `compute_ticket_site_recall_v2.py` 与 `compute_group_output_ticket_recall_v2.py` 的流程与作用
+## 24. `compute_ticket_site_recall.py` 与 `compute_group_output_ticket_recall.py` 的当前流程与作用
 
 **【逻辑】**
 
-这两份 `v2` 脚本是在前面真实召回率脚本的基础上，再叠加上限结果做“差异对照”。
+这两份脚本是当前正式使用的工单站点评测脚本。
 它们共同的思路是：
 
 1. 先读取 `compute_ticket_site_recall_upper_bound.py` 的输出  
@@ -978,9 +904,9 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 开 `--upper-bound-associated-as-gold` 时，则保留 `associated_site_count > 0` 的工单
 
 2. 再跑各自的真实方法  
-   - `compute_ticket_site_recall_v2.py`：
+   - `compute_ticket_site_recall.py`：
      仍然基于原始告警里的 `工单号 + 故障组ID`；
-   - `compute_group_output_ticket_recall_v2.py`：
+   - `compute_group_output_ticket_recall.py`：
      仍然基于 `match_rules.py` 聚合输出的故障组。
 
 3. 对每个保留下来的工单，把站点拆成两类  
@@ -1004,11 +930,11 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 6. 当前不会再额外要求“工单必须在原始告警里带工单号出现过”  
    也就是说，只要这个工单已经通过上一步 upper bound 口径进入样本，
-   两份 `v2` 脚本就不会再因为 `ticket_alarm_count = 0` 或 `ticket_occurrence_count = 0`
+   这两份脚本就不会再因为 `ticket_alarm_count = 0` 或 `ticket_occurrence_count = 0`
    把它二次过滤掉。
 
    因此现在有可能出现一种情况：
-   - 这个工单在 `v2` 里会被统计
+   - 这个工单在当前评测里会被统计
    - 但它的 `ticket_alarm_count / ticket_occurrence_count` 是 `0`
    - 当前方法预测到的 `fault_groups` 也可能为空
 
@@ -1018,18 +944,18 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 **【意义】**
 
-`v2` 的重点不是只看一个平均分，而是把“已经召回的部分”和“还没召回但其实有证据可以召回的部分”显式分开。
+当前这套评测的重点不是只看一个平均分，而是把“已经召回的部分”和“还没召回但其实有证据可以召回的部分”显式分开。
 这样在分析时可以直接回答：
 
 - 当前方法已经把哪些站点串起来了；
 - 剩下哪些站点其实有时间窗/故障组证据，但当前方法没用上；
 - 原始告警口径和聚合故障组口径，到底分别漏掉了哪些站点。
 
-## 24.1 `v2` 的默认模式、`loose`、`only-offline`、`potential` 的当前逻辑
+## 24.1 当前脚本的默认模式、`loose`、`only-offline`、`potential` 的逻辑
 
 **【逻辑】**
 
-当前两份 `v2` 脚本都支持：
+当前这两份脚本都支持：
 
 - 默认模式（不开额外选项）
 - `--loose`
@@ -1039,7 +965,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 另外：
 
-- `compute_group_output_ticket_recall_v2.py` 还额外支持 `--ultimate-only`
+- `compute_group_output_ticket_recall.py` 还额外支持 `--ultimate-only`
 
 它们的作用层级并不一样：
 
@@ -1054,9 +980,9 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 默认模式下，两份脚本都只使用 `base groups`：
 
-- `compute_ticket_site_recall_v2.py`
+- `compute_ticket_site_recall.py`
   - `base groups` 来自原始告警里的 `工单号 + 故障组ID`
-- `compute_group_output_ticket_recall_v2.py`
+- `compute_group_output_ticket_recall.py`
   - `base groups` 来自聚合输出里的 `symptoms[*].工单号 + 当前 group id`
 
 然后用这些 `base groups` 覆盖到的站点去计算：
@@ -1075,7 +1001,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 的样本。
 
-这些样本之所以还能进入 `v2`，
+这些样本之所以还能进入当前评测，
 是因为它们已经通过 upper bound 口径进入了评测分母；
 只是当前默认模式下，往往拿不到任何 `base groups`，
 因此这类样本的预测结果可能为空，召回率也可能直接是 `0`。
@@ -1146,10 +1072,10 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 当前实现里：
 
-- `compute_ticket_site_recall_v2.py`
+- `compute_ticket_site_recall.py`
   - 是按原始告警里的 `告警编码ID -> 故障组ID`
     去反查
-- `compute_group_output_ticket_recall_v2.py`
+- `compute_group_output_ticket_recall.py`
   - 是按 group output 的 `symptoms` 里的 `eid/告警编码ID -> group`
     去反查
 
@@ -1166,7 +1092,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 1. 先算 `base_fault_groups`
 2. 如果开了 `--loose`，得到 `loose_fault_groups`
 3. 如果开了 `--potential`，再得到 `potential_fault_groups`
-4. 对 `compute_group_output_ticket_recall_v2.py` 来说，如果开了 `--ultimate-only`，
+4. 对 `compute_group_output_ticket_recall.py` 来说，如果开了 `--ultimate-only`，
    则以上几步都只在“最终 group”范围内进行
 5. 如果开了 `--only-one`，则会在
    `base ∪ loose ∪ potential`
@@ -1185,7 +1111,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 **【意义】**
 
-把这几个模式区分清楚之后，就能更准确地理解 `v2` 输出里每一部分差异是怎么来的：
+把这几个模式区分清楚之后，就能更准确地理解当前输出里每一部分差异是怎么来的：
 
 - 默认模式：当前方法本来的能力
 - `loose`：当前方法内部是否还能通过 group 间时间关系再扩一层
@@ -1331,7 +1257,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 ### 7. `--loose`
 
-`--loose` 的语义和 `v2` 脚本一致，也是“group 间按时间窗做闭包扩张”，只是这里扩的是：
+`--loose` 的语义与当前工单站点评测脚本一致，也是“group 间按时间窗做闭包扩张”，只是这里扩的是：
 
 - 终极 group <-> 告警故障组ID
 
@@ -1401,7 +1327,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 ### 11. 两个方向的 `cases.jsonl`
 
-这份脚本会像 `v2` 一样，额外输出两份 sidecar 可视化文件：
+这份脚本也会额外输出两份 sidecar 可视化文件：
 
 - `ultimate_group_as_gold.cases.jsonl`
 - `alarm_group_as_gold.cases.jsonl`
