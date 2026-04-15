@@ -2559,6 +2559,7 @@
             initMap();
             setupGroupInput();
             setupSearchInput();
+            tryLoadDefaultNeGraph();
             const siteNeighborModeCheckbox = document.getElementById('siteNeighborModeCheckbox');
             const siteNeighborHopInput = document.getElementById('siteNeighborHopInput');
             if (siteNeighborModeCheckbox) {
@@ -2624,6 +2625,29 @@
             setTimeout(function() {
                 toast.classList.remove('show');
             }, 3000);
+        }
+
+        async function tryLoadDefaultNeGraph() {
+            const defaultPath = '../topology_resources/ne_graph.json';
+            const statusEl = document.getElementById('neGraphStatus');
+            if (!statusEl) return;
+
+            try {
+                const response = await fetch(defaultPath);
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                const data = await response.json();
+                if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                    throw new Error('ne_graph.json 顶层必须是对象');
+                }
+                neGraphData = data;
+                statusEl.textContent = 'ne_graph：已自动加载 ../topology_resources/ne_graph.json，NE 数 ' + Object.keys(neGraphData).length;
+            } catch (error) {
+                neGraphData = null;
+                statusEl.textContent = 'ne_graph：默认加载失败，请手动选择文件';
+                console.warn('默认加载 ne_graph.json 失败:', error);
+            }
         }
 
         // 设置 Group 输入框事件
