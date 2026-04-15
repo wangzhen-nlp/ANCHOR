@@ -88,6 +88,18 @@ def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_st
     })
 
 
+def _apply_clear_delay(first_occurrence_str, clear_time_str, clear_delay_sec):
+    first_occurrence_dt = _parse_datetime_text(first_occurrence_str, "告警首次发生时间")
+    clear_time_dt = _parse_datetime_text(clear_time_str, "告警清除时间")
+
+    actual_delay_sec = max(0.0, (clear_time_dt - first_occurrence_dt).total_seconds())
+    effective_delay_sec = max(float(clear_delay_sec), actual_delay_sec)
+    effective_clear_dt = first_occurrence_dt.fromtimestamp(
+        first_occurrence_dt.timestamp() + effective_delay_sec
+    )
+    return effective_clear_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _load_valid_alarms(
     alarm_file_path,
     valid_alarm_titles,
@@ -95,7 +107,7 @@ def _load_valid_alarms(
     ne_to_site,
     start_ts=None,
     end_ts=None,
-    ignore_clear_alarms=False,
+    clear_delay_sec=0.0,
 ):
     processed_count = 0
     valid_alarms = []
@@ -136,13 +148,18 @@ def _load_valid_alarms(
         normal_alarm_count += 1
 
         clear_time_str = str(alarm.get("告警清除时间", "")).strip()
-        if clear_time_str and not ignore_clear_alarms:
+        if clear_time_str:
+            effective_clear_time_str = _apply_clear_delay(
+                first_occurrence_str,
+                clear_time_str,
+                clear_delay_sec,
+            )
             _append_alarm_event(
                 valid_alarms,
                 alarm,
                 site_id,
                 alarm_title,
-                clear_time_str,
+                effective_clear_time_str,
                 is_clear=True
             )
             clear_alarm_count += 1
@@ -1108,6 +1125,8 @@ def main():
     parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='live', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
+    parser.add_argument('--aggregation-wait-sec', type=float, default=420.0, help='trigger 成熟前的聚合等待时间，单位秒，默认 420')
+    parser.add_argument('--clear-delay-sec', type=float, default=0.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
     parser.add_argument('--verbose-groups', action='store_true', help='打印每个故障组的详细报告；默认静默，仅输出进度与汇总')
@@ -1117,7 +1136,6 @@ def main():
     parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
     parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
-    parser.add_argument('--ignore-clear-alarms', action='store_true', help='忽略清除告警的影响：不生成告警清除时间对应的清除事件')
     args = parser.parse_args()
 
     start_ts = None
@@ -1150,8 +1168,8 @@ def main():
             f"start_time={args.start_time or '-'}, "
             f"end_time={args.end_time or '-'}"
         )
-    if args.ignore_clear_alarms:
-        print("清除告警策略: 已关闭清除影响（忽略告警清除时间，不生成清除事件）")
+    if args.clear_delay_sec > 0:
+        print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
 
     rules_config = {
         "transmission_rule": transmission_rule,
@@ -1161,7 +1179,13 @@ def main():
     }
 
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
-    engine = TemporalGraphEngine(topo_downstream_map, rules_config, site_domain_map)
+    print(f"聚合等待时间: {args.aggregation_wait_sec:g} 秒")
+    engine = TemporalGraphEngine(
+        topo_downstream_map,
+        rules_config,
+        site_domain_map,
+        aggregation_wait_sec=args.aggregation_wait_sec,
+    )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
 
     alarm_file_path = args.alarms
@@ -1174,7 +1198,7 @@ def main():
         ne_to_site,
         start_ts=start_ts,
         end_ts=end_ts,
-        ignore_clear_alarms=args.ignore_clear_alarms,
+        clear_delay_sec=args.clear_delay_sec,
     )
 
     print("⏳ 正在按时间排序有效告警...")
