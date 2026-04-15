@@ -20,6 +20,7 @@ from topology_resources import (
     NE_GRAPH_JSON,
     SITE_DEVICE_COUNTS_JSON,
     SITE_GRAPH_JSON,
+    SITE_GRAPH_BY_NE_JSON,
     resource_display,
 )
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
@@ -1185,7 +1186,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
-    parser.add_argument('--topo', type=str, help='可选：显式指定站点拓扑文件；默认不再依赖 site_graph_by_ne.json，而是基于 ne_graph.json 原始连边自动构建')
+    parser.add_argument('--topo', type=str, default=SITE_GRAPH_BY_NE_JSON, help=f'站点拓扑文件，默认: {resource_display("site_graph_by_ne.json")}；若传空值则退回为基于 ne_graph.json 原始连边自动构建')
     parser.add_argument('--site-domain', type=str, default=SITE_DEVICE_COUNTS_JSON, help=f'站点画像文件，默认: {resource_display("site_device_counts.json")}')
     parser.add_argument('--site-graph', type=str, default=SITE_GRAPH_JSON, help=f'site_graph.json 文件，默认: {resource_display("site_graph.json")}')
     parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
