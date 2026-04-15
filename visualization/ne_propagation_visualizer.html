@@ -4725,7 +4725,6 @@
                     const key = [sourceId, targetId].sort().join('|');
                     if (linkSet.has(key) || baseLinkKeySet.has(key)) return;
                     linkSet.add(key);
-                    const isExpandedEdge = expandedNodeIdSet.has(sourceId) && expandedNodeIdSet.has(targetId);
                     mergedLinks.push({
                         source: sourceId,
                         target: targetId,
@@ -4735,7 +4734,7 @@
                         distance: linkInfo.distance || 0,
                         left_alarm: linkInfo.left_alarm || null,
                         right_alarm: linkInfo.right_alarm || null,
-                        isNeighborExpanded: isExpandedEdge
+                        isNeighborExpanded: true
                     });
                 });
             });
