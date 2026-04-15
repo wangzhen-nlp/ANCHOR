@@ -88,7 +88,15 @@ def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_st
     })
 
 
-def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_site, start_ts=None, end_ts=None):
+def _load_valid_alarms(
+    alarm_file_path,
+    valid_alarm_titles,
+    valid_sites,
+    ne_to_site,
+    start_ts=None,
+    end_ts=None,
+    ignore_clear_alarms=False,
+):
     processed_count = 0
     valid_alarms = []
     normal_alarm_count = 0
@@ -128,7 +136,7 @@ def _load_valid_alarms(alarm_file_path, valid_alarm_titles, valid_sites, ne_to_s
         normal_alarm_count += 1
 
         clear_time_str = str(alarm.get("告警清除时间", "")).strip()
-        if clear_time_str:
+        if clear_time_str and not ignore_clear_alarms:
             _append_alarm_event(
                 valid_alarms,
                 alarm,
@@ -1109,6 +1117,7 @@ def main():
     parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
     parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
+    parser.add_argument('--ignore-clear-alarms', action='store_true', help='忽略清除告警的影响：不生成告警清除时间对应的清除事件')
     args = parser.parse_args()
 
     start_ts = None
@@ -1141,6 +1150,8 @@ def main():
             f"start_time={args.start_time or '-'}, "
             f"end_time={args.end_time or '-'}"
         )
+    if args.ignore_clear_alarms:
+        print("清除告警策略: 已关闭清除影响（忽略告警清除时间，不生成清除事件）")
 
     rules_config = {
         "transmission_rule": transmission_rule,
@@ -1163,6 +1174,7 @@ def main():
         ne_to_site,
         start_ts=start_ts,
         end_ts=end_ts,
+        ignore_clear_alarms=args.ignore_clear_alarms,
     )
 
     print("⏳ 正在按时间排序有效告警...")
