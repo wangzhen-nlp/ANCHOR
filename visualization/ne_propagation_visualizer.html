@@ -448,6 +448,50 @@
             margin-top: 2px;
         }
 
+        .neighbor-mode-panel {
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #b6d4fe;
+        }
+
+        .neighbor-mode-panel h3 {
+            font-size: 13px;
+            color: #0969da;
+            margin-bottom: 10px;
+        }
+
+        .neighbor-mode-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .neighbor-mode-row label {
+            font-size: 12px;
+            color: #24292f;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 600;
+        }
+
+        .neighbor-hop-input {
+            width: 72px;
+            padding: 6px 8px;
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            font-size: 12px;
+        }
+
+        .neighbor-mode-hint {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #57606a;
+            line-height: 1.5;
+        }
+
         .alarm-meta-panel {
             background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
             padding: 12px;
@@ -1690,10 +1734,15 @@
                 <h3>选择数据文件</h3>
                 <div class="file-select">
                     <input type="file" id="fileInput" accept=".json" style="display: none;">
+                    <input type="file" id="neGraphFileInput" accept=".json" style="display: none;">
                     <button onclick="document.getElementById('fileInput').click()" id="fileSelectBtn">
                         📁 选择 JSON 文件
                     </button>
+                    <button onclick="document.getElementById('neGraphFileInput').click()" id="neGraphSelectBtn" style="margin-top: 8px; background: #0969da;">
+                        🗺️ 选择 ne_graph.json
+                    </button>
                     <p id="fileStatus">请选择 JSON 文件</p>
+                    <p id="neGraphStatus" style="font-size: 11px; color: #57606a; margin-top: 6px; word-break: break-all;">ne_graph：未加载</p>
                 </div>
             </div>
 
@@ -1786,6 +1835,21 @@
                         <div class="value active" id="currentNodes">0</div>
                         <div class="label">当前展示</div>
                     </div>
+                </div>
+            </div>
+
+            <div class="neighbor-mode-panel">
+                <h3>站点邻居扩展</h3>
+                <div class="neighbor-mode-row">
+                    <label>
+                        <input type="checkbox" id="siteNeighborModeCheckbox">
+                        点击设备时扩展站点 N 跳邻居
+                    </label>
+                    <input type="number" id="siteNeighborHopInput" class="neighbor-hop-input" min="1" step="1" value="1">
+                </div>
+                <div class="neighbor-mode-hint">
+                    开启后，点击某个站点内的设备，会按站点连接关系把该站点的 N 跳邻居站点及其设备补到当前视图中。
+                    当前仅在已加载 JSON 所包含的节点和连边范围内生效。
                 </div>
             </div>
 
@@ -2127,6 +2191,8 @@
         let currentNodes = [];
         let currentLinks = [];
         let filteredLinks = [];
+        let baseCurrentNodes = [];
+        let baseCurrentLinks = [];
         let selectedNode = null;
         let selectedEdge = null; // 当前选中的边
 
@@ -2151,6 +2217,7 @@
         let currentFileHandle = null; // File System Access API 文件句柄
         let currentNote = ''; // 当前备注内容
         let originalGroupUuid = ''; // 当前故障组UUID
+        let neGraphData = null;
         let referenceData = null;
         let referenceIndex = {
             ticket: new Map(),
@@ -2161,6 +2228,8 @@
             missing_site: new Set(),
             context_site: new Set()
         };
+        let siteNeighborModeEnabled = false;
+        let siteNeighborHopCount = 1;
 
         function updateRoleSiteSets(data) {
             const rootRoleMapping = (data && data.role_mapping && typeof data.role_mapping === 'object') ? data.role_mapping : {};
@@ -2490,6 +2559,21 @@
             initMap();
             setupGroupInput();
             setupSearchInput();
+            const siteNeighborModeCheckbox = document.getElementById('siteNeighborModeCheckbox');
+            const siteNeighborHopInput = document.getElementById('siteNeighborHopInput');
+            if (siteNeighborModeCheckbox) {
+                siteNeighborModeCheckbox.addEventListener('change', function(event) {
+                    handleSiteNeighborModeToggle(event.target.checked);
+                });
+            }
+            if (siteNeighborHopInput) {
+                siteNeighborHopInput.addEventListener('change', function(event) {
+                    const nextValue = Math.max(1, Number(event.target.value || 1));
+                    event.target.value = String(nextValue);
+                    siteNeighborHopCount = nextValue;
+                });
+                siteNeighborHopCount = Math.max(1, Number(siteNeighborHopInput.value || 1));
+            }
             loadData();
 
             // 点击地图或节点列表时关闭告警弹窗
@@ -2529,6 +2613,7 @@
             });
 
             document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+            document.getElementById('neGraphFileInput').addEventListener('change', handleNeGraphFileSelect);
         });
 
         // 显示错误提示
@@ -3066,6 +3151,7 @@
             });
             
             filteredLinks = currentLinks.slice();
+            setBaseCurrentGraph(currentNodes, currentLinks);
             document.getElementById('currentNodes').textContent = currentNodes.length;
 
             renderMap();
@@ -3183,6 +3269,15 @@
         function getAlarmDisplayTime(alarm) {
             if (!alarm || typeof alarm !== 'object') return '-';
             return alarm.time || alarm.alarm_time || alarm.time_str || '-';
+        }
+
+        function handleSiteNeighborModeToggle(enabled) {
+            siteNeighborModeEnabled = !!enabled;
+            if (!siteNeighborModeEnabled) {
+                restoreBaseCurrentGraph();
+                renderMap();
+                renderNodeList(selectedNode || undefined);
+            }
         }
 
         function nodeHasAlarm(node) {
@@ -3514,6 +3609,10 @@
             if (!selectedNode) return;
 
             selectedNode = null;
+            if (siteNeighborModeEnabled) {
+                restoreBaseCurrentGraph();
+                renderMap();
+            }
             updateMapSelection(); // 恢复所有标记为未选中样式
 
             // 新增：关闭当前打开的 Popup
@@ -3575,6 +3674,10 @@
                 mapMarkers[selectedNode].closePopup();
             }
             // 设置新的节点选择
+            const expanded = expandSiteNeighborsForNode(nodeId);
+            if (expanded) {
+                renderMap();
+            }
             selectedNode = nodeId;
             updateMapSelection();
             renderNodeList(nodeId);
@@ -4444,6 +4547,176 @@
             document.getElementById('totalEdges').textContent = allLinks.length;
         }
 
+        function setBaseCurrentGraph(nodes, links) {
+            baseCurrentNodes = (nodes || []).map(function(n) { return Object.assign({}, n); });
+            baseCurrentLinks = (links || []).map(function(l) { return Object.assign({}, l); });
+        }
+
+        function restoreBaseCurrentGraph() {
+            currentNodes = baseCurrentNodes.map(function(n) { return Object.assign({}, n); });
+            currentLinks = baseCurrentLinks.map(function(l) { return Object.assign({}, l); });
+            filteredLinks = currentLinks.slice();
+            document.getElementById('currentNodes').textContent = currentNodes.length;
+        }
+
+        function getAllNodeMap() {
+            const nodeMap = new Map();
+            allNodes.forEach(function(node) {
+                nodeMap.set(node.id, node);
+            });
+            return nodeMap;
+        }
+
+        function buildSiteGraphFromNeGraph() {
+            if (!neGraphData || typeof neGraphData !== 'object') {
+                return new Map();
+            }
+            const siteGraph = new Map();
+
+            function ensureSite(siteId) {
+                if (!siteId) return;
+                if (!siteGraph.has(siteId)) {
+                    siteGraph.set(siteId, new Set());
+                }
+            }
+
+            Object.entries(neGraphData).forEach(function(entry) {
+                const sourceId = entry[0];
+                const neInfo = entry[1] || {};
+                const sourceSite = neInfo && neInfo.site_id ? String(neInfo.site_id) : '';
+                if (!sourceSite) return;
+                ensureSite(sourceSite);
+                const links = neInfo.link || {};
+                Object.keys(links).forEach(function(targetId) {
+                    const targetInfo = neGraphData[targetId] || {};
+                    const targetSite = targetInfo && targetInfo.site_id ? String(targetInfo.site_id) : '';
+                    if (!targetSite || targetSite === sourceSite) return;
+                    ensureSite(targetSite);
+                    siteGraph.get(sourceSite).add(targetSite);
+                    siteGraph.get(targetSite).add(sourceSite);
+                });
+            });
+
+            return siteGraph;
+        }
+
+        function getNthOrderNeighborSites(startSiteId, hopCount) {
+            const normalizedStart = String(startSiteId || '').trim();
+            if (!normalizedStart) return new Set();
+
+            const siteGraph = buildSiteGraphFromNeGraph();
+            if (siteGraph.size === 0) {
+                return new Set([normalizedStart]);
+            }
+            const visited = new Set([normalizedStart]);
+            const queue = [normalizedStart];
+            const maxHop = Math.max(1, Number(hopCount || 1));
+            let currentLevel = 0;
+
+            while (queue.length > 0 && currentLevel < maxHop) {
+                const levelSize = queue.length;
+                for (let i = 0; i < levelSize; i++) {
+                    const currentSite = queue.shift();
+                    const neighbors = siteGraph.get(currentSite) || new Set();
+                    neighbors.forEach(function(neighborSite) {
+                        if (!visited.has(neighborSite)) {
+                            visited.add(neighborSite);
+                            queue.push(neighborSite);
+                        }
+                    });
+                }
+                currentLevel += 1;
+            }
+
+            return visited;
+        }
+
+        function expandSiteNeighborsForNode(nodeId) {
+            if (!siteNeighborModeEnabled) return false;
+            if (!neGraphData || typeof neGraphData !== 'object') {
+                showError('请先加载 ne_graph.json');
+                return false;
+            }
+
+            const anchorNode = allNodes.find(function(n) { return n.id === nodeId; });
+            const anchorSiteId = anchorNode && anchorNode.site_id ? String(anchorNode.site_id) : '';
+            if (!anchorSiteId) return false;
+
+            const expandedSites = getNthOrderNeighborSites(anchorSiteId, siteNeighborHopCount);
+            if (expandedSites.size === 0) return false;
+
+            const baseNodeMap = new Map();
+            baseCurrentNodes.forEach(function(node) {
+                baseNodeMap.set(node.id, node);
+            });
+
+            const expandedNodeIds = [];
+            Object.entries(neGraphData).forEach(function(entry) {
+                const neId = entry[0];
+                const neInfo = entry[1] || {};
+                const siteId = neInfo && neInfo.site_id ? String(neInfo.site_id) : '';
+                if (siteId && expandedSites.has(siteId)) {
+                    expandedNodeIds.push(neId);
+                }
+            });
+
+            currentNodes = expandedNodeIds.map(function(neId) {
+                if (baseNodeMap.has(neId)) {
+                    return Object.assign({}, baseNodeMap.get(neId));
+                }
+                const neInfo = neGraphData[neId] || {};
+                const domain = neInfo.domain || '';
+                return {
+                    id: neId,
+                    group: neInfo.group || 0,
+                    site_id: neInfo.site_id || '',
+                    site_name: neInfo.site_name || '',
+                    type: neInfo.type || '',
+                    network_type: neInfo.network_type || '',
+                    manufacturer: neInfo.manufacturer || '',
+                    domain: domain,
+                    alarm_count: 0,
+                    alarm_types: [],
+                    name: neInfo.name || neId,
+                    alarm: [],
+                    latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
+                    longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined)),
+                    isHighlight: false,
+                    domainStyle: getDomainStyle(domain)
+                };
+            });
+
+            const expandedNodeIdSet = new Set(expandedNodeIds);
+            const linkSet = new Set();
+            currentLinks = [];
+            expandedNodeIds.forEach(function(sourceId) {
+                const sourceInfo = neGraphData[sourceId] || {};
+                const links = sourceInfo.link || {};
+                Object.entries(links).forEach(function(entry) {
+                    const targetId = entry[0];
+                    const linkInfo = entry[1] || {};
+                    if (!expandedNodeIdSet.has(targetId) || targetId === sourceId) return;
+                    const key = [sourceId, targetId].sort().join('|');
+                    if (linkSet.has(key)) return;
+                    linkSet.add(key);
+                    currentLinks.push({
+                        source: sourceId,
+                        target: targetId,
+                        connection_type: linkInfo.connection_type || '',
+                        topology: linkInfo.topology || '',
+                        time_window: linkInfo.time_window || '',
+                        distance: linkInfo.distance || 0,
+                        left_alarm: linkInfo.left_alarm || null,
+                        right_alarm: linkInfo.right_alarm || null
+                    });
+                });
+            });
+
+            filteredLinks = currentLinks.slice();
+            document.getElementById('currentNodes').textContent = currentNodes.length;
+            return true;
+        }
+
         // 显示单个节点（当 NE 不属于任何 Group 时）
         function showNodes(nodeIds) {
             showLoading(true);
@@ -4465,6 +4738,7 @@
 
             currentLinks = allGroupLinks;
             filteredLinks = allGroupLinks.slice();
+            setBaseCurrentGraph(currentNodes, currentLinks);
             document.getElementById('currentNodes').textContent = currentNodes.length;
 
             renderMap();
@@ -4790,6 +5064,33 @@
                     showError('解析文件失败: ' + error.message);
                     showLoading(false);
                     disableNotePanel();
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function handleNeGraphFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            if (!file.name.endsWith('.json')) {
+                showError('请选择 ne_graph.json 文件');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                        throw new Error('ne_graph.json 顶层必须是对象');
+                    }
+                    neGraphData = data;
+                    document.getElementById('neGraphStatus').textContent = 'ne_graph：已加载 ' + file.name + '，NE 数 ' + Object.keys(neGraphData).length;
+                } catch (error) {
+                    neGraphData = null;
+                    document.getElementById('neGraphStatus').textContent = 'ne_graph：加载失败 - ' + error.message;
+                    showError('解析 ne_graph.json 失败: ' + error.message);
                 }
             };
             reader.readAsText(file);
