@@ -27,6 +27,10 @@ from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_
 from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.reports import generate_incident_report
 from fault_grouping.rule_config import transmission_rule, link_rule, power_rule, data_rule
+from fault_grouping.site_merge_helper import (
+    AdaptiveDensitySiteMergeHelper,
+    BatchSiteMergeHelper,
+)
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
 
 
@@ -909,6 +913,15 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engi
         f"effective_harvest_ts={effective_harvest_str}, "
         f"force={snapshot.get('force', False)}"
     )
+    merge_stats = snapshot.get("merge_stats", {})
+    if merge_stats:
+        print(
+            "   ↳ 批内合并统计: "
+            f"eid={merge_stats.get('eid_merge_group_count', 0)}, "
+            f"shared_site={merge_stats.get('shared_site_merge_group_count', 0)}, "
+            f"hop={merge_stats.get('hop_merge_group_count', 0)}, "
+            f"distance={merge_stats.get('distance_merge_group_count', 0)}"
+        )
     if mature_triggers:
         mature_preview = [
             {
@@ -982,6 +995,8 @@ def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_
     try:
         for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
             _process_alarm(engine, item, collect_matches=False)
+            if hasattr(process_progress, "_refresh_extra_text"):
+                process_progress._refresh_extra_text()
             process_progress.update()
     finally:
         process_progress.close()
@@ -996,6 +1011,8 @@ def _run_offline_mode(engine, valid_alarms, on_matches, process_progress):
             matches = _process_alarm(engine, item, collect_matches=True)
             if matches:
                 on_matches(matches)
+            if hasattr(process_progress, "_refresh_extra_text"):
+                process_progress._refresh_extra_text()
             process_progress.update()
     finally:
         process_progress.close()
@@ -1110,6 +1127,8 @@ def _run_debug_mode(
                     print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
                     print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
                     _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
+                if hasattr(process_progress, "_refresh_extra_text"):
+                    process_progress._refresh_extra_text()
                 process_progress.update()
         finally:
             process_progress.close()
@@ -1176,6 +1195,8 @@ def _run_debug_mode(
                 _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
             if matches:
                 on_debug_matches(matches, "同步检查")
+            if hasattr(process_progress, "_refresh_extra_text"):
+                process_progress._refresh_extra_text()
             process_progress.update()
     finally:
         process_progress.close()
@@ -1195,6 +1216,10 @@ def main():
     parser.add_argument('--aggregation-wait-sec', type=float, default=420.0, help='trigger 成熟前的聚合等待时间，单位秒，默认 420')
     parser.add_argument('--clear-delay-sec', type=float, default=0.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
     parser.add_argument('--batch-merge-site-hops', type=int, default=0, help='批内候选组额外按站点邻接合并的 hop 数；0 表示关闭，2 表示两跳内可合并')
+    parser.add_argument('--batch-merge-density-knn', type=int, default=0, help='批内候选组额外按站点局部密度自适应合并时使用的近邻数；0 表示关闭')
+    parser.add_argument('--batch-merge-density-scale', type=float, default=1.0, help='局部密度半径放大倍数，实际阈值=scale * 第k近邻距离')
+    parser.add_argument('--batch-merge-density-min-meters', type=float, default=0.0, help='局部密度自适应半径下限，单位米；0 表示不设下限')
+    parser.add_argument('--batch-merge-density-max-meters', type=float, default=0.0, help='局部密度自适应半径上限，单位米；0 表示不设上限')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--debug-trigger', action='append', help='debug: 指定一个 trigger，格式为 站点ID::告警名，可重复传多次')
     parser.add_argument('--verbose-groups', action='store_true', help='打印每个故障组的详细报告；默认静默，仅输出进度与汇总')
@@ -1214,6 +1239,20 @@ def main():
         end_ts = _parse_datetime_text(args.end_time, "end_time").timestamp()
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         parser.error("start_time 不能晚于 end_time")
+    if args.batch_merge_density_knn < 0:
+        parser.error("batch-merge-density-knn 不能小于 0")
+    if args.batch_merge_density_scale < 0:
+        parser.error("batch-merge-density-scale 不能小于 0")
+    if args.batch_merge_density_min_meters < 0 or args.batch_merge_density_max_meters < 0:
+        parser.error("batch-merge-density-min-meters / max-meters 不能小于 0")
+    if (
+        args.batch_merge_density_max_meters > 0
+        and args.batch_merge_density_min_meters > 0
+        and args.batch_merge_density_max_meters < args.batch_merge_density_min_meters
+    ):
+        parser.error("batch-merge-density-max-meters 不能小于 batch-merge-density-min-meters")
+    if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:
+        parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
 
     ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
     if args.topo:
@@ -1256,6 +1295,14 @@ def main():
         print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
     if args.batch_merge_site_hops > 0:
         print(f"批内站点邻接合并: 开启，hop={args.batch_merge_site_hops}")
+    if args.batch_merge_density_knn > 0:
+        print(
+            "批内站点密度合并: 开启，"
+            f"k={args.batch_merge_density_knn}, "
+            f"scale={args.batch_merge_density_scale:g}, "
+            f"min_radius={args.batch_merge_density_min_meters:g}m, "
+            f"max_radius={args.batch_merge_density_max_meters:g}m"
+        )
 
     rules_config = {
         "transmission_rule": transmission_rule,
@@ -1264,6 +1311,28 @@ def main():
         "data_rule": data_rule,
     }
 
+    density_site_merge_helper = None
+    if args.batch_merge_density_knn > 0:
+        density_site_merge_helper = AdaptiveDensitySiteMergeHelper(
+            args.site_graph,
+            density_knn=args.batch_merge_density_knn,
+            density_scale=args.batch_merge_density_scale,
+            min_radius_meters=args.batch_merge_density_min_meters,
+            max_radius_meters=args.batch_merge_density_max_meters,
+        )
+
+    batch_site_merge_helper = None
+    if args.batch_merge_site_hops > 0 or density_site_merge_helper is not None:
+        batch_site_merge_helper = BatchSiteMergeHelper(
+            topo_downstream_map,
+            site_neighbor_hops=args.batch_merge_site_hops,
+            density_helper=density_site_merge_helper,
+        )
+        if density_site_merge_helper is not None:
+            print("⏳ 正在准备站点批内合并辅助器...")
+            batch_site_merge_helper.warmup()
+            print("✅ 站点批内合并辅助器就绪")
+
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
     print(f"聚合等待时间: {args.aggregation_wait_sec:g} 秒")
     engine = TemporalGraphEngine(
@@ -1271,7 +1340,7 @@ def main():
         rules_config,
         site_domain_map,
         aggregation_wait_sec=args.aggregation_wait_sec,
-        batch_merge_site_hops=args.batch_merge_site_hops,
+        site_merge_helper=batch_site_merge_helper,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
 
@@ -1331,10 +1400,24 @@ def main():
                     fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)
             if process_progress is not None:
-                process_progress.set_extra_text(f"已汇聚故障组数: {match_count}")
+                process_progress.set_extra_text(_build_progress_extra_text())
+
+    def _build_progress_extra_text():
+        merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
+        return (
+            f"已汇聚故障组数: {match_count} | "
+            f"hop合并组数: {merge_stats.get('hop_merge_group_count', 0)} | "
+            f"距离合并组数: {merge_stats.get('distance_merge_group_count', 0)}"
+        )
+
+    def _refresh_progress_extra_text(force=False):
+        if process_progress is None:
+            return
+        process_progress.set_extra_text(_build_progress_extra_text(), force=force)
 
     process_progress = ProgressBar(filtered_count, "处理有效告警")
-    process_progress.set_extra_text(f"已汇聚故障组数: {match_count}", force=True)
+    process_progress._refresh_extra_text = _refresh_progress_extra_text
+    _refresh_progress_extra_text(force=True)
     if debug_enabled:
         _run_debug_mode(
             engine,
@@ -1359,6 +1442,8 @@ def main():
     else:
         _run_offline_mode(engine, valid_alarms, on_matches, process_progress)
 
+    process_progress = None
+
     print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
     final_matches = engine.flush_pending()
     if final_matches:
@@ -1379,7 +1464,14 @@ def main():
         engine.debug_observer = None
 
     elapsed = time.time() - start_time
-    print(f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，生成 {match_count} 个故障组，耗时 {elapsed:.4f} 秒。")
+    final_merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
+    print(
+        f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，"
+        f"生成 {match_count} 个故障组，"
+        f"hop合并组数 {final_merge_stats.get('hop_merge_group_count', 0)}，"
+        f"距离合并组数 {final_merge_stats.get('distance_merge_group_count', 0)}，"
+        f"耗时 {elapsed:.4f} 秒。"
+    )
 
     if args.compute_ticket_recall:
         ticket_recall_output = args.ticket_recall_output or f"{args.output}.ticket_recall.json"

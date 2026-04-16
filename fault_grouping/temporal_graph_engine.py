@@ -11,7 +11,9 @@ from fault_grouping.emitted_group_store import EmittedGroupStore
 from fault_grouping.node_rule_helper import NodeRuleHelper
 from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from fault_grouping.temporal_graph_engine_utils import (
+    add_merge_stats,
     build_pattern_adj,
+    build_empty_merge_stats,
     clone_instance_with_updates,
     matches_expected_alarm,
     merge_match_batch,
@@ -172,7 +174,7 @@ class TemporalGraphEngine:
         rules_config,
         site_domain_map,
         aggregation_wait_sec=420,
-        batch_merge_site_hops=0,
+        site_merge_helper=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -184,12 +186,6 @@ class TemporalGraphEngine:
         for up, downs in self.topo_down.items():
             for down in downs:
                 self.topo_up[down].append(up)
-        self.topo_undirected = collections.defaultdict(set)
-        for up, downs in self.topo_down.items():
-            self.topo_undirected[up]
-            for down in downs:
-                self.topo_undirected[up].add(down)
-                self.topo_undirected[down].add(up)
 
         # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]) }
         self.event_cache = collections.defaultdict(collections.deque)
@@ -204,11 +200,11 @@ class TemporalGraphEngine:
         # 全局拓扑穿透缓存
         self.global_topo_cache = collections.OrderedDict()
         self.max_topo_cache_size = 10000
-        # 站点邻接 hop 查询缓存，供批内弱合并复用
-        self.site_hop_cache = collections.OrderedDict()
-        self.max_site_hop_cache_size = 20000
-        # 批内额外按站点邻接进行合并的 hop 配置，0 表示关闭
-        self.batch_merge_site_hops = max(int(batch_merge_site_hops or 0), 0)
+        # 站点级批内弱合并辅助器：统一承接 hop 合并和空间密度合并
+        self.site_merge_helper = site_merge_helper
+        # 最近一次收割的批内合并统计，以及累计统计
+        self.last_batch_merge_stats = build_empty_merge_stats()
+        self.total_batch_merge_stats = build_empty_merge_stats()
         # nearest_matching 在不带 path_requirements 时只依赖静态拓扑和站点画像，可跨批次复用
         self.global_nearest_match_cache = collections.OrderedDict()
         self.max_nearest_match_cache_size = 10000
@@ -499,17 +495,19 @@ class TemporalGraphEngine:
             if results:
                 raw_matches.extend(results)
 
-        merged_matches = merge_match_batch(
+        merged_matches, batch_merge_stats = merge_match_batch(
             raw_matches,
-            site_neighbor_hops=self.batch_merge_site_hops,
-            get_sites_within_hops=self._get_sites_within_hops,
+            site_merge_helper=self.site_merge_helper,
+            return_stats=True,
         )
-        expanded_matches = self._expand_matches_with_pending_context(
+        expanded_matches, expanded_merge_stats = self._expand_matches_with_pending_context(
             merged_matches,
             helper,
             eval_caches=batch_eval_caches,
         )
+        collection_merge_stats = add_merge_stats(batch_merge_stats, expanded_merge_stats)
         with self._lock:
+            self._record_batch_merge_stats_locked(collection_merge_stats)
             self._prune_expired_state_locked(self.latest_arrived_event_ts)
             current_watermark = self.current_watermark
             effective_harvest_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
@@ -538,6 +536,9 @@ class TemporalGraphEngine:
                 ],
                 "pending_eval_profiles": pending_eval_profiles,
                 "raw_matches": raw_matches,
+                "merge_stats": collection_merge_stats,
+                "batch_merge_stats": batch_merge_stats,
+                "expanded_merge_stats": expanded_merge_stats,
                 "batch_merged_matches": merged_matches,
                 "expanded_matches": expanded_matches,
                 "finalized_matches": finalized_matches,
@@ -925,14 +926,14 @@ class TemporalGraphEngine:
     def _expand_matches_with_pending_context(self, matches, node_rule_helper, eval_caches=None):
         """只读扩充当前批次：汇总整批非 trigger 节点上的 pending，再和当前批统一做一次批内合并。"""
         if not matches:
-            return matches
+            return matches, build_empty_merge_stats()
 
         non_trigger_nodes = set()
         for match_result in matches:
             non_trigger_nodes.update(self._get_non_trigger_nodes_for_match(match_result))
 
         if not non_trigger_nodes:
-            return matches
+            return matches, build_empty_merge_stats()
 
         with self._lock:
             pending_candidates = [
@@ -942,7 +943,7 @@ class TemporalGraphEngine:
             ]
 
         if not pending_candidates:
-            return matches
+            return matches, build_empty_merge_stats()
 
         extra_matches = []
         for (node, rule_name), trigger_anchor in pending_candidates:
@@ -962,13 +963,28 @@ class TemporalGraphEngine:
                 extra_matches.extend(results)
 
         if not extra_matches:
-            return matches
+            return matches, build_empty_merge_stats()
 
         return merge_match_batch(
             list(matches) + extra_matches,
-            site_neighbor_hops=self.batch_merge_site_hops,
-            get_sites_within_hops=self._get_sites_within_hops,
+            site_merge_helper=self.site_merge_helper,
+            return_stats=True,
         )
+
+    def _record_batch_merge_stats_locked(self, merge_stats):
+        self.last_batch_merge_stats = build_empty_merge_stats()
+        self.last_batch_merge_stats.update(merge_stats or {})
+        self.total_batch_merge_stats = add_merge_stats(
+            self.total_batch_merge_stats,
+            self.last_batch_merge_stats,
+        )
+
+    def get_batch_merge_stats_snapshot(self):
+        with self._lock:
+            return {
+                "last_batch": dict(self.last_batch_merge_stats),
+                "total": dict(self.total_batch_merge_stats),
+            }
 
     def _evaluate_rule(
         self,
@@ -1628,36 +1644,3 @@ class TemporalGraphEngine:
         if filtered_neighbor_cache is not None:
             filtered_neighbor_cache[cache_key] = valid_neighbors
         return valid_neighbors
-
-    def _get_sites_within_hops(self, start_site, max_hops):
-        max_hops = max(int(max_hops or 0), 0)
-        cache_key = (start_site, max_hops)
-
-        with self._topo_cache_lock:
-            if cache_key in self.site_hop_cache:
-                self.site_hop_cache.move_to_end(cache_key)
-                return self.site_hop_cache[cache_key]
-
-        visited = {start_site}
-        reachable = {start_site}
-        queue = collections.deque([(start_site, 0)])
-
-        while queue:
-            curr_site, hops = queue.popleft()
-            if hops >= max_hops:
-                continue
-            for next_site in self.topo_undirected.get(curr_site, ()):
-                if next_site in visited:
-                    continue
-                visited.add(next_site)
-                reachable.add(next_site)
-                queue.append((next_site, hops + 1))
-
-        reachable = frozenset(reachable)
-        with self._topo_cache_lock:
-            self.site_hop_cache[cache_key] = reachable
-            self.site_hop_cache.move_to_end(cache_key)
-            if len(self.site_hop_cache) > self.max_site_hop_cache_size:
-                self.site_hop_cache.popitem(last=False)
-
-        return reachable

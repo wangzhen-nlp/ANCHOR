@@ -132,29 +132,30 @@ def merge_match_component(component_matches):
     return merged
 
 
-def _component_is_site_adjacent(left_sites, right_sites, site_neighbor_hops, get_sites_within_hops):
-    if site_neighbor_hops <= 0 or get_sites_within_hops is None:
-        return False
-    if not left_sites or not right_sites:
-        return False
-    if left_sites & right_sites:
-        return True
-
-    if len(left_sites) > len(right_sites):
-        left_sites, right_sites = right_sites, left_sites
-
-    right_sites = set(right_sites)
-    for site in left_sites:
-        if get_sites_within_hops(site, site_neighbor_hops) & right_sites:
-            return True
-
-    return False
+def build_empty_merge_stats():
+    return {
+        "eid_merge_group_count": 0,
+        "shared_site_merge_group_count": 0,
+        "hop_merge_group_count": 0,
+        "distance_merge_group_count": 0,
+    }
 
 
-def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None):
+def add_merge_stats(*stats_list):
+    total = build_empty_merge_stats()
+    for stats in stats_list:
+        if not stats:
+            continue
+        for key in total:
+            total[key] += int(stats.get(key, 0) or 0)
+    return total
+
+
+def merge_match_batch(matches, site_merge_helper=None, return_stats=False):
     """在同一轮收割内，先把共享 eid 的候选组合并后再输出。"""
+    merge_stats = build_empty_merge_stats()
     if len(matches) <= 1:
-        return matches
+        return (matches, merge_stats) if return_stats else matches
 
     parent = list(range(len(matches)))
 
@@ -164,11 +165,17 @@ def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None)
             idx = parent[idx]
         return idx
 
-    def union(left, right):
+    def union(left, right, reason=None):
         left_root = find(left)
         right_root = find(right)
         if left_root != right_root:
             parent[right_root] = left_root
+            if reason:
+                stat_key = f"{reason}_merge_group_count"
+                if stat_key in merge_stats:
+                    merge_stats[stat_key] += 1
+            return True
+        return False
 
     match_alarm_keys = [get_match_alarm_keys(match) for match in matches]
     eid_to_match_indexes = collections.defaultdict(list)
@@ -183,9 +190,9 @@ def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None)
             continue
         head = indexes[0]
         for idx in indexes[1:]:
-            union(head, idx)
+            union(head, idx, reason="eid")
 
-    if site_neighbor_hops > 0 and get_sites_within_hops is not None:
+    if site_merge_helper is not None and site_merge_helper.enabled:
         match_site_keys = [get_match_site_keys(match) for match in matches]
         active_indexes = [idx for idx, site_keys in enumerate(match_site_keys) if site_keys]
         for pos, left_idx in enumerate(active_indexes):
@@ -193,13 +200,12 @@ def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None)
             for right_idx in active_indexes[pos + 1:]:
                 if find(left_idx) == find(right_idx):
                     continue
-                if _component_is_site_adjacent(
+                reason = site_merge_helper.classify_component_adjacency(
                     left_sites,
                     match_site_keys[right_idx],
-                    site_neighbor_hops,
-                    get_sites_within_hops,
-                ):
-                    union(left_idx, right_idx)
+                )
+                if reason:
+                    union(left_idx, right_idx, reason=reason)
 
     groups = collections.defaultdict(list)
     group_indexes = collections.defaultdict(list)
@@ -215,7 +221,7 @@ def merge_match_batch(matches, site_neighbor_hops=0, get_sites_within_hops=None)
             merged_matches.append(matches[indexes[0]])
             continue
         merged_matches.append(merge_match_component(component_matches))
-    return merged_matches
+    return (merged_matches, merge_stats) if return_stats else merged_matches
 
 
 def clone_instance_with_updates(inst, curr_role, surviving_curr_phys, tgt_role, tgt_nodes):
