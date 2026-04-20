@@ -1241,7 +1241,7 @@ def main():
     parser.add_argument('--site-domain', type=str, default=SITE_DEVICE_COUNTS_JSON, help=f'站点画像文件，默认: {resource_display("site_device_counts.json")}')
     parser.add_argument('--site-graph', type=str, default=SITE_GRAPH_JSON, help=f'site_graph.json 文件，默认: {resource_display("site_graph.json")}')
     parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
-    parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='live', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
+    parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='offline', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--aggregation-wait-sec', type=float, default=420.0, help='trigger 成熟前的聚合等待时间，单位秒，默认 420')
     parser.add_argument('--clear-delay-sec', type=float, default=0.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
