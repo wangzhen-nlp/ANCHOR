@@ -16,6 +16,46 @@ TRANSMISSION_SITE_RULES = [
   }
 ]
 
+OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
+  "type": "compound",
+  "patterns": [
+    {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Data"],
+          "expected_alarms": {
+            "required_alarms": LINK_ALARMS,
+            "forbidden_alarms": OFFLINE_ALARMS
+          }
+        }
+      ]
+    },
+    {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Data"],
+          "expected_alarms": {
+            "forbidden_alarms": OFFLINE_ALARMS
+          }
+        }
+      ]
+    }
+  ]
+}
+
+UNDERNEATH_TRANSMISSION_COMPOUND_NODE = {
+  "type": "compound",
+  "min_count": 1,
+  "patterns": [
+    {
+      "type": "primitive",
+      "site_rules": TRANSMISSION_SITE_RULES
+    }
+  ]
+}
+
 transmission_rule = {
   "pattern_name": "bounded_silent_cross_domain_storm",
   "description": "无告警 -> 断站? -> 断站?",
@@ -180,7 +220,7 @@ data_rule = {
     },
     "underneath_compound_node": {
       "type": "compound",
-      "min_count": 2,
+      "min_count": 1,
       "patterns": [
         {
           "type": "primitive",
@@ -193,6 +233,88 @@ data_rule = {
     {
       "source": "underneath_compound_node",
       "target": "parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "max_hops": 1
+    }
+  ]
+}
+
+data_link_neighbor_rule = {
+  "pattern_name": "offline_under_data_with_neighbor_link_context",
+  "description": "本路由/上下游相邻路由至少一侧有link(均无断站) -> 下挂断站",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "underneath_compound_node",
+  "nodes": {
+    "parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "underneath_compound_node": {
+      "type": "compound",
+      "min_count": 1,
+      "patterns": [
+        {
+          "type": "primitive",
+          "site_rules": TRANSMISSION_SITE_RULES
+        }
+      ]
+    }
+  },
+  "edges": [
+    {
+      "source": "underneath_compound_node",
+      "target": "parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "max_hops": 1
+    },
+    {
+      "source": "parent_data_node",
+      "target": "adjacent_data_neighbor_node",
+      "direction": "either",
+      "time_window_sec": 900,
+      "max_hops": 1
+    }
+  ],
+  "result_constraints": {
+    "role_alarm_requirements_any": [
+      {
+        "roles": ["parent_data_node", "adjacent_data_neighbor_node"],
+        "alarms": LINK_ALARMS,
+        "min_roles": 1
+      }
+    ]
+  }
+}
+
+data_link_multi_router_rule = {
+  "pattern_name": "offline_under_adjacent_data_router_context",
+  "description": "本路由和相邻路由均存在下挂断站（路由站点本身均无断站）",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "current_underneath_compound_node",
+  "nodes": {
+    "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
+    "adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "adjacent_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE
+  },
+  "edges": [
+    {
+      "source": "current_underneath_compound_node",
+      "target": "current_parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "max_hops": 1
+    },
+    {
+      "source": "current_parent_data_node",
+      "target": "adjacent_data_neighbor_node",
+      "direction": "either",
+      "time_window_sec": 900,
+      "max_hops": 1
+    },
+    {
+      "source": "adjacent_underneath_compound_node",
+      "target": "adjacent_data_neighbor_node",
       "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1

@@ -12,8 +12,11 @@ def build_pattern_adj(edges_cfg):
         fwd_dir = edge.get("direction", "downstream")
         rev_dir = "upstream" if fwd_dir == "downstream" else (
             "downstream" if fwd_dir == "upstream" else (
-                "self" if fwd_dir == "self" else "bidirectional"
-            ))
+                "self" if fwd_dir == "self" else (
+                    "either" if fwd_dir == "either" else "bidirectional"
+                )
+            )
+        )
         hops = edge.get("max_hops")
         win = edge.get("time_window_sec", 300)
         rev_win = win

@@ -26,7 +26,14 @@ from topology_resources import (
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
 from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.reports import generate_incident_report
-from fault_grouping.rule_config import transmission_rule, link_rule, power_rule, data_rule
+from fault_grouping.rule_config import (
+    transmission_rule,
+    link_rule,
+    power_rule,
+    data_rule,
+    data_link_neighbor_rule,
+    data_link_multi_router_rule,
+)
 from fault_grouping.site_merge_helper import (
     AdaptiveDensitySiteMergeHelper,
     BatchSiteMergeHelper,
@@ -529,6 +536,29 @@ def _parse_debug_targets(args):
         debug_targets.add((site_id, alarm_name))
 
     return debug_targets
+
+
+def _parse_selected_rule_names(raw_values, available_rule_names):
+    if not raw_values:
+        return []
+
+    selected_rule_names = []
+    seen_rule_names = set()
+    available_rule_name_set = set(available_rule_names)
+
+    for raw_value in raw_values:
+        for part in str(raw_value).replace("，", ",").split(","):
+            rule_name = part.strip()
+            if not rule_name or rule_name in seen_rule_names:
+                continue
+            if rule_name not in available_rule_name_set:
+                raise ValueError(
+                    f"未知规则名: {rule_name}；可选值: {', '.join(sorted(available_rule_name_set))}"
+                )
+            seen_rule_names.add(rule_name)
+            selected_rule_names.append(rule_name)
+
+    return selected_rule_names
 
 
 def _format_debug_site_events(engine, site_id, limit=50):
@@ -1229,6 +1259,7 @@ def main():
     parser.add_argument('--ticket-sites', type=str, help='工单站点映射 JSON。不提供时，可退化为从 alarms 自身回推工单站点')
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
     parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
+    parser.add_argument('--rule', action='append', default=[], help='仅启用指定规则；可重复传入，也支持逗号分隔，如 --rule transmission_rule --rule link_rule 或 --rule transmission_rule,link_rule')
     args = parser.parse_args()
 
     start_ts = None
@@ -1304,12 +1335,29 @@ def main():
             f"max_radius={args.batch_merge_density_max_meters:g}m"
         )
 
-    rules_config = {
+    all_rules_config = {
         "transmission_rule": transmission_rule,
         "link_rule": link_rule,
         "power_rule": power_rule,
         "data_rule": data_rule,
+        "data_link_neighbor_rule": data_link_neighbor_rule,
+        "data_link_multi_router_rule": data_link_multi_router_rule,
     }
+    try:
+        selected_rule_names = _parse_selected_rule_names(args.rule, all_rules_config.keys())
+    except ValueError as exc:
+        parser.error(str(exc))
+    rules_config = (
+        {
+            rule_name: all_rules_config[rule_name]
+            for rule_name in selected_rule_names
+        }
+        if selected_rule_names else all_rules_config
+    )
+    print(
+        "启用规则: "
+        + ", ".join(rules_config.keys())
+    )
 
     density_site_merge_helper = None
     if args.batch_merge_density_knn > 0:

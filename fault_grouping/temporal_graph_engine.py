@@ -1368,13 +1368,64 @@ class TemporalGraphEngine:
                     + rule.get("max_stay_time_sec", self.global_ttl)
                 )
             }
+            is_valid_result, result_failure_reason = self._validate_result_constraints(rule, match_result)
+            if not is_valid_result:
+                if debug_trace is not None and result_failure_reason:
+                    debug_trace.setdefault("result_constraint_failures", []).append(result_failure_reason)
+                continue
             results.append(match_result)
         if debug_trace is not None:
             debug_trace["raw_match_count"] = len(results)
             if not results and "final_reason" not in debug_trace:
-                debug_trace["final_reason"] = "规则评估完成，但未产出原始候选组"
+                result_constraint_failures = debug_trace.get("result_constraint_failures", [])
+                if result_constraint_failures:
+                    debug_trace["final_reason"] = (
+                        "规则评估完成，但候选组被后置约束过滤；"
+                        f"主要原因: {result_constraint_failures[:3]}"
+                    )
+                else:
+                    debug_trace["final_reason"] = "规则评估完成，但未产出原始候选组"
             return results, debug_trace
         return results
+
+    def _validate_result_constraints(self, rule, match_result):
+        """对已成型的候选故障组做规则级后置约束校验。"""
+        result_constraints = rule.get("result_constraints") or {}
+        if not result_constraints:
+            return True, None
+
+        role_alarm_requirements_any = result_constraints.get("role_alarm_requirements_any", [])
+        for requirement in role_alarm_requirements_any:
+            roles = {
+                str(role).strip()
+                for role in requirement.get("roles", [])
+                if str(role).strip()
+            }
+            alarms = {
+                str(alarm).strip()
+                for alarm in requirement.get("alarms", [])
+                if str(alarm).strip()
+            }
+            min_roles = max(1, int(requirement.get("min_roles", 1) or 1))
+            if not roles or not alarms:
+                continue
+
+            matched_roles = {
+                symptom.get("matched_role")
+                for symptom in match_result.get("symptoms", [])
+                if symptom.get("matched_role") in roles
+                and str(symptom.get("alarm", "")).strip() in alarms
+            }
+            if len(matched_roles) < min_roles:
+                return (
+                    False,
+                    (
+                        f"后置约束失败：角色 {sorted(roles)} 中至少 {min_roles} 个需要命中告警 "
+                        f"{sorted(alarms)}，实际命中角色={sorted(role for role in matched_roles if role)}"
+                    ),
+                )
+
+        return True, None
 
     def _matches_node_structure_cached(self, node, node_config, helper, structure_match_cache=None):
         if structure_match_cache is None:
@@ -1615,9 +1666,25 @@ class TemporalGraphEngine:
         path_validation_cache=None,
         filtered_neighbor_cache=None,
     ):
-        topo = self.topo_up if direction == "upstream" else self.topo_down
+        if direction == "upstream":
+            topo_neighbors = tuple(self.topo_up.get(node, []))
+        elif direction == "either":
+            seen = set()
+            topo_neighbors = []
+            for nxt in self.topo_up.get(node, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    topo_neighbors.append(nxt)
+            for nxt in self.topo_down.get(node, []):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    topo_neighbors.append(nxt)
+            topo_neighbors = tuple(topo_neighbors)
+        else:
+            topo_neighbors = tuple(self.topo_down.get(node, []))
+
         if path_requirements is None:
-            return topo.get(node, [])
+            return topo_neighbors
 
         cache_key = (
             node,
@@ -1631,7 +1698,7 @@ class TemporalGraphEngine:
 
         valid_neighbors = tuple(
             nxt
-            for nxt in topo.get(node, [])
+            for nxt in topo_neighbors
             if self._validate_path_node_for_traversal(
                 nxt,
                 path_requirements,

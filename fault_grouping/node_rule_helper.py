@@ -138,9 +138,19 @@ class NodeRuleHelper:
         if expected == "NONE":
             return "NONE"
         if isinstance(expected, dict):
+            required_alarms = expected.get("required_alarms")
             forbidden_alarms = expected.get("forbidden_alarms")
+            parts = []
+            if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
+                parts.append(
+                    f"required={sorted(str(alarm) for alarm in required_alarms)}"
+                )
             if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
-                return f"forbidden={sorted(str(alarm) for alarm in forbidden_alarms)}"
+                parts.append(
+                    f"forbidden={sorted(str(alarm) for alarm in forbidden_alarms)}"
+                )
+            if parts:
+                return ", ".join(parts)
             return str(expected)
         if isinstance(expected, Iterable) and not isinstance(expected, str):
             return str(sorted(str(alarm) for alarm in expected))
@@ -187,7 +197,9 @@ class NodeRuleHelper:
                 }
 
             if isinstance(expected, dict):
+                required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
+                required_events = []
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                     forbidden_events = [e for e in events_in_win if e["alarm"] in forbidden_alarms]
                     if forbidden_events:
@@ -198,6 +210,45 @@ class NodeRuleHelper:
                                 f"{self.format_events_for_reason(forbidden_events)}"
                             ),
                         }
+                elif forbidden_alarms is not None:
+                    return {
+                        "valid": False,
+                        "reason": f"forbidden_alarms 配置无法识别: {forbidden_alarms}",
+                    }
+
+                if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
+                    required_events = [e for e in events_in_win if e["alarm"] in required_alarms]
+                    if not required_events:
+                        if event_timeline:
+                            return {
+                                "valid": False,
+                                "reason": (
+                                    f"窗口 {window_text} 内未命中 required alarms "
+                                    f"{self.format_expected_alarms_for_reason(expected)}；"
+                                    f" 实际事件: {event_timeline}"
+                                ),
+                            }
+                        return {
+                            "valid": False,
+                            "reason": (
+                                f"窗口 {window_text} 内没有任何事件，未命中 required alarms "
+                                f"{self.format_expected_alarms_for_reason(expected)}"
+                            ),
+                        }
+                    return {
+                        "valid": True,
+                        "reason": (
+                            f"窗口 {window_text} 内命中 required alarms: "
+                            f"{self.format_events_for_reason(required_events)}"
+                        ),
+                    }
+                if required_alarms is not None:
+                    return {
+                        "valid": False,
+                        "reason": f"required_alarms 配置无法识别: {required_alarms}",
+                    }
+
+                if forbidden_alarms is not None:
                     return {
                         "valid": True,
                         "reason": f"窗口 {window_text} 内未命中 forbidden alarms，满足约束",
@@ -292,10 +343,23 @@ class NodeRuleHelper:
                 has_crit = any(e["alarm"] in self.critical_alarms for e in events_in_win)
                 return not has_crit, []
             if isinstance(expected, dict):
+                required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                     has_forbidden = any(e["alarm"] in forbidden_alarms for e in events_in_win)
-                    return not has_forbidden, []
+                    if has_forbidden:
+                        return False, []
+                elif forbidden_alarms is not None:
+                    return False, []
+
+                if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
+                    valid = [e for e in events_in_win if e["alarm"] in required_alarms]
+                    return len(valid) > 0, valid
+                if required_alarms is not None:
+                    return False, []
+
+                if forbidden_alarms is not None:
+                    return True, []
                 return False, []
             if expected == "ANY":
                 return True, events_in_win
