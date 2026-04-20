@@ -45,6 +45,18 @@ OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
   ]
 }
 
+REQUIRED_OFFLINE_DATA_NODE = {
+  "type": "primitive",
+  "site_rules": [
+    {
+      "include": ["Data"],
+      "expected_alarms": {
+        "required_alarms": OFFLINE_ALARMS
+      }
+    }
+  ]
+}
+
 UNDERNEATH_TRANSMISSION_COMPOUND_NODE = {
   "type": "compound",
   "min_count": 1,
@@ -286,15 +298,15 @@ data_link_neighbor_rule = {
   }
 }
 
-data_link_multi_router_rule = {
+data_adjacent_router_rule = {
   "pattern_name": "offline_under_adjacent_data_router_context",
-  "description": "本路由和相邻路由均存在下挂断站（路由站点本身均无断站）",
+  "description": "本路由和相邻路由均存在下挂断站，且相邻路由站点需有link告警（路由站点本身均无断站）",
   "max_stay_time_sec": 3600,
   "trigger_role": "current_underneath_compound_node",
   "nodes": {
     "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
-    "adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "adjacent_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
     "adjacent_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE
   },
   "edges": [
