@@ -80,6 +80,8 @@ def predict_site_directions_global_path_voting(
             "candidate_paths": [],
             "strict_ring_components": [],
             "strict_ring_stats": {
+                "before_directed_edge_count": 0,
+                "before_bidirectional_edge_count": 0,
                 "forced_edge_count": 0,
                 "entry_direction_edge_count": 0,
                 "changed_edge_count": 0,
@@ -117,6 +119,8 @@ def predict_site_directions_global_path_voting(
         print("path_voting: 识别桥边...")
     bridges = find_bridges(adjacency)
     strict_ring_context = {"pair_context": {}, "components": []}
+    strict_ring_before_directed_edge_count = 0
+    strict_ring_before_bidirectional_edge_count = 0
     strict_ring_forced_edge_count = 0
     strict_ring_entry_direction_edge_count = 0
     strict_ring_changed_edge_count = 0
@@ -255,6 +259,10 @@ def predict_site_directions_global_path_voting(
                 "prior_vote_ba": round(prior_ba, 6),
                 "reasons": reasons,
             }
+            if edge_result.get("prediction") == "bidirectional":
+                strict_ring_before_bidirectional_edge_count += 1
+            else:
+                strict_ring_before_directed_edge_count += 1
             ring_pair_context = strict_ring_pair_context.get(key)
             edge_result, strict_ring_changed = apply_strict_ring_edge_override(
                 edge_result,
@@ -275,6 +283,8 @@ def predict_site_directions_global_path_voting(
         "candidate_paths": candidate_paths,
         "strict_ring_components": strict_ring_context["components"],
         "strict_ring_stats": {
+            "before_directed_edge_count": strict_ring_before_directed_edge_count,
+            "before_bidirectional_edge_count": strict_ring_before_bidirectional_edge_count,
             "forced_edge_count": strict_ring_forced_edge_count,
             "entry_direction_edge_count": strict_ring_entry_direction_edge_count,
             "changed_edge_count": strict_ring_changed_edge_count,
@@ -375,6 +385,23 @@ def main():
     print(f"候选路径数: {len(prediction_result['candidate_paths'])}")
     if args.strict_ring_bidirectional:
         strict_ring_stats = prediction_result["strict_ring_stats"]
+        before_directed_edge_count = strict_ring_stats["before_directed_edge_count"]
+        before_bidirectional_edge_count = strict_ring_stats["before_bidirectional_edge_count"]
+        before_total_edge_count = before_directed_edge_count + before_bidirectional_edge_count
+        print(format_direction_count_summary(
+            before_total_edge_count,
+            before_directed_edge_count,
+            before_bidirectional_edge_count,
+            unit="边",
+            label="strict-ring作用前",
+        ))
+        print(format_direction_count_summary(
+            len(prediction_result["edges"]),
+            directed_edge_count,
+            bidirectional_edge_count,
+            unit="边",
+            label="strict-ring作用后",
+        ))
         print(f"严格环组件数: {len(prediction_result['strict_ring_components'])}")
         print(f"严格环强制双向边数: {strict_ring_stats['forced_edge_count']}")
         print(f"严格环入口定向边数: {strict_ring_stats['entry_direction_edge_count']}")
@@ -387,6 +414,8 @@ def main():
         "edge_count": len(prediction_result["edges"]),
         "directed_edge_count": directed_edge_count,
         "bidirectional_edge_count": bidirectional_edge_count,
+        "strict_ring_before_directed_edge_count": prediction_result["strict_ring_stats"]["before_directed_edge_count"],
+        "strict_ring_before_bidirectional_edge_count": prediction_result["strict_ring_stats"]["before_bidirectional_edge_count"],
         "bridge_edge_count": bridge_edge_count,
         "candidate_path_count": len(prediction_result["candidate_paths"]),
         "strict_ring_bidirectional": args.strict_ring_bidirectional,

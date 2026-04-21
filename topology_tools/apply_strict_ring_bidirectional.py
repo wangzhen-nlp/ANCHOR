@@ -90,11 +90,22 @@ def get_site_scores(data, edges):
     return {}, "none"
 
 
+def count_direction_edges(edges):
+    bidirectional_count = sum(
+        1
+        for edge in edges
+        if edge.get("prediction") == "bidirectional"
+    )
+    directed_count = len(edges) - bidirectional_count
+    return directed_count, bidirectional_count
+
+
 def apply_strict_ring(data, include_components=False):
     edges = data.get("edges", [])
     if not isinstance(edges, list):
         raise ValueError("输入 JSON 中 edges 必须是 list")
 
+    before_directed_edge_count, before_bidirectional_edge_count = count_direction_edges(edges)
     adjacency, edge_keys = build_adjacency(edges)
     bridge_edges = find_bridges(adjacency)
     site_scores, score_source = get_site_scores(data, edges)
@@ -130,12 +141,17 @@ def apply_strict_ring(data, include_components=False):
 
     prediction_result = {"edges": output_edges}
     compact_edges = compact_prediction_edges(prediction_result)
+    after_directed_edge_count, after_bidirectional_edge_count = count_direction_edges(compact_edges)
     downstream_map = build_downstream_map({"edges": compact_edges})
 
     meta = dict(data.get("meta", {}))
     meta.update({
         "strict_ring_bidirectional": True,
         "strict_ring_source": "postprocess",
+        "strict_ring_before_directed_edge_count": before_directed_edge_count,
+        "strict_ring_before_bidirectional_edge_count": before_bidirectional_edge_count,
+        "directed_edge_count": after_directed_edge_count,
+        "bidirectional_edge_count": after_bidirectional_edge_count,
         "strict_ring_component_count": len(strict_ring_context["components"]),
         "strict_ring_forced_edge_count": forced_edge_count,
         "strict_ring_entry_direction_edge_count": entry_direction_edge_count,
@@ -180,17 +196,30 @@ def main():
 
     print(f"输入边数: {len(data.get('edges', []))}")
     output_edges = output.get("edges", [])
-    bidirectional_edge_count = sum(
-        1
-        for edge in output_edges
-        if edge.get("prediction") == "bidirectional"
-    )
-    directed_edge_count = len(output_edges) - bidirectional_edge_count
+    before_directed_edge_count = output["meta"]["strict_ring_before_directed_edge_count"]
+    before_bidirectional_edge_count = output["meta"]["strict_ring_before_bidirectional_edge_count"]
+    before_total_edge_count = before_directed_edge_count + before_bidirectional_edge_count
+    directed_edge_count = output["meta"]["directed_edge_count"]
+    bidirectional_edge_count = output["meta"]["bidirectional_edge_count"]
     print(format_direction_count_summary(
         len(output_edges),
         directed_edge_count,
         bidirectional_edge_count,
         unit="边",
+    ))
+    print(format_direction_count_summary(
+        before_total_edge_count,
+        before_directed_edge_count,
+        before_bidirectional_edge_count,
+        unit="边",
+        label="strict-ring作用前",
+    ))
+    print(format_direction_count_summary(
+        len(output_edges),
+        directed_edge_count,
+        bidirectional_edge_count,
+        unit="边",
+        label="strict-ring作用后",
     ))
     print(f"严格环组件数: {output['meta']['strict_ring_component_count']}")
     print(f"严格环强制双向边数: {output['meta']['strict_ring_forced_edge_count']}")

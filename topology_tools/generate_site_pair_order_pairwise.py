@@ -627,6 +627,8 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
 def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_progress=False):
     pair_orders = {}
     downstream_map = defaultdict(set)
+    before_directed_pair_count = 0
+    before_bidirectional_pair_count = 0
     directed_pair_count = 0
     bidirectional_pair_count = 0
     strict_ring_context = {"pair_context": {}, "components": []}
@@ -663,6 +665,10 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                 pair_graph_metrics,
                 args,
             )
+            if pair_result.get("relation") == "<->":
+                before_bidirectional_pair_count += 1
+            else:
+                before_directed_pair_count += 1
             ring_pair_context = strict_ring_pair_context.get(pair_key)
             pair_result, strict_ring_changed = apply_strict_ring_pairwise_override(
                 pair_result,
@@ -694,6 +700,8 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
             site_id: sorted(neighbors)
             for site_id, neighbors in sorted(downstream_map.items())
         },
+        "before_directed_pair_count": before_directed_pair_count,
+        "before_bidirectional_pair_count": before_bidirectional_pair_count,
         "directed_pair_count": directed_pair_count,
         "bidirectional_pair_count": bidirectional_pair_count,
         "strict_ring_components": strict_ring_context["components"],
@@ -862,6 +870,24 @@ def main():
         unit="站点对",
     ))
     if args.strict_ring_bidirectional:
+        before_total_pair_count = (
+            pair_outputs["before_directed_pair_count"]
+            + pair_outputs["before_bidirectional_pair_count"]
+        )
+        print(format_direction_count_summary(
+            before_total_pair_count,
+            pair_outputs["before_directed_pair_count"],
+            pair_outputs["before_bidirectional_pair_count"],
+            unit="站点对",
+            label="strict-ring作用前",
+        ))
+        print(format_direction_count_summary(
+            total_pair_count,
+            pair_outputs["directed_pair_count"],
+            pair_outputs["bidirectional_pair_count"],
+            unit="站点对",
+            label="strict-ring作用后",
+        ))
         print(f"严格环组件数: {len(pair_outputs['strict_ring_components'])}")
         print(f"严格环强制双向站点对数: {pair_outputs['strict_ring_forced_pair_count']}")
         print(f"严格环入口定向站点对数: {pair_outputs['strict_ring_entry_direction_pair_count']}")
@@ -873,6 +899,8 @@ def main():
         "site_count": len(inputs["all_sites"]),
         "adjacent_pair_count": len(inputs["pair_edge_count"]),
         "component_count": len(component_summaries),
+        "strict_ring_before_directed_pair_count": pair_outputs["before_directed_pair_count"],
+        "strict_ring_before_bidirectional_pair_count": pair_outputs["before_bidirectional_pair_count"],
         "directed_pair_count": pair_outputs["directed_pair_count"],
         "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
         "bridge_pair_count": bridge_pair_count,

@@ -666,7 +666,13 @@ def compact_prediction_edges(prediction_result):
     ]
 
 
-def format_direction_count_summary(total_count, directed_count, bidirectional_count, unit="边"):
+def format_direction_count_summary(
+    total_count,
+    directed_count,
+    bidirectional_count,
+    unit="边",
+    label="上下行预测汇总",
+):
     """格式化有向/双向结果数量与比例。"""
     if total_count <= 0:
         directed_ratio = 0.0
@@ -676,7 +682,7 @@ def format_direction_count_summary(total_count, directed_count, bidirectional_co
         bidirectional_ratio = bidirectional_count / total_count
 
     return (
-        f"上下行预测汇总: 有向{unit} {directed_count}/{total_count} "
+        f"{label}: 有向{unit} {directed_count}/{total_count} "
         f"({directed_ratio:.2%})，双向{unit} {bidirectional_count}/{total_count} "
         f"({bidirectional_ratio:.2%})"
     )
