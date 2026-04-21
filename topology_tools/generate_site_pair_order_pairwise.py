@@ -29,6 +29,7 @@ from topology_tools.site_pair_order_common import (
     _get_site_id,
     apply_strict_ring_pairwise_override,
     build_strict_ring_context,
+    format_direction_count_summary,
     iter_unique_cross_site_links,
     normalize_domain,
 )
@@ -44,7 +45,7 @@ def compact_pairwise_prediction(pair_result):
         upstream_site = pair_result.get("preferred_source")
         downstream_site = pair_result.get("preferred_target")
         prediction = (
-            f"{downstream_site}->{upstream_site}"
+            f"{upstream_site}->{downstream_site}"
             if downstream_site and upstream_site
             else None
         )
@@ -630,6 +631,7 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
     bidirectional_pair_count = 0
     strict_ring_context = {"pair_context": {}, "components": []}
     strict_ring_forced_pair_count = 0
+    strict_ring_entry_direction_pair_count = 0
     strict_ring_changed_pair_count = 0
 
     if args.strict_ring_bidirectional:
@@ -666,8 +668,11 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                 pair_result,
                 ring_pair_context,
             )
-            if ring_pair_context and ring_pair_context.get("force_bidirectional"):
-                strict_ring_forced_pair_count += 1
+            if ring_pair_context:
+                if ring_pair_context.get("force_bidirectional"):
+                    strict_ring_forced_pair_count += 1
+                elif ring_pair_context.get("force_entry_direction"):
+                    strict_ring_entry_direction_pair_count += 1
                 if strict_ring_changed:
                     strict_ring_changed_pair_count += 1
             pair_orders[f"{left_site}||{right_site}"] = pair_result
@@ -693,6 +698,7 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
         "bidirectional_pair_count": bidirectional_pair_count,
         "strict_ring_components": strict_ring_context["components"],
         "strict_ring_forced_pair_count": strict_ring_forced_pair_count,
+        "strict_ring_entry_direction_pair_count": strict_ring_entry_direction_pair_count,
         "strict_ring_changed_pair_count": strict_ring_changed_pair_count,
     }
 
@@ -783,7 +789,7 @@ def parse_args():
     parser.add_argument(
         "--strict-ring-bidirectional",
         action="store_true",
-        help="严格环模式：环块内部除出入口站点相关连接外，其余站点对强制输出双向",
+        help="严格环模式：入口相关站点对强制为入口指向环内站点，其余环内站点对强制输出双向",
     )
     parser.add_argument("--full-output", action="store_true", help="输出完整调试信息")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
@@ -848,9 +854,17 @@ def main():
     )
     print(f"单向站点对数: {pair_outputs['directed_pair_count']}")
     print(f"双向站点对数: {pair_outputs['bidirectional_pair_count']}")
+    total_pair_count = pair_outputs["directed_pair_count"] + pair_outputs["bidirectional_pair_count"]
+    print(format_direction_count_summary(
+        total_pair_count,
+        pair_outputs["directed_pair_count"],
+        pair_outputs["bidirectional_pair_count"],
+        unit="站点对",
+    ))
     if args.strict_ring_bidirectional:
         print(f"严格环组件数: {len(pair_outputs['strict_ring_components'])}")
         print(f"严格环强制双向站点对数: {pair_outputs['strict_ring_forced_pair_count']}")
+        print(f"严格环入口定向站点对数: {pair_outputs['strict_ring_entry_direction_pair_count']}")
         print(f"严格环实际改写站点对数: {pair_outputs['strict_ring_changed_pair_count']}")
 
     meta = {
@@ -866,6 +880,7 @@ def main():
         "strict_ring_bidirectional": args.strict_ring_bidirectional,
         "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
         "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],
+        "strict_ring_entry_direction_pair_count": pair_outputs["strict_ring_entry_direction_pair_count"],
         "strict_ring_changed_pair_count": pair_outputs["strict_ring_changed_pair_count"],
     }
 

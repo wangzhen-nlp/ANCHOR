@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""对已有站点上下行预测结果应用严格环内双向后处理。"""
+"""对已有站点上下行预测结果应用严格环后处理。"""
 
 import argparse
 import json
@@ -19,6 +19,7 @@ from topology_tools.site_pair_order_common import (
     build_strict_ring_context,
     compact_prediction_edges,
     find_bridges,
+    format_direction_count_summary,
 )
 
 
@@ -48,6 +49,47 @@ def extract_site_scores(data):
     return scores
 
 
+def infer_site_scores_from_predictions(edges):
+    """从 compact edges 的上下行预测中推断站点层级分。"""
+    scores = defaultdict(float)
+
+    for edge in edges:
+        site_a = edge.get("site_a")
+        site_b = edge.get("site_b")
+        if site_a:
+            scores[site_a] += 0.0
+        if site_b:
+            scores[site_b] += 0.0
+
+        upstream_site = edge.get("upstream_site")
+        downstream_site = edge.get("downstream_site")
+        prediction = edge.get("prediction")
+
+        if (not upstream_site or not downstream_site) and isinstance(prediction, str):
+            if prediction != "bidirectional" and "->" in prediction:
+                left_site, right_site = prediction.split("->", 1)
+                upstream_site = upstream_site or left_site
+                downstream_site = downstream_site or right_site
+
+        if upstream_site and downstream_site:
+            scores[upstream_site] += 1.0
+            scores[downstream_site] -= 1.0
+
+    return dict(scores)
+
+
+def get_site_scores(data, edges):
+    full_scores = extract_site_scores(data)
+    if full_scores:
+        return full_scores, "site_scores"
+
+    inferred_scores = infer_site_scores_from_predictions(edges)
+    has_directional_signal = any(abs(score) > 1e-9 for score in inferred_scores.values())
+    if has_directional_signal:
+        return inferred_scores, "prediction_edges"
+    return {}, "none"
+
+
 def apply_strict_ring(data, include_components=False):
     edges = data.get("edges", [])
     if not isinstance(edges, list):
@@ -55,15 +97,17 @@ def apply_strict_ring(data, include_components=False):
 
     adjacency, edge_keys = build_adjacency(edges)
     bridge_edges = find_bridges(adjacency)
+    site_scores, score_source = get_site_scores(data, edges)
     strict_ring_context = build_strict_ring_context(
         edge_keys,
         bridge_edges,
-        site_scores=extract_site_scores(data),
+        site_scores=site_scores,
     )
     pair_context = strict_ring_context["pair_context"]
 
     output_edges = []
     forced_edge_count = 0
+    entry_direction_edge_count = 0
     changed_edge_count = 0
     for edge in edges:
         site_a = edge.get("site_a")
@@ -75,8 +119,11 @@ def apply_strict_ring(data, include_components=False):
         pair_key = tuple(sorted((site_a, site_b)))
         ring_pair_context = pair_context.get(pair_key)
         updated_edge, changed = apply_strict_ring_edge_override(edge, ring_pair_context)
-        if ring_pair_context and ring_pair_context.get("force_bidirectional"):
-            forced_edge_count += 1
+        if ring_pair_context:
+            if ring_pair_context.get("force_bidirectional"):
+                forced_edge_count += 1
+            elif ring_pair_context.get("force_entry_direction"):
+                entry_direction_edge_count += 1
             if changed:
                 changed_edge_count += 1
         output_edges.append(updated_edge)
@@ -91,8 +138,10 @@ def apply_strict_ring(data, include_components=False):
         "strict_ring_source": "postprocess",
         "strict_ring_component_count": len(strict_ring_context["components"]),
         "strict_ring_forced_edge_count": forced_edge_count,
+        "strict_ring_entry_direction_edge_count": entry_direction_edge_count,
         "strict_ring_changed_edge_count": changed_edge_count,
         "bridge_edge_count": len(bridge_edges),
+        "strict_ring_score_source": score_source,
     })
 
     output = {
@@ -107,7 +156,7 @@ def apply_strict_ring(data, include_components=False):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="对已有 global 站点上下行预测 JSON 应用严格环内双向后处理"
+        description="对已有 global 站点上下行预测 JSON 应用严格环后处理：入口边定向，其余环内边双向"
     )
     parser.add_argument("input", help="未开启 strict-ring 的预测 JSON")
     parser.add_argument("-o", "--output", required=True, help="输出 JSON")
@@ -130,8 +179,22 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     print(f"输入边数: {len(data.get('edges', []))}")
+    output_edges = output.get("edges", [])
+    bidirectional_edge_count = sum(
+        1
+        for edge in output_edges
+        if edge.get("prediction") == "bidirectional"
+    )
+    directed_edge_count = len(output_edges) - bidirectional_edge_count
+    print(format_direction_count_summary(
+        len(output_edges),
+        directed_edge_count,
+        bidirectional_edge_count,
+        unit="边",
+    ))
     print(f"严格环组件数: {output['meta']['strict_ring_component_count']}")
     print(f"严格环强制双向边数: {output['meta']['strict_ring_forced_edge_count']}")
+    print(f"严格环入口定向边数: {output['meta']['strict_ring_entry_direction_edge_count']}")
     print(f"严格环实际改写边数: {output['meta']['strict_ring_changed_edge_count']}")
     print(f"已保存到: {args.output}")
 

@@ -37,6 +37,7 @@ from topology_tools.site_pair_order_common import (
     edge_prior_vote,
     extract_primary_upstream_map,
     find_bridges,
+    format_direction_count_summary,
     score_to_level,
     select_anchor_sites_enhanced,
     smooth_site_scores,
@@ -222,6 +223,7 @@ def predict_site_directions_global_path_optimized(
             "strict_ring_components": [],
             "strict_ring_stats": {
                 "forced_edge_count": 0,
+                "entry_direction_edge_count": 0,
                 "changed_edge_count": 0,
             },
         }
@@ -273,6 +275,7 @@ def predict_site_directions_global_path_optimized(
     bridges = find_bridges(adjacency)
     strict_ring_context = {"pair_context": {}, "components": []}
     strict_ring_forced_edge_count = 0
+    strict_ring_entry_direction_edge_count = 0
     strict_ring_changed_edge_count = 0
     if strict_ring_bidirectional:
         strict_ring_context = build_strict_ring_context(
@@ -408,8 +411,11 @@ def predict_site_directions_global_path_optimized(
                 edge_result,
                 ring_pair_context,
             )
-            if ring_pair_context and ring_pair_context.get("force_bidirectional"):
-                strict_ring_forced_edge_count += 1
+            if ring_pair_context:
+                if ring_pair_context.get("force_bidirectional"):
+                    strict_ring_forced_edge_count += 1
+                elif ring_pair_context.get("force_entry_direction"):
+                    strict_ring_entry_direction_edge_count += 1
                 if strict_ring_changed:
                     strict_ring_changed_edge_count += 1
             edges_output.append(edge_result)
@@ -426,6 +432,7 @@ def predict_site_directions_global_path_optimized(
         "strict_ring_components": strict_ring_context["components"],
         "strict_ring_stats": {
             "forced_edge_count": strict_ring_forced_edge_count,
+            "entry_direction_edge_count": strict_ring_entry_direction_edge_count,
             "changed_edge_count": strict_ring_changed_edge_count,
         },
     }
@@ -470,7 +477,7 @@ def parse_args():
     parser.add_argument(
         "--strict-ring-bidirectional",
         action="store_true",
-        help="严格环模式：环块内部除出入口站点相关连接外，其余边强制输出双向",
+        help="严格环模式：入口相关边强制为入口指向环内站点，其余环内边强制输出双向",
     )
     parser.add_argument("--full-output", action="store_true", help="输出完整调试信息")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
@@ -528,6 +535,12 @@ def main():
     print(f"边数: {len(prediction_result['edges'])}")
     print(f"单向边数: {directed_edge_count}")
     print(f"双向边数: {bidirectional_edge_count}")
+    print(format_direction_count_summary(
+        len(prediction_result["edges"]),
+        directed_edge_count,
+        bidirectional_edge_count,
+        unit="边",
+    ))
     print(f"桥边数: {bridge_edge_count}")
     print(f"候选路径数: {len(prediction_result['candidate_paths'])}")
     print(f"优化迭代轮数: {prediction_result['optimization'].get('iterations', 0)}")
@@ -535,6 +548,7 @@ def main():
         strict_ring_stats = prediction_result["strict_ring_stats"]
         print(f"严格环组件数: {len(prediction_result['strict_ring_components'])}")
         print(f"严格环强制双向边数: {strict_ring_stats['forced_edge_count']}")
+        print(f"严格环入口定向边数: {strict_ring_stats['entry_direction_edge_count']}")
         print(f"严格环实际改写边数: {strict_ring_stats['changed_edge_count']}")
 
     meta = {
@@ -549,6 +563,7 @@ def main():
         "strict_ring_bidirectional": args.strict_ring_bidirectional,
         "strict_ring_component_count": len(prediction_result["strict_ring_components"]),
         "strict_ring_forced_edge_count": prediction_result["strict_ring_stats"]["forced_edge_count"],
+        "strict_ring_entry_direction_edge_count": prediction_result["strict_ring_stats"]["entry_direction_edge_count"],
         "strict_ring_changed_edge_count": prediction_result["strict_ring_stats"]["changed_edge_count"],
     }
     output_data = {

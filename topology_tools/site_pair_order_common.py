@@ -314,7 +314,7 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
     构造严格环约束上下文。
 
     环块定义为移除桥边后的连通块；环块里通过桥边连到外部的站点视为出入口。
-    严格模式下，环块内部除出入口站点相关边外全部双向。
+    严格模式下，入口站点相关边强制为入口指向环内站点，其它环块内部边全部双向。
     如果传入 site_scores，则分数最高的出入口站点视为更靠上行的 entry，
     分数最低的出入口站点视为更靠端侧的 exit。
     """
@@ -423,9 +423,10 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
         })
 
         for pair_key in internal_pairs:
+            entry_related = entry_site is not None and entry_site in pair_key
             force_bidirectional = (
-                not entry_exit_sites
-                or not any(site_id in pair_key for site_id in entry_exit_sites)
+                entry_site is None
+                or entry_site not in pair_key
             )
             pair_context[pair_key] = {
                 "component_id": component_id,
@@ -433,6 +434,7 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
                 "entry_exit_sites": entry_exit_sites,
                 "entry_site": entry_site,
                 "exit_site": exit_site,
+                "force_entry_direction": entry_related,
                 "force_bidirectional": force_bidirectional,
             }
 
@@ -444,7 +446,45 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
 
 def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
     """按严格环约束覆盖 pairwise 输出。"""
-    if not ring_pair_context or not ring_pair_context.get("force_bidirectional"):
+    if not ring_pair_context:
+        return pair_result, False
+
+    if ring_pair_context.get("force_entry_direction"):
+        entry_site = ring_pair_context.get("entry_site")
+        site_a = pair_result.get("site_a")
+        site_b = pair_result.get("site_b")
+        if entry_site not in {site_a, site_b}:
+            return pair_result, False
+
+        other_site = site_b if entry_site == site_a else site_a
+        updated = dict(pair_result)
+        updated["original_relation"] = pair_result.get("relation")
+        updated["original_preferred_source"] = pair_result.get("preferred_source")
+        updated["original_preferred_target"] = pair_result.get("preferred_target")
+        updated["relation"] = "->"
+        updated["preferred_source"] = entry_site
+        updated["preferred_target"] = other_site
+        updated["strict_ring_entry_direction"] = True
+        updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
+        updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+        updated["strict_ring_entry_site"] = entry_site
+        updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
+        updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
+        updated["uncertainty_adjustments"] = list(
+            updated.get("uncertainty_adjustments", [])
+        ) + [{
+            "feature": "strict_ring_entry_direction",
+            "amount": 0.0,
+            "detail": "严格环模式：入口相关连接强制为入口指向环内站点",
+        }]
+        changed = (
+            pair_result.get("relation") != "->"
+            or pair_result.get("preferred_source") != entry_site
+            or pair_result.get("preferred_target") != other_site
+        )
+        return updated, changed
+
+    if not ring_pair_context.get("force_bidirectional"):
         return pair_result, False
 
     updated = dict(pair_result)
@@ -465,14 +505,48 @@ def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
     ) + [{
         "feature": "strict_ring_bidirectional",
         "amount": 0.0,
-        "detail": "严格环模式：环块内部非出入口相关连接强制保留双向",
+        "detail": "严格环模式：环块内部非入口相关连接强制保留双向",
     }]
     return updated, pair_result.get("relation") != "<->"
 
 
 def apply_strict_ring_edge_override(edge_result, ring_pair_context):
     """按严格环约束覆盖 global/path 输出。"""
-    if not ring_pair_context or not ring_pair_context.get("force_bidirectional"):
+    if not ring_pair_context:
+        return edge_result, False
+
+    if ring_pair_context.get("force_entry_direction"):
+        entry_site = ring_pair_context.get("entry_site")
+        site_a = edge_result.get("site_a")
+        site_b = edge_result.get("site_b")
+        if entry_site not in {site_a, site_b}:
+            return edge_result, False
+
+        other_site = site_b if entry_site == site_a else site_a
+        updated = dict(edge_result)
+        updated["original_prediction"] = edge_result.get("prediction")
+        updated["original_upstream_site"] = edge_result.get("upstream_site")
+        updated["original_downstream_site"] = edge_result.get("downstream_site")
+        updated["original_confidence"] = edge_result.get("confidence")
+        updated["prediction"] = f"{entry_site}->{other_site}"
+        updated["upstream_site"] = entry_site
+        updated["downstream_site"] = other_site
+        updated["strict_ring_entry_direction"] = True
+        updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
+        updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+        updated["strict_ring_entry_site"] = entry_site
+        updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
+        updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
+        updated["reasons"] = list(updated.get("reasons", [])) + [
+            "strict_ring_entry_direction: 入口相关连接强制为入口指向环内站点"
+        ]
+        changed = (
+            edge_result.get("upstream_site") != entry_site
+            or edge_result.get("downstream_site") != other_site
+        )
+        return updated, changed
+
+    if not ring_pair_context.get("force_bidirectional"):
         return edge_result, False
 
     updated = dict(edge_result)
@@ -492,7 +566,7 @@ def apply_strict_ring_edge_override(edge_result, ring_pair_context):
     updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
     updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
     updated["reasons"] = list(updated.get("reasons", [])) + [
-        "strict_ring_bidirectional: 环块内部非出入口相关连接强制保留双向"
+        "strict_ring_bidirectional: 环块内部非入口相关连接强制保留双向"
     ]
     return updated, edge_result.get("prediction") != "bidirectional"
 
@@ -568,12 +642,20 @@ def build_downstream_map(prediction_result):
 
 def compact_edge_prediction(edge):
     """只保留相邻站点对的上下行预测结果。"""
+    upstream_site = edge.get("upstream_site")
+    downstream_site = edge.get("downstream_site")
+    prediction = edge.get("prediction")
+    if upstream_site and downstream_site:
+        prediction = f"{upstream_site}->{downstream_site}"
+    elif prediction != "bidirectional":
+        prediction = "bidirectional"
+
     return {
         "site_a": edge.get("site_a"),
         "site_b": edge.get("site_b"),
-        "prediction": edge.get("prediction"),
-        "upstream_site": edge.get("upstream_site"),
-        "downstream_site": edge.get("downstream_site"),
+        "prediction": prediction,
+        "upstream_site": upstream_site,
+        "downstream_site": downstream_site,
     }
 
 
@@ -582,6 +664,22 @@ def compact_prediction_edges(prediction_result):
         compact_edge_prediction(edge)
         for edge in prediction_result.get("edges", [])
     ]
+
+
+def format_direction_count_summary(total_count, directed_count, bidirectional_count, unit="边"):
+    """格式化有向/双向结果数量与比例。"""
+    if total_count <= 0:
+        directed_ratio = 0.0
+        bidirectional_ratio = 0.0
+    else:
+        directed_ratio = directed_count / total_count
+        bidirectional_ratio = bidirectional_count / total_count
+
+    return (
+        f"上下行预测汇总: 有向{unit} {directed_count}/{total_count} "
+        f"({directed_ratio:.2%})，双向{unit} {bidirectional_count}/{total_count} "
+        f"({bidirectional_ratio:.2%})"
+    )
 
 
 def build_site_topology_enhanced(ne_graph, show_progress=False):
