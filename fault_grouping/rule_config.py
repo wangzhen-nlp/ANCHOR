@@ -303,7 +303,7 @@ data_adjacent_router_rule = {
   "pattern_name": "offline_under_adjacent_data_router_context",
   "description": "本路由和相邻路由均存在下挂断站，且相邻路由站点自身需命中Data设备上的offline告警",
   "max_stay_time_sec": 3600,
-  "trigger_role": "current_underneath_compound_node",
+  "trigger_role": "adjacent_router_data_neighbor_node",
   "nodes": {
     "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
@@ -316,7 +316,11 @@ data_adjacent_router_rule = {
       "target": "current_parent_data_node",
       "direction": "upstream",
       "time_window_sec": 900,
-      "max_hops": 1
+      "constraints": {
+        "path_node_requirements": {
+          "site_rules": TRANSMISSION_SITE_RULES
+        }
+      }
     },
     {
       "source": "current_parent_data_node",
@@ -330,7 +334,11 @@ data_adjacent_router_rule = {
       "target": "adjacent_router_data_neighbor_node",
       "direction": "upstream",
       "time_window_sec": 900,
-      "max_hops": 1
+      "constraints": {
+        "path_node_requirements": {
+          "site_rules": TRANSMISSION_SITE_RULES
+        }
+      }
     }
   ]
 }
