@@ -616,6 +616,10 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                 for pair_key, graph_metrics in pair_graph_metrics.items()
                 if graph_metrics.get("is_bridge")
             ],
+            site_scores={
+                site_id: metrics.get("level_score", 0.0)
+                for site_id, metrics in site_metrics.items()
+            },
         )
         strict_ring_pair_context = strict_ring_context["pair_context"]
     else:
@@ -755,7 +759,7 @@ def parse_args():
     parser.add_argument(
         "--strict-ring-bidirectional",
         action="store_true",
-        help="严格环模式：环块内部除唯一起始点相关连接外，其余站点对强制输出双向",
+        help="严格环模式：环块内部除出入口站点相关连接外，其余站点对强制输出双向",
     )
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
 

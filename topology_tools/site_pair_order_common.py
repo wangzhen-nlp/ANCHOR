@@ -309,13 +309,16 @@ def find_bridges(adjacency):
     return bridges
 
 
-def build_strict_ring_context(edge_keys, bridge_pairs):
+def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
     """
     构造严格环约束上下文。
 
-    环块定义为移除桥边后的连通块；如果该块恰好只有一个站点通过桥边连到外部，
-    则认为它是该环块的唯一起始点。严格模式下，环块内部除起始点相关边外全部双向。
+    环块定义为移除桥边后的连通块；环块里通过桥边连到外部的站点视为出入口。
+    严格模式下，环块内部除出入口站点相关边外全部双向。
+    如果传入 site_scores，则分数最高的出入口站点视为更靠上行的 entry，
+    分数最低的出入口站点视为更靠端侧的 exit。
     """
+    site_scores = site_scores or {}
     normalized_bridge_pairs = {
         tuple(sorted(pair))
         for pair in bridge_pairs
@@ -355,12 +358,12 @@ def build_strict_ring_context(edge_keys, bridge_pairs):
 
         component_set = set(component_sites)
         internal_pairs = []
-        external_start_candidates = set()
+        entry_exit_sites = set()
 
         for site_id in component_set:
             for neighbor_site in bridge_neighbors.get(site_id, ()):
                 if neighbor_site not in component_set:
-                    external_start_candidates.add(site_id)
+                    entry_exit_sites.add(site_id)
 
             for neighbor_site in non_bridge_neighbors.get(site_id, ()):
                 if neighbor_site not in component_set:
@@ -372,26 +375,64 @@ def build_strict_ring_context(edge_keys, bridge_pairs):
             continue
 
         component_id = len(component_summaries)
+        entry_exit_sites = sorted(entry_exit_sites)
         start_site = (
-            next(iter(external_start_candidates))
-            if len(external_start_candidates) == 1
+            entry_exit_sites[0]
+            if len(entry_exit_sites) == 1
             else None
         )
+        scored_entry_exit_sites = [
+            {
+                "site_id": site_id,
+                "score": round(float(site_scores.get(site_id, 0.0)), 6),
+                "has_score": site_id in site_scores,
+            }
+            for site_id in entry_exit_sites
+        ]
+        scored_sites = [
+            site_id
+            for site_id in entry_exit_sites
+            if site_id in site_scores
+        ]
+        entry_site = None
+        exit_site = None
+        if len(entry_exit_sites) == 1:
+            entry_site = entry_exit_sites[0]
+        elif scored_sites:
+            ranked_boundary_sites = sorted(
+                entry_exit_sites,
+                key=lambda site_id: (
+                    float(site_scores.get(site_id, 0.0)),
+                    str(site_id),
+                ),
+            )
+            exit_site = ranked_boundary_sites[0]
+            entry_site = ranked_boundary_sites[-1]
 
         component_summaries.append({
             "component_id": component_id,
             "sites": sorted(component_set),
             "site_count": len(component_set),
             "internal_pair_count": len(internal_pairs),
-            "external_start_candidates": sorted(external_start_candidates),
+            "external_start_candidates": entry_exit_sites,
+            "entry_exit_sites": entry_exit_sites,
+            "entry_exit_site_scores": scored_entry_exit_sites,
+            "entry_site": entry_site,
+            "exit_site": exit_site,
             "start_site": start_site,
         })
 
         for pair_key in internal_pairs:
-            force_bidirectional = start_site is None or start_site not in pair_key
+            force_bidirectional = (
+                not entry_exit_sites
+                or not any(site_id in pair_key for site_id in entry_exit_sites)
+            )
             pair_context[pair_key] = {
                 "component_id": component_id,
                 "start_site": start_site,
+                "entry_exit_sites": entry_exit_sites,
+                "entry_site": entry_site,
+                "exit_site": exit_site,
                 "force_bidirectional": force_bidirectional,
             }
 
@@ -416,12 +457,15 @@ def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
     updated["strict_ring_bidirectional"] = True
     updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
     updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+    updated["strict_ring_entry_site"] = ring_pair_context.get("entry_site")
+    updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
+    updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
     updated["uncertainty_adjustments"] = list(
         updated.get("uncertainty_adjustments", [])
     ) + [{
         "feature": "strict_ring_bidirectional",
         "amount": 0.0,
-        "detail": "严格环模式：环块内部非起始点相关连接强制保留双向",
+        "detail": "严格环模式：环块内部非出入口相关连接强制保留双向",
     }]
     return updated, pair_result.get("relation") != "<->"
 
@@ -444,8 +488,11 @@ def apply_strict_ring_edge_override(edge_result, ring_pair_context):
     updated["strict_ring_bidirectional"] = True
     updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
     updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+    updated["strict_ring_entry_site"] = ring_pair_context.get("entry_site")
+    updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
+    updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
     updated["reasons"] = list(updated.get("reasons", [])) + [
-        "strict_ring_bidirectional: 环块内部非起始点相关连接强制保留双向"
+        "strict_ring_bidirectional: 环块内部非出入口相关连接强制保留双向"
     ]
     return updated, edge_result.get("prediction") != "bidirectional"
 

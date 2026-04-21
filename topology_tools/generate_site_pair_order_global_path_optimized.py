@@ -274,7 +274,11 @@ def predict_site_directions_global_path_optimized(
     strict_ring_forced_edge_count = 0
     strict_ring_changed_edge_count = 0
     if strict_ring_bidirectional:
-        strict_ring_context = build_strict_ring_context(site_edges.keys(), bridges)
+        strict_ring_context = build_strict_ring_context(
+            site_edges.keys(),
+            bridges,
+            site_scores=optimized_scores,
+        )
         strict_ring_pair_context = strict_ring_context["pair_context"]
     else:
         strict_ring_pair_context = {}
@@ -465,7 +469,7 @@ def parse_args():
     parser.add_argument(
         "--strict-ring-bidirectional",
         action="store_true",
-        help="严格环模式：环块内部除唯一起始点相关连接外，其余边强制输出双向",
+        help="严格环模式：环块内部除出入口站点相关连接外，其余边强制输出双向",
     )
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     args = parser.parse_args()
