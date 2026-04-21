@@ -22,12 +22,14 @@ if __package__ in (None, ""):
 
 from topology_resources import NE_GRAPH_JSON, resource_display, resource_path
 from topology_tools.site_pair_order_common import (
+    ProgressReporter,
     build_candidate_paths,
     build_downstream_map,
     build_site_topology_enhanced,
     collect_path_votes,
     compute_distance_scores,
     compute_site_priors_enhanced,
+    counter_to_json_dict,
     edge_prior_vote,
     extract_primary_upstream_map,
     find_bridges,
@@ -46,6 +48,7 @@ def predict_site_directions_global_path_voting(
     score_diff_weight=0.15,
     cycle_bidirectional_margin=0.90,
     same_level_bidirectional_margin=0.70,
+    show_progress=False,
 ):
     """
     路径投票融合版站点上下行预测。
@@ -61,13 +64,18 @@ def predict_site_directions_global_path_voting(
       prediction = "A->B"  表示 A 向 B 上行
       prediction = "bidirectional" 表示双向/不确定
     """
-    site_stats, site_edges, adjacency = build_site_topology_enhanced(ne_graph)
+    site_stats, site_edges, adjacency = build_site_topology_enhanced(
+        ne_graph,
+        show_progress=show_progress,
+    )
     if not site_stats:
         return {"sites": {}, "edges": [], "candidate_paths": []}
 
-    compute_site_priors_enhanced(site_stats)
+    compute_site_priors_enhanced(site_stats, show_progress=show_progress)
     core_anchors, access_anchors = select_anchor_sites_enhanced(site_stats)
 
+    if show_progress:
+        print("path_voting: 计算 anchor 距离分...")
     distance_scores = compute_distance_scores(
         site_stats, adjacency, core_anchors, access_anchors
     )
@@ -77,7 +85,7 @@ def predict_site_directions_global_path_voting(
         rec["distance_score"] = distance_scores.get(site_id, 0.0)
         rec["base_score"] = base_score
 
-    final_scores = smooth_site_scores(site_stats, adjacency)
+    final_scores = smooth_site_scores(site_stats, adjacency, show_progress=show_progress)
 
     candidate_paths = build_candidate_paths(
         site_stats,
@@ -86,132 +94,139 @@ def predict_site_directions_global_path_voting(
         access_anchors,
         core_anchors,
         final_scores,
+        show_progress=show_progress,
     )
 
-    path_votes = collect_path_votes(candidate_paths, final_scores)
+    path_votes = collect_path_votes(candidate_paths, final_scores, show_progress=show_progress)
+    if show_progress:
+        print("path_voting: 识别桥边...")
     bridges = find_bridges(adjacency)
 
     site_output = {}
-    for site_id, rec in site_stats.items():
-        score = final_scores[site_id]
-        site_output[site_id] = {
-            "score": round(score, 6),
-            "level": score_to_level(score),
-            "predominant_role": rec["predominant_role"],
-            "role_counts": dict(rec["role_counts"]),
-            "degree": rec["degree"],
-            "raw_prior": round(rec["raw_prior"], 6),
-            "distance_score": round(rec["distance_score"], 6),
-            "anchor_strength": round(rec["anchor_strength"], 6),
-            "is_core_anchor": site_id in core_anchors,
-            "is_access_anchor": site_id in access_anchors,
-            "neighbors": sorted(rec["neighbors"]),
-        }
+    with ProgressReporter(len(site_stats), "path_voting: 生成站点输出", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            score = final_scores[site_id]
+            site_output[site_id] = {
+                "score": round(score, 6),
+                "level": score_to_level(score),
+                "predominant_role": rec["predominant_role"],
+                "role_counts": dict(rec["role_counts"]),
+                "degree": rec["degree"],
+                "raw_prior": round(rec["raw_prior"], 6),
+                "distance_score": round(rec["distance_score"], 6),
+                "anchor_strength": round(rec["anchor_strength"], 6),
+                "is_core_anchor": site_id in core_anchors,
+                "is_access_anchor": site_id in access_anchors,
+                "neighbors": sorted(rec["neighbors"]),
+            }
 
     edges_output = []
-    for key in sorted(site_edges.keys()):
-        site_a, site_b = key
-        edge = site_edges[key]
+    with ProgressReporter(len(site_edges), "path_voting: 预测边方向", show_progress) as progress:
+        for key in sorted(site_edges.keys()):
+            progress.update()
+            site_a, site_b = key
+            edge = site_edges[key]
 
-        score_a = final_scores[site_a]
-        score_b = final_scores[site_b]
-        diff = score_b - score_a
+            score_a = final_scores[site_a]
+            score_b = final_scores[site_b]
+            diff = score_b - score_a
 
-        vote_ab_from_score = max(0.0, diff)
-        vote_ba_from_score = max(0.0, -diff)
+            vote_ab_from_score = max(0.0, diff)
+            vote_ba_from_score = max(0.0, -diff)
 
-        prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
+            prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
 
-        path_vote = path_votes.get(key, {"ab": 0.0, "ba": 0.0, "support_paths": 0})
-        path_ab = path_vote["ab"]
-        path_ba = path_vote["ba"]
+            path_vote = path_votes.get(key, {"ab": 0.0, "ba": 0.0, "support_paths": 0})
+            path_ab = path_vote["ab"]
+            path_ba = path_vote["ba"]
 
-        vote_ab = (
-            score_diff_weight * vote_ab_from_score +
-            edge_prior_weight * prior_ab +
-            path_vote_weight * path_ab
-        )
-        vote_ba = (
-            score_diff_weight * vote_ba_from_score +
-            edge_prior_weight * prior_ba +
-            path_vote_weight * path_ba
-        )
+            vote_ab = (
+                score_diff_weight * vote_ab_from_score +
+                edge_prior_weight * prior_ab +
+                path_vote_weight * path_ab
+            )
+            vote_ba = (
+                score_diff_weight * vote_ba_from_score +
+                edge_prior_weight * prior_ba +
+                path_vote_weight * path_ba
+            )
 
-        total_vote = vote_ab + vote_ba
-        vote_gap = abs(vote_ab - vote_ba)
+            total_vote = vote_ab + vote_ba
+            vote_gap = abs(vote_ab - vote_ba)
 
-        level_a = site_output[site_a]["level"]
-        level_b = site_output[site_b]["level"]
-        same_level = level_a == level_b
-        same_role = (
-            site_output[site_a]["predominant_role"] ==
-            site_output[site_b]["predominant_role"]
-            and site_output[site_a]["predominant_role"] != "unknown"
-        )
-        is_bridge = key in bridges
-        in_cycle = not is_bridge
+            level_a = site_output[site_a]["level"]
+            level_b = site_output[site_b]["level"]
+            same_level = level_a == level_b
+            same_role = (
+                site_output[site_a]["predominant_role"] ==
+                site_output[site_b]["predominant_role"]
+                and site_output[site_a]["predominant_role"] != "unknown"
+            )
+            is_bridge = key in bridges
+            in_cycle = not is_bridge
 
-        reasons = []
-        bidirectional = False
+            reasons = []
+            bidirectional = False
 
-        if total_vote == 0:
-            bidirectional = True
-            reasons.append("no_directional_evidence")
-        elif abs(diff) < score_margin and vote_gap < cycle_bidirectional_margin:
-            if in_cycle:
+            if total_vote == 0:
                 bidirectional = True
-                reasons.append("low_score_gap_and_low_vote_gap_in_cycle")
-        elif same_level and vote_gap < same_level_bidirectional_margin:
-            bidirectional = True
-            reasons.append(f"same_level={level_a}")
-        elif same_role and in_cycle and vote_gap < cycle_bidirectional_margin:
-            bidirectional = True
-            reasons.append("same_role_cycle_edge_low_vote_gap")
+                reasons.append("no_directional_evidence")
+            elif abs(diff) < score_margin and vote_gap < cycle_bidirectional_margin:
+                if in_cycle:
+                    bidirectional = True
+                    reasons.append("low_score_gap_and_low_vote_gap_in_cycle")
+            elif same_level and vote_gap < same_level_bidirectional_margin:
+                bidirectional = True
+                reasons.append(f"same_level={level_a}")
+            elif same_role and in_cycle and vote_gap < cycle_bidirectional_margin:
+                bidirectional = True
+                reasons.append("same_role_cycle_edge_low_vote_gap")
 
-        if bidirectional:
-            prediction = "bidirectional"
-            upstream_site = None
-            downstream_site = None
-            confidence = max(0.05, min(0.55, vote_gap / max(1.0, total_vote + 1e-6)))
-        else:
-            if vote_ab >= vote_ba:
-                prediction = f"{site_a}->{site_b}"
-                downstream_site = site_a
-                upstream_site = site_b
+            if bidirectional:
+                prediction = "bidirectional"
+                upstream_site = None
+                downstream_site = None
+                confidence = max(0.05, min(0.55, vote_gap / max(1.0, total_vote + 1e-6)))
             else:
-                prediction = f"{site_b}->{site_a}"
-                downstream_site = site_b
-                upstream_site = site_a
+                if vote_ab >= vote_ba:
+                    prediction = f"{site_a}->{site_b}"
+                    downstream_site = site_a
+                    upstream_site = site_b
+                else:
+                    prediction = f"{site_b}->{site_a}"
+                    downstream_site = site_b
+                    upstream_site = site_a
 
-            confidence = min(0.99, vote_gap / max(0.5, total_vote))
-            reasons.append(f"vote_ab={vote_ab:.3f}")
-            reasons.append(f"vote_ba={vote_ba:.3f}")
-            reasons.append(f"score_diff={diff:.3f}")
+                confidence = min(0.99, vote_gap / max(0.5, total_vote))
+                reasons.append(f"vote_ab={vote_ab:.3f}")
+                reasons.append(f"vote_ba={vote_ba:.3f}")
+                reasons.append(f"score_diff={diff:.3f}")
 
-        edges_output.append({
-            "site_a": site_a,
-            "site_b": site_b,
-            "prediction": prediction,
-            "upstream_site": upstream_site,
-            "downstream_site": downstream_site,
-            "confidence": round(confidence, 6),
-            "score_a": round(score_a, 6),
-            "score_b": round(score_b, 6),
-            "level_a": level_a,
-            "level_b": level_b,
-            "same_level": same_level,
-            "same_role": same_role,
-            "is_bridge": is_bridge,
-            "in_cycle": in_cycle,
-            "link_types": sorted(edge["link_types"]),
-            "link_count": edge["link_count"],
-            "role_pair_counter": dict(edge["role_pair_counter"]),
-            "path_vote_ab": round(path_ab, 6),
-            "path_vote_ba": round(path_ba, 6),
-            "prior_vote_ab": round(prior_ab, 6),
-            "prior_vote_ba": round(prior_ba, 6),
-            "reasons": reasons,
-        })
+            edges_output.append({
+                "site_a": site_a,
+                "site_b": site_b,
+                "prediction": prediction,
+                "upstream_site": upstream_site,
+                "downstream_site": downstream_site,
+                "confidence": round(confidence, 6),
+                "score_a": round(score_a, 6),
+                "score_b": round(score_b, 6),
+                "level_a": level_a,
+                "level_b": level_b,
+                "same_level": same_level,
+                "same_role": same_role,
+                "is_bridge": is_bridge,
+                "in_cycle": in_cycle,
+                "link_types": sorted(edge["link_types"]),
+                "link_count": edge["link_count"],
+                "role_pair_counter": counter_to_json_dict(edge["role_pair_counter"]),
+                "path_vote_ab": round(path_ab, 6),
+                "path_vote_ba": round(path_ba, 6),
+                "prior_vote_ab": round(prior_ab, 6),
+                "prior_vote_ba": round(prior_ba, 6),
+                "reasons": reasons,
+            })
 
     return {
         "sites": site_output,
@@ -251,6 +266,7 @@ def parse_args():
         default=0.70,
         help="同层边低票差时转双向的阈值",
     )
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     return parser.parse_args()
 
 
@@ -273,6 +289,7 @@ def main():
         score_diff_weight=args.score_diff_weight,
         cycle_bidirectional_margin=args.cycle_bidirectional_margin,
         same_level_bidirectional_margin=args.same_level_bidirectional_margin,
+        show_progress=not args.no_progress,
     )
 
     primary_upstream_map = extract_primary_upstream_map(prediction_result)

@@ -315,12 +315,7 @@ data_adjacent_router_rule = {
       "source": "current_underneath_compound_node",
       "target": "current_parent_data_node",
       "direction": "upstream",
-      "time_window_sec": 900,
-      "constraints": {
-        "path_node_requirements": {
-          "site_rules": TRANSMISSION_SITE_RULES
-        }
-      }
+      "time_window_sec": 900
     },
     {
       "source": "current_parent_data_node",
@@ -333,12 +328,7 @@ data_adjacent_router_rule = {
       "source": "adjacent_router_underneath_compound_node",
       "target": "adjacent_router_data_neighbor_node",
       "direction": "upstream",
-      "time_window_sec": 900,
-      "constraints": {
-        "path_node_requirements": {
-          "site_rules": TRANSMISSION_SITE_RULES
-        }
-      }
+      "time_window_sec": 900
     }
   ]
 }

@@ -23,6 +23,7 @@ if __package__ in (None, ""):
 
 from topology_resources import NE_GRAPH_JSON, resource_display, resource_path
 from topology_tools.site_pair_order_common import (
+    ProgressReporter,
     ROLE_SCORE,
     _get_site_id,
     build_downstream_map,
@@ -39,7 +40,7 @@ from topology_tools.site_pair_order_common import (
 # 2) 从 NE 图构建站点图
 # =========================
 
-def build_site_topology(ne_graph):
+def build_site_topology(ne_graph, show_progress=False):
     """
     将 ne_graph 聚合成站点级无向图。
     返回:
@@ -67,54 +68,86 @@ def build_site_topology(ne_graph):
     site_stats = {}
     adjacency = defaultdict(set)
     site_edges = {}
+    seen_links = set()
 
     # 2.1 聚合站点内设备
-    for ne_id, ne_info in ne_graph.items():
-        if not isinstance(ne_info, dict):
-            continue
+    with ProgressReporter(len(ne_graph), "global: 聚合站点设备", show_progress) as progress:
+        for ne_id, ne_info in ne_graph.items():
+            progress.update()
+            if not isinstance(ne_info, dict):
+                continue
 
-        site_id = _get_site_id(ne_info)
-        if not site_id:
-            continue
+            site_id = _get_site_id(ne_info)
+            if not site_id:
+                continue
 
-        site_rec = site_stats.setdefault(site_id, {
-            "site_id": site_id,
-            "nes": set(),
-            "role_counts": Counter(),
-            "neighbors": set(),
-            "degree": 0,
-        })
-        site_rec["nes"].add(ne_id)
+            site_rec = site_stats.setdefault(site_id, {
+                "site_id": site_id,
+                "nes": set(),
+                "role_counts": Counter(),
+                "neighbors": set(),
+                "degree": 0,
+            })
+            site_rec["nes"].add(ne_id)
 
-        role = classify_device_role(ne_info.get("domain", ""))
-        site_rec["role_counts"][role] += 1
+            role = classify_device_role(ne_info.get("domain", ""))
+            site_rec["role_counts"][role] += 1
 
     # 2.2 聚合跨站点链路
-    for link in iter_unique_cross_site_links(ne_graph):
-        a = link["source_site"]
-        b = link["target_site"]
-        if not a or not b or a == b:
-            continue
+    with ProgressReporter(len(ne_graph), "global: 扫描跨站链路", show_progress) as progress:
+        for source_ne, source_info in ne_graph.items():
+            progress.update()
+            if not isinstance(source_info, dict):
+                continue
+            source_site = _get_site_id(source_info)
+            if not source_site:
+                continue
 
-        key = tuple(sorted((a, b)))
-        rec = site_edges.setdefault(key, {
-            "site_a": key[0],
-            "site_b": key[1],
-            "ne_pairs": [],
-            "link_types": set(),
-            "link_count": 0,
-        })
-        rec["ne_pairs"].append((link["source_ne"], link["target_ne"]))
-        rec["link_types"].add(link.get("link_type", "__unknown__"))
-        rec["link_count"] += 1
+            raw_links = source_info.get("link", {})
+            if not isinstance(raw_links, dict):
+                continue
 
-        adjacency[a].add(b)
-        adjacency[b].add(a)
+            for target_ne, link_meta in raw_links.items():
+                target_info = ne_graph.get(target_ne)
+                if not isinstance(target_info, dict):
+                    continue
+
+                target_site = _get_site_id(target_info)
+                if not target_site or target_site == source_site:
+                    continue
+
+                link_types = (
+                    sorted(link_meta.keys())
+                    if isinstance(link_meta, dict) and link_meta
+                    else ["__unknown__"]
+                )
+                for link_type in link_types:
+                    dedupe_key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+                    if dedupe_key in seen_links:
+                        continue
+                    seen_links.add(dedupe_key)
+
+                    key = tuple(sorted((source_site, target_site)))
+                    rec = site_edges.setdefault(key, {
+                        "site_a": key[0],
+                        "site_b": key[1],
+                        "ne_pairs": [],
+                        "link_types": set(),
+                        "link_count": 0,
+                    })
+                    rec["ne_pairs"].append((source_ne, target_ne))
+                    rec["link_types"].add(str(link_type))
+                    rec["link_count"] += 1
+
+                    adjacency[source_site].add(target_site)
+                    adjacency[target_site].add(source_site)
 
     # 2.3 写回 degree / neighbors
-    for site_id, rec in site_stats.items():
-        rec["neighbors"] = set(adjacency.get(site_id, set()))
-        rec["degree"] = len(rec["neighbors"])
+    with ProgressReporter(len(site_stats), "global: 回填站点度数", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            rec["neighbors"] = set(adjacency.get(site_id, set()))
+            rec["degree"] = len(rec["neighbors"])
 
     return site_stats, site_edges, adjacency
 
@@ -123,68 +156,70 @@ def build_site_topology(ne_graph):
 # 3) 站点初始层级先验
 # =========================
 
-def compute_site_priors(site_stats):
+def compute_site_priors(site_stats, show_progress=False):
     """
     给每个站点计算:
     - raw_prior: 仅根据设备类型组成得到的初始分
     - anchor_strength: 该站点自身类型先验的可信度
     - predominant_role: 主导类型
     """
-    for site_id, rec in site_stats.items():
-        counts = rec["role_counts"]
-        known_total = counts["wireless"] + counts["microwave"] + counts["router"]
+    with ProgressReporter(len(site_stats), "global: 计算站点先验", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            counts = rec["role_counts"]
+            known_total = counts["wireless"] + counts["microwave"] + counts["router"]
 
-        if known_total > 0:
-            raw_prior = (
-                counts["wireless"] * ROLE_SCORE["wireless"] +
-                counts["microwave"] * ROLE_SCORE["microwave"] +
-                counts["router"] * ROLE_SCORE["router"]
-            ) / known_total
-        else:
-            raw_prior = 0.0
+            if known_total > 0:
+                raw_prior = (
+                    counts["wireless"] * ROLE_SCORE["wireless"] +
+                    counts["microwave"] * ROLE_SCORE["microwave"] +
+                    counts["router"] * ROLE_SCORE["router"]
+                ) / known_total
+            else:
+                raw_prior = 0.0
 
-        degree = rec["degree"]
-        wireless_ratio = counts["wireless"] / known_total if known_total else 0.0
-        microwave_ratio = counts["microwave"] / known_total if known_total else 0.0
-        router_ratio = counts["router"] / known_total if known_total else 0.0
+            degree = rec["degree"]
+            wireless_ratio = counts["wireless"] / known_total if known_total else 0.0
+            microwave_ratio = counts["microwave"] / known_total if known_total else 0.0
+            router_ratio = counts["router"] / known_total if known_total else 0.0
 
-        # 轻量拓扑修正:
-        # - 无线叶子更偏下
-        # - 路由汇聚点更偏上
-        if degree <= 1 and wireless_ratio >= 0.5:
-            raw_prior -= 0.5
-        if degree >= 3 and router_ratio >= 0.5:
-            raw_prior += 0.5
+            # 轻量拓扑修正:
+            # - 无线叶子更偏下
+            # - 路由汇聚点更偏上
+            if degree <= 1 and wireless_ratio >= 0.5:
+                raw_prior -= 0.5
+            if degree >= 3 and router_ratio >= 0.5:
+                raw_prior += 0.5
 
-        # 主导类型
-        predominant_role = "unknown"
-        if known_total > 0:
-            predominant_role = max(
-                ("wireless", "microwave", "router"),
-                key=lambda x: counts[x]
-            )
+            # 主导类型
+            predominant_role = "unknown"
+            if known_total > 0:
+                predominant_role = max(
+                    ("wireless", "microwave", "router"),
+                    key=lambda x: counts[x]
+                )
 
-        # 锚点强度：类型越纯，先验越可信
-        purity = 0.0
-        if known_total > 0:
-            purity = max(wireless_ratio, microwave_ratio, router_ratio)
+            # 锚点强度：类型越纯，先验越可信
+            purity = 0.0
+            if known_total > 0:
+                purity = max(wireless_ratio, microwave_ratio, router_ratio)
 
-        if router_ratio >= 0.7 and wireless_ratio == 0:
-            anchor_strength = 0.85
-        elif wireless_ratio >= 0.7 and router_ratio == 0:
-            anchor_strength = 0.85
-        elif purity >= 0.6:
-            anchor_strength = 0.65
-        else:
-            anchor_strength = 0.45
+            if router_ratio >= 0.7 and wireless_ratio == 0:
+                anchor_strength = 0.85
+            elif wireless_ratio >= 0.7 and router_ratio == 0:
+                anchor_strength = 0.85
+            elif purity >= 0.6:
+                anchor_strength = 0.65
+            else:
+                anchor_strength = 0.45
 
-        rec["known_total"] = known_total
-        rec["wireless_ratio"] = wireless_ratio
-        rec["microwave_ratio"] = microwave_ratio
-        rec["router_ratio"] = router_ratio
-        rec["raw_prior"] = raw_prior
-        rec["anchor_strength"] = anchor_strength
-        rec["predominant_role"] = predominant_role
+            rec["known_total"] = known_total
+            rec["wireless_ratio"] = wireless_ratio
+            rec["microwave_ratio"] = microwave_ratio
+            rec["router_ratio"] = router_ratio
+            rec["raw_prior"] = raw_prior
+            rec["anchor_strength"] = anchor_strength
+            rec["predominant_role"] = predominant_role
 
 
 def select_anchor_sites(site_stats):
@@ -251,7 +286,7 @@ def select_anchor_sites(site_stats):
     return list(dict.fromkeys(core_anchors)), list(dict.fromkeys(access_anchors))
 
 
-def smooth_site_scores(site_stats, adjacency, max_iter=100, tol=1e-4):
+def smooth_site_scores(site_stats, adjacency, max_iter=100, tol=1e-4, show_progress=False):
     """
     在站点图上做一个带锚点的平滑迭代:
         new = anchor_strength * base_score + (1-anchor_strength) * (0.7 * neighbor_avg + 0.3 * base_score)
@@ -262,28 +297,31 @@ def smooth_site_scores(site_stats, adjacency, max_iter=100, tol=1e-4):
     """
     scores = {site: rec["base_score"] for site, rec in site_stats.items()}
 
-    for _ in range(max_iter):
-        new_scores = {}
-        max_delta = 0.0
+    with ProgressReporter(max_iter, "global: 平滑站点分数", show_progress) as progress:
+        for iteration in range(max_iter):
+            progress.update()
+            new_scores = {}
+            max_delta = 0.0
 
-        for site, rec in site_stats.items():
-            neighbors = adjacency.get(site, set())
-            base = rec["base_score"]
-            anchor_strength = rec["anchor_strength"]
+            for site, rec in site_stats.items():
+                neighbors = adjacency.get(site, set())
+                base = rec["base_score"]
+                anchor_strength = rec["anchor_strength"]
 
-            if neighbors:
-                neighbor_avg = sum(scores[n] for n in neighbors) / len(neighbors)
-                structural = 0.7 * neighbor_avg + 0.3 * base
-            else:
-                structural = base
+                if neighbors:
+                    neighbor_avg = sum(scores[n] for n in neighbors) / len(neighbors)
+                    structural = 0.7 * neighbor_avg + 0.3 * base
+                else:
+                    structural = base
 
-            new_score = anchor_strength * base + (1.0 - anchor_strength) * structural
-            new_scores[site] = new_score
-            max_delta = max(max_delta, abs(new_score - scores[site]))
+                new_score = anchor_strength * base + (1.0 - anchor_strength) * structural
+                new_scores[site] = new_score
+                max_delta = max(max_delta, abs(new_score - scores[site]))
 
-        scores = new_scores
-        if max_delta < tol:
-            break
+            progress.set_extra_text(f"iter={iteration + 1}, delta={max_delta:.6g}")
+            scores = new_scores
+            if max_delta < tol:
+                break
 
     return scores
 
@@ -298,6 +336,7 @@ def predict_site_directions_global(
     base_margin=0.35,
     ring_margin=0.75,
     same_role_margin=0.60,
+    show_progress=False,
 ):
     """
     基于设备类型 + 全局站点拓扑，预测站点间上下行关系。
@@ -336,14 +375,16 @@ def predict_site_directions_global(
     - 下行方向是反向
     - bidirectional 表示无法稳定判断，常见于同级环链/保护链路/证据不足
     """
-    site_stats, site_edges, adjacency = build_site_topology(ne_graph)
+    site_stats, site_edges, adjacency = build_site_topology(ne_graph, show_progress=show_progress)
 
     if not site_stats:
         return {"sites": {}, "edges": []}
 
-    compute_site_priors(site_stats)
+    compute_site_priors(site_stats, show_progress=show_progress)
     core_anchors, access_anchors = select_anchor_sites(site_stats)
 
+    if show_progress:
+        print("global: 计算 anchor 距离分...")
     distance_scores = compute_distance_scores(
         site_stats, adjacency, core_anchors, access_anchors
     )
@@ -355,103 +396,109 @@ def predict_site_directions_global(
         rec["distance_score"] = dist_score
         rec["base_score"] = base_score
 
-    final_scores = smooth_site_scores(site_stats, adjacency)
+    final_scores = smooth_site_scores(site_stats, adjacency, show_progress=show_progress)
+    if show_progress:
+        print("global: 识别桥边...")
     bridges = find_bridges(adjacency)
 
     # 写回站点信息
     site_output = {}
-    for site_id, rec in site_stats.items():
-        score = final_scores.get(site_id, rec["base_score"])
-        level = score_to_level(score)
-        site_output[site_id] = {
-            "score": round(score, 6),
-            "level": level,
-            "predominant_role": rec["predominant_role"],
-            "role_counts": dict(rec["role_counts"]),
-            "degree": rec["degree"],
-            "raw_prior": round(rec["raw_prior"], 6),
-            "distance_score": round(rec["distance_score"], 6),
-            "anchor_strength": round(rec["anchor_strength"], 6),
-            "neighbors": sorted(rec["neighbors"]),
-            "is_core_anchor": site_id in core_anchors,
-            "is_access_anchor": site_id in access_anchors,
-        }
+    with ProgressReporter(len(site_stats), "global: 生成站点输出", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            score = final_scores.get(site_id, rec["base_score"])
+            level = score_to_level(score)
+            site_output[site_id] = {
+                "score": round(score, 6),
+                "level": level,
+                "predominant_role": rec["predominant_role"],
+                "role_counts": dict(rec["role_counts"]),
+                "degree": rec["degree"],
+                "raw_prior": round(rec["raw_prior"], 6),
+                "distance_score": round(rec["distance_score"], 6),
+                "anchor_strength": round(rec["anchor_strength"], 6),
+                "neighbors": sorted(rec["neighbors"]),
+                "is_core_anchor": site_id in core_anchors,
+                "is_access_anchor": site_id in access_anchors,
+            }
 
     # 边方向预测
     edge_output = []
-    for key in sorted(site_edges.keys()):
-        a, b = key
-        edge_rec = site_edges[key]
+    with ProgressReporter(len(site_edges), "global: 预测边方向", show_progress) as progress:
+        for key in sorted(site_edges.keys()):
+            progress.update()
+            a, b = key
+            edge_rec = site_edges[key]
 
-        sa = final_scores.get(a, 0.0)
-        sb = final_scores.get(b, 0.0)
-        diff = sb - sa  # >0 表示 b 比 a 更靠核心
+            sa = final_scores.get(a, 0.0)
+            sb = final_scores.get(b, 0.0)
+            diff = sb - sa  # >0 表示 b 比 a 更靠核心
 
-        level_a = site_output[a]["level"]
-        level_b = site_output[b]["level"]
-        role_a = site_output[a]["predominant_role"]
-        role_b = site_output[b]["predominant_role"]
+            level_a = site_output[a]["level"]
+            level_b = site_output[b]["level"]
+            role_a = site_output[a]["predominant_role"]
+            role_b = site_output[b]["predominant_role"]
 
-        same_level = (level_a == level_b)
-        same_role = (role_a == role_b and role_a != "unknown")
-        is_bridge = key in bridges
+            same_level = (level_a == level_b)
+            same_role = (role_a == role_b and role_a != "unknown")
+            is_bridge = key in bridges
 
         # 不同情况使用不同阈值
-        margin = base_margin
-        if same_role:
-            margin = max(margin, same_role_margin)
-        if same_level and not is_bridge:
-            margin = max(margin, ring_margin)
+            margin = base_margin
+            if same_role:
+                margin = max(margin, same_role_margin)
+            if same_level and not is_bridge:
+                margin = max(margin, ring_margin)
 
-        reasons = []
-        if same_role:
-            reasons.append(f"same_predominant_role={role_a}")
-        if same_level:
-            reasons.append(f"same_level={level_a}")
-        if not is_bridge:
-            reasons.append("edge_in_cycle_or_ring_like")
-        else:
-            reasons.append("bridge_edge")
-
-        if abs(diff) < margin:
-            prediction = "bidirectional"
-            upstream_site = None
-            downstream_site = None
-            confidence = max(0.05, min(0.50, abs(diff) / max(margin, 1e-6)))
-            reasons.append(f"score_gap={diff:.3f} < margin={margin:.3f}")
-        else:
-            if diff > 0:
-                # a -> b 为上行
-                prediction = f"{a}->{b}"
-                downstream_site = a
-                upstream_site = b
+            reasons = []
+            if same_role:
+                reasons.append(f"same_predominant_role={role_a}")
+            if same_level:
+                reasons.append(f"same_level={level_a}")
+            if not is_bridge:
+                reasons.append("edge_in_cycle_or_ring_like")
             else:
-                # b -> a 为上行
-                prediction = f"{b}->{a}"
-                downstream_site = b
-                upstream_site = a
+                reasons.append("bridge_edge")
 
-            # gap 越大，置信度越高
-            confidence = min(0.99, abs(diff) / (margin + 1.5))
-            reasons.append(f"score_gap={diff:.3f} >= margin={margin:.3f}")
+            if abs(diff) < margin:
+                prediction = "bidirectional"
+                upstream_site = None
+                downstream_site = None
+                confidence = max(0.05, min(0.50, abs(diff) / max(margin, 1e-6)))
+                reasons.append(f"score_gap={diff:.3f} < margin={margin:.3f}")
+            else:
+                if diff > 0:
+                    # a -> b 为上行
+                    prediction = f"{a}->{b}"
+                    downstream_site = a
+                    upstream_site = b
+                else:
+                    # b -> a 为上行
+                    prediction = f"{b}->{a}"
+                    downstream_site = b
+                    upstream_site = a
 
-        edge_output.append({
-            "site_a": a,
-            "site_b": b,
-            "prediction": prediction,
-            "upstream_site": upstream_site,
-            "downstream_site": downstream_site,
-            "confidence": round(confidence, 6),
-            "reasons": reasons,
-            "link_types": sorted(edge_rec["link_types"]),
-            "link_count": edge_rec["link_count"],
-            "ne_pairs": edge_rec["ne_pairs"],
-            "is_bridge": is_bridge,
-            "score_a": round(sa, 6),
-            "score_b": round(sb, 6),
-            "level_a": level_a,
-            "level_b": level_b,
-        })
+                # gap 越大，置信度越高
+                confidence = min(0.99, abs(diff) / (margin + 1.5))
+                reasons.append(f"score_gap={diff:.3f} >= margin={margin:.3f}")
+
+            edge_output.append({
+                "site_a": a,
+                "site_b": b,
+                "prediction": prediction,
+                "upstream_site": upstream_site,
+                "downstream_site": downstream_site,
+                "confidence": round(confidence, 6),
+                "reasons": reasons,
+                "link_types": sorted(edge_rec["link_types"]),
+                "link_count": edge_rec["link_count"],
+                "ne_pairs": edge_rec["ne_pairs"],
+                "is_bridge": is_bridge,
+                "score_a": round(sa, 6),
+                "score_b": round(sb, 6),
+                "level_a": level_a,
+                "level_b": level_b,
+            })
 
     return {
         "sites": site_output,
@@ -491,6 +538,7 @@ def parse_args():
         default=0.60,
         help="同主导角色站点对的更高判定门槛",
     )
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     args = parser.parse_args()
 
     if args.base_margin < 0:
@@ -518,6 +566,7 @@ def main():
         base_margin=args.base_margin,
         ring_margin=args.ring_margin,
         same_role_margin=args.same_role_margin,
+        show_progress=not args.no_progress,
     )
     primary_upstream_map = extract_primary_upstream_map(prediction_result)
     downstream_map = build_downstream_map(prediction_result)

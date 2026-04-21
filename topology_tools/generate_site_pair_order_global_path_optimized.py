@@ -23,12 +23,14 @@ if __package__ in (None, ""):
 
 from topology_resources import NE_GRAPH_JSON, resource_display, resource_path
 from topology_tools.site_pair_order_common import (
+    ProgressReporter,
     build_candidate_paths,
     build_downstream_map,
     build_site_topology_enhanced,
     collect_path_votes,
     compute_distance_scores,
     compute_site_priors_enhanced,
+    counter_to_json_dict,
     edge_prior_vote,
     extract_primary_upstream_map,
     find_bridges,
@@ -55,6 +57,7 @@ def optimize_site_heights(
     lambda_path=1.80,
     lambda_edge=0.90,
     clip_grad=3.0,
+    show_progress=False,
 ):
     """
     在站点层级 h(v) 上做软约束优化。
@@ -86,80 +89,83 @@ def optimize_site_heights(
 
     history = []
 
-    for step in range(max_iter):
-        grad = {site: 0.0 for site in sites}
-        loss = 0.0
+    with ProgressReporter(max_iter, "path_optimized: 优化站点高度", show_progress) as progress:
+        for step in range(max_iter):
+            progress.update()
+            grad = {site: 0.0 for site in sites}
+            loss = 0.0
 
-        for site in sites:
-            weight = anchor_strength[site]
-            diff = heights[site] - base_score[site]
-            loss += lambda_prior * weight * diff * diff
-            grad[site] += 2.0 * lambda_prior * weight * diff
+            for site in sites:
+                weight = anchor_strength[site]
+                diff = heights[site] - base_score[site]
+                loss += lambda_prior * weight * diff * diff
+                grad[site] += 2.0 * lambda_prior * weight * diff
 
-        for (site_a, site_b), weight in edge_weight.items():
-            diff = heights[site_a] - heights[site_b]
-            loss += lambda_smooth * weight * diff * diff
-            g = 2.0 * lambda_smooth * weight * diff
-            grad[site_a] += g
-            grad[site_b] -= g
+            for (site_a, site_b), weight in edge_weight.items():
+                diff = heights[site_a] - heights[site_b]
+                loss += lambda_smooth * weight * diff * diff
+                g = 2.0 * lambda_smooth * weight * diff
+                grad[site_a] += g
+                grad[site_b] -= g
 
-        for path in candidate_paths:
-            if len(path) < 2:
-                continue
-            for index in range(len(path) - 1):
-                source_site = path[index]
-                target_site = path[index + 1]
-                violation = heights[source_site] - heights[target_site] + path_margin
-                if violation > 0:
-                    loss += lambda_path * violation * violation
-                    g = 2.0 * lambda_path * violation
-                    grad[source_site] += g
-                    grad[target_site] -= g
+            for path in candidate_paths:
+                if len(path) < 2:
+                    continue
+                for index in range(len(path) - 1):
+                    source_site = path[index]
+                    target_site = path[index + 1]
+                    violation = heights[source_site] - heights[target_site] + path_margin
+                    if violation > 0:
+                        loss += lambda_path * violation * violation
+                        g = 2.0 * lambda_path * violation
+                        grad[source_site] += g
+                        grad[target_site] -= g
 
-        for (site_a, site_b) in site_edges.items():
-            prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
-            prior_gap = prior_ab - prior_ba
-            if abs(prior_gap) < 1e-9:
-                continue
+            for site_a, site_b in site_edges:
+                prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
+                prior_gap = prior_ab - prior_ba
+                if abs(prior_gap) < 1e-9:
+                    continue
 
-            weight = abs(prior_gap)
-            if prior_gap > 0:
-                violation = heights[site_a] - heights[site_b] + edge_margin
-                if violation > 0:
-                    loss += lambda_edge * weight * violation * violation
-                    g = 2.0 * lambda_edge * weight * violation
-                    grad[site_a] += g
-                    grad[site_b] -= g
-            else:
-                violation = heights[site_b] - heights[site_a] + edge_margin
-                if violation > 0:
-                    loss += lambda_edge * weight * violation * violation
-                    g = 2.0 * lambda_edge * weight * violation
-                    grad[site_b] += g
-                    grad[site_a] -= g
+                weight = abs(prior_gap)
+                if prior_gap > 0:
+                    violation = heights[site_a] - heights[site_b] + edge_margin
+                    if violation > 0:
+                        loss += lambda_edge * weight * violation * violation
+                        g = 2.0 * lambda_edge * weight * violation
+                        grad[site_a] += g
+                        grad[site_b] -= g
+                else:
+                    violation = heights[site_b] - heights[site_a] + edge_margin
+                    if violation > 0:
+                        loss += lambda_edge * weight * violation * violation
+                        g = 2.0 * lambda_edge * weight * violation
+                        grad[site_b] += g
+                        grad[site_a] -= g
 
-        history.append(loss)
-        if step > 3 and abs(history[-1] - history[-2]) < tol:
-            break
+            history.append(loss)
+            progress.set_extra_text(f"iter={step + 1}, loss={loss:.6g}")
+            if step > 3 and abs(history[-1] - history[-2]) < tol:
+                break
 
-        max_update = 0.0
-        for site in sites:
-            g = grad[site]
-            if g > clip_grad:
-                g = clip_grad
-            elif g < -clip_grad:
-                g = -clip_grad
+            max_update = 0.0
+            for site in sites:
+                g = grad[site]
+                if g > clip_grad:
+                    g = clip_grad
+                elif g < -clip_grad:
+                    g = -clip_grad
 
-            update = lr * g
-            heights[site] -= update
-            max_update = max(max_update, abs(update))
+                update = lr * g
+                heights[site] -= update
+                max_update = max(max_update, abs(update))
 
-        mean_height = sum(heights.values()) / len(heights)
-        for site in sites:
-            heights[site] -= mean_height
+            mean_height = sum(heights.values()) / len(heights)
+            for site in sites:
+                heights[site] -= mean_height
 
-        if max_update < tol:
-            break
+            if max_update < tol:
+                break
 
     stats = {
         "final_loss": history[-1] if history else 0.0,
@@ -190,6 +196,7 @@ def predict_site_directions_global_path_optimized(
     lambda_smooth=0.08,
     lambda_path=1.80,
     lambda_edge=0.90,
+    show_progress=False,
 ):
     """
     路径约束优化版：
@@ -198,7 +205,10 @@ def predict_site_directions_global_path_optimized(
     3) 优化站点层级 h
     4) 用优化后的 h + 路径票 + 边先验输出边方向
     """
-    site_stats, site_edges, adjacency = build_site_topology_enhanced(ne_graph)
+    site_stats, site_edges, adjacency = build_site_topology_enhanced(
+        ne_graph,
+        show_progress=show_progress,
+    )
     if not site_stats:
         return {
             "sites": {},
@@ -207,8 +217,10 @@ def predict_site_directions_global_path_optimized(
             "optimization": {},
         }
 
-    compute_site_priors_enhanced(site_stats)
+    compute_site_priors_enhanced(site_stats, show_progress=show_progress)
     core_anchors, access_anchors = select_anchor_sites_enhanced(site_stats)
+    if show_progress:
+        print("path_optimized: 计算 anchor 距离分...")
     distance_scores = compute_distance_scores(
         site_stats, adjacency, core_anchors, access_anchors
     )
@@ -226,6 +238,7 @@ def predict_site_directions_global_path_optimized(
         access_anchors,
         core_anchors,
         init_scores,
+        show_progress=show_progress,
     )
 
     optimized_scores, opt_stats = optimize_site_heights(
@@ -242,126 +255,133 @@ def predict_site_directions_global_path_optimized(
         lambda_smooth=lambda_smooth,
         lambda_path=lambda_path,
         lambda_edge=lambda_edge,
+        show_progress=show_progress,
     )
 
-    path_votes = collect_path_votes(candidate_paths, optimized_scores)
+    path_votes = collect_path_votes(candidate_paths, optimized_scores, show_progress=show_progress)
+    if show_progress:
+        print("path_optimized: 识别桥边...")
     bridges = find_bridges(adjacency)
 
     site_output = {}
-    for site_id, rec in site_stats.items():
-        score = optimized_scores[site_id]
-        site_output[site_id] = {
-            "score": round(score, 6),
-            "level": score_to_level(score),
-            "predominant_role": rec["predominant_role"],
-            "role_counts": dict(rec["role_counts"]),
-            "degree": rec["degree"],
-            "raw_prior": round(rec["raw_prior"], 6),
-            "distance_score": round(rec["distance_score"], 6),
-            "anchor_strength": round(rec["anchor_strength"], 6),
-            "base_score": round(rec["base_score"], 6),
-            "is_core_anchor": site_id in core_anchors,
-            "is_access_anchor": site_id in access_anchors,
-            "neighbors": sorted(rec["neighbors"]),
-        }
+    with ProgressReporter(len(site_stats), "path_optimized: 生成站点输出", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            score = optimized_scores[site_id]
+            site_output[site_id] = {
+                "score": round(score, 6),
+                "level": score_to_level(score),
+                "predominant_role": rec["predominant_role"],
+                "role_counts": dict(rec["role_counts"]),
+                "degree": rec["degree"],
+                "raw_prior": round(rec["raw_prior"], 6),
+                "distance_score": round(rec["distance_score"], 6),
+                "anchor_strength": round(rec["anchor_strength"], 6),
+                "base_score": round(rec["base_score"], 6),
+                "is_core_anchor": site_id in core_anchors,
+                "is_access_anchor": site_id in access_anchors,
+                "neighbors": sorted(rec["neighbors"]),
+            }
 
     edges_output = []
-    for key in sorted(site_edges.keys()):
-        site_a, site_b = key
-        edge = site_edges[key]
+    with ProgressReporter(len(site_edges), "path_optimized: 预测边方向", show_progress) as progress:
+        for key in sorted(site_edges.keys()):
+            progress.update()
+            site_a, site_b = key
+            edge = site_edges[key]
 
-        score_a = optimized_scores[site_a]
-        score_b = optimized_scores[site_b]
-        diff = score_b - score_a
+            score_a = optimized_scores[site_a]
+            score_b = optimized_scores[site_b]
+            diff = score_b - score_a
 
-        score_ab = max(0.0, diff)
-        score_ba = max(0.0, -diff)
+            score_ab = max(0.0, diff)
+            score_ba = max(0.0, -diff)
 
-        prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
+            prior_ab, prior_ba = edge_prior_vote(site_a, site_b, site_edges)
 
-        path_vote = path_votes.get(key, {"ab": 0.0, "ba": 0.0, "support_paths": 0})
-        path_ab = path_vote["ab"]
-        path_ba = path_vote["ba"]
+            path_vote = path_votes.get(key, {"ab": 0.0, "ba": 0.0, "support_paths": 0})
+            path_ab = path_vote["ab"]
+            path_ba = path_vote["ba"]
 
-        vote_ab = 0.45 * score_ab + 0.25 * prior_ab + 0.30 * path_ab
-        vote_ba = 0.45 * score_ba + 0.25 * prior_ba + 0.30 * path_ba
+            vote_ab = 0.45 * score_ab + 0.25 * prior_ab + 0.30 * path_ab
+            vote_ba = 0.45 * score_ba + 0.25 * prior_ba + 0.30 * path_ba
 
-        normalized_ab, normalized_ba, vote_total = normalize_vote_pair(vote_ab, vote_ba)
-        vote_gap = abs(normalized_ab - normalized_ba)
+            normalized_ab, normalized_ba, vote_total = normalize_vote_pair(vote_ab, vote_ba)
+            vote_gap = abs(normalized_ab - normalized_ba)
 
-        level_a = site_output[site_a]["level"]
-        level_b = site_output[site_b]["level"]
-        same_level = level_a == level_b
-        same_role = (
-            site_output[site_a]["predominant_role"] ==
-            site_output[site_b]["predominant_role"]
-            and site_output[site_a]["predominant_role"] != "unknown"
-        )
-        is_bridge = key in bridges
-        in_cycle = not is_bridge
+            level_a = site_output[site_a]["level"]
+            level_b = site_output[site_b]["level"]
+            same_level = level_a == level_b
+            same_role = (
+                site_output[site_a]["predominant_role"] ==
+                site_output[site_b]["predominant_role"]
+                and site_output[site_a]["predominant_role"] != "unknown"
+            )
+            is_bridge = key in bridges
+            in_cycle = not is_bridge
 
-        reasons = []
-        bidirectional = False
+            reasons = []
+            bidirectional = False
 
-        if vote_total == 0:
-            bidirectional = True
-            reasons.append("no_directional_evidence")
-        elif abs(diff) < score_margin and in_cycle and vote_gap < cycle_vote_gap_margin:
-            bidirectional = True
-            reasons.append("cycle_edge_low_score_gap_low_vote_gap")
-        elif same_level and vote_gap < same_level_vote_gap_margin:
-            bidirectional = True
-            reasons.append(f"same_level={level_a}")
-        elif same_role and in_cycle and vote_gap < cycle_vote_gap_margin:
-            bidirectional = True
-            reasons.append("same_role_cycle_edge")
+            if vote_total == 0:
+                bidirectional = True
+                reasons.append("no_directional_evidence")
+            elif abs(diff) < score_margin and in_cycle and vote_gap < cycle_vote_gap_margin:
+                bidirectional = True
+                reasons.append("cycle_edge_low_score_gap_low_vote_gap")
+            elif same_level and vote_gap < same_level_vote_gap_margin:
+                bidirectional = True
+                reasons.append(f"same_level={level_a}")
+            elif same_role and in_cycle and vote_gap < cycle_vote_gap_margin:
+                bidirectional = True
+                reasons.append("same_role_cycle_edge")
 
-        if bidirectional:
-            prediction = "bidirectional"
-            upstream_site = None
-            downstream_site = None
-            confidence = max(0.05, min(0.55, vote_gap))
-        else:
-            if vote_ab >= vote_ba:
-                prediction = f"{site_a}->{site_b}"
-                downstream_site = site_a
-                upstream_site = site_b
+            if bidirectional:
+                prediction = "bidirectional"
+                upstream_site = None
+                downstream_site = None
+                confidence = max(0.05, min(0.55, vote_gap))
             else:
-                prediction = f"{site_b}->{site_a}"
-                downstream_site = site_b
-                upstream_site = site_a
+                if vote_ab >= vote_ba:
+                    prediction = f"{site_a}->{site_b}"
+                    downstream_site = site_a
+                    upstream_site = site_b
+                else:
+                    prediction = f"{site_b}->{site_a}"
+                    downstream_site = site_b
+                    upstream_site = site_a
 
-            confidence = min(0.99, max(vote_gap, min(1.0, abs(diff) / 1.5)))
-            reasons.append(f"score_diff={diff:.3f}")
-            reasons.append(f"vote_ab={vote_ab:.3f}")
-            reasons.append(f"vote_ba={vote_ba:.3f}")
+                confidence = min(0.99, max(vote_gap, min(1.0, abs(diff) / 1.5)))
+                reasons.append(f"score_diff={diff:.3f}")
+                reasons.append(f"vote_ab={vote_ab:.3f}")
+                reasons.append(f"vote_ba={vote_ba:.3f}")
 
-        edges_output.append({
-            "site_a": site_a,
-            "site_b": site_b,
-            "prediction": prediction,
-            "upstream_site": upstream_site,
-            "downstream_site": downstream_site,
-            "confidence": round(confidence, 6),
-            "score_a": round(score_a, 6),
-            "score_b": round(score_b, 6),
-            "level_a": level_a,
-            "level_b": level_b,
-            "same_level": same_level,
-            "same_role": same_role,
-            "is_bridge": is_bridge,
-            "in_cycle": in_cycle,
-            "link_types": sorted(edge["link_types"]),
-            "link_count": edge["link_count"],
-            "role_pair_counter": dict(edge["role_pair_counter"]),
-            "path_vote_ab": round(path_ab, 6),
-            "path_vote_ba": round(path_ba, 6),
-            "prior_vote_ab": round(prior_ab, 6),
-            "prior_vote_ba": round(prior_ba, 6),
-            "normalized_vote_ab": round(normalized_ab, 6),
-            "normalized_vote_ba": round(normalized_ba, 6),
-            "reasons": reasons,
-        })
+            edges_output.append({
+                "site_a": site_a,
+                "site_b": site_b,
+                "prediction": prediction,
+                "upstream_site": upstream_site,
+                "downstream_site": downstream_site,
+                "confidence": round(confidence, 6),
+                "score_a": round(score_a, 6),
+                "score_b": round(score_b, 6),
+                "level_a": level_a,
+                "level_b": level_b,
+                "same_level": same_level,
+                "same_role": same_role,
+                "is_bridge": is_bridge,
+                "in_cycle": in_cycle,
+                "link_types": sorted(edge["link_types"]),
+                "link_count": edge["link_count"],
+                "role_pair_counter": counter_to_json_dict(edge["role_pair_counter"]),
+                "path_vote_ab": round(path_ab, 6),
+                "path_vote_ba": round(path_ba, 6),
+                "prior_vote_ab": round(prior_ab, 6),
+                "prior_vote_ba": round(prior_ba, 6),
+                "normalized_vote_ab": round(normalized_ab, 6),
+                "normalized_vote_ba": round(normalized_ba, 6),
+                "reasons": reasons,
+            })
 
     return {
         "sites": site_output,
@@ -411,6 +431,7 @@ def parse_args():
     parser.add_argument("--lambda-smooth", type=float, default=0.08, help="图平滑项权重")
     parser.add_argument("--lambda-path", type=float, default=1.80, help="路径项权重")
     parser.add_argument("--lambda-edge", type=float, default=0.90, help="边先验项权重")
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     args = parser.parse_args()
 
     if args.max_iter <= 0:
@@ -442,6 +463,7 @@ def main():
         lambda_smooth=args.lambda_smooth,
         lambda_path=args.lambda_path,
         lambda_edge=args.lambda_edge,
+        show_progress=not args.no_progress,
     )
 
     primary_upstream_map = extract_primary_upstream_map(prediction_result)

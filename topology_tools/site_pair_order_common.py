@@ -6,6 +6,8 @@ import heapq
 
 from collections import Counter, defaultdict, deque
 
+from alarm_tools.progress_utils import ProgressBar
+
 
 CANONICAL_DOMAIN_MAP = {
     "data": "Data",
@@ -28,6 +30,36 @@ ROLE_ORDER = {
     "router": 2,
     "unknown": 1,
 }
+
+
+class ProgressReporter:
+    """轻量进度上下文，方便脚本统一打开/关闭进度条。"""
+
+    def __init__(self, total, label, enabled=True):
+        self._bar = ProgressBar(total, label) if enabled else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def update(self, step=1):
+        if self._bar is not None:
+            self._bar.update(step)
+
+    def set(self, current):
+        if self._bar is not None:
+            self._bar.set(current)
+
+    def set_extra_text(self, text, force=False):
+        if self._bar is not None:
+            self._bar.set_extra_text(text, force=force)
+
+    def close(self):
+        if self._bar is not None:
+            self._bar.close()
+            self._bar = None
 
 
 def normalize_domain(domain):
@@ -207,6 +239,18 @@ def score_to_level(score):
     return "backhaul"
 
 
+def counter_to_json_dict(counter):
+    """把 Counter/dict 中可能存在的 tuple key 转成 JSON 可序列化的字符串。"""
+    output = {}
+    for key, value in counter.items():
+        if isinstance(key, tuple):
+            json_key = "||".join(str(part) for part in key)
+        else:
+            json_key = str(key)
+        output[json_key] = value
+    return output
+
+
 def extract_primary_upstream_map(prediction_result):
     upstream_candidates = defaultdict(list)
 
@@ -256,7 +300,7 @@ def build_downstream_map(prediction_result):
     }
 
 
-def build_site_topology_enhanced(ne_graph):
+def build_site_topology_enhanced(ne_graph, show_progress=False):
     """
     从 ne_graph 构建站点级无向图，并保留跨站边上的 NE 角色证据。
 
@@ -269,135 +313,162 @@ def build_site_topology_enhanced(ne_graph):
     site_edges = {}
     adjacency = defaultdict(set)
 
-    for ne_id, ne_info in ne_graph.items():
-        if not isinstance(ne_info, dict):
-            continue
+    with ProgressReporter(len(ne_graph), "增强拓扑: 聚合站点设备", show_progress) as progress:
+        for ne_id, ne_info in ne_graph.items():
+            progress.update()
+            if not isinstance(ne_info, dict):
+                continue
 
-        site_id = _get_site_id(ne_info)
-        if not site_id:
-            continue
+            site_id = _get_site_id(ne_info)
+            if not site_id:
+                continue
 
-        role = classify_device_role(ne_info.get("domain", ""))
-        rec = site_stats.setdefault(site_id, {
-            "site_id": site_id,
-            "nes": set(),
-            "role_counts": Counter(),
-            "neighbors": set(),
-            "degree": 0,
-        })
-        rec["nes"].add(ne_id)
-        rec["role_counts"][role] += 1
+            role = classify_device_role(ne_info.get("domain", ""))
+            rec = site_stats.setdefault(site_id, {
+                "site_id": site_id,
+                "nes": set(),
+                "role_counts": Counter(),
+                "neighbors": set(),
+                "degree": 0,
+            })
+            rec["nes"].add(ne_id)
+            rec["role_counts"][role] += 1
 
-    for item in iter_unique_cross_site_links(ne_graph):
-        source_site = item["source_site"]
-        target_site = item["target_site"]
-        if not source_site or not target_site or source_site == target_site:
-            continue
+    seen_links = set()
+    with ProgressReporter(len(ne_graph), "增强拓扑: 扫描跨站链路", show_progress) as progress:
+        for source_ne, source_info in ne_graph.items():
+            progress.update()
+            source_site = _get_site_id(source_info) if isinstance(source_info, dict) else ""
+            if not source_site:
+                continue
 
-        source_ne = item["source_ne"]
-        target_ne = item["target_ne"]
-        source_info = ne_graph.get(source_ne, {})
-        target_info = ne_graph.get(target_ne, {})
+            raw_links = source_info.get("link", {})
+            if not isinstance(raw_links, dict):
+                continue
 
-        role_source = classify_device_role(source_info.get("domain", ""))
-        role_target = classify_device_role(target_info.get("domain", ""))
+            for target_ne, link_meta in raw_links.items():
+                target_info = ne_graph.get(target_ne)
+                if not isinstance(target_info, dict):
+                    continue
 
-        key = tuple(sorted((source_site, target_site)))
-        edge = site_edges.setdefault(key, {
-            "site_a": key[0],
-            "site_b": key[1],
-            "link_types": set(),
-            "link_count": 0,
-            "ne_pairs": [],
-            "role_pair_counter": Counter(),
-            "direct_role_evidence": {
-                key[0]: Counter(),
-                key[1]: Counter(),
-            },
-        })
+                target_site = _get_site_id(target_info)
+                if not target_site or target_site == source_site:
+                    continue
 
-        edge["link_types"].add(item.get("link_type", "__unknown__"))
-        edge["link_count"] += 1
-        edge["ne_pairs"].append((source_ne, target_ne, role_source, role_target))
+                role_source = classify_device_role(source_info.get("domain", ""))
+                role_target = classify_device_role(target_info.get("domain", ""))
+                link_types = (
+                    sorted(link_meta.keys())
+                    if isinstance(link_meta, dict) and link_meta
+                    else ["__unknown__"]
+                )
 
-        role_pair = tuple(sorted((role_source, role_target)))
-        edge["role_pair_counter"][role_pair] += 1
+                for link_type in link_types:
+                    link_key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+                    if link_key in seen_links:
+                        continue
+                    seen_links.add(link_key)
 
-        if ROLE_ORDER[role_source] < ROLE_ORDER[role_target]:
-            low_site = source_site
-            high_site = target_site
-        elif ROLE_ORDER[role_target] < ROLE_ORDER[role_source]:
-            low_site = target_site
-            high_site = source_site
-        else:
-            low_site = None
-            high_site = None
+                    key = tuple(sorted((source_site, target_site)))
+                    edge = site_edges.setdefault(key, {
+                        "site_a": key[0],
+                        "site_b": key[1],
+                        "link_types": set(),
+                        "link_count": 0,
+                        "ne_pairs": [],
+                        "role_pair_counter": Counter(),
+                        "direct_role_evidence": {
+                            key[0]: Counter(),
+                            key[1]: Counter(),
+                        },
+                    })
 
-        if low_site and high_site:
-            edge["direct_role_evidence"][low_site]["down_like"] += 1
-            edge["direct_role_evidence"][high_site]["up_like"] += 1
-        else:
-            edge["direct_role_evidence"][source_site]["flat_like"] += 1
-            edge["direct_role_evidence"][target_site]["flat_like"] += 1
+                    edge["link_types"].add(str(link_type))
+                    edge["link_count"] += 1
+                    edge["ne_pairs"].append((source_ne, target_ne, role_source, role_target))
 
-        adjacency[source_site].add(target_site)
-        adjacency[target_site].add(source_site)
+                    role_pair = tuple(sorted((role_source, role_target)))
+                    edge["role_pair_counter"][role_pair] += 1
 
-    for site_id, rec in site_stats.items():
-        rec["neighbors"] = set(adjacency.get(site_id, set()))
-        rec["degree"] = len(rec["neighbors"])
+                    if ROLE_ORDER[role_source] < ROLE_ORDER[role_target]:
+                        low_site = source_site
+                        high_site = target_site
+                    elif ROLE_ORDER[role_target] < ROLE_ORDER[role_source]:
+                        low_site = target_site
+                        high_site = source_site
+                    else:
+                        low_site = None
+                        high_site = None
+
+                    if low_site and high_site:
+                        edge["direct_role_evidence"][low_site]["down_like"] += 1
+                        edge["direct_role_evidence"][high_site]["up_like"] += 1
+                    else:
+                        edge["direct_role_evidence"][source_site]["flat_like"] += 1
+                        edge["direct_role_evidence"][target_site]["flat_like"] += 1
+
+                    adjacency[source_site].add(target_site)
+                    adjacency[target_site].add(source_site)
+
+    with ProgressReporter(len(site_stats), "增强拓扑: 回填站点度数", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            rec["neighbors"] = set(adjacency.get(site_id, set()))
+            rec["degree"] = len(rec["neighbors"])
 
     return site_stats, site_edges, adjacency
 
 
-def compute_site_priors_enhanced(site_stats):
-    for site_id, rec in site_stats.items():
-        counts = rec["role_counts"]
-        known_total = counts["wireless"] + counts["microwave"] + counts["router"]
+def compute_site_priors_enhanced(site_stats, show_progress=False):
+    with ProgressReporter(len(site_stats), "计算增强站点先验", show_progress) as progress:
+        for site_id, rec in site_stats.items():
+            progress.update()
+            counts = rec["role_counts"]
+            known_total = counts["wireless"] + counts["microwave"] + counts["router"]
 
-        if known_total > 0:
-            raw_prior = (
-                counts["wireless"] * ROLE_SCORE["wireless"] +
-                counts["microwave"] * ROLE_SCORE["microwave"] +
-                counts["router"] * ROLE_SCORE["router"]
-            ) / known_total
-        else:
-            raw_prior = 0.0
+            if known_total > 0:
+                raw_prior = (
+                    counts["wireless"] * ROLE_SCORE["wireless"] +
+                    counts["microwave"] * ROLE_SCORE["microwave"] +
+                    counts["router"] * ROLE_SCORE["router"]
+                ) / known_total
+            else:
+                raw_prior = 0.0
 
-        wireless_ratio = counts["wireless"] / known_total if known_total else 0.0
-        microwave_ratio = counts["microwave"] / known_total if known_total else 0.0
-        router_ratio = counts["router"] / known_total if known_total else 0.0
+            wireless_ratio = counts["wireless"] / known_total if known_total else 0.0
+            microwave_ratio = counts["microwave"] / known_total if known_total else 0.0
+            router_ratio = counts["router"] / known_total if known_total else 0.0
 
-        predominant_role = "unknown"
-        if known_total > 0:
-            predominant_role = max(
-                ("wireless", "microwave", "router"),
-                key=lambda role: counts[role],
-            )
+            predominant_role = "unknown"
+            if known_total > 0:
+                predominant_role = max(
+                    ("wireless", "microwave", "router"),
+                    key=lambda role: counts[role],
+                )
 
-        degree = rec["degree"]
-        if degree <= 1 and wireless_ratio >= 0.5:
-            raw_prior -= 0.6
-        if degree >= 3 and router_ratio >= 0.5:
-            raw_prior += 0.6
+            degree = rec["degree"]
+            if degree <= 1 and wireless_ratio >= 0.5:
+                raw_prior -= 0.6
+            if degree >= 3 and router_ratio >= 0.5:
+                raw_prior += 0.6
 
-        purity = max(wireless_ratio, microwave_ratio, router_ratio) if known_total else 0.0
-        if router_ratio >= 0.75 and wireless_ratio == 0:
-            anchor_strength = 0.90
-        elif wireless_ratio >= 0.75 and router_ratio == 0:
-            anchor_strength = 0.90
-        elif purity >= 0.60:
-            anchor_strength = 0.70
-        else:
-            anchor_strength = 0.50
+            purity = max(wireless_ratio, microwave_ratio, router_ratio) if known_total else 0.0
+            if router_ratio >= 0.75 and wireless_ratio == 0:
+                anchor_strength = 0.90
+            elif wireless_ratio >= 0.75 and router_ratio == 0:
+                anchor_strength = 0.90
+            elif purity >= 0.60:
+                anchor_strength = 0.70
+            else:
+                anchor_strength = 0.50
 
-        rec["known_total"] = known_total
-        rec["wireless_ratio"] = wireless_ratio
-        rec["microwave_ratio"] = microwave_ratio
-        rec["router_ratio"] = router_ratio
-        rec["raw_prior"] = raw_prior
-        rec["predominant_role"] = predominant_role
-        rec["anchor_strength"] = anchor_strength
+            rec["known_total"] = known_total
+            rec["wireless_ratio"] = wireless_ratio
+            rec["microwave_ratio"] = microwave_ratio
+            rec["router_ratio"] = router_ratio
+            rec["raw_prior"] = raw_prior
+            rec["predominant_role"] = predominant_role
+            rec["anchor_strength"] = anchor_strength
 
 
 def select_anchor_sites_enhanced(site_stats):
@@ -450,31 +521,34 @@ def select_anchor_sites_enhanced(site_stats):
     return list(dict.fromkeys(core_anchors)), list(dict.fromkeys(access_anchors))
 
 
-def smooth_site_scores(site_stats, adjacency, max_iter=120, tol=1e-4):
+def smooth_site_scores(site_stats, adjacency, max_iter=120, tol=1e-4, show_progress=False):
     scores = {site_id: rec["base_score"] for site_id, rec in site_stats.items()}
 
-    for _ in range(max_iter):
-        new_scores = {}
-        max_delta = 0.0
+    with ProgressReporter(max_iter, "平滑站点分数", show_progress) as progress:
+        for iteration in range(max_iter):
+            progress.update()
+            new_scores = {}
+            max_delta = 0.0
 
-        for site_id, rec in site_stats.items():
-            neighbors = adjacency.get(site_id, set())
-            base = rec["base_score"]
-            anchor_strength = rec["anchor_strength"]
+            for site_id, rec in site_stats.items():
+                neighbors = adjacency.get(site_id, set())
+                base = rec["base_score"]
+                anchor_strength = rec["anchor_strength"]
 
-            if neighbors:
-                neighbor_avg = sum(scores[neighbor] for neighbor in neighbors) / len(neighbors)
-                structural = 0.75 * neighbor_avg + 0.25 * base
-            else:
-                structural = base
+                if neighbors:
+                    neighbor_avg = sum(scores[neighbor] for neighbor in neighbors) / len(neighbors)
+                    structural = 0.75 * neighbor_avg + 0.25 * base
+                else:
+                    structural = base
 
-            new_score = anchor_strength * base + (1 - anchor_strength) * structural
-            new_scores[site_id] = new_score
-            max_delta = max(max_delta, abs(new_score - scores[site_id]))
+                new_score = anchor_strength * base + (1 - anchor_strength) * structural
+                new_scores[site_id] = new_score
+                max_delta = max(max_delta, abs(new_score - scores[site_id]))
 
-        scores = new_scores
-        if max_delta < tol:
-            break
+            progress.set_extra_text(f"iter={iteration + 1}, delta={max_delta:.6g}")
+            scores = new_scores
+            if max_delta < tol:
+                break
 
     return scores
 
@@ -549,6 +623,7 @@ def build_candidate_paths(
     access_anchors,
     core_anchors,
     score_hint,
+    show_progress=False,
 ):
     """
     为路径投票生成候选路径。
@@ -557,33 +632,35 @@ def build_candidate_paths(
     paths = []
     nodes = set(site_stats.keys())
 
-    for access_site in access_anchors:
-        if access_site not in nodes:
-            continue
-
-        ranked_cores = sorted(
-            core_anchors,
-            key=lambda core_site: (
-                abs(score_hint.get(core_site, 0.0) - score_hint.get(access_site, 0.0)),
-                -site_stats[core_site]["router_ratio"],
-                -site_stats[core_site]["degree"],
-            ),
-        )[:3]
-
-        for core_site in ranked_cores:
-            if core_site == access_site:
+    with ProgressReporter(len(access_anchors), "生成候选路径", show_progress) as progress:
+        for access_site in access_anchors:
+            progress.update()
+            if access_site not in nodes:
                 continue
 
-            path = dijkstra_path(
-                adjacency,
-                access_site,
-                core_site,
-                lambda source, target: edge_cost_for_path(
-                    source, target, site_stats, site_edges, score_hint
+            ranked_cores = sorted(
+                core_anchors,
+                key=lambda core_site: (
+                    abs(score_hint.get(core_site, 0.0) - score_hint.get(access_site, 0.0)),
+                    -site_stats[core_site]["router_ratio"],
+                    -site_stats[core_site]["degree"],
                 ),
-            )
-            if path and len(path) >= 2:
-                paths.append(path)
+            )[:3]
+
+            for core_site in ranked_cores:
+                if core_site == access_site:
+                    continue
+
+                path = dijkstra_path(
+                    adjacency,
+                    access_site,
+                    core_site,
+                    lambda source, target: edge_cost_for_path(
+                        source, target, site_stats, site_edges, score_hint
+                    ),
+                )
+                if path and len(path) >= 2:
+                    paths.append(path)
 
     unique_paths = []
     seen = set()
@@ -621,7 +698,7 @@ def edge_prior_vote(source_site, target_site, site_edges):
     return vote_source_to_target, vote_target_to_source
 
 
-def collect_path_votes(paths, final_scores):
+def collect_path_votes(paths, final_scores, show_progress=False):
     """
     路径对边方向投票。
     规则：
@@ -631,35 +708,37 @@ def collect_path_votes(paths, final_scores):
     """
     votes = defaultdict(lambda: {"ab": 0.0, "ba": 0.0, "support_paths": 0})
 
-    for path in paths:
-        if len(path) < 2:
-            continue
+    with ProgressReporter(len(paths), "统计路径投票", show_progress) as progress:
+        for path in paths:
+            progress.update()
+            if len(path) < 2:
+                continue
 
-        for index in range(len(path) - 1):
-            source_site = path[index]
-            target_site = path[index + 1]
-            key = tuple(sorted((source_site, target_site)))
-            source_score = final_scores.get(source_site, 0.0)
-            target_score = final_scores.get(target_site, 0.0)
-            diff = target_score - source_score
+            for index in range(len(path) - 1):
+                source_site = path[index]
+                target_site = path[index + 1]
+                key = tuple(sorted((source_site, target_site)))
+                source_score = final_scores.get(source_site, 0.0)
+                target_score = final_scores.get(target_site, 0.0)
+                diff = target_score - source_score
 
-            weight = 1.0
-            if abs(diff) >= 0.7:
-                weight = 1.25
-            elif abs(diff) < 0.2:
-                weight = 0.35
+                weight = 1.0
+                if abs(diff) >= 0.7:
+                    weight = 1.25
+                elif abs(diff) < 0.2:
+                    weight = 0.35
 
-            if key[0] == source_site:
-                if diff >= 0:
-                    votes[key]["ab"] += weight
+                if key[0] == source_site:
+                    if diff >= 0:
+                        votes[key]["ab"] += weight
+                    else:
+                        votes[key]["ba"] += weight
                 else:
-                    votes[key]["ba"] += weight
-            else:
-                if diff >= 0:
-                    votes[key]["ba"] += weight
-                else:
-                    votes[key]["ab"] += weight
+                    if diff >= 0:
+                        votes[key]["ba"] += weight
+                    else:
+                        votes[key]["ab"] += weight
 
-            votes[key]["support_paths"] += 1
+                votes[key]["support_paths"] += 1
 
     return votes

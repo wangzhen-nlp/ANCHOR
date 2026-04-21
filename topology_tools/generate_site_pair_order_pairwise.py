@@ -25,13 +25,14 @@ if __package__ in (None, ""):
 
 from topology_resources import NE_GRAPH_JSON, resource_display, resource_path
 from topology_tools.site_pair_order_common import (
+    ProgressReporter,
     _get_site_id,
     iter_unique_cross_site_links,
     normalize_domain,
 )
 
 
-def build_site_pair_inputs(ne_graph):
+def build_site_pair_inputs(ne_graph, show_progress=False):
     site_domain_counts = defaultdict(Counter)
     site_neighbors = defaultdict(set)
     site_external_edge_count = Counter()
@@ -41,42 +42,48 @@ def build_site_pair_inputs(ne_graph):
     pair_site_domain_counts = defaultdict(lambda: defaultdict(Counter))
     all_sites = set()
 
-    for ne_info in ne_graph.values():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = _get_site_id(ne_info)
-        if not site_id:
-            continue
-        all_sites.add(site_id)
-        site_domain_counts[site_id][normalize_domain(ne_info.get("domain", ""))] += 1
+    with ProgressReporter(len(ne_graph), "pairwise: 聚合站点设备", show_progress) as progress:
+        for ne_info in ne_graph.values():
+            progress.update()
+            if not isinstance(ne_info, dict):
+                continue
+            site_id = _get_site_id(ne_info)
+            if not site_id:
+                continue
+            all_sites.add(site_id)
+            site_domain_counts[site_id][normalize_domain(ne_info.get("domain", ""))] += 1
 
-    for link in iter_unique_cross_site_links(ne_graph):
-        left_site = link["source_site"]
-        right_site = link["target_site"]
-        pair_key = tuple(sorted((left_site, right_site)))
+    with ProgressReporter(0, "pairwise: 扫描跨站链路", show_progress) as progress:
+        for link in iter_unique_cross_site_links(ne_graph):
+            progress.update()
+            left_site = link["source_site"]
+            right_site = link["target_site"]
+            pair_key = tuple(sorted((left_site, right_site)))
 
-        site_neighbors[left_site].add(right_site)
-        site_neighbors[right_site].add(left_site)
-        pair_edge_count[pair_key] += 1
+            site_neighbors[left_site].add(right_site)
+            site_neighbors[right_site].add(left_site)
+            pair_edge_count[pair_key] += 1
 
-        left_domain = link["source_domain"]
-        right_domain = link["target_domain"]
-        pair_site_domain_counts[pair_key][left_site][left_domain] += 1
-        pair_site_domain_counts[pair_key][right_site][right_domain] += 1
+            left_domain = link["source_domain"]
+            right_domain = link["target_domain"]
+            pair_site_domain_counts[pair_key][left_site][left_domain] += 1
+            pair_site_domain_counts[pair_key][right_site][right_domain] += 1
 
-        site_external_edge_count[left_site] += 1
-        site_external_edge_count[right_site] += 1
-        if left_domain == "Data":
-            site_data_edge_count[left_site] += 1
-        elif left_domain == "Transmission":
-            site_transmission_edge_count[left_site] += 1
-        if right_domain == "Data":
-            site_data_edge_count[right_site] += 1
-        elif right_domain == "Transmission":
-            site_transmission_edge_count[right_site] += 1
+            site_external_edge_count[left_site] += 1
+            site_external_edge_count[right_site] += 1
+            if left_domain == "Data":
+                site_data_edge_count[left_site] += 1
+            elif left_domain == "Transmission":
+                site_transmission_edge_count[left_site] += 1
+            if right_domain == "Data":
+                site_data_edge_count[right_site] += 1
+            elif right_domain == "Transmission":
+                site_transmission_edge_count[right_site] += 1
 
-    for site_id in all_sites:
-        site_neighbors[site_id]
+    with ProgressReporter(len(all_sites), "pairwise: 初始化孤立站点邻接", show_progress) as progress:
+        for site_id in all_sites:
+            progress.update()
+            site_neighbors[site_id]
 
     return {
         "all_sites": all_sites,
@@ -90,82 +97,93 @@ def build_site_pair_inputs(ne_graph):
     }
 
 
-def compute_connected_components(all_sites, site_neighbors):
+def compute_connected_components(all_sites, site_neighbors, show_progress=False):
     visited = set()
     components = []
 
-    for start_site in sorted(all_sites):
-        if start_site in visited:
-            continue
-        queue = deque([start_site])
-        visited.add(start_site)
-        component = []
+    with ProgressReporter(len(all_sites), "pairwise: 计算连通分量", show_progress) as progress:
+        for start_site in sorted(all_sites):
+            progress.update()
+            if start_site in visited:
+                continue
+            queue = deque([start_site])
+            visited.add(start_site)
+            component = []
 
-        while queue:
-            current_site = queue.popleft()
-            component.append(current_site)
-            for neighbor_site in sorted(site_neighbors.get(current_site, ())):
-                if neighbor_site in visited:
-                    continue
-                visited.add(neighbor_site)
-                queue.append(neighbor_site)
+            while queue:
+                current_site = queue.popleft()
+                component.append(current_site)
+                for neighbor_site in sorted(site_neighbors.get(current_site, ())):
+                    if neighbor_site in visited:
+                        continue
+                    visited.add(neighbor_site)
+                    queue.append(neighbor_site)
 
-        components.append(sorted(component))
+            components.append(sorted(component))
 
     return components
 
 
-def find_bridge_pairs(all_sites, site_neighbors):
+def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
     """Tarjan 算法识别无向站点图中的桥边。"""
     discovery_time = {}
     low_link = {}
     bridges = set()
     current_time = 0
 
-    def dfs(site_id, parent_site):
-        nonlocal current_time
-        current_time += 1
-        discovery_time[site_id] = current_time
-        low_link[site_id] = current_time
+    with ProgressReporter(len(all_sites), "pairwise: 识别桥边", show_progress) as progress:
 
-        for neighbor_site in sorted(site_neighbors.get(site_id, ())):
-            if neighbor_site == parent_site:
+        def dfs(site_id, parent_site):
+            nonlocal current_time
+            progress.update()
+            current_time += 1
+            discovery_time[site_id] = current_time
+            low_link[site_id] = current_time
+
+            for neighbor_site in sorted(site_neighbors.get(site_id, ())):
+                if neighbor_site == parent_site:
+                    continue
+                if neighbor_site not in discovery_time:
+                    dfs(neighbor_site, site_id)
+                    low_link[site_id] = min(low_link[site_id], low_link[neighbor_site])
+                    if low_link[neighbor_site] > discovery_time[site_id]:
+                        bridges.add(tuple(sorted((site_id, neighbor_site))))
+                else:
+                    low_link[site_id] = min(low_link[site_id], discovery_time[neighbor_site])
+
+        for site_id in sorted(all_sites):
+            if site_id in discovery_time:
                 continue
-            if neighbor_site not in discovery_time:
-                dfs(neighbor_site, site_id)
-                low_link[site_id] = min(low_link[site_id], low_link[neighbor_site])
-                if low_link[neighbor_site] > discovery_time[site_id]:
-                    bridges.add(tuple(sorted((site_id, neighbor_site))))
-            else:
-                low_link[site_id] = min(low_link[site_id], discovery_time[neighbor_site])
-
-    for site_id in sorted(all_sites):
-        if site_id in discovery_time:
-            continue
-        dfs(site_id, None)
+            dfs(site_id, None)
 
     return bridges
 
 
-def build_pairwise_graph_metrics(inputs):
-    bridge_pairs = find_bridge_pairs(inputs["all_sites"], inputs["site_neighbors"])
+def build_pairwise_graph_metrics(inputs, show_progress=False):
+    bridge_pairs = find_bridge_pairs(
+        inputs["all_sites"],
+        inputs["site_neighbors"],
+        show_progress=show_progress,
+    )
     pair_graph_metrics = {}
 
-    for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
-        pair_key = tuple(sorted((left_site, right_site)))
-        left_neighbors = set(inputs["site_neighbors"].get(left_site, ()))
-        right_neighbors = set(inputs["site_neighbors"].get(right_site, ()))
-        left_neighbors.discard(right_site)
-        right_neighbors.discard(left_site)
-        shared_neighbors = sorted(left_neighbors & right_neighbors)
+    with ProgressReporter(len(inputs["pair_edge_count"]), "pairwise: 计算站点对图指标", show_progress) as progress:
+        for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
+            progress.update()
+            pair_key = tuple(sorted((left_site, right_site)))
+            left_neighbors = set(inputs["site_neighbors"].get(left_site, ()))
+            right_neighbors = set(inputs["site_neighbors"].get(right_site, ()))
+            left_neighbors.discard(right_site)
+            right_neighbors.discard(left_site)
+            shared_neighbors = sorted(left_neighbors & right_neighbors)
 
-        is_bridge = pair_key in bridge_pairs
-        pair_graph_metrics[pair_key] = {
-            "is_bridge": is_bridge,
-            "has_alternative_path": not is_bridge,
-            "shared_neighbor_count": len(shared_neighbors),
-            "shared_neighbors": shared_neighbors,
-        }
+            is_bridge = pair_key in bridge_pairs
+            pair_graph_metrics[pair_key] = {
+                "is_bridge": is_bridge,
+                "has_alternative_path": not is_bridge,
+                "shared_neighbor_count": len(shared_neighbors),
+                "shared_neighbors": shared_neighbors,
+            }
 
     return pair_graph_metrics
 
@@ -255,7 +273,7 @@ def compute_component_core_distance(component_sites, anchors, site_neighbors):
     return distance_map
 
 
-def build_pairwise_site_metrics(inputs, args):
+def build_pairwise_site_metrics(inputs, args, show_progress=False):
     base_scores = {
         site_id: compute_base_core_score(site_id, inputs, args)
         for site_id in inputs["all_sites"]
@@ -263,45 +281,48 @@ def build_pairwise_site_metrics(inputs, args):
     components = compute_connected_components(
         inputs["all_sites"],
         inputs["site_neighbors"],
+        show_progress=show_progress,
     )
 
     site_metrics = {}
     component_summaries = []
-    for component_index, component_sites in enumerate(components):
-        anchors = select_component_anchors(component_sites, inputs, base_scores, args)
-        distance_map = compute_component_core_distance(
-            component_sites,
-            anchors,
-            inputs["site_neighbors"],
-        )
-        component_summaries.append(
-            {
-                "component_id": component_index,
-                "site_count": len(component_sites),
-                "anchor_sites": anchors,
-            }
-        )
+    with ProgressReporter(len(components), "pairwise: 计算分量层级指标", show_progress) as progress:
+        for component_index, component_sites in enumerate(components):
+            progress.update()
+            anchors = select_component_anchors(component_sites, inputs, base_scores, args)
+            distance_map = compute_component_core_distance(
+                component_sites,
+                anchors,
+                inputs["site_neighbors"],
+            )
+            component_summaries.append(
+                {
+                    "component_id": component_index,
+                    "site_count": len(component_sites),
+                    "anchor_sites": anchors,
+                }
+            )
 
-        for site_id in component_sites:
-            core_distance = distance_map.get(site_id)
-            level_score = base_scores[site_id]
-            if core_distance is not None:
-                level_score -= args.core_distance_penalty * core_distance
-            site_metrics[site_id] = {
-                "component_id": component_index,
-                "domain_counts": dict(inputs["site_domain_counts"].get(site_id, {})),
-                "neighbor_count": len(inputs["site_neighbors"].get(site_id, ())),
-                "external_edge_count": int(
-                    inputs["site_external_edge_count"].get(site_id, 0)
-                ),
-                "data_edge_count": int(inputs["site_data_edge_count"].get(site_id, 0)),
-                "transmission_edge_count": int(
-                    inputs["site_transmission_edge_count"].get(site_id, 0)
-                ),
-                "base_core_score": round(base_scores[site_id], 6),
-                "core_distance": core_distance,
-                "level_score": round(level_score, 6),
-            }
+            for site_id in component_sites:
+                core_distance = distance_map.get(site_id)
+                level_score = base_scores[site_id]
+                if core_distance is not None:
+                    level_score -= args.core_distance_penalty * core_distance
+                site_metrics[site_id] = {
+                    "component_id": component_index,
+                    "domain_counts": dict(inputs["site_domain_counts"].get(site_id, {})),
+                    "neighbor_count": len(inputs["site_neighbors"].get(site_id, ())),
+                    "external_edge_count": int(
+                        inputs["site_external_edge_count"].get(site_id, 0)
+                    ),
+                    "data_edge_count": int(inputs["site_data_edge_count"].get(site_id, 0)),
+                    "transmission_edge_count": int(
+                        inputs["site_transmission_edge_count"].get(site_id, 0)
+                    ),
+                    "base_core_score": round(base_scores[site_id], 6),
+                    "core_distance": core_distance,
+                    "level_score": round(level_score, 6),
+                }
 
     return site_metrics, component_summaries
 
@@ -563,33 +584,35 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
     }
 
 
-def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args):
+def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_progress=False):
     pair_orders = {}
     downstream_map = defaultdict(set)
     directed_pair_count = 0
     bidirectional_pair_count = 0
 
-    for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
-        pair_result = evaluate_pair_direction(
-            left_site,
-            right_site,
-            site_metrics,
-            inputs,
-            pair_graph_metrics,
-            args,
-        )
-        pair_orders[f"{left_site}||{right_site}"] = pair_result
-
-        relation = pair_result["relation"]
-        if relation == "<->":
-            bidirectional_pair_count += 1
-            downstream_map[left_site].add(right_site)
-            downstream_map[right_site].add(left_site)
-        else:
-            directed_pair_count += 1
-            downstream_map[pair_result["preferred_source"]].add(
-                pair_result["preferred_target"]
+    with ProgressReporter(len(inputs["pair_edge_count"]), "pairwise: 判断站点对方向", show_progress) as progress:
+        for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
+            progress.update()
+            pair_result = evaluate_pair_direction(
+                left_site,
+                right_site,
+                site_metrics,
+                inputs,
+                pair_graph_metrics,
+                args,
             )
+            pair_orders[f"{left_site}||{right_site}"] = pair_result
+
+            relation = pair_result["relation"]
+            if relation == "<->":
+                bidirectional_pair_count += 1
+                downstream_map[left_site].add(right_site)
+                downstream_map[right_site].add(left_site)
+            else:
+                directed_pair_count += 1
+                downstream_map[pair_result["preferred_source"]].add(
+                    pair_result["preferred_target"]
+                )
 
     return {
         "pair_orders": pair_orders,
@@ -685,6 +708,7 @@ def parse_args():
     parser.add_argument("--max-base-score-delta", type=float, default=6.0)
     parser.add_argument("--max-neighbor-delta", type=int, default=4)
     parser.add_argument("--max-pair-domain-delta", type=int, default=4)
+    parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
 
     args = parser.parse_args()
 
@@ -713,12 +737,13 @@ def main():
     print(f"加载 ne_graph: {args.ne_graph}")
     with open(ne_graph_path, "r", encoding="utf-8") as f:
         ne_graph = json.load(f)
+    show_progress = not args.no_progress
 
     print("构建站点级输入特征...")
-    inputs = build_site_pair_inputs(ne_graph)
+    inputs = build_site_pair_inputs(ne_graph, show_progress=show_progress)
     print(f"站点数: {len(inputs['all_sites'])}")
     print(f"相邻站点对数: {len(inputs['pair_edge_count'])}")
-    pair_graph_metrics = build_pairwise_graph_metrics(inputs)
+    pair_graph_metrics = build_pairwise_graph_metrics(inputs, show_progress=show_progress)
     bridge_pair_count = sum(
         1
         for graph_metrics in pair_graph_metrics.values()
@@ -728,11 +753,21 @@ def main():
     print(f"存在替代路径的站点对数: {len(pair_graph_metrics) - bridge_pair_count}")
 
     print("计算站点层级与汇聚 anchor...")
-    site_metrics, component_summaries = build_pairwise_site_metrics(inputs, args)
+    site_metrics, component_summaries = build_pairwise_site_metrics(
+        inputs,
+        args,
+        show_progress=show_progress,
+    )
     print(f"连通分量数: {len(component_summaries)}")
 
     print("生成相邻站点对方向判断...")
-    pair_outputs = build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args)
+    pair_outputs = build_pairwise_orders(
+        inputs,
+        site_metrics,
+        pair_graph_metrics,
+        args,
+        show_progress=show_progress,
+    )
     print(f"单向站点对数: {pair_outputs['directed_pair_count']}")
     print(f"双向站点对数: {pair_outputs['bidirectional_pair_count']}")
 
