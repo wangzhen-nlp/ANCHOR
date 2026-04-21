@@ -121,10 +121,45 @@ def find_non_bridge_component(adjacency, bridge_edges, site_a, site_b):
             "sites": sorted(component_set),
             "site_count": len(component_set),
             "external_start_candidates": external_start_candidates,
+            "entry_exit_sites": external_start_candidates,
             "start_site": start_site,
         }
 
     return None
+
+
+def build_entry_exit_edges(component_sites, site_edges, bridge_edges, include_ne_pairs=False):
+    """输出环块通过桥边连到外部的出入口边。"""
+    component_set = set(component_sites)
+    output = []
+
+    for key in sorted(bridge_edges):
+        site_a, site_b = key
+        site_a_in = site_a in component_set
+        site_b_in = site_b in component_set
+        if site_a_in == site_b_in:
+            continue
+
+        ring_site = site_a if site_a_in else site_b
+        outside_site = site_b if site_a_in else site_a
+        edge = site_edges.get(key, {
+            "link_count": 0,
+            "link_types": set(),
+            "ne_pairs": [],
+        })
+        rec = {
+            "ring_site": ring_site,
+            "outside_site": outside_site,
+            "site_a": site_a,
+            "site_b": site_b,
+            "link_count": edge["link_count"],
+            "link_types": sorted(edge["link_types"]),
+        }
+        if include_ne_pairs:
+            rec["ne_pairs"] = edge["ne_pairs"]
+        output.append(rec)
+
+    return output
 
 
 def component_edges(component_sites, site_edges, include_ne_pairs=False):
@@ -304,6 +339,12 @@ def build_result(ne_graph_path, site_a, site_b, args):
         result["reason"] = "两个站点不在同一个非桥边环块中，未找到同时包含二者的环链"
         return result
 
+    ring_component["entry_exit_edges"] = build_entry_exit_edges(
+        ring_component["sites"],
+        site_edges,
+        bridge_edges,
+        include_ne_pairs=args.include_ne_pairs,
+    )
     ring_component["edges"] = component_edges(
         ring_component["sites"],
         site_edges,
@@ -376,10 +417,17 @@ def print_summary(result):
     if component:
         print(f"环块站点数: {component['site_count']}")
         print(f"环块边数: {len(component['edges'])}")
+        print(f"环块出入口数: {len(component.get('entry_exit_edges', []))}")
         if component.get("start_site"):
             print(f"唯一起始点: {component['start_site']}")
         elif component.get("external_start_candidates"):
             print(f"外部接入候选: {', '.join(component['external_start_candidates'])}")
+        for edge in component.get("entry_exit_edges", []):
+            print(
+                "  出入口: "
+                f"{edge['ring_site']} <-> {edge['outside_site']} "
+                f"links={edge['link_count']} types={','.join(edge['link_types'])}"
+            )
 
     for cycle in result.get("cycles", []):
         print(
