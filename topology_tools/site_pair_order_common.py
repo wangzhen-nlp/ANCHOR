@@ -309,6 +309,147 @@ def find_bridges(adjacency):
     return bridges
 
 
+def build_strict_ring_context(edge_keys, bridge_pairs):
+    """
+    构造严格环约束上下文。
+
+    环块定义为移除桥边后的连通块；如果该块恰好只有一个站点通过桥边连到外部，
+    则认为它是该环块的唯一起始点。严格模式下，环块内部除起始点相关边外全部双向。
+    """
+    normalized_bridge_pairs = {
+        tuple(sorted(pair))
+        for pair in bridge_pairs
+    }
+    non_bridge_neighbors = defaultdict(set)
+    bridge_neighbors = defaultdict(set)
+
+    for left_site, right_site in edge_keys:
+        pair_key = tuple(sorted((left_site, right_site)))
+        if pair_key in normalized_bridge_pairs:
+            bridge_neighbors[left_site].add(right_site)
+            bridge_neighbors[right_site].add(left_site)
+        else:
+            non_bridge_neighbors[left_site].add(right_site)
+            non_bridge_neighbors[right_site].add(left_site)
+
+    visited = set()
+    pair_context = {}
+    component_summaries = []
+
+    for start_site in sorted(non_bridge_neighbors):
+        if start_site in visited:
+            continue
+
+        queue = deque([start_site])
+        visited.add(start_site)
+        component_sites = []
+
+        while queue:
+            site_id = queue.popleft()
+            component_sites.append(site_id)
+            for neighbor_site in sorted(non_bridge_neighbors.get(site_id, ())):
+                if neighbor_site in visited:
+                    continue
+                visited.add(neighbor_site)
+                queue.append(neighbor_site)
+
+        component_set = set(component_sites)
+        internal_pairs = []
+        external_start_candidates = set()
+
+        for site_id in component_set:
+            for neighbor_site in bridge_neighbors.get(site_id, ()):
+                if neighbor_site not in component_set:
+                    external_start_candidates.add(site_id)
+
+            for neighbor_site in non_bridge_neighbors.get(site_id, ()):
+                if neighbor_site not in component_set:
+                    continue
+                internal_pairs.append(tuple(sorted((site_id, neighbor_site))))
+
+        internal_pairs = sorted(set(internal_pairs))
+        if not internal_pairs:
+            continue
+
+        component_id = len(component_summaries)
+        start_site = (
+            next(iter(external_start_candidates))
+            if len(external_start_candidates) == 1
+            else None
+        )
+
+        component_summaries.append({
+            "component_id": component_id,
+            "sites": sorted(component_set),
+            "site_count": len(component_set),
+            "internal_pair_count": len(internal_pairs),
+            "external_start_candidates": sorted(external_start_candidates),
+            "start_site": start_site,
+        })
+
+        for pair_key in internal_pairs:
+            force_bidirectional = start_site is None or start_site not in pair_key
+            pair_context[pair_key] = {
+                "component_id": component_id,
+                "start_site": start_site,
+                "force_bidirectional": force_bidirectional,
+            }
+
+    return {
+        "pair_context": pair_context,
+        "components": component_summaries,
+    }
+
+
+def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
+    """按严格环约束覆盖 pairwise 输出。"""
+    if not ring_pair_context or not ring_pair_context.get("force_bidirectional"):
+        return pair_result, False
+
+    updated = dict(pair_result)
+    updated["original_relation"] = pair_result.get("relation")
+    updated["original_preferred_source"] = pair_result.get("preferred_source")
+    updated["original_preferred_target"] = pair_result.get("preferred_target")
+    updated["relation"] = "<->"
+    updated["preferred_source"] = None
+    updated["preferred_target"] = None
+    updated["strict_ring_bidirectional"] = True
+    updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
+    updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+    updated["uncertainty_adjustments"] = list(
+        updated.get("uncertainty_adjustments", [])
+    ) + [{
+        "feature": "strict_ring_bidirectional",
+        "amount": 0.0,
+        "detail": "严格环模式：环块内部非起始点相关连接强制保留双向",
+    }]
+    return updated, pair_result.get("relation") != "<->"
+
+
+def apply_strict_ring_edge_override(edge_result, ring_pair_context):
+    """按严格环约束覆盖 global/path 输出。"""
+    if not ring_pair_context or not ring_pair_context.get("force_bidirectional"):
+        return edge_result, False
+
+    updated = dict(edge_result)
+    updated["original_prediction"] = edge_result.get("prediction")
+    updated["original_upstream_site"] = edge_result.get("upstream_site")
+    updated["original_downstream_site"] = edge_result.get("downstream_site")
+    updated["original_confidence"] = edge_result.get("confidence")
+    updated["prediction"] = "bidirectional"
+    updated["upstream_site"] = None
+    updated["downstream_site"] = None
+    if isinstance(updated.get("confidence"), (int, float)):
+        updated["confidence"] = round(min(float(updated["confidence"]), 0.55), 6)
+    updated["strict_ring_bidirectional"] = True
+    updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
+    updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
+    updated["reasons"] = list(updated.get("reasons", [])) + [
+        "strict_ring_bidirectional: 环块内部非起始点相关连接强制保留双向"
+    ]
+    return updated, edge_result.get("prediction") != "bidirectional"
+
+
 def score_to_level(score):
     if score <= -0.75:
         return "access"

@@ -26,7 +26,9 @@ from topology_tools.site_pair_order_common import (
     ProgressReporter,
     ROLE_SCORE,
     _get_site_id,
+    apply_strict_ring_edge_override,
     build_downstream_map,
+    build_strict_ring_context,
     build_site_role_counts,
     classify_device_role,
     compute_distance_scores,
@@ -350,6 +352,7 @@ def predict_site_directions_global(
     base_margin=0.35,
     ring_margin=0.75,
     same_role_margin=0.60,
+    strict_ring_bidirectional=False,
     show_progress=False,
 ):
     """
@@ -392,7 +395,15 @@ def predict_site_directions_global(
     site_stats, site_edges, adjacency = build_site_topology(ne_graph, show_progress=show_progress)
 
     if not site_stats:
-        return {"sites": {}, "edges": []}
+        return {
+            "sites": {},
+            "edges": [],
+            "strict_ring_components": [],
+            "strict_ring_stats": {
+                "forced_edge_count": 0,
+                "changed_edge_count": 0,
+            },
+        }
 
     compute_site_priors(site_stats, show_progress=show_progress)
     core_anchors, access_anchors = select_anchor_sites(site_stats)
@@ -414,6 +425,14 @@ def predict_site_directions_global(
     if show_progress:
         print("global: 识别桥边...")
     bridges = find_bridges(adjacency)
+    strict_ring_context = {"pair_context": {}, "components": []}
+    strict_ring_forced_edge_count = 0
+    strict_ring_changed_edge_count = 0
+    if strict_ring_bidirectional:
+        strict_ring_context = build_strict_ring_context(site_edges.keys(), bridges)
+        strict_ring_pair_context = strict_ring_context["pair_context"]
+    else:
+        strict_ring_pair_context = {}
 
     # 写回站点信息
     site_output = {}
@@ -496,7 +515,7 @@ def predict_site_directions_global(
                 confidence = min(0.99, abs(diff) / (margin + 1.5))
                 reasons.append(f"score_gap={diff:.3f} >= margin={margin:.3f}")
 
-            edge_output.append({
+            edge_result = {
                 "site_a": a,
                 "site_b": b,
                 "prediction": prediction,
@@ -512,11 +531,26 @@ def predict_site_directions_global(
                 "score_b": round(sb, 6),
                 "level_a": level_a,
                 "level_b": level_b,
-            })
+            }
+            ring_pair_context = strict_ring_pair_context.get(key)
+            edge_result, strict_ring_changed = apply_strict_ring_edge_override(
+                edge_result,
+                ring_pair_context,
+            )
+            if ring_pair_context and ring_pair_context.get("force_bidirectional"):
+                strict_ring_forced_edge_count += 1
+                if strict_ring_changed:
+                    strict_ring_changed_edge_count += 1
+            edge_output.append(edge_result)
 
     return {
         "sites": site_output,
         "edges": edge_output,
+        "strict_ring_components": strict_ring_context["components"],
+        "strict_ring_stats": {
+            "forced_edge_count": strict_ring_forced_edge_count,
+            "changed_edge_count": strict_ring_changed_edge_count,
+        },
     }
 
 def parse_args():
@@ -552,6 +586,11 @@ def parse_args():
         default=0.60,
         help="同主导角色站点对的更高判定门槛",
     )
+    parser.add_argument(
+        "--strict-ring-bidirectional",
+        action="store_true",
+        help="严格环模式：环块内部除唯一起始点相关连接外，其余边强制输出双向",
+    )
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     args = parser.parse_args()
 
@@ -580,6 +619,7 @@ def main():
         base_margin=args.base_margin,
         ring_margin=args.ring_margin,
         same_role_margin=args.same_role_margin,
+        strict_ring_bidirectional=args.strict_ring_bidirectional,
         show_progress=not args.no_progress,
     )
     primary_upstream_map = extract_primary_upstream_map(prediction_result)
@@ -602,6 +642,11 @@ def main():
     print(f"单向边数: {directed_edge_count}")
     print(f"双向边数: {bidirectional_edge_count}")
     print(f"桥边数: {bridge_edge_count}")
+    if args.strict_ring_bidirectional:
+        strict_ring_stats = prediction_result["strict_ring_stats"]
+        print(f"严格环组件数: {len(prediction_result['strict_ring_components'])}")
+        print(f"严格环强制双向边数: {strict_ring_stats['forced_edge_count']}")
+        print(f"严格环实际改写边数: {strict_ring_stats['changed_edge_count']}")
 
     output_data = {
         "meta": {
@@ -615,9 +660,14 @@ def main():
             "base_margin": args.base_margin,
             "ring_margin": args.ring_margin,
             "same_role_margin": args.same_role_margin,
+            "strict_ring_bidirectional": args.strict_ring_bidirectional,
+            "strict_ring_component_count": len(prediction_result["strict_ring_components"]),
+            "strict_ring_forced_edge_count": prediction_result["strict_ring_stats"]["forced_edge_count"],
+            "strict_ring_changed_edge_count": prediction_result["strict_ring_stats"]["changed_edge_count"],
         },
         "sites": prediction_result["sites"],
         "edges": prediction_result["edges"],
+        "strict_ring_components": prediction_result["strict_ring_components"],
         "primary_upstream_map": primary_upstream_map,
         "downstream_map": downstream_map,
     }
