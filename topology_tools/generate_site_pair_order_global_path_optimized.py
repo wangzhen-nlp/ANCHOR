@@ -30,6 +30,7 @@ from topology_tools.site_pair_order_common import (
     build_site_topology_enhanced,
     build_strict_ring_context,
     collect_path_votes,
+    compact_prediction_edges,
     compute_distance_scores,
     compute_site_priors_enhanced,
     counter_to_json_dict,
@@ -471,6 +472,7 @@ def parse_args():
         action="store_true",
         help="严格环模式：环块内部除出入口站点相关连接外，其余边强制输出双向",
     )
+    parser.add_argument("--full-output", action="store_true", help="输出完整调试信息")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
     args = parser.parse_args()
 
@@ -535,40 +537,50 @@ def main():
         print(f"严格环强制双向边数: {strict_ring_stats['forced_edge_count']}")
         print(f"严格环实际改写边数: {strict_ring_stats['changed_edge_count']}")
 
+    meta = {
+        "algorithm": "global_path_optimized",
+        "ne_graph": args.ne_graph,
+        "site_count": len(prediction_result["sites"]),
+        "edge_count": len(prediction_result["edges"]),
+        "directed_edge_count": directed_edge_count,
+        "bidirectional_edge_count": bidirectional_edge_count,
+        "bridge_edge_count": bridge_edge_count,
+        "candidate_path_count": len(prediction_result["candidate_paths"]),
+        "strict_ring_bidirectional": args.strict_ring_bidirectional,
+        "strict_ring_component_count": len(prediction_result["strict_ring_components"]),
+        "strict_ring_forced_edge_count": prediction_result["strict_ring_stats"]["forced_edge_count"],
+        "strict_ring_changed_edge_count": prediction_result["strict_ring_stats"]["changed_edge_count"],
+    }
     output_data = {
-        "meta": {
-            "algorithm": "global_path_optimized",
-            "ne_graph": args.ne_graph,
-            "site_count": len(prediction_result["sites"]),
-            "edge_count": len(prediction_result["edges"]),
-            "directed_edge_count": directed_edge_count,
-            "bidirectional_edge_count": bidirectional_edge_count,
-            "bridge_edge_count": bridge_edge_count,
-            "candidate_path_count": len(prediction_result["candidate_paths"]),
-            "score_margin": args.score_margin,
-            "cycle_vote_gap_margin": args.cycle_vote_gap_margin,
-            "same_level_vote_gap_margin": args.same_level_vote_gap_margin,
-            "lr": args.lr,
-            "max_iter": args.max_iter,
-            "path_margin": args.path_margin,
-            "edge_margin": args.edge_margin,
-            "lambda_prior": args.lambda_prior,
-            "lambda_smooth": args.lambda_smooth,
-            "lambda_path": args.lambda_path,
-            "lambda_edge": args.lambda_edge,
-            "strict_ring_bidirectional": args.strict_ring_bidirectional,
-            "strict_ring_component_count": len(prediction_result["strict_ring_components"]),
-            "strict_ring_forced_edge_count": prediction_result["strict_ring_stats"]["forced_edge_count"],
-            "strict_ring_changed_edge_count": prediction_result["strict_ring_stats"]["changed_edge_count"],
-        },
-        "sites": prediction_result["sites"],
-        "edges": prediction_result["edges"],
-        "candidate_paths": prediction_result["candidate_paths"],
-        "optimization": prediction_result["optimization"],
-        "strict_ring_components": prediction_result["strict_ring_components"],
-        "primary_upstream_map": primary_upstream_map,
+        "meta": meta,
+        "edges": compact_prediction_edges(prediction_result),
         "downstream_map": downstream_map,
     }
+
+    if args.full_output:
+        output_data = {
+            "meta": {
+                **meta,
+                "score_margin": args.score_margin,
+                "cycle_vote_gap_margin": args.cycle_vote_gap_margin,
+                "same_level_vote_gap_margin": args.same_level_vote_gap_margin,
+                "lr": args.lr,
+                "max_iter": args.max_iter,
+                "path_margin": args.path_margin,
+                "edge_margin": args.edge_margin,
+                "lambda_prior": args.lambda_prior,
+                "lambda_smooth": args.lambda_smooth,
+                "lambda_path": args.lambda_path,
+                "lambda_edge": args.lambda_edge,
+            },
+            "sites": prediction_result["sites"],
+            "edges": prediction_result["edges"],
+            "candidate_paths": prediction_result["candidate_paths"],
+            "optimization": prediction_result["optimization"],
+            "strict_ring_components": prediction_result["strict_ring_components"],
+            "primary_upstream_map": primary_upstream_map,
+            "downstream_map": downstream_map,
+        }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=2)

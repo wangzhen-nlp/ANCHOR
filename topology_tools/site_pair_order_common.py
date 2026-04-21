@@ -566,6 +566,24 @@ def build_downstream_map(prediction_result):
     }
 
 
+def compact_edge_prediction(edge):
+    """只保留相邻站点对的上下行预测结果。"""
+    return {
+        "site_a": edge.get("site_a"),
+        "site_b": edge.get("site_b"),
+        "prediction": edge.get("prediction"),
+        "upstream_site": edge.get("upstream_site"),
+        "downstream_site": edge.get("downstream_site"),
+    }
+
+
+def compact_prediction_edges(prediction_result):
+    return [
+        compact_edge_prediction(edge)
+        for edge in prediction_result.get("edges", [])
+    ]
+
+
 def build_site_topology_enhanced(ne_graph, show_progress=False):
     """
     从 ne_graph 构建站点级无向图，并保留跨站边上的 NE 角色证据。

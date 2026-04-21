@@ -34,6 +34,30 @@ from topology_tools.site_pair_order_common import (
 )
 
 
+def compact_pairwise_prediction(pair_result):
+    """把 pairwise 内部方向结果转换成统一的上下行预测格式。"""
+    if pair_result.get("relation") == "<->":
+        prediction = "bidirectional"
+        upstream_site = None
+        downstream_site = None
+    else:
+        upstream_site = pair_result.get("preferred_source")
+        downstream_site = pair_result.get("preferred_target")
+        prediction = (
+            f"{downstream_site}->{upstream_site}"
+            if downstream_site and upstream_site
+            else None
+        )
+
+    return {
+        "site_a": pair_result.get("site_a"),
+        "site_b": pair_result.get("site_b"),
+        "prediction": prediction,
+        "upstream_site": upstream_site,
+        "downstream_site": downstream_site,
+    }
+
+
 def build_site_pair_inputs(ne_graph, show_progress=False):
     site_domain_counts = defaultdict(Counter)
     site_neighbors = defaultdict(set)
@@ -761,6 +785,7 @@ def parse_args():
         action="store_true",
         help="严格环模式：环块内部除出入口站点相关连接外，其余站点对强制输出双向",
     )
+    parser.add_argument("--full-output", action="store_true", help="输出完整调试信息")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
 
     args = parser.parse_args()
@@ -828,32 +853,47 @@ def main():
         print(f"严格环强制双向站点对数: {pair_outputs['strict_ring_forced_pair_count']}")
         print(f"严格环实际改写站点对数: {pair_outputs['strict_ring_changed_pair_count']}")
 
+    meta = {
+        "algorithm": "pairwise_evidence",
+        "ne_graph": args.ne_graph,
+        "site_count": len(inputs["all_sites"]),
+        "adjacent_pair_count": len(inputs["pair_edge_count"]),
+        "component_count": len(component_summaries),
+        "directed_pair_count": pair_outputs["directed_pair_count"],
+        "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
+        "bridge_pair_count": bridge_pair_count,
+        "non_bridge_pair_count": len(pair_graph_metrics) - bridge_pair_count,
+        "strict_ring_bidirectional": args.strict_ring_bidirectional,
+        "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
+        "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],
+        "strict_ring_changed_pair_count": pair_outputs["strict_ring_changed_pair_count"],
+    }
+
+    compact_edges = [
+        compact_pairwise_prediction(pair_result)
+        for pair_result in pair_outputs["pair_orders"].values()
+    ]
     output_data = {
-        "meta": {
-            "algorithm": "pairwise_evidence",
-            "ne_graph": args.ne_graph,
-            "site_count": len(inputs["all_sites"]),
-            "adjacent_pair_count": len(inputs["pair_edge_count"]),
-            "component_count": len(component_summaries),
-            "directed_pair_count": pair_outputs["directed_pair_count"],
-            "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
-            "bridge_pair_count": bridge_pair_count,
-            "non_bridge_pair_count": len(pair_graph_metrics) - bridge_pair_count,
-            "direction_margin": args.direction_margin,
-            "core_distance_penalty": args.core_distance_penalty,
-            "non_bridge_margin_bonus": args.non_bridge_margin_bonus,
-            "shared_neighbor_margin_bonus": args.shared_neighbor_margin_bonus,
-            "strict_ring_bidirectional": args.strict_ring_bidirectional,
-            "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
-            "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],
-            "strict_ring_changed_pair_count": pair_outputs["strict_ring_changed_pair_count"],
-        },
-        "components": component_summaries,
-        "strict_ring_components": pair_outputs["strict_ring_components"],
-        "site_metrics": site_metrics,
-        "pair_orders": pair_outputs["pair_orders"],
+        "meta": meta,
+        "edges": compact_edges,
         "downstream_map": pair_outputs["downstream_map"],
     }
+
+    if args.full_output:
+        output_data = {
+            "meta": {
+                **meta,
+                "direction_margin": args.direction_margin,
+                "core_distance_penalty": args.core_distance_penalty,
+                "non_bridge_margin_bonus": args.non_bridge_margin_bonus,
+                "shared_neighbor_margin_bonus": args.shared_neighbor_margin_bonus,
+            },
+            "components": component_summaries,
+            "strict_ring_components": pair_outputs["strict_ring_components"],
+            "site_metrics": site_metrics,
+            "pair_orders": pair_outputs["pair_orders"],
+            "downstream_map": pair_outputs["downstream_map"],
+        }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=2)
