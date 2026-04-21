@@ -5,10 +5,11 @@ from collections.abc import Iterable
 class NodeRuleHelper:
     """封装节点结构匹配、告警窗口校验和失败诊断逻辑。"""
 
-    def __init__(self, sites_domain_map, critical_alarms, event_getter):
+    def __init__(self, sites_domain_map, critical_alarms, event_getter, alarm_source_domain_map=None):
         self.sites_domain_map = sites_domain_map
         self.critical_alarms = critical_alarms
         self.event_getter = event_getter
+        self.alarm_source_domain_map = alarm_source_domain_map or {}
 
     @staticmethod
     def normalize_edge_window(edge_window):
@@ -25,7 +26,14 @@ class NodeRuleHelper:
         """获取某个节点在指定时间窗口内的缓存事件。"""
         before_sec, after_sec = self.normalize_edge_window(edge_window)
         return [
-            {"node": physical_node, "ts": ts, "eid": eid, "alarm": alarm, "alarm_source": alarm_source}
+            {
+                "node": physical_node,
+                "ts": ts,
+                "eid": eid,
+                "alarm": alarm,
+                "alarm_source": alarm_source,
+                "alarm_source_domain": self.alarm_source_domain_map.get(alarm_source, ""),
+            }
             for ts, eid, alarm, alarm_source, consumed_trigger_rules in self.event_getter(physical_node)
             if (reference_ts - before_sec) <= ts <= (reference_ts + after_sec)
             and not (
@@ -71,9 +79,36 @@ class NodeRuleHelper:
             return domain in physical_node_domain
 
         if isinstance(physical_node_domain, str):
-            return domain == physical_node_domain
+            return str(domain).strip().lower() == str(physical_node_domain).strip().lower()
 
         return False
+
+    @staticmethod
+    def _normalize_domain_filter(domain_filter):
+        if domain_filter is None:
+            return None
+        if isinstance(domain_filter, str):
+            return [domain_filter]
+        if isinstance(domain_filter, Iterable):
+            return list(domain_filter)
+        return None
+
+    @staticmethod
+    def matches_alarm_source_domains(event, domain_filter):
+        """判断事件告警源所属设备域是否满足指定域过滤。未配置时不限制。"""
+        domains = NodeRuleHelper._normalize_domain_filter(domain_filter)
+        if domains is None:
+            return domain_filter is None
+        alarm_source_domain = event.get("alarm_source_domain", "")
+        return any(NodeRuleHelper.has_domain(alarm_source_domain, domain) for domain in domains)
+
+    @staticmethod
+    def filter_events_by_alarm_and_source(events, alarms, source_domains=None):
+        return [
+            event for event in events
+            if event["alarm"] in alarms
+            and NodeRuleHelper.matches_alarm_source_domains(event, source_domains)
+        ]
 
     @staticmethod
     def match_site_rule(physical_node_domain, site_rule):
@@ -140,15 +175,21 @@ class NodeRuleHelper:
         if isinstance(expected, dict):
             required_alarms = expected.get("required_alarms")
             forbidden_alarms = expected.get("forbidden_alarms")
+            required_source_domains = expected.get("required_alarm_source_domains")
+            forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
             parts = []
             if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
                 parts.append(
                     f"required={sorted(str(alarm) for alarm in required_alarms)}"
                 )
+                if required_source_domains is not None:
+                    parts.append(f"required_source_domains={required_source_domains}")
             if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                 parts.append(
                     f"forbidden={sorted(str(alarm) for alarm in forbidden_alarms)}"
                 )
+                if forbidden_source_domains is not None:
+                    parts.append(f"forbidden_source_domains={forbidden_source_domains}")
             if parts:
                 return ", ".join(parts)
             return str(expected)
@@ -199,9 +240,15 @@ class NodeRuleHelper:
             if isinstance(expected, dict):
                 required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
+                required_source_domains = expected.get("required_alarm_source_domains")
+                forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
                 required_events = []
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
-                    forbidden_events = [e for e in events_in_win if e["alarm"] in forbidden_alarms]
+                    forbidden_events = self.filter_events_by_alarm_and_source(
+                        events_in_win,
+                        forbidden_alarms,
+                        forbidden_source_domains,
+                    )
                     if forbidden_events:
                         return {
                             "valid": False,
@@ -217,8 +264,22 @@ class NodeRuleHelper:
                     }
 
                 if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
-                    required_events = [e for e in events_in_win if e["alarm"] in required_alarms]
+                    required_events = self.filter_events_by_alarm_and_source(
+                        events_in_win,
+                        required_alarms,
+                        required_source_domains,
+                    )
                     if not required_events:
+                        same_alarm_events = [e for e in events_in_win if e["alarm"] in required_alarms]
+                        if same_alarm_events and required_source_domains is not None:
+                            return {
+                                "valid": False,
+                                "reason": (
+                                    f"窗口 {window_text} 内命中 required alarm 标题，但告警源设备域不满足 "
+                                    f"{required_source_domains}: "
+                                    f"{self.format_events_for_reason(same_alarm_events)}"
+                                ),
+                            }
                         if event_timeline:
                             return {
                                 "valid": False,
@@ -345,15 +406,25 @@ class NodeRuleHelper:
             if isinstance(expected, dict):
                 required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
+                required_source_domains = expected.get("required_alarm_source_domains")
+                forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
-                    has_forbidden = any(e["alarm"] in forbidden_alarms for e in events_in_win)
+                    has_forbidden = any(
+                        self.matches_alarm_source_domains(e, forbidden_source_domains)
+                        for e in events_in_win
+                        if e["alarm"] in forbidden_alarms
+                    )
                     if has_forbidden:
                         return False, []
                 elif forbidden_alarms is not None:
                     return False, []
 
                 if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
-                    valid = [e for e in events_in_win if e["alarm"] in required_alarms]
+                    valid = self.filter_events_by_alarm_and_source(
+                        events_in_win,
+                        required_alarms,
+                        required_source_domains,
+                    )
                     return len(valid) > 0, valid
                 if required_alarms is not None:
                     return False, []

@@ -1312,6 +1312,11 @@ def main():
         for ne_id, ne_info in ne_graph_data.items()
         if str(ne_info.get("site_id", "")).strip()
     }
+    alarm_source_domain_map = {
+        ne_id: str(ne_info.get("domain", "")).strip()
+        for ne_id, ne_info in ne_graph_data.items()
+        if str(ne_info.get("domain", "")).strip()
+    }
     print(f"NE 数量: {len(ne_to_site)}")
 
     valid_alarm_titles = CRITICAL_ALARMS
@@ -1387,6 +1392,7 @@ def main():
         topo_downstream_map,
         rules_config,
         site_domain_map,
+        alarm_source_domain_map=alarm_source_domain_map,
         aggregation_wait_sec=args.aggregation_wait_sec,
         site_merge_helper=batch_site_merge_helper,
     )

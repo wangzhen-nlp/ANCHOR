@@ -173,6 +173,7 @@ class TemporalGraphEngine:
         topo_downstream_map,
         rules_config,
         site_domain_map,
+        alarm_source_domain_map=None,
         aggregation_wait_sec=420,
         site_merge_helper=None,
     ):
@@ -196,6 +197,7 @@ class TemporalGraphEngine:
 
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
+        self.alarm_source_domain_map = alarm_source_domain_map or {}
 
         # 全局拓扑穿透缓存
         self.global_topo_cache = collections.OrderedDict()
@@ -233,7 +235,8 @@ class TemporalGraphEngine:
         self.node_rule_helper = NodeRuleHelper(
             self.sites_domain_map,
             CRITICAL_ALARMS,
-            lambda node: self.event_cache.get(node, [])
+            lambda node: self.event_cache.get(node, []),
+            self.alarm_source_domain_map,
         )
 
         # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
@@ -416,7 +419,8 @@ class TemporalGraphEngine:
         return NodeRuleHelper(
             self.sites_domain_map,
             CRITICAL_ALARMS,
-            get_events
+            get_events,
+            self.alarm_source_domain_map,
         )
 
     def _collect_mature_pending_locked(self, force=False):

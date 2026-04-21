@@ -55,6 +55,13 @@ def matches_expected_alarm(alarm_type, expected):
         return False
     if expected == "ANY":
         return True
+    if isinstance(expected, dict):
+        required_alarms = expected.get("required_alarms")
+        return (
+            isinstance(required_alarms, Iterable)
+            and not isinstance(required_alarms, str)
+            and alarm_type in required_alarms
+        )
     return isinstance(expected, Iterable) and alarm_type in expected
 
 

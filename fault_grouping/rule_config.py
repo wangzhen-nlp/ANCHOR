@@ -51,7 +51,8 @@ REQUIRED_OFFLINE_DATA_NODE = {
     {
       "include": ["Data"],
       "expected_alarms": {
-        "required_alarms": OFFLINE_ALARMS
+        "required_alarms": OFFLINE_ALARMS,
+        "required_alarm_source_domains": ["Data"]
       }
     }
   ]
@@ -217,9 +218,9 @@ data_rule = {
   "pattern_name": "cross_domain_storm_under_data",
   "description": "无断站 -> 断站",
   "max_stay_time_sec": 3600,
-  "trigger_role": "underneath_compound_node",
+  "trigger_role": "data_underneath_compound_node",
   "nodes": {
-    "parent_data_node": {
+    "data_parent_data_node": {
       "type": "primitive",
       "site_rules": [
         {
@@ -230,7 +231,7 @@ data_rule = {
         }
       ]
     },
-    "underneath_compound_node": {
+    "data_underneath_compound_node": {
       "type": "compound",
       "min_count": 1,
       "patterns": [
@@ -243,8 +244,8 @@ data_rule = {
   },
   "edges": [
     {
-      "source": "underneath_compound_node",
-      "target": "parent_data_node",
+      "source": "data_underneath_compound_node",
+      "target": "data_parent_data_node",
       "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1
@@ -256,11 +257,11 @@ data_link_neighbor_rule = {
   "pattern_name": "offline_under_data_with_neighbor_link_context",
   "description": "本路由/上下游相邻路由至少一侧有link(均无断站) -> 下挂断站",
   "max_stay_time_sec": 3600,
-  "trigger_role": "underneath_compound_node",
+  "trigger_role": "data_link_underneath_compound_node",
   "nodes": {
-    "parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
-    "adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
-    "underneath_compound_node": {
+    "data_link_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_underneath_compound_node": {
       "type": "compound",
       "min_count": 1,
       "patterns": [
@@ -273,16 +274,16 @@ data_link_neighbor_rule = {
   },
   "edges": [
     {
-      "source": "underneath_compound_node",
-      "target": "parent_data_node",
+      "source": "data_link_underneath_compound_node",
+      "target": "data_link_parent_data_node",
       "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1
     },
     {
-      "source": "parent_data_node",
-      "target": "adjacent_data_neighbor_node",
-      "direction": "either",
+      "source": "data_link_parent_data_node",
+      "target": "data_link_adjacent_data_neighbor_node",
+      "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1
     }
@@ -290,7 +291,7 @@ data_link_neighbor_rule = {
   "result_constraints": {
     "role_alarm_requirements_any": [
       {
-        "roles": ["parent_data_node", "adjacent_data_neighbor_node"],
+        "roles": ["data_link_parent_data_node", "data_link_adjacent_data_neighbor_node"],
         "alarms": LINK_ALARMS,
         "min_roles": 1
       }
@@ -300,14 +301,14 @@ data_link_neighbor_rule = {
 
 data_adjacent_router_rule = {
   "pattern_name": "offline_under_adjacent_data_router_context",
-  "description": "本路由和相邻路由均存在下挂断站，且相邻路由站点需有link告警（路由站点本身均无断站）",
+  "description": "本路由和相邻路由均存在下挂断站，且相邻路由站点自身需命中Data设备上的offline告警",
   "max_stay_time_sec": 3600,
   "trigger_role": "current_underneath_compound_node",
   "nodes": {
     "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
-    "adjacent_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
-    "adjacent_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE
+    "adjacent_router_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
+    "adjacent_router_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE
   },
   "edges": [
     {
@@ -319,14 +320,14 @@ data_adjacent_router_rule = {
     },
     {
       "source": "current_parent_data_node",
-      "target": "adjacent_data_neighbor_node",
-      "direction": "either",
+      "target": "adjacent_router_data_neighbor_node",
+      "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1
     },
     {
-      "source": "adjacent_underneath_compound_node",
-      "target": "adjacent_data_neighbor_node",
+      "source": "adjacent_router_underneath_compound_node",
+      "target": "adjacent_router_data_neighbor_node",
       "direction": "upstream",
       "time_window_sec": 900,
       "max_hops": 1
