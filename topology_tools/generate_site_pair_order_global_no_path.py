@@ -27,12 +27,14 @@ from topology_tools.site_pair_order_common import (
     ROLE_SCORE,
     _get_site_id,
     build_downstream_map,
+    build_site_role_counts,
     classify_device_role,
     compute_distance_scores,
     extract_primary_upstream_map,
     find_bridges,
-    iter_unique_cross_site_links,
+    normalize_domain,
     score_to_level,
+    should_include_cross_site_link,
 )
 
 
@@ -69,6 +71,7 @@ def build_site_topology(ne_graph, show_progress=False):
     adjacency = defaultdict(set)
     site_edges = {}
     seen_links = set()
+    site_role_counts = build_site_role_counts(ne_graph)
 
     # 2.1 聚合站点内设备
     with ProgressReporter(len(ne_graph), "global: 聚合站点设备", show_progress) as progress:
@@ -114,6 +117,17 @@ def build_site_topology(ne_graph, show_progress=False):
 
                 target_site = _get_site_id(target_info)
                 if not target_site or target_site == source_site:
+                    continue
+
+                source_domain = normalize_domain(source_info.get("domain", ""))
+                target_domain = normalize_domain(target_info.get("domain", ""))
+                if not should_include_cross_site_link(
+                    source_site,
+                    source_domain,
+                    target_site,
+                    target_domain,
+                    site_role_counts,
+                ):
                     continue
 
                 link_types = (

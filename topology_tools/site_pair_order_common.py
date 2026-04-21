@@ -73,52 +73,6 @@ def _get_site_id(ne_info):
     return str(ne_info.get("site_id", "")).strip().upper()
 
 
-def iter_unique_cross_site_links(ne_graph):
-    """按 NE 对 + link_type 去重，遍历跨站点链路。"""
-    seen = set()
-
-    for source_ne, source_info in ne_graph.items():
-        source_site = _get_site_id(source_info)
-        if not source_site:
-            continue
-
-        source_domain = normalize_domain(source_info.get("domain", ""))
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-
-        for target_ne, link_meta in raw_links.items():
-            target_info = ne_graph.get(target_ne)
-            if not isinstance(target_info, dict):
-                continue
-
-            target_site = _get_site_id(target_info)
-            if not target_site or target_site == source_site:
-                continue
-
-            target_domain = normalize_domain(target_info.get("domain", ""))
-            link_types = (
-                sorted(link_meta.keys())
-                if isinstance(link_meta, dict) and link_meta
-                else ["__unknown__"]
-            )
-
-            for link_type in link_types:
-                key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
-                if key in seen:
-                    continue
-                seen.add(key)
-                yield {
-                    "source_ne": source_ne,
-                    "target_ne": target_ne,
-                    "source_site": source_site,
-                    "target_site": target_site,
-                    "source_domain": source_domain,
-                    "target_domain": target_domain,
-                    "link_type": str(link_type),
-                }
-
-
 def classify_device_role(domain: str) -> str:
     """归一化设备类型: wireless / microwave / router / unknown。"""
     text = normalize_domain(domain or "")
@@ -150,6 +104,115 @@ def classify_device_role(domain: str) -> str:
     if any(keyword in text for keyword in router_keywords):
         return "router"
     return "unknown"
+
+
+def build_site_role_counts(ne_graph):
+    site_role_counts = defaultdict(Counter)
+    for ne_info in ne_graph.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _get_site_id(ne_info)
+        if not site_id:
+            continue
+        role = classify_device_role(ne_info.get("domain", ""))
+        site_role_counts[site_id][role] += 1
+    return site_role_counts
+
+
+def is_wireless_only_site(site_id, site_role_counts):
+    role_counts = site_role_counts.get(site_id, Counter())
+    total = sum(role_counts.values())
+    return total > 0 and role_counts.get("wireless", 0) == total
+
+
+def should_include_cross_site_link(source_site, source_domain, target_site, target_domain, site_role_counts):
+    """
+    判断跨站 NE 边是否可用于站点拓扑推断。
+
+    默认忽略不同 domain 的跨站连接，因为这类边大概率是逻辑边。
+    例外：如果某一端站点只有无线设备，则允许该端无线设备跨站连接到
+    对端无线或路由设备。
+    """
+    source_domain = normalize_domain(source_domain)
+    target_domain = normalize_domain(target_domain)
+    if source_domain == target_domain:
+        return True
+
+    source_role = classify_device_role(source_domain)
+    target_role = classify_device_role(target_domain)
+    allowed_peer_roles = {"wireless", "router"}
+
+    if (
+        is_wireless_only_site(source_site, site_role_counts)
+        and source_role == "wireless"
+        and target_role in allowed_peer_roles
+    ):
+        return True
+
+    if (
+        is_wireless_only_site(target_site, site_role_counts)
+        and target_role == "wireless"
+        and source_role in allowed_peer_roles
+    ):
+        return True
+
+    return False
+
+
+def iter_unique_cross_site_links(ne_graph):
+    """按 NE 对 + link_type 去重，遍历跨站点链路。"""
+    seen = set()
+    site_role_counts = build_site_role_counts(ne_graph)
+
+    for source_ne, source_info in ne_graph.items():
+        source_site = _get_site_id(source_info)
+        if not source_site:
+            continue
+
+        source_domain = normalize_domain(source_info.get("domain", ""))
+        raw_links = source_info.get("link", {})
+        if not isinstance(raw_links, dict):
+            continue
+
+        for target_ne, link_meta in raw_links.items():
+            target_info = ne_graph.get(target_ne)
+            if not isinstance(target_info, dict):
+                continue
+
+            target_site = _get_site_id(target_info)
+            if not target_site or target_site == source_site:
+                continue
+
+            target_domain = normalize_domain(target_info.get("domain", ""))
+            if not should_include_cross_site_link(
+                source_site,
+                source_domain,
+                target_site,
+                target_domain,
+                site_role_counts,
+            ):
+                continue
+
+            link_types = (
+                sorted(link_meta.keys())
+                if isinstance(link_meta, dict) and link_meta
+                else ["__unknown__"]
+            )
+
+            for link_type in link_types:
+                key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield {
+                    "source_ne": source_ne,
+                    "target_ne": target_ne,
+                    "source_site": source_site,
+                    "target_site": target_site,
+                    "source_domain": source_domain,
+                    "target_domain": target_domain,
+                    "link_type": str(link_type),
+                }
 
 
 def multi_source_bfs(adjacency, nodes, sources):
@@ -202,31 +265,46 @@ def compute_distance_scores(site_stats, adjacency, core_anchors, access_anchors)
 
 
 def find_bridges(adjacency):
-    time = 0
-    disc = {}
-    low = {}
+    """非递归 Tarjan 桥边识别，避免大拓扑上触发 Python 递归深度限制。"""
+    visit_time = 0
+    discovery = {}
+    low_link = {}
     parent = {}
     bridges = set()
 
-    def dfs(node):
-        nonlocal time
-        time += 1
-        disc[node] = low[node] = time
+    for start_node in adjacency:
+        if start_node in discovery:
+            continue
 
-        for neighbor in adjacency.get(node, ()):
-            if neighbor not in disc:
+        parent[start_node] = None
+        visit_time += 1
+        discovery[start_node] = low_link[start_node] = visit_time
+        stack = [(start_node, iter(adjacency.get(start_node, ())))]
+
+        while stack:
+            node, neighbors_iter = stack[-1]
+
+            try:
+                neighbor = next(neighbors_iter)
+            except StopIteration:
+                stack.pop()
+                parent_node = parent.get(node)
+                if parent_node is not None:
+                    low_link[parent_node] = min(low_link[parent_node], low_link[node])
+                    if low_link[node] > discovery[parent_node]:
+                        bridges.add(tuple(sorted((parent_node, node))))
+                continue
+
+            if neighbor == parent.get(node):
+                continue
+
+            if neighbor not in discovery:
                 parent[neighbor] = node
-                dfs(neighbor)
-                low[node] = min(low[node], low[neighbor])
-
-                if low[neighbor] > disc[node]:
-                    bridges.add(tuple(sorted((node, neighbor))))
-            elif parent.get(node) != neighbor:
-                low[node] = min(low[node], disc[neighbor])
-
-    for node in adjacency:
-        if node not in disc:
-            dfs(node)
+                visit_time += 1
+                discovery[neighbor] = low_link[neighbor] = visit_time
+                stack.append((neighbor, iter(adjacency.get(neighbor, ()))))
+            else:
+                low_link[node] = min(low_link[node], discovery[neighbor])
 
     return bridges
 
@@ -335,6 +413,7 @@ def build_site_topology_enhanced(ne_graph, show_progress=False):
             rec["role_counts"][role] += 1
 
     seen_links = set()
+    site_role_counts = build_site_role_counts(ne_graph)
     with ProgressReporter(len(ne_graph), "增强拓扑: 扫描跨站链路", show_progress) as progress:
         for source_ne, source_info in ne_graph.items():
             progress.update()
@@ -355,8 +434,19 @@ def build_site_topology_enhanced(ne_graph, show_progress=False):
                 if not target_site or target_site == source_site:
                     continue
 
-                role_source = classify_device_role(source_info.get("domain", ""))
-                role_target = classify_device_role(target_info.get("domain", ""))
+                source_domain = normalize_domain(source_info.get("domain", ""))
+                target_domain = normalize_domain(target_info.get("domain", ""))
+                if not should_include_cross_site_link(
+                    source_site,
+                    source_domain,
+                    target_site,
+                    target_domain,
+                    site_role_counts,
+                ):
+                    continue
+
+                role_source = classify_device_role(source_domain)
+                role_target = classify_device_role(target_domain)
                 link_types = (
                     sorted(link_meta.keys())
                     if isinstance(link_meta, dict) and link_meta

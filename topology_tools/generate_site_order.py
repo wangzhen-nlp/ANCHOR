@@ -12,6 +12,18 @@
 import json
 from collections import defaultdict
 
+if __package__ in (None, ""):
+    from _script_env import ensure_repo_root
+
+    ensure_repo_root(1)
+
+from topology_tools.site_pair_order_common import (
+    _get_site_id,
+    build_site_role_counts,
+    normalize_domain,
+    should_include_cross_site_link,
+)
+
 NE_GRAPH_FILE = "ne_graph.json"
 
 
@@ -32,9 +44,9 @@ def build_site_graph_no_ran(ne_graph_file: str = NE_GRAPH_FILE) -> tuple:
     site_to_nes = defaultdict(lambda: defaultdict(list))
 
     for ne_name, ne_info in ne_graph.items():
-        site_id = ne_info.get('site_id', '')
+        site_id = _get_site_id(ne_info)
         site_name = ne_info.get('site_name', '')
-        domain = ne_info.get('domain', '')
+        domain = normalize_domain(ne_info.get('domain', ''))
         if site_id and site_name and domain:
             ne_to_site[ne_name] = site_id
             site_to_nes[site_id][domain].append(ne_name)
@@ -43,12 +55,13 @@ def build_site_graph_no_ran(ne_graph_file: str = NE_GRAPH_FILE) -> tuple:
     site_connections = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
     # 站点 设备入度（来自其他站点的连接）
     site_degree = {}
+    site_role_counts = build_site_role_counts(ne_graph)
 
     domain_weights = {'Data': 0, 'Transmission': 1, 'Ran': 2}
 
     for ne_name, ne_info in ne_graph.items():
         source_site = ne_to_site.get(ne_name)
-        source_domain = ne_info.get('domain', '')
+        source_domain = normalize_domain(ne_info.get('domain', ''))
         if not source_site or not source_domain:
             continue
 
@@ -59,7 +72,18 @@ def build_site_graph_no_ran(ne_graph_file: str = NE_GRAPH_FILE) -> tuple:
                 continue
 
             target_info = ne_graph.get(target_ne, {})
-            target_domain = target_info.get('domain', '')
+            target_domain = normalize_domain(target_info.get('domain', ''))
+            if not should_include_cross_site_link(
+                source_site,
+                source_domain,
+                target_site,
+                target_domain,
+                site_role_counts,
+            ):
+                continue
+
+            if source_domain not in domain_weights or target_domain not in domain_weights:
+                continue
 
             if source_site not in site_degree:
                 site_degree[source_site] = [0 for _ in range(9)]
@@ -135,7 +159,7 @@ def main():
     parser.add_argument("--output", default='site_order.json', help='output file')
     args = parser.parse_args()
 
-    site_list = generate_site_order()
+    site_list = generate_site_order(args.ne_graph_file)
     site_order = {site: i for i, site in enumerate(site_list)}
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(site_order, f, ensure_ascii=False, indent=2)

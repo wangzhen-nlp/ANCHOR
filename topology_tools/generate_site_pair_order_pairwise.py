@@ -125,36 +125,49 @@ def compute_connected_components(all_sites, site_neighbors, show_progress=False)
 
 
 def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
-    """Tarjan 算法识别无向站点图中的桥边。"""
+    """非递归 Tarjan 算法识别无向站点图中的桥边。"""
     discovery_time = {}
     low_link = {}
+    parent = {}
     bridges = set()
     current_time = 0
 
     with ProgressReporter(len(all_sites), "pairwise: 识别桥边", show_progress) as progress:
+        for start_site in sorted(all_sites):
+            if start_site in discovery_time:
+                continue
 
-        def dfs(site_id, parent_site):
-            nonlocal current_time
-            progress.update()
+            parent[start_site] = None
             current_time += 1
-            discovery_time[site_id] = current_time
-            low_link[site_id] = current_time
+            discovery_time[start_site] = low_link[start_site] = current_time
+            progress.update()
+            stack = [(start_site, iter(sorted(site_neighbors.get(start_site, ()))))]
 
-            for neighbor_site in sorted(site_neighbors.get(site_id, ())):
-                if neighbor_site == parent_site:
+            while stack:
+                site_id, neighbors_iter = stack[-1]
+
+                try:
+                    neighbor_site = next(neighbors_iter)
+                except StopIteration:
+                    stack.pop()
+                    parent_site = parent.get(site_id)
+                    if parent_site is not None:
+                        low_link[parent_site] = min(low_link[parent_site], low_link[site_id])
+                        if low_link[site_id] > discovery_time[parent_site]:
+                            bridges.add(tuple(sorted((parent_site, site_id))))
                     continue
+
+                if neighbor_site == parent.get(site_id):
+                    continue
+
                 if neighbor_site not in discovery_time:
-                    dfs(neighbor_site, site_id)
-                    low_link[site_id] = min(low_link[site_id], low_link[neighbor_site])
-                    if low_link[neighbor_site] > discovery_time[site_id]:
-                        bridges.add(tuple(sorted((site_id, neighbor_site))))
+                    parent[neighbor_site] = site_id
+                    current_time += 1
+                    discovery_time[neighbor_site] = low_link[neighbor_site] = current_time
+                    progress.update()
+                    stack.append((neighbor_site, iter(sorted(site_neighbors.get(neighbor_site, ())))))
                 else:
                     low_link[site_id] = min(low_link[site_id], discovery_time[neighbor_site])
-
-        for site_id in sorted(all_sites):
-            if site_id in discovery_time:
-                continue
-            dfs(site_id, None)
 
     return bridges
 
