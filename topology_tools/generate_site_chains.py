@@ -24,6 +24,7 @@ from topology_tools.find_site_chain import (
     normalize_site_id,
 )
 from topology_tools.site_pair_order_common import (
+    ProgressReporter,
     _get_site_id,
     normalize_domain,
 )
@@ -117,63 +118,65 @@ def domain_tuple_index(domain):
     return None
 
 
-def iter_raw_unique_cross_site_links(ne_graph):
+def iter_raw_unique_cross_site_links(ne_graph, show_progress=False):
     """不做 domain 过滤，按 NE 对 + link_type 去重遍历原始跨站连边。"""
     seen = set()
 
-    for source_ne, source_info in ne_graph.items():
-        if not isinstance(source_info, dict):
-            continue
-
-        source_site = normalize_site_id(_get_site_id(source_info))
-        if not source_site:
-            continue
-
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-
-        source_domain = normalize_domain(source_info.get("domain", ""))
-        for target_ne, link_meta in raw_links.items():
-            target_info = ne_graph.get(target_ne)
-            if not isinstance(target_info, dict):
+    with ProgressReporter(len(ne_graph), "site_chains: 扫描原始 ne_graph 连边", show_progress) as progress:
+        for source_ne, source_info in ne_graph.items():
+            progress.update()
+            if not isinstance(source_info, dict):
                 continue
 
-            target_site = normalize_site_id(_get_site_id(target_info))
-            if not target_site or target_site == source_site:
+            source_site = normalize_site_id(_get_site_id(source_info))
+            if not source_site:
                 continue
 
-            target_domain = normalize_domain(target_info.get("domain", ""))
-            link_types = (
-                sorted(link_meta.keys())
-                if isinstance(link_meta, dict) and link_meta
-                else ["__unknown__"]
-            )
+            raw_links = source_info.get("link", {})
+            if not isinstance(raw_links, dict):
+                continue
 
-            for link_type in link_types:
-                key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
-                if key in seen:
+            source_domain = normalize_domain(source_info.get("domain", ""))
+            for target_ne, link_meta in raw_links.items():
+                target_info = ne_graph.get(target_ne)
+                if not isinstance(target_info, dict):
                     continue
-                seen.add(key)
-                yield {
-                    "source_ne": source_ne,
-                    "target_ne": target_ne,
-                    "source_site": source_site,
-                    "target_site": target_site,
-                    "source_domain": source_domain,
-                    "target_domain": target_domain,
-                    "link_type": str(link_type),
-                }
+
+                target_site = normalize_site_id(_get_site_id(target_info))
+                if not target_site or target_site == source_site:
+                    continue
+
+                target_domain = normalize_domain(target_info.get("domain", ""))
+                link_types = (
+                    sorted(link_meta.keys())
+                    if isinstance(link_meta, dict) and link_meta
+                    else ["__unknown__"]
+                )
+
+                for link_type in link_types:
+                    key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield {
+                        "source_ne": source_ne,
+                        "target_ne": target_ne,
+                        "source_site": source_site,
+                        "target_site": target_site,
+                        "source_domain": source_domain,
+                        "target_domain": target_domain,
+                        "link_type": str(link_type),
+                    }
 
 
-def collect_missing_ne_graph_pair_domain_counts(ne_graph, prediction_pairs):
+def collect_missing_ne_graph_pair_domain_counts(ne_graph, prediction_pairs, show_progress=False):
     """只为 prediction 未覆盖的站点对统计原始连边两端设备 domain 数量。"""
     missing_pair_counts = {}
     ne_graph_pair_count = 0
     skipped_prediction_pair_count = 0
     seen_pairs = set()
 
-    for link in iter_raw_unique_cross_site_links(ne_graph):
+    for link in iter_raw_unique_cross_site_links(ne_graph, show_progress=show_progress):
         source_site = normalize_site_id(link["source_site"])
         target_site = normalize_site_id(link["target_site"])
         if not source_site or not target_site or source_site == target_site:
@@ -219,6 +222,7 @@ def apply_ne_graph_augmentation(
     all_sites,
     *,
     directed_only=False,
+    show_progress=True,
 ):
     """用 ne_graph 中 prediction 未覆盖的站点连边补充方向关系。"""
     with open(ne_graph_path, "r", encoding="utf-8") as f:
@@ -228,6 +232,7 @@ def apply_ne_graph_augmentation(
     missing_pair_counts, collect_stats = collect_missing_ne_graph_pair_domain_counts(
         ne_graph,
         prediction_pairs,
+        show_progress=show_progress,
     )
     stats = {
         "ne_graph": str(ne_graph_path),
@@ -240,29 +245,31 @@ def apply_ne_graph_augmentation(
         "domain_tuple_semantics": "raw_inter_site_link_endpoint_domains",
     }
 
-    for pair_key, rec in sorted(missing_pair_counts.items()):
-        site_a, site_b = pair_key
-        all_sites.update(pair_key)
+    with ProgressReporter(len(missing_pair_counts), "site_chains: 应用 ne_graph 补边", show_progress) as progress:
+        for pair_key, rec in sorted(missing_pair_counts.items()):
+            progress.update()
+            site_a, site_b = pair_key
+            all_sites.update(pair_key)
 
-        tuple_a = tuple(rec["site_counts"].get(site_a, [0, 0, 0]))
-        tuple_b = tuple(rec["site_counts"].get(site_b, [0, 0, 0]))
-        stats["augmented_pair_count"] += 1
+            tuple_a = tuple(rec["site_counts"].get(site_a, [0, 0, 0]))
+            tuple_b = tuple(rec["site_counts"].get(site_b, [0, 0, 0]))
+            stats["augmented_pair_count"] += 1
 
-        if tuple_a > tuple_b:
-            add_adjacency_edge(adjacency, all_sites, site_a, site_b)
-            add_adjacency_edge(first_hop_adjacency, all_sites, site_a, site_b)
-            stats["augmented_directed_pair_count"] += 1
-        elif tuple_b > tuple_a:
-            add_adjacency_edge(adjacency, all_sites, site_b, site_a)
-            add_adjacency_edge(first_hop_adjacency, all_sites, site_b, site_a)
-            stats["augmented_directed_pair_count"] += 1
-        else:
-            bidirectional_neighbors[site_a].add(site_b)
-            bidirectional_neighbors[site_b].add(site_a)
-            if not directed_only:
+            if tuple_a > tuple_b:
                 add_adjacency_edge(adjacency, all_sites, site_a, site_b)
+                add_adjacency_edge(first_hop_adjacency, all_sites, site_a, site_b)
+                stats["augmented_directed_pair_count"] += 1
+            elif tuple_b > tuple_a:
                 add_adjacency_edge(adjacency, all_sites, site_b, site_a)
-            stats["augmented_bidirectional_pair_count"] += 1
+                add_adjacency_edge(first_hop_adjacency, all_sites, site_b, site_a)
+                stats["augmented_directed_pair_count"] += 1
+            else:
+                bidirectional_neighbors[site_a].add(site_b)
+                bidirectional_neighbors[site_b].add(site_a)
+                if not directed_only:
+                    add_adjacency_edge(adjacency, all_sites, site_a, site_b)
+                    add_adjacency_edge(adjacency, all_sites, site_b, site_a)
+                stats["augmented_bidirectional_pair_count"] += 1
 
     return stats
 
@@ -328,6 +335,7 @@ def build_site_chains(
             bidirectional_neighbors,
             all_sites,
             directed_only=directed_only,
+            show_progress=show_progress,
         )
 
     all_sites.update(adjacency.keys())
@@ -342,18 +350,18 @@ def build_site_chains(
 
     sorted_sites = sorted(all_sites)
     total_sites = len(sorted_sites)
-    for index, site_id in enumerate(sorted_sites, 1):
-        if show_progress and (index == 1 or index == total_sites or index % 500 == 0):
-            print(f"生成站点链路集合: {index}/{total_sites}")
-        downstream_site_hops = reachable_downstream_sites(
-            adjacency,
-            first_hop_adjacency,
-            site_id,
-            max_depth=max_depth,
-        )
-        downstream_hops_by_site[site_id] = downstream_site_hops
-        for downstream_site, hop in downstream_site_hops.items():
-            upstream_hops_by_site.setdefault(downstream_site, {})[site_id] = hop
+    with ProgressReporter(total_sites, "site_chains: 生成每站点链路集合", show_progress) as progress:
+        for site_id in sorted_sites:
+            progress.update()
+            downstream_site_hops = reachable_downstream_sites(
+                adjacency,
+                first_hop_adjacency,
+                site_id,
+                max_depth=max_depth,
+            )
+            downstream_hops_by_site[site_id] = downstream_site_hops
+            for downstream_site, hop in downstream_site_hops.items():
+                upstream_hops_by_site.setdefault(downstream_site, {})[site_id] = hop
 
     site_chains = {}
     for site_id in sorted_sites:
