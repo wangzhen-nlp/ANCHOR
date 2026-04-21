@@ -134,37 +134,55 @@ def build_adjacency(data, directed_only=False):
     warnings = []
     source = "unknown"
     edge_stats = None
+    first_hop_adjacency = None
 
     if isinstance(data, dict) and directed_only and isinstance(data.get("edges"), list):
         adjacency, all_sites, edge_stats = build_adjacency_from_edges(
             data["edges"],
             include_bidirectional=False,
         )
+        first_hop_adjacency = adjacency
         source = "edges_directed_only"
     elif isinstance(data, dict) and isinstance(data.get("downstream_map"), dict):
         adjacency, all_sites = normalize_downstream_map(data["downstream_map"])
         source = "downstream_map"
-        if directed_only:
-            warnings.append("输入没有 edges，--directed-only 只能退回按 downstream_map 遍历")
+        if isinstance(data.get("edges"), list):
+            first_hop_adjacency, edge_sites, edge_stats = build_adjacency_from_edges(
+                data["edges"],
+                include_bidirectional=False,
+            )
+            all_sites.update(edge_sites)
+        else:
+            first_hop_adjacency = adjacency
+            warnings.append("输入没有 edges，第一跳只能退回按 downstream_map 判断，无法排除双向边")
     elif isinstance(data, dict) and isinstance(data.get("edges"), list):
         adjacency, all_sites, edge_stats = build_adjacency_from_edges(
             data["edges"],
             include_bidirectional=not directed_only,
         )
+        if directed_only:
+            first_hop_adjacency = adjacency
+        else:
+            first_hop_adjacency, first_hop_sites, _ = build_adjacency_from_edges(
+                data["edges"],
+                include_bidirectional=False,
+            )
+            all_sites.update(first_hop_sites)
         source = "edges"
     elif looks_like_downstream_map(data):
         adjacency, all_sites = normalize_downstream_map(data)
+        first_hop_adjacency = adjacency
         source = "plain_downstream_map"
-        if directed_only:
-            warnings.append("纯 downstream map 无法区分双向边，--directed-only 不会改变遍历结果")
+        warnings.append("纯 downstream map 无法区分双向边，第一跳只能按 downstream_map 判断")
     else:
         raise ValueError("输入 JSON 需要包含 downstream_map、edges，或本身就是 {site: [downstream_sites]} 格式")
 
-    return adjacency, all_sites, source, edge_stats, warnings
+    return adjacency, first_hop_adjacency, all_sites, source, edge_stats, warnings
 
 
-def find_downstream_sites(adjacency, source_site, max_depth=None):
+def find_downstream_sites(adjacency, source_site, max_depth=None, first_hop_adjacency=None):
     source_site = normalize_site_id(source_site)
+    first_hop_adjacency = first_hop_adjacency or adjacency
     visited = {source_site}
     parent = {}
     depth = {source_site: 0}
@@ -176,7 +194,12 @@ def find_downstream_sites(adjacency, source_site, max_depth=None):
         if max_depth is not None and current_depth >= max_depth:
             continue
 
-        for next_site in sorted(adjacency.get(current_site, ())):
+        next_sites = (
+            first_hop_adjacency.get(current_site, ())
+            if current_depth == 0
+            else adjacency.get(current_site, ())
+        )
+        for next_site in sorted(next_sites):
             if next_site in visited:
                 continue
             visited.add(next_site)
@@ -217,7 +240,7 @@ def build_result(prediction_path, source_site, args):
     with open(prediction_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    adjacency, all_sites, adjacency_source, edge_stats, warnings = build_adjacency(
+    adjacency, first_hop_adjacency, all_sites, adjacency_source, edge_stats, warnings = build_adjacency(
         data,
         directed_only=args.directed_only,
     )
@@ -226,6 +249,7 @@ def build_result(prediction_path, source_site, args):
         adjacency,
         source_site,
         max_depth=args.max_depth,
+        first_hop_adjacency=first_hop_adjacency,
     )
 
     result = {
@@ -234,14 +258,15 @@ def build_result(prediction_path, source_site, args):
             "source_site": source_site,
             "adjacency_source": adjacency_source,
             "directed_only": args.directed_only,
+            "first_hop_downstream_only": True,
             "max_depth": args.max_depth,
             "site_count": len(all_sites),
             "downstream_count": len(downstream_sites),
-            "direct_child_count": len(adjacency.get(source_site, set())),
+            "direct_child_count": len(first_hop_adjacency.get(source_site, set())),
             "site_present": source_site in all_sites,
             "warnings": warnings,
         },
-        "direct_children": sorted(adjacency.get(source_site, set())),
+        "direct_children": sorted(first_hop_adjacency.get(source_site, set())),
         "downstream_sites": downstream_sites,
         "downstream_by_hop": group_sites_by_hop(downstream_sites, depth),
     }
@@ -277,7 +302,7 @@ def parse_args():
     parser.add_argument(
         "--directed-only",
         action="store_true",
-        help="只沿显式 upstream_site -> downstream_site 边遍历，忽略 bidirectional 边",
+        help="所有 hop 都只沿显式 upstream_site -> downstream_site 边遍历，忽略 bidirectional 边",
     )
     parser.add_argument(
         "--include-paths",
@@ -300,7 +325,8 @@ def print_summary(result, max_print):
     print(f"站点: {meta['source_site']}")
     print(f"站点是否存在于输入图: {'是' if meta['site_present'] else '否'}")
     print(f"邻接来源: {meta['adjacency_source']}")
-    print(f"遍历模式: {'只走显式有向边' if meta['directed_only'] else '按 downstream_map/双向边可双向传播'}")
+    print("第一跳约束: 必须走显式下游边")
+    print(f"后续遍历模式: {'只走显式有向边' if meta['directed_only'] else '按 downstream_map/双向边可双向传播'}")
     print(f"图内站点数: {meta['site_count']}")
     print(f"直接下游数: {meta['direct_child_count']}")
     print(f"全部下游站点数: {meta['downstream_count']}")
