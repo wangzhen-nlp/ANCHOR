@@ -17,10 +17,10 @@ from topology_resources import resource_display, resource_path
 
 
 DEFAULT_PREDICTION_CANDIDATES = [
-    "site_pair_order_global_path_optimized.json",
-    "site_pair_order_global_path_voting.json",
-    "site_pair_order_global_no_path.json",
-    "site_pair_order_pairwise.json",
+    "site_pair_order_global_path_optimized_ring.json",
+    "site_pair_order_global_path_voting_ring.json",
+    "site_pair_order_global_no_path_ring.json",
+    "site_pair_order_pairwise_ring.json",
 ]
 
 
