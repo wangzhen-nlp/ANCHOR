@@ -404,6 +404,7 @@
         let siteFilterQuery = '';
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
+        let detailBlobUrls = [];
         let currentFaultGroupFileHandle = null;
         let currentFaultGroupFileName = '';
         let durationFilterSeconds = 0;
@@ -946,10 +947,22 @@
         function openGroupDetail(index) {
             const group = faultGroups[index];
             const sessionKey = `fault-group-${Date.now()}-${index}`;
-            localStorage.setItem(sessionKey, JSON.stringify({
-                group
-            }));
-            window.open(`ne_propagation_visualizer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+            try {
+                localStorage.setItem(sessionKey, JSON.stringify({
+                    group
+                }));
+                window.open(`ne_propagation_visualizer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+            } catch (error) {
+                console.warn('localStorage 写入故障组详情失败，改用 Blob URL 打开:', error);
+                const blob = new Blob([JSON.stringify(group)], { type: 'application/json' });
+                const blobUrl = URL.createObjectURL(blob);
+                detailBlobUrls.push(blobUrl);
+                window.open(`ne_propagation_visualizer.html?file=${encodeURIComponent(blobUrl)}`, '_blank');
+                setTimeout(() => {
+                    URL.revokeObjectURL(blobUrl);
+                    detailBlobUrls = detailBlobUrls.filter(url => url !== blobUrl);
+                }, 10 * 60 * 1000);
+            }
         }
 
         function openGroupDetailByUuid(uuid) {
