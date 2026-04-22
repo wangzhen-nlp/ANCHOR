@@ -72,6 +72,7 @@ OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
           "include": ["Data"],
           "expected_alarms": {
             "required_alarms": LINK_ALARMS,
+            "required_alarm_source_domains": ["Data"],
             "forbidden_alarms": OFFLINE_ALARMS,
             "forbidden_alarm_source_domains": ["Data"]
           }
