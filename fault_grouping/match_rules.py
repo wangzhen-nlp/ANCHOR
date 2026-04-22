@@ -33,6 +33,7 @@ from fault_grouping.rule_config import (
     data_rule,
     data_link_neighbor_rule,
     data_adjacent_router_rule,
+    data_offline_adjacent_router_rule,
 )
 from fault_grouping.site_merge_helper import (
     AdaptiveDensitySiteMergeHelper,
@@ -1409,6 +1410,7 @@ def main():
         "data_rule": data_rule,
         "data_link_neighbor_rule": data_link_neighbor_rule,
         "data_adjacent_router_rule": data_adjacent_router_rule,
+        "data_offline_adjacent_router_rule": data_offline_adjacent_router_rule,
     }
     try:
         selected_rule_names = _parse_selected_rule_names(args.rule, all_rules_config.keys())

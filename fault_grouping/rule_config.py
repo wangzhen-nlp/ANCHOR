@@ -108,13 +108,33 @@ OFFLINE_UNDERNEATH_SITE_RULES = [
   }
 ]
 
-UNDERNEATH_TRANSMISSION_COMPOUND_NODE = {
+UNDERNEATH_TRANSMISSION_CONTEXT_COMPOUND_NODE = {
   "type": "compound",
   "min_count": 1,
   "patterns": [
     {
       "type": "primitive",
-      "site_rules": TRANSMISSION_SITE_RULES
+      "site_rules": [
+        {
+          "include": ["Transmission"],
+          "exclude": ["Ran"],
+          "expected_alarms": {
+            "forbidden_alarms": []
+          }
+        },
+        {
+          "include": ["Transmission", "Ran"],
+          "expected_alarms": {
+            "forbidden_alarms": []
+          }
+        },
+        {
+          "include": ["Data", "Ran"],
+          "expected_alarms": {
+            "forbidden_alarms": []
+          }
+        }
+      ]
     }
   ]
 }
@@ -360,7 +380,7 @@ data_adjacent_router_rule = {
   "trigger_role": "current_underneath_compound_node",
   "nodes": {
     "current_parent_data_node": NO_OFFLINE_DATA_NODE,
-    "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
+    "current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
     "adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
     "adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
@@ -392,6 +412,52 @@ data_adjacent_router_rule = {
         "alarm_roles": ["adjacent_router_data_neighbor_node"],
         "alarms": OFFLINE_ALARMS,
         "presence_roles": ["adjacent_router_underneath_compound_node"],
+        "min_matches": 1
+      }
+    ]
+  }
+}
+
+data_offline_adjacent_router_rule = {
+  "pattern_name": "data_offline_adjacent_router_context",
+  "description": "本路由Data offline，双向相邻路由自身Data offline或其下游存在offline，本路由下挂可有可无",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "offline_current_parent_data_node",
+  "nodes": {
+    "offline_current_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
+    "offline_current_underneath_context_node": UNDERNEATH_TRANSMISSION_CONTEXT_COMPOUND_NODE,
+    "offline_adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
+    "offline_adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+  },
+  "edges": [
+    {
+      "source": "offline_current_underneath_context_node",
+      "target": "offline_current_parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "optional": True
+    },
+    {
+      "source": "offline_current_parent_data_node",
+      "target": "offline_adjacent_router_data_neighbor_node",
+      "direction": "bidirection",
+      "time_window_sec": 900,
+      "max_hops": 1
+    },
+    {
+      "source": "offline_adjacent_router_underneath_compound_node",
+      "target": "offline_adjacent_router_data_neighbor_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "optional": True
+    }
+  ],
+  "result_constraints": {
+    "role_alarm_or_presence_any": [
+      {
+        "alarm_roles": ["offline_adjacent_router_data_neighbor_node"],
+        "alarms": OFFLINE_ALARMS,
+        "presence_roles": ["offline_adjacent_router_underneath_compound_node"],
         "min_matches": 1
       }
     ]
