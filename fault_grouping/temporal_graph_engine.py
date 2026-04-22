@@ -312,6 +312,258 @@ class TemporalGraphEngine:
             for match_result in matches
         ]
 
+    def _get_parent_roles_for_site_ownership(self, role, match_result):
+        parent_roles = []
+        seen = set()
+        merged_rules = match_result.get("merged_rules", [match_result.get("rule")])
+        for rule_name in merged_rules:
+            rule = self.rules.get(rule_name)
+            if not rule:
+                continue
+            for edge in rule.get("edges", []):
+                source = edge.get("source")
+                target = edge.get("target")
+                directions = self._normalize_traverse_directions(edge.get("direction", "downstream"))
+                if source == role and "upstream" in directions:
+                    parent_role = target
+                elif target == role and "downstream" in directions:
+                    parent_role = source
+                else:
+                    continue
+                if parent_role and parent_role not in seen:
+                    seen.add(parent_role)
+                    parent_roles.append(parent_role)
+        return parent_roles
+
+    def _get_match_role_site_owner_distance(self, match_result, role, site):
+        if not self.site_chain_index:
+            return None
+
+        role_mapping = match_result.get("role_mapping", {})
+        best_hop = None
+        for parent_role in self._get_parent_roles_for_site_ownership(role, match_result):
+            for parent_site in role_mapping.get(parent_role, []):
+                hop = self._get_site_chain_downstream_hop(parent_site, site)
+                if hop is None:
+                    continue
+                if best_hop is None or hop < best_hop:
+                    best_hop = hop
+        return best_hop
+
+    def _choose_match_site_owner_role(self, match_result, site, roles, role_order):
+        distance_candidates = []
+        for role in roles:
+            distance = self._get_match_role_site_owner_distance(match_result, role, site)
+            if distance is not None:
+                distance_candidates.append((distance, role_order[role], role))
+
+        if distance_candidates:
+            return min(distance_candidates)[2]
+        return min(roles, key=lambda role: role_order[role])
+
+    def _apply_default_output_site_role_ownership(self, match_result):
+        role_mapping = match_result.get("role_mapping", {})
+        if len(role_mapping) <= 1:
+            return match_result
+
+        owned_roles = [
+            role for role, nodes in role_mapping.items()
+            if nodes and self._participates_in_default_site_role_ownership(
+                self._get_role_node_config_for_output(role, match_result)
+            )
+        ]
+        if len(owned_roles) <= 1:
+            return match_result
+
+        role_order = {role: idx for idx, role in enumerate(role_mapping.keys())}
+        site_to_roles = collections.defaultdict(list)
+        for role in owned_roles:
+            for site in role_mapping.get(role, []):
+                site_to_roles[site].append(role)
+
+        remove_by_role = collections.defaultdict(set)
+        owner_by_site = {}
+        for site, site_roles in site_to_roles.items():
+            if len(site_roles) <= 1:
+                continue
+            owner_role = self._choose_match_site_owner_role(match_result, site, site_roles, role_order)
+            owner_by_site[site] = owner_role
+            for role in site_roles:
+                if role != owner_role:
+                    remove_by_role[role].add(site)
+
+        if not remove_by_role:
+            return match_result
+
+        filtered_role_mapping = {}
+        for role, nodes in role_mapping.items():
+            filtered_nodes = [
+                node for node in nodes
+                if node not in remove_by_role.get(role, set())
+            ]
+            if filtered_nodes:
+                filtered_role_mapping[role] = filtered_nodes
+
+        filtered_inferred_roots = {}
+        for role, nodes in match_result.get("inferred_roots", {}).items():
+            filtered_nodes = [
+                node for node in nodes
+                if node not in remove_by_role.get(role, set())
+            ]
+            if filtered_nodes:
+                filtered_inferred_roots[role] = filtered_nodes
+
+        filtered_symptoms = []
+        for symptom in match_result.get("symptoms", []):
+            role = symptom.get("matched_role")
+            node = symptom.get("node")
+            if role in remove_by_role and node in remove_by_role.get(role, set()):
+                owner_role = owner_by_site.get(node)
+                if owner_role and node in filtered_role_mapping.get(owner_role, []):
+                    symptom = {**symptom, "matched_role": owner_role}
+                else:
+                    continue
+            filtered_symptoms.append(symptom)
+
+        return {
+            **match_result,
+            "role_mapping": filtered_role_mapping,
+            "inferred_roots": filtered_inferred_roots,
+            "symptoms": filtered_symptoms,
+        }
+
+    def _apply_default_output_site_role_ownership_to_matches(self, matches):
+        if not matches:
+            return matches
+        return [
+            self._apply_default_output_site_role_ownership(match_result)
+            for match_result in matches
+        ]
+
+    @staticmethod
+    def _participates_in_default_site_role_ownership(node_config):
+        """默认只对 compound role 做站点归属去重，保留 primitive 同站多语义匹配。"""
+        return (node_config or {}).get("type") == "compound"
+
+    @staticmethod
+    def _get_optional_only_roles(rule):
+        """识别仅通过 optional 边引入的角色；这些 role 被裁空时可视作未命中。"""
+        optional_incident = set()
+        required_incident = set()
+        for edge in rule.get("edges", []):
+            source = edge.get("source")
+            target = edge.get("target")
+            if not source or not target:
+                continue
+            if edge.get("optional"):
+                optional_incident.update([source, target])
+            else:
+                required_incident.update([source, target])
+        return optional_incident - required_incident
+
+    def _get_site_chain_downstream_hop(self, parent_site, child_site):
+        if not self.site_chain_index:
+            return None
+
+        parent_site = str(parent_site or "").strip()
+        child_site = str(child_site or "").strip()
+        if not parent_site or not child_site or parent_site == child_site:
+            return None
+
+        chain_info = self.site_chain_index.get(parent_site)
+        if not chain_info:
+            return None
+
+        return chain_info.get("downstream_site_hops", {}).get(child_site)
+
+    def _get_role_site_owner_distance(self, inst, role, site):
+        """用 site_chains 判断某 role 的上游支撑节点到该站点的最短 downstream hop。"""
+        if not self.site_chain_index:
+            return None
+
+        best_hop = None
+        dependencies = inst.get("_dependencies", {})
+        for (src_role, _dst_role), dep in dependencies.items():
+            if src_role != role:
+                continue
+            support_nodes = dep.get("src_to_dst", {}).get(site, set())
+            for support_node in support_nodes:
+                hop = self._get_site_chain_downstream_hop(support_node, site)
+                if hop is None:
+                    continue
+                if best_hop is None or hop < best_hop:
+                    best_hop = hop
+
+        return best_hop
+
+    def _choose_site_owner_role(self, inst, site, roles, role_order):
+        """同一站点命中多个 compound role 时，优先归属到 parent->child hop 最近的一边。"""
+        distance_candidates = []
+        for role in roles:
+            distance = self._get_role_site_owner_distance(inst, role, site)
+            if distance is not None:
+                distance_candidates.append((distance, role_order[role], role))
+
+        if distance_candidates:
+            return min(distance_candidates)[2]
+
+        # 无 site_chains 或无法用 downstream_hops 判定时，保持原有遍历顺序 first-win。
+        return min(roles, key=lambda role: role_order[role])
+
+    def _apply_default_site_role_ownership(self, inst, rule, nodes_cfg):
+        """默认裁剪 compound role 的重复站点归属，避免环/双向边导致下挂站点串到多侧。"""
+        roles = inst.get("roles", {})
+        if len(roles) <= 1:
+            return inst
+
+        owned_roles = [
+            role for role, role_state in roles.items()
+            if self._participates_in_default_site_role_ownership(nodes_cfg.get(role, {}))
+            and role_state.get("nodes")
+        ]
+        if len(owned_roles) <= 1:
+            return inst
+
+        role_order = {role: idx for idx, role in enumerate(roles.keys())}
+        site_to_roles = collections.defaultdict(list)
+        for role in owned_roles:
+            for site in roles[role].get("nodes", {}):
+                site_to_roles[site].append(role)
+
+        remove_by_role = collections.defaultdict(set)
+        for site, site_roles in site_to_roles.items():
+            if len(site_roles) <= 1:
+                continue
+            owner_role = self._choose_site_owner_role(inst, site, site_roles, role_order)
+            for role in site_roles:
+                if role != owner_role:
+                    remove_by_role[role].add(site)
+
+        if not remove_by_role:
+            return inst
+
+        optional_only_roles = self._get_optional_only_roles(rule)
+        new_inst = dict(inst)
+        new_roles = {}
+        for role, role_state in roles.items():
+            new_nodes = dict(role_state.get("nodes", {}))
+            for site in remove_by_role.get(role, set()):
+                new_nodes.pop(site, None)
+
+            min_count = nodes_cfg.get(role, {}).get("min_count", 1)
+            if len(new_nodes) < min_count:
+                if not new_nodes and role in optional_only_roles:
+                    continue
+                return None
+
+            new_roles[role] = {
+                "nodes": new_nodes,
+                "checked": role_state.get("checked", False),
+            }
+
+        new_inst["roles"] = new_roles
+        return new_inst
+
     def __init__(
         self,
         topo_downstream_map,
@@ -670,7 +922,8 @@ class TemporalGraphEngine:
                 finalized_matches = self._finalize_matches_with_history(expanded_matches)
                 finalize_profiles = []
 
-        output_matches = self._apply_output_visibility_filters_to_matches(finalized_matches)
+        owned_matches = self._apply_default_output_site_role_ownership_to_matches(finalized_matches)
+        output_matches = self._apply_output_visibility_filters_to_matches(owned_matches)
 
         if self.debug_observer:
             self.debug_observer({
@@ -1014,6 +1267,7 @@ class TemporalGraphEngine:
             original_uuid = match_result.get("uuid", "")
             original_rule = match_result.get("rule", "")
             match_result, merged_group_indexes, related_group_uuids, should_emit, emit_reason = self.emitted_group_store.merge_with_related(match_result)
+            match_result = self._apply_default_output_site_role_ownership(match_result)
             if not should_emit:
                 if return_debug_trace:
                     finalize_profiles.append({
@@ -1485,6 +1739,12 @@ class TemporalGraphEngine:
 
         for inst in instances:
             stabilized_inst = self._stabilize_instance_dependencies(inst, nodes_cfg)
+            if stabilized_inst is None:
+                continue
+            ownership_inst = self._apply_default_site_role_ownership(stabilized_inst, rule, nodes_cfg)
+            if ownership_inst is None:
+                continue
+            stabilized_inst = self._stabilize_instance_dependencies(ownership_inst, nodes_cfg)
             if stabilized_inst is None:
                 continue
             inst = stabilized_inst
