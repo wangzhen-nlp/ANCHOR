@@ -420,7 +420,7 @@ def _build_site_to_ne_ids(ne_graph_data):
     }
 
 
-def _format_ne_link_info(ne_graph_entry):
+def _format_ne_link_info(ne_graph_entry, compact_output=False):
     raw_links = ne_graph_entry.get("link", {}) if isinstance(ne_graph_entry, dict) else {}
     if not isinstance(raw_links, dict):
         return {}
@@ -434,27 +434,47 @@ def _format_ne_link_info(ne_graph_entry):
             connection_types = [str(link_meta)]
             topologies = []
 
-        formatted_links[neighbor_id] = {
-            "connection_type": ",".join(connection_types),
-            "distance": "",
-            "topology": ",".join(topologies),
-            "time_window": "",
-            "left_alarm": {},
-            "right_alarm": {},
-        }
+        connection_type = ",".join(connection_types)
+        topology = ",".join(topologies)
+        if compact_output:
+            formatted_link = {}
+            if connection_type:
+                formatted_link["connection_type"] = connection_type
+            if topology:
+                formatted_link["topology"] = topology
+        else:
+            formatted_link = {
+                "connection_type": connection_type,
+                "distance": "",
+                "topology": topology,
+                "time_window": "",
+                "left_alarm": {},
+                "right_alarm": {},
+            }
+
+        formatted_links[neighbor_id] = formatted_link
     return formatted_links
 
 
-def _get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache):
+def _get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache, compact_output=False):
     if ne_link_info_cache is None:
-        return _format_ne_link_info(ne_graph_data.get(ne_id, {}))
-    if ne_id not in ne_link_info_cache:
-        ne_link_info_cache[ne_id] = _format_ne_link_info(ne_graph_data.get(ne_id, {}))
-    return ne_link_info_cache[ne_id]
+        return _format_ne_link_info(ne_graph_data.get(ne_id, {}), compact_output=compact_output)
+    cache_key = (ne_id, compact_output)
+    if cache_key not in ne_link_info_cache:
+        ne_link_info_cache[cache_key] = _format_ne_link_info(
+            ne_graph_data.get(ne_id, {}),
+            compact_output=compact_output,
+        )
+    return ne_link_info_cache[cache_key]
 
 
-def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache=None):
-    formatted_links = _get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache)
+def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache=None, compact_output=False):
+    formatted_links = _get_cached_ne_link_info(
+        ne_id,
+        ne_graph_data,
+        ne_link_info_cache,
+        compact_output=compact_output,
+    )
     link_info = {}
 
     if len(group_ne_ids) < len(formatted_links):
@@ -501,6 +521,7 @@ def _build_group_output(
     site_graph_data,
     site_to_ne_ids=None,
     ne_link_info_cache=None,
+    compact_output=False,
 ):
     group_id = match.get("uuid", "")
     ne_info = {}
@@ -560,13 +581,13 @@ def _build_group_output(
         if site_id:
             group_site_ids.add(site_id)
 
-        ne_info[ne_id] = {
-            "alarm": alarms,
+        node_info = {
             "link": _build_group_link_info(
                 ne_id,
                 group_ne_id_set,
                 ne_graph_data,
                 ne_link_info_cache=ne_link_info_cache,
+                compact_output=compact_output,
             ),
             "group": group_id,
             "name": ne_graph_entry.get("name", ne_id),
@@ -581,6 +602,10 @@ def _build_group_output(
             "longitude": site_context["longitude"],
             "latitude": site_context["latitude"],
         }
+        if not compact_output:
+            node_info["alarm"] = alarms
+
+        ne_info[ne_id] = node_info
 
     return {
         "match_info": {
@@ -649,6 +674,7 @@ def _build_jsonl_match_output(
     alarm_metadata_index,
     site_to_ne_ids=None,
     ne_link_info_cache=None,
+    compact_output=False,
 ):
     enriched_match = dict(match)
     enriched_match["symptoms"] = _enrich_match_symptoms(match, alarm_metadata_index)
@@ -659,6 +685,7 @@ def _build_jsonl_match_output(
         site_graph_data,
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
+        compact_output=compact_output,
     )
     timestamps = [symptom["ts"] for symptom in enriched_match.get("symptoms", []) if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
@@ -1451,6 +1478,7 @@ def main():
     parser.add_argument('--rule', action='append', default=[], help='仅启用指定规则；可重复传入，也支持逗号分隔，如 --rule transmission_rule --rule link_rule 或 --rule transmission_rule,link_rule')
     parser.add_argument('--sorted-alarms-input', type=str, default='', help='直接加载 prepare_sorted_alarms.py 生成的排序告警缓存(JSONL/ZIP)；若 alarms 本身是该缓存格式，也会自动识别')
     parser.add_argument('--sorted-alarms-output', type=str, default='', help='从原始告警加载并排序后，额外写出排序告警缓存；后缀为 .zip 时写压缩包，供后续快速加载')
+    parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
     args = parser.parse_args()
 
     start_ts = None
@@ -1703,6 +1731,7 @@ def main():
                         alarm_metadata_index,
                         site_to_ne_ids=site_to_ne_ids,
                         ne_link_info_cache=ne_link_info_cache,
+                        compact_output=args.compact_output,
                     )
                     output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
                 fw.writelines(output_lines)

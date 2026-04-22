@@ -3395,9 +3395,69 @@
             return parts[parts.length - 1] || fullId;
         }
 
+        function formatTimestampSeconds(ts) {
+            if (ts === null || ts === undefined || ts === '') return '';
+            const numberTs = Number(ts);
+            if (!Number.isFinite(numberTs)) return '';
+            const date = new Date(numberTs * 1000);
+            if (isNaN(date.getTime())) return '';
+            const pad = function(value) { return String(value).padStart(2, '0'); };
+            return date.getFullYear() + '-' +
+                pad(date.getMonth() + 1) + '-' +
+                pad(date.getDate()) + ' ' +
+                pad(date.getHours()) + ':' +
+                pad(date.getMinutes()) + ':' +
+                pad(date.getSeconds());
+        }
+
         function getAlarmDisplayTime(alarm) {
             if (!alarm || typeof alarm !== 'object') return '-';
-            return alarm.time || alarm.alarm_time || alarm.time_str || '-';
+            return alarm.time || alarm.alarm_time || alarm.time_str || formatTimestampSeconds(alarm.ts) || '-';
+        }
+
+        function getSymptomAlarmSource(symptom) {
+            if (!symptom || typeof symptom !== 'object') return '';
+            return symptom.alarm_source || symptom.alarmSource || symptom.ne_id || symptom.neId || symptom.source || '';
+        }
+
+        function convertSymptomToNodeAlarm(symptom) {
+            return {
+                alarm_id: symptom.eid || symptom.alarm_id || '',
+                alarm_type: symptom.alarm || symptom.alarm_type || symptom.title || '',
+                alarm_time: symptom.alarm_time || formatTimestampSeconds(symptom.ts),
+                alarm_clear_time: symptom['告警清除时间'] || symptom.alarm_clear_time || '',
+                domain: symptom.domain || '',
+                site_id: symptom.node || symptom.site_id || '',
+                matched_role: symptom.matched_role || '',
+                '工单号': symptom['工单号'] || '',
+                '故障组ID': symptom['故障组ID'] || '',
+                ts: symptom.ts
+            };
+        }
+
+        function buildNeAlarmIndexFromSymptoms(data) {
+            const index = new Map();
+            const symptoms = Array.isArray(data && data.symptoms)
+                ? data.symptoms
+                : (Array.isArray(data && data.match_info && data.match_info.symptoms) ? data.match_info.symptoms : []);
+
+            symptoms.forEach(function(symptom) {
+                const neId = getSymptomAlarmSource(symptom);
+                if (!neId) return;
+                if (!index.has(neId)) {
+                    index.set(neId, []);
+                }
+                index.get(neId).push(convertSymptomToNodeAlarm(symptom));
+            });
+
+            return index;
+        }
+
+        function getNeAlarmsFromInfo(neId, neInfo, symptomAlarmIndex) {
+            if (Array.isArray(neInfo && neInfo.alarm)) {
+                return neInfo.alarm;
+            }
+            return symptomAlarmIndex.get(neId) || [];
         }
 
         function handleSiteNeighborModeToggle(enabled) {
@@ -4642,6 +4702,7 @@
             allNodes = [];
             const hiddenSiteIds = getVisualizationExcludedSiteIds(data);
             const hiddenNeIds = new Set();
+            const symptomAlarmIndex = buildNeAlarmIndexFromSymptoms(data);
             
             for (const neId in data.ne_info) {
                 const neInfo = data.ne_info[neId];
@@ -4649,13 +4710,12 @@
                     hiddenNeIds.add(neId);
                     continue;
                 }
+                const nodeAlarms = getNeAlarmsFromInfo(neId, neInfo, symptomAlarmIndex);
                 const alarmTypes = [];
-                if (neInfo.alarm) {
-                    for (let i = 0; i < neInfo.alarm.length; i++) {
-                        const alarm = neInfo.alarm[i];
-                        if (alarm.alarm_type && alarmTypes.indexOf(alarm.alarm_type) === -1) {
-                            alarmTypes.push(alarm.alarm_type);
-                        }
+                for (let i = 0; i < nodeAlarms.length; i++) {
+                    const alarm = nodeAlarms[i];
+                    if (alarm.alarm_type && alarmTypes.indexOf(alarm.alarm_type) === -1) {
+                        alarmTypes.push(alarm.alarm_type);
                     }
                 }
 
@@ -4668,10 +4728,10 @@
                     network_type: neInfo.network_type || '',
                     manufacturer: neInfo.manufacturer || '',
                     domain: neInfo.domain || '',
-                    alarm_count: neInfo.alarm ? neInfo.alarm.length : 0,
+                    alarm_count: nodeAlarms.length,
                     alarm_types: alarmTypes,
                     name: neInfo.name || neId,
-                    alarm: neInfo.alarm || [],
+                    alarm: nodeAlarms,
                     latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
                     longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined))
                 });
