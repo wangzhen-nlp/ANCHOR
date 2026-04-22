@@ -31,9 +31,10 @@ from fault_grouping.rule_config import (
     link_rule,
     power_rule,
     data_rule,
-    data_link_neighbor_rule,
-    data_adjacent_router_rule,
-    data_offline_adjacent_router_rule,
+    data_link_adjacent_no_offline_rule,
+    data_link_adjacent_offline_rule,
+    data_no_offline_adjacent_optional_offline_rule,
+    data_offline_adjacent_offline_rule,
 )
 from fault_grouping.site_merge_helper import (
     AdaptiveDensitySiteMergeHelper,
@@ -1474,9 +1475,10 @@ def main():
         "link_rule": link_rule,
         "power_rule": power_rule,
         "data_rule": data_rule,
-        "data_link_neighbor_rule": data_link_neighbor_rule,
-        "data_adjacent_router_rule": data_adjacent_router_rule,
-        "data_offline_adjacent_router_rule": data_offline_adjacent_router_rule,
+        "data_link_adjacent_no_offline_rule": data_link_adjacent_no_offline_rule,
+        "data_link_adjacent_offline_rule": data_link_adjacent_offline_rule,
+        "data_no_offline_adjacent_optional_offline_rule": data_no_offline_adjacent_optional_offline_rule,
+        "data_offline_adjacent_offline_rule": data_offline_adjacent_offline_rule,
     }
     try:
         selected_rule_names = _parse_selected_rule_names(args.rule, all_rules_config.keys())

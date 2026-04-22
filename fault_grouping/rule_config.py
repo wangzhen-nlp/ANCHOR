@@ -22,6 +22,8 @@ NO_OFFLINE_DATA_NODE = {
     {
       "include": ["Data"],
       "expected_alarms": {
+        "optional_alarms": LINK_ALARMS | POWER_ALARMS,
+        "optional_alarm_source_domains": ["Data"],
         "forbidden_alarms": OFFLINE_ALARMS,
         "forbidden_alarm_source_domains": ["Data"]
       }
@@ -36,7 +38,9 @@ REQUIRED_OFFLINE_DATA_NODE = {
       "include": ["Data"],
       "expected_alarms": {
         "required_alarms": OFFLINE_ALARMS,
-        "required_alarm_source_domains": ["Data"]
+        "required_alarm_source_domains": ["Data"],
+        "optional_alarms": LINK_ALARMS | POWER_ALARMS,
+        "optional_alarm_source_domains": ["Data"]
       }
     }
   ]
@@ -48,7 +52,7 @@ OPTIONAL_OFFLINE_DATA_NODE = {
     {
       "include": ["Data"],
       "expected_alarms": {
-        "optional_alarms": OFFLINE_ALARMS,
+        "optional_alarms": OFFLINE_ALARMS | LINK_ALARMS | POWER_ALARMS,
         "optional_alarm_source_domains": ["Data"]
       }
     }
@@ -61,7 +65,24 @@ OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
     {
       "include": ["Data"],
       "expected_alarms": {
-        "optional_alarms": LINK_ALARMS,
+        "optional_alarms": LINK_ALARMS | POWER_ALARMS,
+        "optional_alarm_source_domains": ["Data"],
+        "forbidden_alarms": OFFLINE_ALARMS,
+        "forbidden_alarm_source_domains": ["Data"]
+      }
+    }
+  ]
+}
+
+REQUIRED_LINK_NO_OFFLINE_DATA_NODE = {
+  "type": "primitive",
+  "site_rules": [
+    {
+      "include": ["Data"],
+      "expected_alarms": {
+        "required_alarms": LINK_ALARMS,
+        "required_alarm_source_domains": ["Data"],
+        "optional_alarms": POWER_ALARMS,
         "optional_alarm_source_domains": ["Data"],
         "forbidden_alarms": OFFLINE_ALARMS,
         "forbidden_alarm_source_domains": ["Data"]
@@ -283,14 +304,14 @@ data_rule = {
   ]
 }
 
-data_link_neighbor_rule = {
-  "pattern_name": "offline_under_data_with_neighbor_link_context",
-  "description": "本路由/上下游相邻路由至少一侧有link(均无断站) -> 下挂断站",
+data_link_adjacent_no_offline_rule = {
+  "pattern_name": "data_link_adjacent_no_offline_context",
+  "description": "本路由Data link且无Data offline，邻接路由无Data offline -> 下挂断站",
   "max_stay_time_sec": 3600,
   "trigger_role": "data_link_underneath_compound_node",
   "nodes": {
-    "data_link_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
-    "data_link_adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_parent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_adjacent_data_neighbor_node": NO_OFFLINE_DATA_NODE,
     "data_link_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
@@ -298,30 +319,48 @@ data_link_neighbor_rule = {
       "source": "data_link_underneath_compound_node",
       "target": "data_link_parent_data_node",
       "direction": "upstream",
-      "time_window_sec": 900,
-      "max_hops": 1
+      "time_window_sec": 900
     },
     {
       "source": "data_link_parent_data_node",
       "target": "data_link_adjacent_data_neighbor_node",
-      "direction": "bidirection",
+      "direction": ["bidirection", "upstream", "downstream"],
       "time_window_sec": 900,
       "max_hops": 1
     }
-  ],
-  "result_constraints": {
-    "role_alarm_requirements_any": [
-      {
-        "roles": ["data_link_parent_data_node", "data_link_adjacent_data_neighbor_node"],
-        "alarms": LINK_ALARMS,
-        "min_roles": 1
-      }
-    ]
-  }
+  ]
 }
 
-data_adjacent_router_rule = {
-  "pattern_name": "offline_under_adjacent_data_router_context",
+data_link_adjacent_offline_rule = {
+  "pattern_name": "data_link_adjacent_offline_context",
+  "description": "本路由Data link且无Data offline，邻接路由Data offline，下挂断站可有可无",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "data_link_offline_adjacent_data_node",
+  "nodes": {
+    "data_link_offline_parent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_offline_adjacent_data_node": REQUIRED_OFFLINE_DATA_NODE,
+    "data_link_offline_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+  },
+  "edges": [
+    {
+      "source": "data_link_offline_parent_data_node",
+      "target": "data_link_offline_adjacent_data_node",
+      "direction": ["bidirection", "upstream", "downstream"],
+      "time_window_sec": 900,
+      "max_hops": 1
+    },
+    {
+      "source": "data_link_offline_underneath_compound_node",
+      "target": "data_link_offline_adjacent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "optional": True
+    }
+  ]
+}
+
+data_no_offline_adjacent_optional_offline_rule = {
+  "pattern_name": "data_no_offline_adjacent_optional_offline_context",
   "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",
   "max_stay_time_sec": 3600,
   "trigger_role": "current_underneath_compound_node",
@@ -341,7 +380,7 @@ data_adjacent_router_rule = {
     {
       "source": "current_parent_data_node",
       "target": "adjacent_router_data_neighbor_node",
-      "direction": "bidirection",
+      "direction": ["bidirection", "upstream", "downstream"],
       "time_window_sec": 900,
       "max_hops": 1
     },
@@ -365,21 +404,22 @@ data_adjacent_router_rule = {
   }
 }
 
-data_offline_adjacent_router_rule = {
-  "pattern_name": "data_offline_adjacent_router_context",
-  "description": "本路由Data offline，双向相邻路由自身Data offline或其下游存在offline，本路由下挂可有可无",
+data_offline_adjacent_offline_rule = {
+  "pattern_name": "data_offline_adjacent_offline_context",
+  "description": "本路由Data offline，双向相邻路由Data offline，本路由/相邻路由下挂offline可有可无",
   "max_stay_time_sec": 3600,
   "trigger_role": "offline_current_parent_data_node",
   "nodes": {
     "offline_current_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
-    "offline_adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
+    "offline_current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
+    "offline_adjacent_router_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
     "offline_adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
     {
       "source": "offline_current_parent_data_node",
       "target": "offline_adjacent_router_data_neighbor_node",
-      "direction": "bidirection",
+      "direction": ["bidirection", "upstream", "downstream"],
       "time_window_sec": 900,
       "max_hops": 1
     },
@@ -389,16 +429,13 @@ data_offline_adjacent_router_rule = {
       "direction": "upstream",
       "time_window_sec": 900,
       "optional": True
+    },
+    {
+      "source": "offline_current_underneath_compound_node",
+      "target": "offline_current_parent_data_node",
+      "direction": "upstream",
+      "time_window_sec": 900,
+      "optional": True
     }
-  ],
-  "result_constraints": {
-    "role_alarm_or_presence_any": [
-      {
-        "alarm_roles": ["offline_adjacent_router_data_neighbor_node"],
-        "alarms": OFFLINE_ALARMS,
-        "presence_roles": ["offline_adjacent_router_underneath_compound_node"],
-        "min_matches": 1
-      }
-    ]
-  }
+  ]
 }

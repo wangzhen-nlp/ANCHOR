@@ -24,6 +24,33 @@ logger = logging.getLogger(__name__)
 
 class TemporalGraphEngine:
     @staticmethod
+    def _normalize_traverse_directions(direction):
+        if isinstance(direction, str):
+            text = direction.strip()
+            return (text,) if text else ("downstream",)
+        if isinstance(direction, (list, tuple, set)):
+            directions = []
+            seen = set()
+            for item in direction:
+                text = str(item).strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                directions.append(text)
+            return tuple(directions) if directions else ("downstream",)
+        return (str(direction).strip() or "downstream",)
+
+    @staticmethod
+    def _merge_candidate_hops(*candidate_maps):
+        merged = {}
+        for candidate_map in candidate_maps:
+            for site_id, hop in candidate_map.items():
+                previous_hop = merged.get(site_id)
+                if previous_hop is None or hop < previous_hop:
+                    merged[site_id] = hop
+        return merged
+
+    @staticmethod
     def _make_edge_window_cache_key(edge_window):
         if isinstance(edge_window, dict):
             return tuple(sorted(edge_window.items()))
@@ -1620,10 +1647,26 @@ class TemporalGraphEngine:
         if not self.site_chain_index:
             return None
 
+        directions = self._normalize_traverse_directions(direction)
+        if len(directions) > 1:
+            candidate_maps = []
+            for single_direction in directions:
+                single_candidates = self._get_precomputed_site_chain_candidates(
+                    start_node,
+                    single_direction,
+                    max_hops=max_hops,
+                )
+                if single_candidates is None:
+                    return None
+                candidate_maps.append(single_candidates)
+            return self._merge_candidate_hops(*candidate_maps)
+
         start_node = str(start_node or "").strip()
         chain_info = self.site_chain_index.get(start_node)
         if chain_info is None:
             return None
+
+        direction = directions[0]
 
         candidates = {}
 
@@ -1717,6 +1760,55 @@ class TemporalGraphEngine:
         以避免在稠密图上无意义地遍历整张图。
         """
         helper = node_rule_helper or self.node_rule_helper
+        directions = self._normalize_traverse_directions(direction)
+        if len(directions) > 1:
+            cache_key = (
+                "nearest_matching_multi",
+                start_node,
+                directions,
+                max_hops,
+                reference_ts,
+                self._make_edge_window_cache_key(edge_window),
+                id(path_requirements),
+                id(target_node_config),
+            )
+            if traversal_cache is not None and cache_key in traversal_cache:
+                return traversal_cache[cache_key]
+
+            candidate_maps = []
+            had_topology_candidate = False
+            for single_direction in directions:
+                single_candidates, single_had_topology = self._traverse_graph_nearest_matching(
+                    start_node=start_node,
+                    direction=single_direction,
+                    target_node_config=target_node_config,
+                    max_hops=max_hops,
+                    reference_ts=reference_ts,
+                    edge_window=edge_window,
+                    path_requirements=path_requirements,
+                    node_rule_helper=helper,
+                    traversal_cache=traversal_cache,
+                    path_validation_cache=path_validation_cache,
+                    structure_match_cache=structure_match_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                )
+                candidate_maps.append(single_candidates)
+                had_topology_candidate = had_topology_candidate or single_had_topology
+
+            result = self._merge_candidate_hops(*candidate_maps)
+            if result:
+                nearest_hop = min(result.values())
+                result = {
+                    node: hop
+                    for node, hop in result.items()
+                    if hop == nearest_hop
+                }
+            cached_result = (result, had_topology_candidate)
+            if traversal_cache is not None:
+                traversal_cache[cache_key] = cached_result
+            return cached_result
+
+        direction = directions[0]
 
         static_cache_key = None
         if path_requirements is None:
@@ -1853,6 +1945,40 @@ class TemporalGraphEngine:
                         filtered_neighbor_cache=None):
         """通用的广度优先搜索，支持路径节点约束"""
         helper = node_rule_helper or self.node_rule_helper
+        directions = self._normalize_traverse_directions(direction)
+        if len(directions) > 1:
+            local_cache_key = (
+                "full_multi",
+                start_node,
+                directions,
+                max_hops,
+                reference_ts,
+                self._make_edge_window_cache_key(edge_window),
+                id(path_requirements),
+            )
+            if traversal_cache is not None and local_cache_key in traversal_cache:
+                return traversal_cache[local_cache_key]
+
+            result = self._merge_candidate_hops(*[
+                self._traverse_graph(
+                    start_node,
+                    single_direction,
+                    max_hops=max_hops,
+                    reference_ts=reference_ts,
+                    edge_window=edge_window,
+                    path_requirements=path_requirements,
+                    node_rule_helper=helper,
+                    traversal_cache=traversal_cache,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                )
+                for single_direction in directions
+            ])
+            if traversal_cache is not None:
+                traversal_cache[local_cache_key] = result
+            return result
+
+        direction = directions[0]
 
         if direction == "self":
             return {start_node: 0}
@@ -1942,6 +2068,28 @@ class TemporalGraphEngine:
         path_validation_cache=None,
         filtered_neighbor_cache=None,
     ):
+        directions = self._normalize_traverse_directions(direction)
+        if len(directions) > 1:
+            neighbors = []
+            seen = set()
+            for single_direction in directions:
+                for nxt in self._get_filtered_neighbors_for_traversal(
+                    node,
+                    single_direction,
+                    reference_ts,
+                    edge_window,
+                    path_requirements,
+                    helper,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                ):
+                    if nxt in seen:
+                        continue
+                    seen.add(nxt)
+                    neighbors.append(nxt)
+            return tuple(neighbors)
+
+        direction = directions[0]
         if direction == "upstream":
             topo_neighbors = tuple(self.topo_up.get(node, []))
         elif direction == "either":

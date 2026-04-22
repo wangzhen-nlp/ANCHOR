@@ -4,19 +4,52 @@ import uuid
 from collections.abc import Iterable
 
 
+def _normalize_edge_directions(direction):
+    if direction is None:
+        return ("downstream",)
+    if isinstance(direction, str):
+        text = direction.strip()
+        return (text,) if text else ("downstream",)
+    if isinstance(direction, Iterable):
+        directions = []
+        seen = set()
+        for item in direction:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            directions.append(text)
+        return tuple(directions) if directions else ("downstream",)
+    return (str(direction).strip() or "downstream",)
+
+
+def _reverse_edge_direction(direction):
+    if direction == "downstream":
+        return "upstream"
+    if direction == "upstream":
+        return "downstream"
+    if direction == "self":
+        return "self"
+    if direction == "either":
+        return "either"
+    if direction in {"bidirection", "bidirectional"}:
+        return "bidirectional"
+    return "bidirectional"
+
+
+def _format_edge_directions(directions):
+    return directions[0] if len(directions) == 1 else directions
+
+
 def build_pattern_adj(edges_cfg):
     """把规则边展开成支持双向遍历的模式邻接表。"""
     pattern_adj = collections.defaultdict(list)
     for edge in edges_cfg:
         source, target = edge["source"], edge["target"]
-        fwd_dir = edge.get("direction", "downstream")
-        rev_dir = "upstream" if fwd_dir == "downstream" else (
-            "downstream" if fwd_dir == "upstream" else (
-                "self" if fwd_dir == "self" else (
-                    "either" if fwd_dir == "either" else "bidirectional"
-                )
-            )
-        )
+        fwd_dirs = _normalize_edge_directions(edge.get("direction", "downstream"))
+        rev_dirs = tuple(dict.fromkeys(_reverse_edge_direction(direction) for direction in fwd_dirs))
+        fwd_dir = _format_edge_directions(fwd_dirs)
+        rev_dir = _format_edge_directions(rev_dirs)
         hops = edge.get("max_hops")
         win = edge.get("time_window_sec", 300)
         rev_win = win
