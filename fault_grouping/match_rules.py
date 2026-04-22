@@ -39,6 +39,11 @@ from fault_grouping.site_merge_helper import (
     AdaptiveDensitySiteMergeHelper,
     BatchSiteMergeHelper,
 )
+from fault_grouping.sorted_alarm_cache import (
+    is_sorted_alarm_cache_file,
+    load_sorted_alarm_cache,
+    write_sorted_alarm_cache,
+)
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
 
 
@@ -188,6 +193,65 @@ def _trim_trailing_clear_alarms(valid_alarms):
         return []
 
     return valid_alarms[: last_non_clear_index + 1]
+
+
+def _count_alarm_event_types(valid_alarms):
+    clear_alarm_count = sum(
+        1 for item in valid_alarms if _is_clear_alarm(item.get("alarm", {}))
+    )
+    return len(valid_alarms) - clear_alarm_count, clear_alarm_count
+
+
+def _load_sorted_alarm_cache(cache_path):
+    metadata, valid_alarms = load_sorted_alarm_cache(cache_path, show_progress=True)
+    normal_alarm_count = int(
+        metadata.get("cached_normal_alarm_count")
+        if metadata.get("cached_normal_alarm_count") is not None
+        else metadata.get("normal_alarm_count", 0)
+    )
+    clear_alarm_count = int(
+        metadata.get("cached_clear_alarm_count")
+        if metadata.get("cached_clear_alarm_count") is not None
+        else metadata.get("clear_alarm_count", 0)
+    )
+    if normal_alarm_count + clear_alarm_count != len(valid_alarms):
+        normal_alarm_count, clear_alarm_count = _count_alarm_event_types(valid_alarms)
+    processed_count = int(metadata.get("processed_count", len(valid_alarms)))
+    return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count, metadata
+
+
+def _warn_sorted_alarm_cache_option_mismatch(metadata, args):
+    if not metadata:
+        return
+
+    mismatches = []
+    expected_start_time = str(metadata.get("start_time", "") or "")
+    expected_end_time = str(metadata.get("end_time", "") or "")
+    expected_clear_delay = float(metadata.get("clear_delay_sec", 0.0) or 0.0)
+    expected_topo = str(metadata.get("topo", "") or "")
+    expected_ne_graph = str(metadata.get("ne_graph", "") or "")
+    current_topo = os.path.abspath(args.topo) if args.topo else ""
+    current_ne_graph = os.path.abspath(args.ne_graph)
+    if expected_topo and expected_topo != current_topo:
+        mismatches.append(f"topo: 缓存={expected_topo}, 当前={current_topo or '-'}")
+    if expected_ne_graph and expected_ne_graph != current_ne_graph:
+        mismatches.append(f"ne_graph: 缓存={expected_ne_graph}, 当前={current_ne_graph}")
+    if (args.start_time or "") != expected_start_time:
+        mismatches.append(f"start_time: 缓存={expected_start_time or '-'}, 当前={args.start_time or '-'}")
+    if (args.end_time or "") != expected_end_time:
+        mismatches.append(f"end_time: 缓存={expected_end_time or '-'}, 当前={args.end_time or '-'}")
+    if abs(float(args.clear_delay_sec) - expected_clear_delay) > 1e-9:
+        mismatches.append(
+            f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(args.clear_delay_sec):g}"
+        )
+
+    if mismatches:
+        print(
+            "⚠️ 排序告警缓存已预先应用过滤/清除延迟参数，当前参数与缓存元信息不一致："
+        )
+        for item in mismatches:
+            print(f"   - {item}")
+        print("   如需使用新参数，请重新生成排序告警缓存。")
 
 
 def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
@@ -1314,6 +1378,8 @@ def main():
     parser.add_argument('--ticket-field', type=str, default='工单号', help='工单字段名，默认: 工单号')
     parser.add_argument('--ticket-recall-output', type=str, help='工单站点召回率输出文件。默认: <output>.ticket_recall.json')
     parser.add_argument('--rule', action='append', default=[], help='仅启用指定规则；可重复传入，也支持逗号分隔，如 --rule transmission_rule --rule link_rule 或 --rule transmission_rule,link_rule')
+    parser.add_argument('--sorted-alarms-input', type=str, default='', help='直接加载 prepare_sorted_alarms.py 生成的排序告警缓存；若 alarms 本身是该缓存格式，也会自动识别')
+    parser.add_argument('--sorted-alarms-output', type=str, default='', help='从原始告警加载并排序后，额外写出排序告警缓存，供后续快速加载')
     args = parser.parse_args()
 
     start_ts = None
@@ -1466,24 +1532,67 @@ def main():
     alarm_file_path = args.alarms
     start_time = time.time()
 
-    processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = _load_valid_alarms(
-        alarm_file_path,
-        valid_alarm_titles,
-        valid_sites,
-        ne_to_site,
-        start_ts=start_ts,
-        end_ts=end_ts,
-        clear_delay_sec=args.clear_delay_sec,
-    )
+    sorted_alarm_cache_input = args.sorted_alarms_input.strip()
+    if sorted_alarm_cache_input:
+        if not os.path.exists(sorted_alarm_cache_input):
+            parser.error(f"排序告警缓存不存在: {sorted_alarm_cache_input}")
+        if not is_sorted_alarm_cache_file(sorted_alarm_cache_input):
+            parser.error(f"不是有效的排序告警缓存: {sorted_alarm_cache_input}")
+    elif is_sorted_alarm_cache_file(alarm_file_path):
+        sorted_alarm_cache_input = alarm_file_path
 
-    print("⏳ 正在按时间排序有效告警...")
-    sort_start_time = time.time()
-    valid_alarms.sort(key=lambda item: item["ts"])
-    valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
+    if sorted_alarm_cache_input:
+        print(f"⚡ 直接加载排序告警缓存: {sorted_alarm_cache_input}")
+        load_start_time = time.time()
+        (
+            processed_count,
+            valid_alarms,
+            normal_alarm_count,
+            clear_alarm_count,
+            sorted_alarm_cache_metadata,
+        ) = _load_sorted_alarm_cache(sorted_alarm_cache_input)
+        _warn_sorted_alarm_cache_option_mismatch(sorted_alarm_cache_metadata, args)
+        sort_elapsed = time.time() - load_start_time
+    else:
+        processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = _load_valid_alarms(
+            alarm_file_path,
+            valid_alarm_titles,
+            valid_sites,
+            ne_to_site,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            clear_delay_sec=args.clear_delay_sec,
+        )
+
+        print("⏳ 正在按时间排序有效告警...")
+        sort_start_time = time.time()
+        valid_alarms.sort(key=lambda item: item["ts"])
+        valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
+        sort_elapsed = time.time() - sort_start_time
+        if args.sorted_alarms_output:
+            cached_normal_alarm_count, cached_clear_alarm_count = _count_alarm_event_types(valid_alarms)
+            cache_metadata = {
+                "source_alarms": os.path.abspath(alarm_file_path),
+                "topo": os.path.abspath(args.topo) if args.topo else "",
+                "ne_graph": os.path.abspath(args.ne_graph),
+                "start_time": args.start_time or "",
+                "end_time": args.end_time or "",
+                "clear_delay_sec": float(args.clear_delay_sec),
+                "processed_count": processed_count,
+                "normal_alarm_count": normal_alarm_count,
+                "clear_alarm_count": clear_alarm_count,
+                "cached_normal_alarm_count": cached_normal_alarm_count,
+                "cached_clear_alarm_count": cached_clear_alarm_count,
+                "valid_site_count": len(valid_sites),
+                "ne_to_site_count": len(ne_to_site),
+                "valid_alarm_title_count": len(valid_alarm_titles),
+            }
+            write_sorted_alarm_cache(args.sorted_alarms_output, valid_alarms, cache_metadata)
+            print(f"💾 排序告警缓存已写出: {args.sorted_alarms_output}")
+
     alarm_metadata_index = _build_alarm_metadata_index(valid_alarms)
-    sort_elapsed = time.time() - sort_start_time
     filtered_count = len(valid_alarms)
-    print(f"有效告警数: {filtered_count}，排序耗时: {sort_elapsed:.4f} 秒")
+    print(f"有效告警数: {filtered_count}，排序/加载耗时: {sort_elapsed:.4f} 秒")
     print(f"正常告警数: {normal_alarm_count}，清除告警数: {clear_alarm_count}")
 
     debug_targets = _parse_debug_targets(args)

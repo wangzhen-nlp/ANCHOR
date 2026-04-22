@@ -223,28 +223,44 @@ class TemporalGraphEngine:
             or node_config.get("hide_if_no_events")
         )
 
-    def _apply_output_visibility_filters(self, match_result, inst_roles, nodes_cfg):
+    def _get_role_node_config_for_output(self, role, match_result):
+        merged_rules = match_result.get("merged_rules", [match_result.get("rule")])
+        for rule_name in merged_rules:
+            rule = self.rules.get(rule_name)
+            if not rule:
+                continue
+            node_config = rule.get("nodes", {}).get(role)
+            if node_config is not None:
+                return node_config
+        return {}
+
+    def _apply_output_visibility_filters(self, match_result):
         """仅过滤最终输出视图，不影响规则匹配和 result_constraints 判断。"""
+        alarm_nodes_by_role = collections.defaultdict(set)
+        for symptom in match_result.get("symptoms", []):
+            role = symptom.get("matched_role")
+            node = symptom.get("node")
+            if role and node not in (None, ""):
+                alarm_nodes_by_role[role].add(node)
+
         filtered_role_mapping = {}
         for role, nodes in match_result.get("role_mapping", {}).items():
-            node_config = nodes_cfg.get(role, {})
+            node_config = self._get_role_node_config_for_output(role, match_result)
             if self._hide_role_node_without_alarm(node_config):
-                role_nodes = inst_roles.get(role, {}).get("nodes", {})
                 nodes = [
                     node for node in nodes
-                    if role_nodes.get(node)
+                    if node in alarm_nodes_by_role.get(role, set())
                 ]
             if nodes:
                 filtered_role_mapping[role] = nodes
 
         filtered_inferred_roots = {}
         for role, nodes in match_result.get("inferred_roots", {}).items():
-            node_config = nodes_cfg.get(role, {})
+            node_config = self._get_role_node_config_for_output(role, match_result)
             if self._hide_role_node_without_alarm(node_config):
-                role_nodes = inst_roles.get(role, {}).get("nodes", {})
                 nodes = [
                     node for node in nodes
-                    if role_nodes.get(node)
+                    if node in alarm_nodes_by_role.get(role, set())
                 ]
             if nodes:
                 filtered_inferred_roots[role] = nodes
@@ -260,6 +276,14 @@ class TemporalGraphEngine:
             "role_mapping": filtered_role_mapping,
             "inferred_roots": filtered_inferred_roots,
         }
+
+    def _apply_output_visibility_filters_to_matches(self, matches):
+        if not matches:
+            return matches
+        return [
+            self._apply_output_visibility_filters(match_result)
+            for match_result in matches
+        ]
 
     def __init__(
         self,
@@ -619,6 +643,8 @@ class TemporalGraphEngine:
                 finalized_matches = self._finalize_matches_with_history(expanded_matches)
                 finalize_profiles = []
 
+        output_matches = self._apply_output_visibility_filters_to_matches(finalized_matches)
+
         if self.debug_observer:
             self.debug_observer({
                 "force": force,
@@ -640,11 +666,11 @@ class TemporalGraphEngine:
                 "expanded_merge_stats": expanded_merge_stats,
                 "batch_merged_matches": merged_matches,
                 "expanded_matches": expanded_matches,
-                "finalized_matches": finalized_matches,
+                "finalized_matches": output_matches,
                 "finalize_profiles": finalize_profiles,
             })
 
-        return finalized_matches
+        return output_matches
 
     def advance_watermark(self, now_ts=None):
         """通过定时任务推进水印，并收割已成熟的故障组。"""
@@ -1479,7 +1505,6 @@ class TemporalGraphEngine:
                 if debug_trace is not None and result_failure_reason:
                     debug_trace.setdefault("result_constraint_failures", []).append(result_failure_reason)
                 continue
-            match_result = self._apply_output_visibility_filters(match_result, inst_roles, nodes_cfg)
             results.append(match_result)
         if debug_trace is not None:
             debug_trace["raw_match_count"] = len(results)
