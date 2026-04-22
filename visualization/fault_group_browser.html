@@ -148,6 +148,60 @@
             font-size: 13px;
             font-weight: 600;
         }
+        .filter-add-btn {
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+            padding: 10px 14px;
+            background: #fff;
+            color: #344054;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .filter-add-btn:hover {
+            background: #f8fafc;
+            border-color: #98a2b3;
+        }
+        .rule-filter-group {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .rule-filter-list {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            min-height: 34px;
+        }
+        .rule-filter-token {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid #b6d4fe;
+            border-radius: 999px;
+            padding: 6px 10px;
+            background: #eff6ff;
+            color: #0969da;
+            font-size: 12px;
+            font-weight: 700;
+            max-width: 360px;
+        }
+        .rule-filter-token-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .rule-filter-remove {
+            border: none;
+            background: transparent;
+            color: #0969da;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+            padding: 0 2px;
+        }
         .list {
             margin-top: 22px;
             display: grid;
@@ -301,9 +355,15 @@
                 <button class="filter-chip" data-filter="without-related">无关联故障组</button>
                 <button class="filter-chip" data-filter="ultimate">终极故障组</button>
                 <button class="filter-chip" data-filter="multi-site">站点数大于 1</button>
-                <button class="filter-chip" data-filter="rule:transmission_rule">规则: transmission_rule</button>
-                <button class="filter-chip" data-filter="rule:link_rule">规则: link_rule</button>
-                <button class="filter-chip" data-filter="rule:power_rule">规则: power_rule</button>
+            </div>
+            <div class="filter-row">
+                <span class="site-filter-label">规则过滤</span>
+                <div class="rule-filter-group">
+                    <input id="ruleFilterInput" class="site-filter-input" type="text" placeholder="输入规则名，回车/逗号添加多个">
+                    <button id="addRuleFilterBtn" class="filter-add-btn" type="button">添加</button>
+                    <button id="clearRuleFilterBtn" class="filter-add-btn" type="button">清空规则</button>
+                </div>
+                <div id="ruleFilterTokens" class="rule-filter-list"></div>
             </div>
             <div class="filter-row">
                 <span class="site-filter-label">站点过滤</span>
@@ -340,6 +400,7 @@
     <script>
         let faultGroups = [];
         let activeFilters = new Set(['all']);
+        let ruleFilterQueries = [];
         let siteFilterQuery = '';
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
@@ -899,8 +960,27 @@
         }
 
         function matchesRuleFilter(group, ruleName) {
+            const normalizedRuleName = String(ruleName || '').trim().toLowerCase();
+            if (!normalizedRuleName) {
+                return true;
+            }
             const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
-            return mergedRules.includes(ruleName) || group.rule === ruleName || group.match_info?.rule === ruleName;
+            const ruleValues = [
+                ...mergedRules,
+                group.rule,
+                group.match_info?.rule
+            ]
+                .filter(value => value !== null && value !== undefined)
+                .map(value => String(value).trim().toLowerCase())
+                .filter(Boolean);
+            return ruleValues.some(value => value === normalizedRuleName || value.includes(normalizedRuleName));
+        }
+
+        function matchesAnyRuleFilter(group) {
+            if (ruleFilterQueries.length === 0) {
+                return true;
+            }
+            return ruleFilterQueries.some(ruleName => matchesRuleFilter(group, ruleName));
         }
 
         function filterGroups(groups) {
@@ -923,10 +1003,11 @@
                         if (filter === 'multi-site' && getSiteCount(group) <= 1) {
                             return false;
                         }
-                        if (filter.startsWith('rule:') && !matchesRuleFilter(group, filter.slice(5))) {
-                            return false;
-                        }
                     }
+                }
+
+                if (!matchesAnyRuleFilter(group)) {
+                    return false;
                 }
 
                 if (siteFilterQuery) {
@@ -1033,6 +1114,59 @@
             }).join('');
         }
 
+        function parseRuleFilterInput(value) {
+            return String(value || '')
+                .split(/[,，\n]+/)
+                .map(item => item.trim())
+                .filter(Boolean);
+        }
+
+        function addRuleFiltersFromInput() {
+            const input = document.getElementById('ruleFilterInput');
+            const newRules = parseRuleFilterInput(input.value);
+            if (newRules.length === 0) {
+                return;
+            }
+            const seen = new Set(ruleFilterQueries.map(ruleName => ruleName.toLowerCase()));
+            newRules.forEach(ruleName => {
+                const key = ruleName.toLowerCase();
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    ruleFilterQueries.push(ruleName);
+                }
+            });
+            input.value = '';
+            renderRuleFilterTokens();
+            renderGroups();
+        }
+
+        function removeRuleFilter(index) {
+            ruleFilterQueries.splice(index, 1);
+            renderRuleFilterTokens();
+            renderGroups();
+        }
+
+        function clearRuleFilters() {
+            ruleFilterQueries = [];
+            document.getElementById('ruleFilterInput').value = '';
+            renderRuleFilterTokens();
+            renderGroups();
+        }
+
+        function renderRuleFilterTokens() {
+            const tokenList = document.getElementById('ruleFilterTokens');
+            if (ruleFilterQueries.length === 0) {
+                tokenList.innerHTML = '<span class="hint">未限制规则</span>';
+                return;
+            }
+            tokenList.innerHTML = ruleFilterQueries.map((ruleName, index) => `
+                <span class="rule-filter-token" title="${escapeHtml(ruleName)}">
+                    <span class="rule-filter-token-text">${escapeHtml(ruleName)}</span>
+                    <button class="rule-filter-remove" type="button" onclick="removeRuleFilter(${index})" title="移除规则过滤">×</button>
+                </span>
+            `).join('');
+        }
+
         function parseJsonl(text) {
             return text
                 .split(/\r?\n/)
@@ -1105,6 +1239,20 @@
             renderGroups();
         });
 
+        document.getElementById('addRuleFilterBtn').addEventListener('click', addRuleFiltersFromInput);
+        document.getElementById('clearRuleFilterBtn').addEventListener('click', clearRuleFilters);
+        document.getElementById('ruleFilterInput').addEventListener('keydown', function(event) {
+            if (event.key === 'Enter' || event.key === ',') {
+                event.preventDefault();
+                addRuleFiltersFromInput();
+            }
+        });
+        document.getElementById('ruleFilterInput').addEventListener('input', function(event) {
+            if (event.target.value.includes(',') || event.target.value.includes('，') || event.target.value.includes('\n')) {
+                addRuleFiltersFromInput();
+            }
+        });
+
         document.getElementById('siteFilterInput').addEventListener('input', function(event) {
             siteFilterQuery = event.target.value.trim();
             renderGroups();
@@ -1131,6 +1279,7 @@
         document.getElementById('durationHoursInput').addEventListener('input', updateDurationFilter);
         document.getElementById('durationMinutesInput').addEventListener('input', updateDurationFilter);
         document.getElementById('durationSecondsInput').addEventListener('input', updateDurationFilter);
+        renderRuleFilterTokens();
     </script>
 </body>
 </html>
