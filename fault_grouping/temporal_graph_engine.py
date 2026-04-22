@@ -1307,6 +1307,13 @@ class TemporalGraphEngine:
                 if not branch_survived:
                     if edge_trace is not None and branch_failure_reasons:
                         edge_trace["failures"].extend(branch_failure_reasons[:6])
+                    if edge.get("optional"):
+                        if edge_trace is not None:
+                            edge_trace["failures"].append(
+                                f"可选边 {curr_role}->{tgt_role} 未命中，保留当前实例"
+                            )
+                        next_instances.append(inst)
+                        continue
                     continue
 
                 # 回溯检查数量
@@ -1475,6 +1482,50 @@ class TemporalGraphEngine:
                     (
                         f"后置约束失败：角色 {sorted(roles)} 中至少 {min_roles} 个需要命中告警 "
                         f"{sorted(alarms)}，实际命中角色={sorted(role for role in matched_roles if role)}"
+                    ),
+                )
+
+        role_alarm_or_presence_any = result_constraints.get("role_alarm_or_presence_any", [])
+        for requirement in role_alarm_or_presence_any:
+            alarm_roles = {
+                str(role).strip()
+                for role in requirement.get("alarm_roles", [])
+                if str(role).strip()
+            }
+            alarms = {
+                str(alarm).strip()
+                for alarm in requirement.get("alarms", [])
+                if str(alarm).strip()
+            }
+            presence_roles = {
+                str(role).strip()
+                for role in requirement.get("presence_roles", [])
+                if str(role).strip()
+            }
+            min_matches = max(1, int(requirement.get("min_matches", 1) or 1))
+
+            matched_alarm_roles = {
+                symptom.get("matched_role")
+                for symptom in match_result.get("symptoms", [])
+                if symptom.get("matched_role") in alarm_roles
+                and str(symptom.get("alarm", "")).strip() in alarms
+            }
+            role_mapping = match_result.get("role_mapping", {})
+            matched_presence_roles = {
+                role
+                for role in presence_roles
+                if role_mapping.get(role)
+            }
+            matched_items = matched_alarm_roles | matched_presence_roles
+            if len(matched_items) < min_matches:
+                return (
+                    False,
+                    (
+                        "后置约束失败：需要满足至少 "
+                        f"{min_matches} 个条件，告警角色={sorted(alarm_roles)} 命中告警={sorted(alarms)} "
+                        f"或存在角色={sorted(presence_roles)}；"
+                        f"实际告警命中={sorted(role for role in matched_alarm_roles if role)}，"
+                        f"实际存在角色={sorted(role for role in matched_presence_roles if role)}"
                     ),
                 )
 

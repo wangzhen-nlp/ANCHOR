@@ -58,6 +58,41 @@ REQUIRED_OFFLINE_DATA_NODE = {
   ]
 }
 
+DATA_CONTEXT_NODE = {
+  "type": "primitive",
+  "site_rules": [
+    {
+      "include": ["Data"],
+      "expected_alarms": {
+        "forbidden_alarms": []
+      }
+    }
+  ]
+}
+
+OPTIONAL_OFFLINE_DATA_NODE = {
+  "type": "compound",
+  "patterns": [
+    REQUIRED_OFFLINE_DATA_NODE,
+    DATA_CONTEXT_NODE
+  ]
+}
+
+OFFLINE_UNDERNEATH_SITE_RULES = [
+  {
+    "include": ["Transmission"],
+    "expected_alarms": OFFLINE_ALARMS
+  },
+  {
+    "include": ["Transmission", "Ran"],
+    "expected_alarms": OFFLINE_ALARMS
+  },
+  {
+    "include": ["Data", "Ran"],
+    "expected_alarms": OFFLINE_ALARMS
+  }
+]
+
 UNDERNEATH_TRANSMISSION_COMPOUND_NODE = {
   "type": "compound",
   "min_count": 1,
@@ -65,6 +100,17 @@ UNDERNEATH_TRANSMISSION_COMPOUND_NODE = {
     {
       "type": "primitive",
       "site_rules": TRANSMISSION_SITE_RULES
+    }
+  ]
+}
+
+UNDERNEATH_OFFLINE_COMPOUND_NODE = {
+  "type": "compound",
+  "min_count": 1,
+  "patterns": [
+    {
+      "type": "primitive",
+      "site_rules": OFFLINE_UNDERNEATH_SITE_RULES
     }
   ]
 }
@@ -301,14 +347,14 @@ data_link_neighbor_rule = {
 
 data_adjacent_router_rule = {
   "pattern_name": "offline_under_adjacent_data_router_context",
-  "description": "本路由和相邻路由均存在下挂断站，且相邻路由站点自身需命中Data设备上的offline告警",
+  "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",
   "max_stay_time_sec": 3600,
-  "trigger_role": "adjacent_router_data_neighbor_node",
+  "trigger_role": "current_underneath_compound_node",
   "nodes": {
     "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
-    "adjacent_router_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
-    "adjacent_router_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE
+    "adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
+    "adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
     {
@@ -328,7 +374,18 @@ data_adjacent_router_rule = {
       "source": "adjacent_router_underneath_compound_node",
       "target": "adjacent_router_data_neighbor_node",
       "direction": "upstream",
-      "time_window_sec": 900
+      "time_window_sec": 900,
+      "optional": True
     }
-  ]
+  ],
+  "result_constraints": {
+    "role_alarm_or_presence_any": [
+      {
+        "alarm_roles": ["adjacent_router_data_neighbor_node"],
+        "alarms": OFFLINE_ALARMS,
+        "presence_roles": ["adjacent_router_underneath_compound_node"],
+        "min_matches": 1
+      }
+    ]
+  }
 }

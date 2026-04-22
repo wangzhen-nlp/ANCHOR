@@ -29,6 +29,7 @@ def build_pattern_adj(edges_cfg):
         path_requirements = constraints.get("path_node_requirements")
         source_candidate_selector = constraints.get("source_candidate_selector")
         target_candidate_selector = constraints.get("target_candidate_selector")
+        optional = bool(edge.get("optional", False))
 
         pattern_adj[source].append({
             "role": target,
@@ -36,7 +37,8 @@ def build_pattern_adj(edges_cfg):
             "hops": hops,
             "win": win,
             "path_requirements": path_requirements,
-            "candidate_selector": target_candidate_selector
+            "candidate_selector": target_candidate_selector,
+            "optional": optional,
         })
         pattern_adj[target].append({
             "role": source,
@@ -44,7 +46,8 @@ def build_pattern_adj(edges_cfg):
             "hops": hops,
             "win": rev_win,
             "path_requirements": path_requirements,
-            "candidate_selector": source_candidate_selector
+            "candidate_selector": source_candidate_selector,
+            "optional": optional,
         })
     return pattern_adj
 
