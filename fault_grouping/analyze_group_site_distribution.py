@@ -17,6 +17,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
 def _add_site_id(site_ids, raw_site_id):
     site_id = str(raw_site_id or "").strip()
     if site_id:
@@ -36,19 +40,21 @@ def extract_site_ids(record):
     优先使用 match_rules.py 当前输出的 group_info[*].site_list；
     若缺失，则兼容 compact/旧格式中的 role_mapping、symptoms、ne_info。
     """
+    if not isinstance(record, dict):
+        return set()
+
     site_ids = set()
 
-    group_info = record.get("group_info") or {}
-    if isinstance(group_info, dict):
-        for gmeta in group_info.values():
-            if isinstance(gmeta, dict):
-                _add_site_ids(site_ids, gmeta.get("site_list"))
+    group_info = _as_dict(record.get("group_info"))
+    for gmeta in group_info.values():
+        if isinstance(gmeta, dict):
+            _add_site_ids(site_ids, gmeta.get("site_list"))
 
     _add_site_ids(site_ids, record.get("site_list"))
 
     role_mapping_sources = [
         record.get("role_mapping"),
-        (record.get("match_info") or {}).get("role_mapping"),
+        _as_dict(record.get("match_info")).get("role_mapping"),
     ]
     for role_mapping in role_mapping_sources:
         if not isinstance(role_mapping, dict):
@@ -58,7 +64,7 @@ def extract_site_ids(record):
 
     symptom_sources = [
         record.get("symptoms"),
-        (record.get("match_info") or {}).get("symptoms"),
+        _as_dict(record.get("match_info")).get("symptoms"),
     ]
     for symptoms in symptom_sources:
         if not isinstance(symptoms, list):
@@ -68,11 +74,10 @@ def extract_site_ids(record):
                 continue
             _add_site_id(site_ids, symptom.get("node") or symptom.get("site_id"))
 
-    ne_info = record.get("ne_info") or {}
-    if isinstance(ne_info, dict):
-        for ne_meta in ne_info.values():
-            if isinstance(ne_meta, dict):
-                _add_site_id(site_ids, ne_meta.get("site_id"))
+    ne_info = _as_dict(record.get("ne_info"))
+    for ne_meta in ne_info.values():
+        if isinstance(ne_meta, dict):
+            _add_site_id(site_ids, ne_meta.get("site_id"))
 
     return site_ids
 
@@ -94,7 +99,11 @@ def load_groups(jsonl_path):
                 print(f"⚠️ 跳过第 {line_num} 行 JSON 解析失败: {exc}", file=sys.stderr)
                 continue
 
-            match_info = record.get("match_info") or {}
+            if not isinstance(record, dict):
+                print(f"⚠️ 跳过第 {line_num} 行：JSON 顶层不是对象", file=sys.stderr)
+                continue
+
+            match_info = _as_dict(record.get("match_info"))
             uuid = match_info.get("uuid", "")
             rule = match_info.get("rule", "")
             if not uuid and record.get("uuid"):
