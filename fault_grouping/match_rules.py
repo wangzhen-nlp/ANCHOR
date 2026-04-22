@@ -1692,6 +1692,7 @@ def main():
         nonlocal match_count
         with output_lock:
             with open(args.output, 'a', encoding='utf-8') as fw:
+                output_lines = []
                 for match in matches:
                     if args.verbose_groups:
                         generate_incident_report(match)
@@ -1703,7 +1704,8 @@ def main():
                         site_to_ne_ids=site_to_ne_ids,
                         ne_link_info_cache=ne_link_info_cache,
                     )
-                    fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
+                    output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
+                fw.writelines(output_lines)
             match_count += len(matches)
             if process_progress is not None:
                 process_progress.set_extra_text(_build_progress_extra_text())
