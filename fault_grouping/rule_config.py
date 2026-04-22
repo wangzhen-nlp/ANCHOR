@@ -87,6 +87,7 @@ OFFLINE_UNDERNEATH_SITE_RULES = [
 
 UNDERNEATH_OFFLINE_COMPOUND_NODE = {
   "type": "compound",
+  "hide_if_no_alarms": True,
   "min_count": 1,
   "patterns": [
     {

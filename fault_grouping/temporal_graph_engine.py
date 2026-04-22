@@ -215,6 +215,52 @@ class TemporalGraphEngine:
             if not changed:
                 return stabilized_inst
 
+    @staticmethod
+    def _hide_role_node_without_alarm(node_config):
+        """是否在最终输出中隐藏该 role 下没有贡献任何告警的站点。"""
+        return bool(
+            node_config.get("hide_if_no_alarms")
+            or node_config.get("hide_if_no_events")
+        )
+
+    def _apply_output_visibility_filters(self, match_result, inst_roles, nodes_cfg):
+        """仅过滤最终输出视图，不影响规则匹配和 result_constraints 判断。"""
+        filtered_role_mapping = {}
+        for role, nodes in match_result.get("role_mapping", {}).items():
+            node_config = nodes_cfg.get(role, {})
+            if self._hide_role_node_without_alarm(node_config):
+                role_nodes = inst_roles.get(role, {}).get("nodes", {})
+                nodes = [
+                    node for node in nodes
+                    if role_nodes.get(node)
+                ]
+            if nodes:
+                filtered_role_mapping[role] = nodes
+
+        filtered_inferred_roots = {}
+        for role, nodes in match_result.get("inferred_roots", {}).items():
+            node_config = nodes_cfg.get(role, {})
+            if self._hide_role_node_without_alarm(node_config):
+                role_nodes = inst_roles.get(role, {}).get("nodes", {})
+                nodes = [
+                    node for node in nodes
+                    if role_nodes.get(node)
+                ]
+            if nodes:
+                filtered_inferred_roots[role] = nodes
+
+        if (
+            filtered_role_mapping == match_result.get("role_mapping", {})
+            and filtered_inferred_roots == match_result.get("inferred_roots", {})
+        ):
+            return match_result
+
+        return {
+            **match_result,
+            "role_mapping": filtered_role_mapping,
+            "inferred_roots": filtered_inferred_roots,
+        }
+
     def __init__(
         self,
         topo_downstream_map,
@@ -1433,6 +1479,7 @@ class TemporalGraphEngine:
                 if debug_trace is not None and result_failure_reason:
                     debug_trace.setdefault("result_constraint_failures", []).append(result_failure_reason)
                 continue
+            match_result = self._apply_output_visibility_filters(match_result, inst_roles, nodes_cfg)
             results.append(match_result)
         if debug_trace is not None:
             debug_trace["raw_match_count"] = len(results)
