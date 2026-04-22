@@ -564,6 +564,37 @@ class TemporalGraphEngine:
         new_inst["roles"] = new_roles
         return new_inst
 
+    @staticmethod
+    def _keep_symmetric_pair_candidate(curr_role, tgt_role, edge, curr_phys, cand_phys):
+        source_role = edge.get("source_role")
+        target_role = edge.get("target_role")
+
+        if curr_role == source_role and tgt_role == target_role:
+            source_site = curr_phys
+            target_site = cand_phys
+        elif curr_role == target_role and tgt_role == source_role:
+            source_site = cand_phys
+            target_site = curr_phys
+        else:
+            source_site = curr_phys
+            target_site = cand_phys
+
+        return str(source_site) < str(target_site)
+
+    def _filter_symmetric_pair_candidates(self, candidate_hops, curr_role, tgt_role, edge, curr_phys):
+        if not edge.get("dedupe_symmetric_pair") or not candidate_hops:
+            return candidate_hops, 0
+
+        filtered = {}
+        removed_count = 0
+        for cand_phys, hop in candidate_hops.items():
+            if self._keep_symmetric_pair_candidate(curr_role, tgt_role, edge, curr_phys, cand_phys):
+                filtered[cand_phys] = hop
+            else:
+                removed_count += 1
+
+        return filtered, removed_count
+
     def __init__(
         self,
         topo_downstream_map,
@@ -1546,8 +1577,19 @@ class TemporalGraphEngine:
                             structure_match_cache=structure_match_cache,
                             filtered_neighbor_cache=filtered_neighbor_cache,
                         )
+                        candidate_hops, symmetric_deduped_count = self._filter_symmetric_pair_candidates(
+                            candidate_hops,
+                            curr_role,
+                            tgt_role,
+                            edge,
+                            curr_phys,
+                        )
                         raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
                         candidates = list(raw_candidates)
+                        if edge_trace is not None and symmetric_deduped_count:
+                            edge_trace["failures"].append(
+                                f"{curr_role}:{curr_phys} 的 {tgt_role} 候选因 symmetric pair 去重过滤 {symmetric_deduped_count} 个"
+                            )
                         if edge_trace is not None and not raw_candidates:
                             if had_topology_candidate:
                                 branch_failure_reasons.append(
@@ -1572,8 +1614,19 @@ class TemporalGraphEngine:
                             path_validation_cache=path_validation_cache,
                             filtered_neighbor_cache=filtered_neighbor_cache,
                         )
+                        candidate_hops, symmetric_deduped_count = self._filter_symmetric_pair_candidates(
+                            candidate_hops,
+                            curr_role,
+                            tgt_role,
+                            edge,
+                            curr_phys,
+                        )
                         raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
                         candidates = list(raw_candidates)
+                        if edge_trace is not None and symmetric_deduped_count:
+                            edge_trace["failures"].append(
+                                f"{curr_role}:{curr_phys} 的 {tgt_role} 候选因 symmetric pair 去重过滤 {symmetric_deduped_count} 个"
+                            )
                         # 先跑拓扑可达，再按 rule 里的 selector 收窄候选集
                         candidates = helper.select_candidates_by_rule(
                             candidates, candidate_hops, tgt_cfg, edge.get("candidate_selector")

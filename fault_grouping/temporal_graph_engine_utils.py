@@ -62,24 +62,34 @@ def build_pattern_adj(edges_cfg):
         path_requirements = constraints.get("path_node_requirements")
         source_candidate_selector = constraints.get("source_candidate_selector")
         target_candidate_selector = constraints.get("target_candidate_selector")
+        dedupe_symmetric_pair = bool(
+            edge.get("dedupe_symmetric_pair")
+            or constraints.get("dedupe_symmetric_pair")
+        )
         optional = bool(edge.get("optional", False))
 
         pattern_adj[source].append({
             "role": target,
+            "source_role": source,
+            "target_role": target,
             "traverse_dir": fwd_dir,
             "hops": hops,
             "win": win,
             "path_requirements": path_requirements,
             "candidate_selector": target_candidate_selector,
+            "dedupe_symmetric_pair": dedupe_symmetric_pair,
             "optional": optional,
         })
         pattern_adj[target].append({
             "role": source,
+            "source_role": source,
+            "target_role": target,
             "traverse_dir": rev_dir,
             "hops": hops,
             "win": rev_win,
             "path_requirements": path_requirements,
             "candidate_selector": source_candidate_selector,
+            "dedupe_symmetric_pair": dedupe_symmetric_pair,
             "optional": optional,
         })
     return pattern_adj

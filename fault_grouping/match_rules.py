@@ -405,15 +405,28 @@ def _build_simulated_now_ts_getter(valid_alarms, speedup):
     return get_now_ts
 
 
-def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data):
-    ne_graph_entry = ne_graph_data.get(ne_id, {})
-    raw_links = ne_graph_entry.get("link", {}) if isinstance(ne_graph_entry, dict) else {}
-    link_info = {}
-
-    for neighbor_id, link_meta in raw_links.items():
-        if neighbor_id not in group_ne_ids:
+def _build_site_to_ne_ids(ne_graph_data):
+    site_to_ne_ids = defaultdict(list)
+    for ne_id, ne_info in ne_graph_data.items():
+        if not isinstance(ne_info, dict):
             continue
+        site_id = str(ne_info.get("site_id", "")).strip()
+        if not site_id:
+            continue
+        site_to_ne_ids[site_id].append(ne_id)
+    return {
+        site_id: tuple(sorted(ne_ids))
+        for site_id, ne_ids in site_to_ne_ids.items()
+    }
 
+
+def _format_ne_link_info(ne_graph_entry):
+    raw_links = ne_graph_entry.get("link", {}) if isinstance(ne_graph_entry, dict) else {}
+    if not isinstance(raw_links, dict):
+        return {}
+
+    formatted_links = {}
+    for neighbor_id, link_meta in raw_links.items():
         if isinstance(link_meta, dict):
             connection_types = sorted(str(link_type) for link_type in link_meta.keys())
             topologies = sorted({str(direction) for direction in link_meta.values() if direction})
@@ -421,7 +434,7 @@ def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data):
             connection_types = [str(link_meta)]
             topologies = []
 
-        link_info[neighbor_id] = {
+        formatted_links[neighbor_id] = {
             "connection_type": ",".join(connection_types),
             "distance": "",
             "topology": ",".join(topologies),
@@ -429,6 +442,32 @@ def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data):
             "left_alarm": {},
             "right_alarm": {},
         }
+    return formatted_links
+
+
+def _get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache):
+    if ne_link_info_cache is None:
+        return _format_ne_link_info(ne_graph_data.get(ne_id, {}))
+    if ne_id not in ne_link_info_cache:
+        ne_link_info_cache[ne_id] = _format_ne_link_info(ne_graph_data.get(ne_id, {}))
+    return ne_link_info_cache[ne_id]
+
+
+def _build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache=None):
+    formatted_links = _get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache)
+    link_info = {}
+
+    if len(group_ne_ids) < len(formatted_links):
+        for neighbor_id in group_ne_ids:
+            if neighbor_id == ne_id:
+                continue
+            if neighbor_id in formatted_links:
+                link_info[neighbor_id] = formatted_links[neighbor_id]
+        return link_info
+
+    for neighbor_id, formatted_link in formatted_links.items():
+        if neighbor_id in group_ne_ids:
+            link_info[neighbor_id] = formatted_link
 
     return link_info
 
@@ -456,7 +495,13 @@ def _resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data):
     }
 
 
-def _build_group_output(match, ne_graph_data, site_graph_data):
+def _build_group_output(
+    match,
+    ne_graph_data,
+    site_graph_data,
+    site_to_ne_ids=None,
+    ne_link_info_cache=None,
+):
     group_id = match.get("uuid", "")
     ne_info = {}
     ne_alarms = defaultdict(list)
@@ -491,11 +536,18 @@ def _build_group_output(match, ne_graph_data, site_graph_data):
             "故障组ID": symptom.get("故障组ID", ""),
         })
 
-    group_ne_ids = sorted({
-        ne_id
-        for ne_id, ne_graph_entry in ne_graph_data.items()
-        if ne_graph_entry.get("site_id", "") in group_site_ids
-    } | set(ne_alarms.keys()))
+    group_ne_id_set = set(ne_alarms.keys())
+    if site_to_ne_ids is None:
+        group_ne_id_set.update(
+            ne_id
+            for ne_id, ne_graph_entry in ne_graph_data.items()
+            if ne_graph_entry.get("site_id", "") in group_site_ids
+        )
+    else:
+        for site_id in group_site_ids:
+            group_ne_id_set.update(site_to_ne_ids.get(site_id, ()))
+    group_ne_ids = sorted(group_ne_id_set)
+    group_ne_id_set = set(group_ne_ids)
 
     for ne_id in group_ne_ids:
         ne_graph_entry = ne_graph_data.get(ne_id, {})
@@ -510,7 +562,12 @@ def _build_group_output(match, ne_graph_data, site_graph_data):
 
         ne_info[ne_id] = {
             "alarm": alarms,
-            "link": _build_group_link_info(ne_id, set(group_ne_ids), ne_graph_data),
+            "link": _build_group_link_info(
+                ne_id,
+                group_ne_id_set,
+                ne_graph_data,
+                ne_link_info_cache=ne_link_info_cache,
+            ),
             "group": group_id,
             "name": ne_graph_entry.get("name", ne_id),
             "site_id": site_id,
@@ -585,11 +642,24 @@ def _enrich_match_symptoms(match, alarm_metadata_index):
     return enriched_symptoms
 
 
-def _build_jsonl_match_output(match, ne_graph_data, site_graph_data, alarm_metadata_index):
+def _build_jsonl_match_output(
+    match,
+    ne_graph_data,
+    site_graph_data,
+    alarm_metadata_index,
+    site_to_ne_ids=None,
+    ne_link_info_cache=None,
+):
     enriched_match = dict(match)
     enriched_match["symptoms"] = _enrich_match_symptoms(match, alarm_metadata_index)
 
-    group_output = _build_group_output(enriched_match, ne_graph_data, site_graph_data)
+    group_output = _build_group_output(
+        enriched_match,
+        ne_graph_data,
+        site_graph_data,
+        site_to_ne_ids=site_to_ne_ids,
+        ne_link_info_cache=ne_link_info_cache,
+    )
     timestamps = [symptom["ts"] for symptom in enriched_match.get("symptoms", []) if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
 
@@ -1448,6 +1518,10 @@ def main():
         if str(ne_info.get("domain", "")).strip()
     }
     print(f"NE 数量: {len(ne_to_site)}")
+    print("构建 site -> NE 输出索引...")
+    site_to_ne_ids = _build_site_to_ne_ids(ne_graph_data)
+    ne_link_info_cache = {}
+    print(f"site -> NE 索引站点数: {len(site_to_ne_ids)}")
 
     valid_alarm_titles = CRITICAL_ALARMS
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
@@ -1625,7 +1699,9 @@ def main():
                         match,
                         ne_graph_data,
                         site_graph_data,
-                        alarm_metadata_index
+                        alarm_metadata_index,
+                        site_to_ne_ids=site_to_ne_ids,
+                        ne_link_info_cache=ne_link_info_cache,
                     )
                     fw.write(json.dumps(enriched_match, ensure_ascii=False) + '\n')
             match_count += len(matches)

@@ -421,7 +421,10 @@ data_offline_adjacent_offline_rule = {
       "target": "offline_adjacent_router_data_neighbor_node",
       "direction": ["bidirection", "upstream", "downstream"],
       "time_window_sec": 900,
-      "max_hops": 1
+      "max_hops": 1,
+      "constraints": {
+        "dedupe_symmetric_pair": True
+      }
     },
     {
       "source": "offline_adjacent_router_underneath_compound_node",
