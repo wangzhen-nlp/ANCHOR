@@ -16,31 +16,15 @@ TRANSMISSION_SITE_RULES = [
   }
 ]
 
-OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
-  "type": "compound",
-  "patterns": [
+NO_OFFLINE_DATA_NODE = {
+  "type": "primitive",
+  "site_rules": [
     {
-      "type": "primitive",
-      "site_rules": [
-        {
-          "include": ["Data"],
-          "expected_alarms": {
-            "required_alarms": LINK_ALARMS,
-            "forbidden_alarms": OFFLINE_ALARMS
-          }
-        }
-      ]
-    },
-    {
-      "type": "primitive",
-      "site_rules": [
-        {
-          "include": ["Data"],
-          "expected_alarms": {
-            "forbidden_alarms": OFFLINE_ALARMS
-          }
-        }
-      ]
+      "include": ["Data"],
+      "expected_alarms": {
+        "forbidden_alarms": OFFLINE_ALARMS,
+        "forbidden_alarm_source_domains": ["Data"]
+      }
     }
   ]
 }
@@ -75,6 +59,37 @@ OPTIONAL_OFFLINE_DATA_NODE = {
   "patterns": [
     REQUIRED_OFFLINE_DATA_NODE,
     DATA_CONTEXT_NODE
+  ]
+}
+
+OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
+  "type": "compound",
+  "patterns": [
+    {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Data"],
+          "expected_alarms": {
+            "required_alarms": LINK_ALARMS,
+            "forbidden_alarms": OFFLINE_ALARMS,
+            "forbidden_alarm_source_domains": ["Data"]
+          }
+        }
+      ]
+    },
+    {
+      "type": "primitive",
+      "site_rules": [
+        {
+          "include": ["Data"],
+          "expected_alarms": {
+            "forbidden_alarms": OFFLINE_ALARMS,
+            "forbidden_alarm_source_domains": ["Data"]
+          }
+        }
+      ]
+    }
   ]
 }
 
@@ -132,7 +147,8 @@ transmission_rule = {
             {
               "include": ["Data"],
               "expected_alarms": {
-                "forbidden_alarms": OFFLINE_ALARMS
+                "forbidden_alarms": OFFLINE_ALARMS,
+                "forbidden_alarm_source_domains": ["Data"]
               }
             },
             {
@@ -272,7 +288,8 @@ data_rule = {
         {
           "include": ["Data"],
           "expected_alarms": {
-            "forbidden_alarms": OFFLINE_ALARMS
+            "forbidden_alarms": OFFLINE_ALARMS,
+            "forbidden_alarm_source_domains": ["Data"]
           }
         }
       ]
@@ -307,16 +324,7 @@ data_link_neighbor_rule = {
   "nodes": {
     "data_link_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
     "data_link_adjacent_data_neighbor_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
-    "data_link_underneath_compound_node": {
-      "type": "compound",
-      "min_count": 1,
-      "patterns": [
-        {
-          "type": "primitive",
-          "site_rules": TRANSMISSION_SITE_RULES
-        }
-      ]
-    }
+    "data_link_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
     {
@@ -329,7 +337,7 @@ data_link_neighbor_rule = {
     {
       "source": "data_link_parent_data_node",
       "target": "data_link_adjacent_data_neighbor_node",
-      "direction": "upstream",
+      "direction": "bidirection",
       "time_window_sec": 900,
       "max_hops": 1
     }
@@ -351,7 +359,7 @@ data_adjacent_router_rule = {
   "max_stay_time_sec": 3600,
   "trigger_role": "current_underneath_compound_node",
   "nodes": {
-    "current_parent_data_node": OPTIONAL_LINK_NO_OFFLINE_DATA_NODE,
+    "current_parent_data_node": NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_TRANSMISSION_COMPOUND_NODE,
     "adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
     "adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
