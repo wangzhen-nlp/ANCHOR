@@ -39,6 +39,53 @@ class TemporalGraphEngine:
             "filtered_neighbor_cache": {},
         }
 
+    @staticmethod
+    def _normalize_site_chain_hops(raw_hops):
+        if not isinstance(raw_hops, dict):
+            return {}
+
+        normalized = {}
+        for raw_site_id, raw_hop in raw_hops.items():
+            site_id = str(raw_site_id or "").strip()
+            if not site_id:
+                continue
+            try:
+                hop = int(raw_hop)
+            except (TypeError, ValueError):
+                continue
+            if hop <= 0:
+                continue
+            normalized[site_id] = hop
+        return normalized
+
+    @classmethod
+    def _normalize_site_chain_index(cls, site_chain_index):
+        if not isinstance(site_chain_index, dict):
+            return {}
+
+        normalized = {}
+        for raw_site_id, raw_info in site_chain_index.items():
+            site_id = str(raw_site_id or "").strip()
+            if not site_id or not isinstance(raw_info, dict):
+                continue
+
+            bidirectional_sites = {
+                str(site_id).strip()
+                for site_id in raw_info.get("bidirectional_sites", [])
+                if str(site_id).strip()
+            }
+            normalized[site_id] = {
+                "downstream_site_hops": cls._normalize_site_chain_hops(
+                    raw_info.get("downstream_site_hops")
+                ),
+                "upstream_site_hops": cls._normalize_site_chain_hops(
+                    raw_info.get("upstream_site_hops")
+                ),
+                "bidirectional_sites": bidirectional_sites,
+            }
+
+        return normalized
+
     def _compile_rule_execution_plan(self, rule):
         """为单条规则预编译静态执行计划，避免每次评估重复构图和排边。"""
         nodes_cfg = rule.get("nodes", {})
@@ -176,6 +223,7 @@ class TemporalGraphEngine:
         alarm_source_domain_map=None,
         aggregation_wait_sec=420,
         site_merge_helper=None,
+        site_chain_index=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -187,6 +235,7 @@ class TemporalGraphEngine:
         for up, downs in self.topo_down.items():
             for down in downs:
                 self.topo_up[down].append(up)
+        self.site_chain_index = self._normalize_site_chain_index(site_chain_index)
 
         # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]) }
         self.event_cache = collections.defaultdict(collections.deque)
@@ -1443,6 +1492,57 @@ class TemporalGraphEngine:
             )
         return structure_match_cache[cache_key]
 
+    def _get_precomputed_site_chain_candidates(self, start_node, direction, max_hops=None):
+        """从 site_chains.json 预计算结果中取候选 hop；不支持混合多跳 either。"""
+        if not self.site_chain_index:
+            return None
+
+        start_node = str(start_node or "").strip()
+        chain_info = self.site_chain_index.get(start_node)
+        if chain_info is None:
+            return None
+
+        candidates = {}
+
+        def add_candidate(site_id, hop):
+            site_id = str(site_id or "").strip()
+            if not site_id or site_id == start_node:
+                return
+            if max_hops is not None and hop > max_hops:
+                return
+            previous_hop = candidates.get(site_id)
+            if previous_hop is None or hop < previous_hop:
+                candidates[site_id] = hop
+
+        if direction == "downstream":
+            for site_id, hop in chain_info.get("downstream_site_hops", {}).items():
+                add_candidate(site_id, hop)
+            return candidates
+
+        if direction == "upstream":
+            for site_id, hop in chain_info.get("upstream_site_hops", {}).items():
+                add_candidate(site_id, hop)
+            return candidates
+
+        if direction == "either":
+            # site_chains 只保存纯上游/纯下游的可达关系；混合方向多跳仍回退到原 BFS。
+            if max_hops != 1:
+                return None
+            for site_id, hop in chain_info.get("downstream_site_hops", {}).items():
+                add_candidate(site_id, hop)
+            for site_id, hop in chain_info.get("upstream_site_hops", {}).items():
+                add_candidate(site_id, hop)
+            for site_id in chain_info.get("bidirectional_sites", set()):
+                add_candidate(site_id, 1)
+            return candidates
+
+        if direction in {"bidirection", "bidirectional"}:
+            for site_id in chain_info.get("bidirectional_sites", set()):
+                add_candidate(site_id, 1)
+            return candidates
+
+        return None
+
     def _validate_path_node_for_traversal(
         self,
         node,
@@ -1532,6 +1632,40 @@ class TemporalGraphEngine:
         )
         if traversal_cache is not None and cache_key in traversal_cache:
             return traversal_cache[cache_key]
+
+        if path_requirements is None:
+            precomputed_candidates = self._get_precomputed_site_chain_candidates(
+                start_node,
+                direction,
+                max_hops=max_hops,
+            )
+            if precomputed_candidates is not None:
+                had_topology_candidate = bool(precomputed_candidates)
+                result = {}
+                nearest_hop = None
+                for curr, hops in sorted(precomputed_candidates.items(), key=lambda item: (item[1], str(item[0]))):
+                    if nearest_hop is not None and hops > nearest_hop:
+                        break
+                    if self._matches_node_structure_cached(
+                        curr,
+                        target_node_config,
+                        helper,
+                        structure_match_cache=structure_match_cache,
+                    ):
+                        if nearest_hop is None:
+                            nearest_hop = hops
+                        result[curr] = hops
+
+                cached_result = (result, had_topology_candidate)
+                if traversal_cache is not None:
+                    traversal_cache[cache_key] = cached_result
+                if static_cache_key is not None:
+                    with self._topo_cache_lock:
+                        self.global_nearest_match_cache[static_cache_key] = cached_result
+                        self.global_nearest_match_cache.move_to_end(static_cache_key)
+                        if len(self.global_nearest_match_cache) > self.max_nearest_match_cache_size:
+                            self.global_nearest_match_cache.popitem(last=False)
+                return cached_result
 
         visited = {start_node}
         queue = collections.deque([(start_node, 0)])
@@ -1623,6 +1757,21 @@ class TemporalGraphEngine:
                         traversal_cache[local_cache_key] = result
                     return result
 
+            precomputed_candidates = self._get_precomputed_site_chain_candidates(
+                start_node,
+                direction,
+                max_hops=max_hops,
+            )
+            if precomputed_candidates is not None:
+                with self._topo_cache_lock:
+                    self.global_topo_cache[cache_key] = precomputed_candidates
+                    self.global_topo_cache.move_to_end(cache_key)
+                    if len(self.global_topo_cache) > self.max_topo_cache_size:
+                        self.global_topo_cache.popitem(last=False)
+                if traversal_cache is not None:
+                    traversal_cache[local_cache_key] = precomputed_candidates
+                return precomputed_candidates
+
         visited = {start_node}
         queue = collections.deque([(start_node, 0)])
         result = {}
@@ -1684,6 +1833,10 @@ class TemporalGraphEngine:
                     seen.add(nxt)
                     topo_neighbors.append(nxt)
             topo_neighbors = tuple(topo_neighbors)
+        elif direction in {"bidirection", "bidirectional"}:
+            topo_neighbors = tuple(
+                sorted(set(self.topo_down.get(node, ())) & set(self.topo_up.get(node, ())))
+            )
         else:
             topo_neighbors = tuple(self.topo_down.get(node, []))
 

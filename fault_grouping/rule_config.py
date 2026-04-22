@@ -320,7 +320,7 @@ data_adjacent_router_rule = {
     {
       "source": "current_parent_data_node",
       "target": "adjacent_router_data_neighbor_node",
-      "direction": "upstream",
+      "direction": "bidirection",
       "time_window_sec": 900,
       "max_hops": 1
     },

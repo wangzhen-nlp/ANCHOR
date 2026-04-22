@@ -171,10 +171,28 @@ def iter_raw_unique_cross_site_links(ne_graph, show_progress=False):
 
 def collect_missing_ne_graph_pair_domain_counts(ne_graph, prediction_pairs, show_progress=False):
     """只为 prediction 未覆盖的站点对统计原始连边两端设备 domain 数量。"""
+    relation_data = collect_ne_graph_relation_data(
+        ne_graph,
+        prediction_pairs=prediction_pairs,
+        collect_missing_counts=True,
+        show_progress=show_progress,
+    )
+    return relation_data["missing_pair_counts"], relation_data["stats"]
+
+
+def collect_ne_graph_relation_data(
+    ne_graph,
+    prediction_pairs=None,
+    *,
+    collect_missing_counts=False,
+    show_progress=False,
+):
+    """收集 ne_graph 中真实出现过跨站连边的站点对，可选统计缺失关系补边证据。"""
+    prediction_pairs = prediction_pairs or set()
+    ne_graph_pairs = set()
     missing_pair_counts = {}
-    ne_graph_pair_count = 0
-    skipped_prediction_pair_count = 0
-    seen_pairs = set()
+    skipped_prediction_link_count = 0
+    raw_cross_site_link_count = 0
 
     for link in iter_raw_unique_cross_site_links(ne_graph, show_progress=show_progress):
         source_site = normalize_site_id(link["source_site"])
@@ -183,12 +201,13 @@ def collect_missing_ne_graph_pair_domain_counts(ne_graph, prediction_pairs, show
             continue
 
         key = site_pair_key(source_site, target_site)
-        if key not in seen_pairs:
-            seen_pairs.add(key)
-            ne_graph_pair_count += 1
+        ne_graph_pairs.add(key)
+        raw_cross_site_link_count += 1
 
+        if not collect_missing_counts:
+            continue
         if key in prediction_pairs:
-            skipped_prediction_pair_count += 1
+            skipped_prediction_link_count += 1
             continue
 
         rec = missing_pair_counts.setdefault(key, {
@@ -207,15 +226,22 @@ def collect_missing_ne_graph_pair_domain_counts(ne_graph, prediction_pairs, show
         if target_index is not None:
             rec["site_counts"][target_site][target_index] += 1
 
-    return missing_pair_counts, {
-        "ne_graph_pair_count": ne_graph_pair_count,
-        "skipped_prediction_link_count": skipped_prediction_pair_count,
+    return {
+        "ne_graph_pairs": ne_graph_pairs,
+        "missing_pair_counts": missing_pair_counts,
+        "stats": {
+            "ne_graph_pair_count": len(ne_graph_pairs),
+            "raw_cross_site_link_count": raw_cross_site_link_count,
+            "skipped_prediction_link_count": skipped_prediction_link_count,
+        },
     }
 
 
-def apply_ne_graph_augmentation(
-    data,
+def apply_ne_graph_augmentation_from_counts(
     ne_graph_path,
+    prediction_pair_count,
+    missing_pair_counts,
+    collect_stats,
     adjacency,
     first_hop_adjacency,
     bidirectional_neighbors,
@@ -225,18 +251,9 @@ def apply_ne_graph_augmentation(
     show_progress=True,
 ):
     """用 ne_graph 中 prediction 未覆盖的站点连边补充方向关系。"""
-    with open(ne_graph_path, "r", encoding="utf-8") as f:
-        ne_graph = json.load(f)
-
-    prediction_pairs = collect_prediction_pairs(data)
-    missing_pair_counts, collect_stats = collect_missing_ne_graph_pair_domain_counts(
-        ne_graph,
-        prediction_pairs,
-        show_progress=show_progress,
-    )
     stats = {
         "ne_graph": str(ne_graph_path),
-        "prediction_pair_count": len(prediction_pairs),
+        "prediction_pair_count": prediction_pair_count,
         "ne_graph_pair_count": collect_stats["ne_graph_pair_count"],
         "skipped_prediction_link_count": collect_stats["skipped_prediction_link_count"],
         "augmented_pair_count": 0,
@@ -272,6 +289,42 @@ def apply_ne_graph_augmentation(
                 stats["augmented_bidirectional_pair_count"] += 1
 
     return stats
+
+
+def apply_ne_graph_augmentation(
+    data,
+    ne_graph_path,
+    adjacency,
+    first_hop_adjacency,
+    bidirectional_neighbors,
+    all_sites,
+    *,
+    directed_only=False,
+    show_progress=True,
+):
+    """兼容旧调用：加载 ne_graph 后补充 prediction 未覆盖的站点关系。"""
+    with open(ne_graph_path, "r", encoding="utf-8") as f:
+        ne_graph = json.load(f)
+
+    prediction_pairs = collect_prediction_pairs(data)
+    relation_data = collect_ne_graph_relation_data(
+        ne_graph,
+        prediction_pairs=prediction_pairs,
+        collect_missing_counts=True,
+        show_progress=show_progress,
+    )
+    return apply_ne_graph_augmentation_from_counts(
+        ne_graph_path,
+        len(prediction_pairs),
+        relation_data["missing_pair_counts"],
+        relation_data["stats"],
+        adjacency,
+        first_hop_adjacency,
+        bidirectional_neighbors,
+        all_sites,
+        directed_only=directed_only,
+        show_progress=show_progress,
+    )
 
 
 def reachable_downstream_sites(adjacency, first_hop_adjacency, source_site, max_depth=None):
@@ -312,6 +365,8 @@ def build_site_chains(
     prediction_path,
     *,
     ne_graph_path=None,
+    enrich_relation=False,
+    restrict_relation=False,
     directed_only=False,
     max_depth=None,
     show_progress=True,
@@ -323,20 +378,58 @@ def build_site_chains(
         data,
         directed_only=directed_only,
     )
+    warnings = list(warnings or [])
     bidirectional_neighbors, bidirectional_sites, bidirectional_source = build_bidirectional_neighbors(data)
     all_sites.update(bidirectional_sites)
+    relation_data = None
     augmentation_stats = None
-    if ne_graph_path:
-        augmentation_stats = apply_ne_graph_augmentation(
-            data,
-            ne_graph_path,
-            adjacency,
-            first_hop_adjacency,
-            bidirectional_neighbors,
-            all_sites,
-            directed_only=directed_only,
+    restriction_stats = None
+
+    if ne_graph_path and (enrich_relation or restrict_relation):
+        with open(ne_graph_path, "r", encoding="utf-8") as f:
+            ne_graph = json.load(f)
+
+        prediction_pairs = collect_prediction_pairs(data)
+        relation_data = collect_ne_graph_relation_data(
+            ne_graph,
+            prediction_pairs=prediction_pairs,
+            collect_missing_counts=enrich_relation,
             show_progress=show_progress,
         )
+        if enrich_relation:
+            augmentation_stats = apply_ne_graph_augmentation_from_counts(
+                ne_graph_path,
+                len(prediction_pairs),
+                relation_data["missing_pair_counts"],
+                relation_data["stats"],
+                adjacency,
+                first_hop_adjacency,
+                bidirectional_neighbors,
+                all_sites,
+                directed_only=directed_only,
+                show_progress=show_progress,
+            )
+    elif enrich_relation or restrict_relation:
+        warnings.append("--enrich-relation/--restrict-relation 未生效：未提供 --ne-graph")
+
+    if ne_graph_path and not enrich_relation and not restrict_relation:
+        warnings.append("--ne-graph 已提供，但未开启 --enrich-relation/--restrict-relation；不会影响站点关系")
+
+    if restrict_relation and not ne_graph_path:
+        restriction_stats = {
+            "enabled": False,
+            "reason": "missing_ne_graph",
+        }
+    elif restrict_relation:
+        restriction_stats = {
+            "enabled": True,
+            "mode": "filter_final_downstream_site_hops",
+            "ne_graph": str(ne_graph_path),
+            "ne_graph_pair_count": len(relation_data["ne_graph_pairs"]) if relation_data else 0,
+            "downstream_relation_count_before": 0,
+            "downstream_relation_count_after": 0,
+            "removed_downstream_relation_count": 0,
+        }
 
     all_sites.update(adjacency.keys())
     all_sites.update(first_hop_adjacency.keys())
@@ -359,6 +452,18 @@ def build_site_chains(
                 site_id,
                 max_depth=max_depth,
             )
+            if restriction_stats and restriction_stats.get("enabled"):
+                before_count = len(downstream_site_hops)
+                ne_graph_pairs = relation_data["ne_graph_pairs"] if relation_data else set()
+                downstream_site_hops = {
+                    downstream_site: hop
+                    for downstream_site, hop in downstream_site_hops.items()
+                    if site_pair_key(site_id, downstream_site) in ne_graph_pairs
+                }
+                after_count = len(downstream_site_hops)
+                restriction_stats["downstream_relation_count_before"] += before_count
+                restriction_stats["downstream_relation_count_after"] += after_count
+                restriction_stats["removed_downstream_relation_count"] += before_count - after_count
             downstream_hops_by_site[site_id] = downstream_site_hops
             for downstream_site, hop in downstream_site_hops.items():
                 upstream_hops_by_site.setdefault(downstream_site, {})[site_id] = hop
@@ -391,9 +496,18 @@ def build_site_chains(
         "warning_count": len(warnings),
         "warnings": warnings,
         "edge_stats": edge_stats,
+        "relation_options": {
+            "ne_graph_provided": bool(ne_graph_path),
+            "enrich_relation_requested": enrich_relation,
+            "restrict_relation_requested": restrict_relation,
+            "enrich_relation_effective": bool(ne_graph_path and enrich_relation),
+            "restrict_relation_effective": bool(ne_graph_path and restrict_relation),
+        },
     }
     if augmentation_stats:
         meta["ne_graph_augmentation"] = augmentation_stats
+    if restriction_stats:
+        meta["ne_graph_restriction"] = restriction_stats
 
     total_downstream_relations = sum(
         len(info["downstream_site_hops"])
@@ -443,8 +557,24 @@ def parse_args():
     parser.add_argument(
         "--ne-graph",
         help=(
-            "可选 ne_graph.json；如果 prediction 未覆盖某站点对，则按两端连边设备 "
-            "(data_num, transmission_num, ran_num) 三元组补方向"
+            "可选 ne_graph.json；仅作为 --enrich-relation/--restrict-relation 的数据源，"
+            "单独提供不会改变站点关系"
+        ),
+    )
+    parser.add_argument(
+        "--enrich-relation",
+        action="store_true",
+        help=(
+            "开启后，如果 prediction 未覆盖某站点对，则基于 ne_graph 连边两端设备 "
+            "(data_num, transmission_num, ran_num) 三元组补充方向；未提供 --ne-graph 时失效"
+        ),
+    )
+    parser.add_argument(
+        "--restrict-relation",
+        action="store_true",
+        help=(
+            "开启后，在生成每个站点的 downstream_site_hops 后，只保留与当前站点在 "
+            "ne_graph 中存在跨站连边的下游站点；未提供 --ne-graph 时失效"
         ),
     )
     parser.add_argument(
@@ -472,6 +602,10 @@ def print_summary(result, output_path):
     print(f"双向直接边数: {meta['total_bidirectional_edges']}")
     print(f"下游可达关系数: {meta['total_downstream_relations']}")
     print(f"上游可达关系数: {meta['total_upstream_relations']}")
+    relation_options = meta.get("relation_options", {})
+    if relation_options:
+        print(f"ne_graph关系补充: {'开启' if relation_options.get('enrich_relation_effective') else '关闭'}")
+        print(f"ne_graph下游结果裁剪: {'开启' if relation_options.get('restrict_relation_effective') else '关闭'}")
     augmentation_stats = meta.get("ne_graph_augmentation")
     if augmentation_stats:
         print(f"ne_graph补充候选站点对数: {augmentation_stats['ne_graph_pair_count']}")
@@ -479,6 +613,12 @@ def print_summary(result, output_path):
         print(f"ne_graph补充站点对数: {augmentation_stats['augmented_pair_count']}")
         print(f"ne_graph补充有向边数: {augmentation_stats['augmented_directed_pair_count']}")
         print(f"ne_graph补充双向边数: {augmentation_stats['augmented_bidirectional_pair_count']}")
+    restriction_stats = meta.get("ne_graph_restriction")
+    if restriction_stats and restriction_stats.get("enabled"):
+        print(f"ne_graph裁剪站点对数: {restriction_stats['ne_graph_pair_count']}")
+        print(f"裁剪前下游关系数: {restriction_stats['downstream_relation_count_before']}")
+        print(f"裁剪后下游关系数: {restriction_stats['downstream_relation_count_after']}")
+        print(f"移除下游关系数: {restriction_stats['removed_downstream_relation_count']}")
     for warning in meta.get("warnings", []):
         print(f"警告: {warning}")
 
@@ -495,6 +635,8 @@ def main():
     result = build_site_chains(
         prediction_path,
         ne_graph_path=ne_graph_path,
+        enrich_relation=args.enrich_relation,
+        restrict_relation=args.restrict_relation,
         directed_only=args.directed_only,
         max_depth=args.max_depth,
         show_progress=not args.no_progress,

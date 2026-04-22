@@ -272,6 +272,58 @@ def _build_site_topology_from_ne_graph(ne_graph_data):
     }, all_sites
 
 
+def _normalize_site_chain_hops(raw_hops):
+    if not isinstance(raw_hops, dict):
+        return {}
+
+    normalized = {}
+    for raw_site_id, raw_hop in raw_hops.items():
+        site_id = str(raw_site_id or "").strip()
+        if not site_id:
+            continue
+        try:
+            hop = int(raw_hop)
+        except (TypeError, ValueError):
+            continue
+        if hop <= 0:
+            continue
+        normalized[site_id] = hop
+    return normalized
+
+
+def _load_site_chain_index(site_chains_path):
+    """加载 generate_site_chains.py 产出的预计算上下游 hop 索引。"""
+    data = json.load(open(site_chains_path, 'r', encoding='utf-8'))
+    raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
+    site_chain_index = {}
+    valid_sites = set()
+
+    for raw_site_id, raw_info in raw_sites.items():
+        site_id = str(raw_site_id or "").strip()
+        if not site_id or not isinstance(raw_info, dict):
+            continue
+
+        downstream_hops = _normalize_site_chain_hops(raw_info.get("downstream_site_hops"))
+        upstream_hops = _normalize_site_chain_hops(raw_info.get("upstream_site_hops"))
+        bidirectional_sites = {
+            str(neighbor_site or "").strip()
+            for neighbor_site in raw_info.get("bidirectional_sites", [])
+            if str(neighbor_site or "").strip()
+        }
+
+        site_chain_index[site_id] = {
+            "downstream_site_hops": downstream_hops,
+            "upstream_site_hops": upstream_hops,
+            "bidirectional_sites": bidirectional_sites,
+        }
+        valid_sites.add(site_id)
+        valid_sites.update(downstream_hops)
+        valid_sites.update(upstream_hops)
+        valid_sites.update(bidirectional_sites)
+
+    return site_chain_index, valid_sites
+
+
 def _build_simulated_now_ts_getter(valid_alarms, speedup):
     """构造与告警 ts 回放节奏一致的模拟时钟。"""
     if not valid_alarms:
@@ -1238,6 +1290,7 @@ def main():
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
     parser.add_argument('--topo', type=str, default=SITE_GRAPH_BY_NE_JSON, help=f'站点拓扑文件，默认: {resource_display("site_graph_by_ne.json")}；若传空值则退回为基于 ne_graph.json 原始连边自动构建')
+    parser.add_argument('--site-chains', type=str, default='', help=f'可选 generate_site_chains.py 输出文件；提供后无 path 约束的上下游遍历优先使用预计算 hop，推荐: {resource_display("site_chains.json")}')
     parser.add_argument('--site-domain', type=str, default=SITE_DEVICE_COUNTS_JSON, help=f'站点画像文件，默认: {resource_display("site_device_counts.json")}')
     parser.add_argument('--site-graph', type=str, default=SITE_GRAPH_JSON, help=f'site_graph.json 文件，默认: {resource_display("site_graph.json")}')
     parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
@@ -1284,6 +1337,8 @@ def main():
         parser.error("batch-merge-density-max-meters 不能小于 batch-merge-density-min-meters")
     if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:
         parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
+    if args.site_chains and not os.path.exists(args.site_chains):
+        parser.error(f"site_chains 文件不存在: {args.site_chains}")
 
     ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
     if args.topo:
@@ -1298,6 +1353,13 @@ def main():
     else:
         print(f"基于 ne_graph 原始连边构建站点传播拓扑: {args.ne_graph}")
         topo_downstream_map, valid_sites = _build_site_topology_from_ne_graph(ne_graph_data)
+
+    site_chain_index = None
+    if args.site_chains:
+        print(f"加载预计算站点链路: {args.site_chains}")
+        site_chain_index, site_chain_valid_sites = _load_site_chain_index(args.site_chains)
+        valid_sites.update(site_chain_valid_sites)
+        print(f"预计算站点链路站点数: {len(site_chain_index)}")
 
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
     site_graph_data = json.load(open(args.site_graph, 'r', encoding='utf-8'))
@@ -1395,6 +1457,7 @@ def main():
         alarm_source_domain_map=alarm_source_domain_map,
         aggregation_wait_sec=args.aggregation_wait_sec,
         site_merge_helper=batch_site_merge_helper,
+        site_chain_index=site_chain_index,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
 
