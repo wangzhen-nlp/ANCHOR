@@ -175,8 +175,10 @@ class NodeRuleHelper:
         if isinstance(expected, dict):
             required_alarms = expected.get("required_alarms")
             forbidden_alarms = expected.get("forbidden_alarms")
+            optional_alarms = expected.get("optional_alarms")
             required_source_domains = expected.get("required_alarm_source_domains")
             forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
+            optional_source_domains = expected.get("optional_alarm_source_domains")
             parts = []
             if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
                 parts.append(
@@ -184,6 +186,12 @@ class NodeRuleHelper:
                 )
                 if required_source_domains is not None:
                     parts.append(f"required_source_domains={required_source_domains}")
+            if isinstance(optional_alarms, Iterable) and not isinstance(optional_alarms, str):
+                parts.append(
+                    f"optional={sorted(str(alarm) for alarm in optional_alarms)}"
+                )
+                if optional_source_domains is not None:
+                    parts.append(f"optional_source_domains={optional_source_domains}")
             if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                 parts.append(
                     f"forbidden={sorted(str(alarm) for alarm in forbidden_alarms)}"
@@ -240,9 +248,12 @@ class NodeRuleHelper:
             if isinstance(expected, dict):
                 required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
+                optional_alarms = expected.get("optional_alarms")
                 required_source_domains = expected.get("required_alarm_source_domains")
                 forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
+                optional_source_domains = expected.get("optional_alarm_source_domains")
                 required_events = []
+                optional_events = []
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                     forbidden_events = self.filter_events_by_alarm_and_source(
                         events_in_win,
@@ -296,17 +307,48 @@ class NodeRuleHelper:
                                 f"{self.format_expected_alarms_for_reason(expected)}"
                             ),
                         }
-                    return {
-                        "valid": True,
-                        "reason": (
-                            f"窗口 {window_text} 内命中 required alarms: "
-                            f"{self.format_events_for_reason(required_events)}"
-                        ),
-                    }
-                if required_alarms is not None:
+                elif required_alarms is not None:
                     return {
                         "valid": False,
                         "reason": f"required_alarms 配置无法识别: {required_alarms}",
+                    }
+
+                if isinstance(optional_alarms, Iterable) and not isinstance(optional_alarms, str):
+                    optional_events = self.filter_events_by_alarm_and_source(
+                        events_in_win,
+                        optional_alarms,
+                        optional_source_domains,
+                    )
+                elif optional_alarms is not None:
+                    return {
+                        "valid": False,
+                        "reason": f"optional_alarms 配置无法识别: {optional_alarms}",
+                    }
+
+                if required_events:
+                    detail_parts = [
+                        f"命中 required alarms: {self.format_events_for_reason(required_events)}"
+                    ]
+                    if optional_alarms is not None:
+                        detail_parts.append(
+                            f"命中 optional alarms: {self.format_events_for_reason(optional_events)}"
+                            if optional_events else "未命中 optional alarms，但 optional 不影响节点通过"
+                        )
+                    return {
+                        "valid": True,
+                        "reason": f"窗口 {window_text} 内" + "；".join(detail_parts),
+                    }
+
+                if optional_alarms is not None:
+                    return {
+                        "valid": True,
+                        "reason": (
+                            f"窗口 {window_text} 内"
+                            + (
+                                f"命中 optional alarms: {self.format_events_for_reason(optional_events)}"
+                                if optional_events else "未命中 optional alarms，但 optional 不影响节点通过"
+                            )
+                        ),
                     }
 
                 if forbidden_alarms is not None:
@@ -406,8 +448,10 @@ class NodeRuleHelper:
             if isinstance(expected, dict):
                 required_alarms = expected.get("required_alarms")
                 forbidden_alarms = expected.get("forbidden_alarms")
+                optional_alarms = expected.get("optional_alarms")
                 required_source_domains = expected.get("required_alarm_source_domains")
                 forbidden_source_domains = expected.get("forbidden_alarm_source_domains")
+                optional_source_domains = expected.get("optional_alarm_source_domains")
                 if isinstance(forbidden_alarms, Iterable) and not isinstance(forbidden_alarms, str):
                     has_forbidden = any(
                         self.matches_alarm_source_domains(e, forbidden_source_domains)
@@ -419,15 +463,48 @@ class NodeRuleHelper:
                 elif forbidden_alarms is not None:
                     return False, []
 
+                collected_events = []
                 if isinstance(required_alarms, Iterable) and not isinstance(required_alarms, str):
                     valid = self.filter_events_by_alarm_and_source(
                         events_in_win,
                         required_alarms,
                         required_source_domains,
                     )
-                    return len(valid) > 0, valid
-                if required_alarms is not None:
+                    if not valid:
+                        return False, []
+                    collected_events.extend(valid)
+                elif required_alarms is not None:
                     return False, []
+
+                if isinstance(optional_alarms, Iterable) and not isinstance(optional_alarms, str):
+                    collected_events.extend(
+                        self.filter_events_by_alarm_and_source(
+                            events_in_win,
+                            optional_alarms,
+                            optional_source_domains,
+                        )
+                    )
+                elif optional_alarms is not None:
+                    return False, []
+
+                if collected_events:
+                    deduped_events = []
+                    seen_event_ids = set()
+                    for event in collected_events:
+                        event_id = event.get("eid") or (
+                            event.get("node"),
+                            event.get("ts"),
+                            event.get("alarm"),
+                            event.get("alarm_source"),
+                        )
+                        if event_id in seen_event_ids:
+                            continue
+                        seen_event_ids.add(event_id)
+                        deduped_events.append(event)
+                    return True, deduped_events
+
+                if optional_alarms is not None:
+                    return True, []
 
                 if forbidden_alarms is not None:
                     return True, []
