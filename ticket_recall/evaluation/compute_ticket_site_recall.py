@@ -167,6 +167,10 @@ def _site_alarm_map_contains_offline(site_alarm_map):
     return False
 
 
+def _normalize_domain_arg(value):
+    return _normalize_text(value).upper()
+
+
 def _normalize_debug_ticket_ids(values):
     return {
         normalized_ticket_id
@@ -409,6 +413,13 @@ def _print_debug_summary(debug_summary):
             "- upper-bound-associated-as-gold: "
             f"{'开' if debug_summary['upper_bound_associated_as_gold_mode'] else '关'}"
         )
+    for label, key in (
+        ("no-domain-site", "no_domain_site"),
+        ("require-domain-per-site", "require_domain_per_site"),
+        ("no-domain-alarm", "no_domain_alarm"),
+    ):
+        if debug_summary.get(key):
+            print(f"- {label}: {debug_summary[key]}")
     if "allowed_site_count" in debug_summary:
         print(f"- allowed_site_ids 数量: {debug_summary['allowed_site_count']}")
     if "allowed_site_ids" in debug_summary:
@@ -419,8 +430,8 @@ def _print_debug_summary(debug_summary):
         ("满足 upper bound 口径的工单数", "upper_bound_eligible_ticket_count"),
         ("ticket-sites 原始工单数", "ticket_site_source_count"),
         ("upper bound 过滤后工单数", "after_upper_bound_filter_count"),
-        ("no-data-site 后工单数", "after_no_data_site_count"),
-        ("require-transmission-per-site 后工单数", "after_require_transmission_count"),
+        ("no-domain-site 后工单数", "after_no_domain_site_count"),
+        ("require-domain-per-site 后工单数", "after_require_domain_per_site_count"),
         ("min-site-num 后工单数", "after_min_site_num_count"),
         ("进入 group 评估循环的工单数", "candidate_ticket_count"),
         ("有 base group 的工单数", "ticket_with_base_group_count"),
@@ -429,7 +440,7 @@ def _print_debug_summary(debug_summary):
         ("预测到非空告警站点的工单数", "ticket_with_predicted_sites_count"),
         ("有召回站点的工单数", "ticket_with_recalled_sites_count"),
         ("被 only-offline 过滤的工单数", "filtered_by_only_offline_count"),
-        ("被 no-data-alarm 过滤的工单数", "filtered_by_no_data_alarm_count"),
+        ("被 no-domain-alarm 过滤的工单数", "filtered_by_no_domain_alarm_count"),
         ("最终输出工单数", "final_output_count"),
     ):
         if key in debug_summary:
@@ -438,14 +449,14 @@ def _print_debug_summary(debug_summary):
     examples = debug_summary.get("example_ticket_ids", {})
     for label, key in (
         ("被 upper bound 过滤样例", "filtered_by_upper_bound"),
-        ("被 no-data-site 过滤样例", "filtered_by_no_data_site"),
-        ("被 require-transmission-per-site 过滤样例", "filtered_by_require_transmission"),
+        ("被 no-domain-site 过滤样例", "filtered_by_no_domain_site"),
+        ("被 require-domain-per-site 过滤样例", "filtered_by_require_domain_per_site"),
         ("被 min-site-num 过滤样例", "filtered_by_min_site_num"),
         ("没有候选 group 的样例", "no_fault_groups"),
         ("有 group 但没有预测站点的样例", "no_predicted_sites"),
         ("召回为 0 的样例", "zero_recall"),
         ("被 only-offline 过滤样例", "filtered_by_only_offline"),
-        ("被 no-data-alarm 过滤样例", "filtered_by_no_data_alarm"),
+        ("被 no-domain-alarm 过滤样例", "filtered_by_no_domain_alarm"),
     ):
         if examples.get(key):
             print(f"  * {label}: {examples[key]}")
@@ -466,10 +477,10 @@ def _print_debug_tickets(debug_ticket_details, count_field_name, count_label):
         print(f"- upper bound evidence sites: {item.get('upper_bound_site_evidence_sites', [])}")
         print(f"- 来源站点: {item.get('source_ticket_sites', [])}")
         print(f"- upper bound 过滤后站点: {item.get('sites_after_upper_bound_filter', [])}")
-        print(f"- no-data-site 命中站点: {item.get('data_sites_in_ticket', [])}")
-        print(f"- no-data-site 后站点: {item.get('sites_after_no_data_site', [])}")
-        print(f"- require-transmission 去掉的站点: {item.get('transmission_removed_sites', [])}")
-        print(f"- require-transmission 后站点: {item.get('sites_after_require_transmission', [])}")
+        print(f"- no-domain-site 命中站点: {item.get('no_domain_site_matched_sites', [])}")
+        print(f"- no-domain-site 后站点: {item.get('sites_after_no_domain_site', [])}")
+        print(f"- require-domain 去掉的站点: {item.get('require_domain_removed_sites', [])}")
+        print(f"- require-domain 后站点: {item.get('sites_after_require_domain_per_site', [])}")
         print(f"- min-site-num 之前站点: {item.get('sites_before_min_site_num', [])}")
         print(f"- 最终 gold 站点: {item.get('final_ticket_sites', [])}")
         print(f"- {count_label}: {item.get(count_field_name, 0)}")
@@ -486,7 +497,7 @@ def _print_debug_tickets(debug_ticket_details, count_field_name, count_label):
         print(f"- associated_sites: {item.get('associated_sites', [])}")
         print(f"- missing_sites: {item.get('missing_sites', [])}")
         print(f"- upper bound 有 offline evidence: {'是' if item.get('upper_bound_has_offline_evidence') else '否'}")
-        print(f"- upper bound 有 data alarm: {'是' if item.get('upper_bound_has_data_alarm') else '否'}")
+        print(f"- upper bound 有 no-domain-alarm 指定域告警: {'是' if item.get('upper_bound_has_no_domain_alarm') else '否'}")
         print(f"- 最终进入输出: {'是' if item.get('included_in_final_output') else '否'}")
         print(f"- 过滤原因: {item.get('excluded_reasons', [])}")
         if "recall" in item:
@@ -508,9 +519,9 @@ def compute_ticket_site_recall(
     output_file=None,
     case_jsonl_output_file=None,
     only_offline=False,
-    no_data_alarm=False,
-    no_data_site=False,
-    require_transmission_per_site=False,
+    no_domain_alarm="",
+    no_domain_site="",
+    require_domain_per_site="",
     loose=False,
     potential=False,
     only_one=False,
@@ -523,6 +534,9 @@ def compute_ticket_site_recall(
     debug_site_ids=None,
     debug_group_ids=None,
 ):
+    no_domain_alarm = _normalize_domain_arg(no_domain_alarm)
+    no_domain_site = _normalize_domain_arg(no_domain_site)
+    require_domain_per_site = _normalize_domain_arg(require_domain_per_site)
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
     debug_ticket_id_set = _normalize_debug_ticket_ids(debug_ticket_ids)
@@ -581,6 +595,9 @@ def compute_ticket_site_recall(
             "method": "alarm_stream_group_field",
             "ticket_site_source": ticket_site_source,
             "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+            "no_domain_site": no_domain_site,
+            "require_domain_per_site": require_domain_per_site,
+            "no_domain_alarm": no_domain_alarm,
             "upper_bound_ticket_count": len(upper_bound_index),
             "upper_bound_eligible_ticket_count": len(eligible_ticket_ids),
             "ticket_site_source_count": len(source_ticket_sites),
@@ -609,10 +626,10 @@ def compute_ticket_site_recall(
                 "upper_bound_site_evidence_sites": sorted(upper_info.get("site_evidence", {}).keys()),
                 "source_ticket_sites": list(source_ticket_sites.get(debug_ticket_id, [])),
                 "sites_after_upper_bound_filter": list(ticket_sites.get(debug_ticket_id, [])),
-                "data_sites_in_ticket": [],
-                "sites_after_no_data_site": [],
-                "transmission_removed_sites": [],
-                "sites_after_require_transmission": [],
+                "no_domain_site_matched_sites": [],
+                "sites_after_no_domain_site": [],
+                "require_domain_removed_sites": [],
+                "sites_after_require_domain_per_site": [],
                 "sites_before_min_site_num": [],
                 "final_ticket_sites": [],
                 "ticket_alarm_count": 0,
@@ -629,7 +646,7 @@ def compute_ticket_site_recall(
                 "associated_sites": [],
                 "missing_sites": [],
                 "upper_bound_has_offline_evidence": False,
-                "upper_bound_has_data_alarm": False,
+                "upper_bound_has_no_domain_alarm": False,
                 "included_in_final_output": False,
                 "excluded_reasons": [],
             }
@@ -647,42 +664,42 @@ def compute_ticket_site_recall(
         _snapshot_debug_sites("sites_after_upper_bound_filter", ticket_sites)
 
     ne_graph_data = load_ne_graph_data(ne_graph_file)
-    if no_data_site:
+    if no_domain_site:
         if not ne_graph_data:
-            raise ValueError("开启 no-data-site 时，必须提供有效的 ne_graph 文件")
-        site_has_data = build_site_has_domain_map(ne_graph_data, "DATA")
+            raise ValueError("开启 no-domain-site 时，必须提供有效的 ne_graph 文件")
+        site_has_excluded_domain = build_site_has_domain_map(ne_graph_data, no_domain_site)
         filtered_ticket_sites = {}
         for ticket_id, site_list in ticket_sites.items():
-            data_sites = sorted({
+            excluded_domain_sites = sorted({
                 normalized_site_id
                 for normalized_site_id in (_normalize_text(site_id) for site_id in site_list)
-                if normalized_site_id and site_has_data.get(normalized_site_id, False)
+                if normalized_site_id and site_has_excluded_domain.get(normalized_site_id, False)
             })
             if ticket_id in debug_ticket_details:
-                debug_ticket_details[ticket_id]["data_sites_in_ticket"] = data_sites
-            if data_sites:
+                debug_ticket_details[ticket_id]["no_domain_site_matched_sites"] = excluded_domain_sites
+            if excluded_domain_sites:
                 if debug_enabled:
                     _append_debug_example(
                         debug_summary["example_ticket_ids"],
-                        "filtered_by_no_data_site",
+                        "filtered_by_no_domain_site",
                         ticket_id,
                         debug_sample_limit,
                     )
                 if ticket_id in debug_ticket_details:
-                    debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_data_site")
+                    debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_domain_site")
                 continue
             filtered_ticket_sites[ticket_id] = site_list
         ticket_sites = filtered_ticket_sites
     if debug_enabled:
-        debug_summary["after_no_data_site_count"] = len(ticket_sites)
+        debug_summary["after_no_domain_site_count"] = len(ticket_sites)
     if debug_ticket_id_set:
-        _snapshot_debug_sites("sites_after_no_data_site", ticket_sites)
+        _snapshot_debug_sites("sites_after_no_domain_site", ticket_sites)
 
-    if require_transmission_per_site:
+    if require_domain_per_site:
         if not ne_graph_data:
-            raise ValueError("开启 require-transmission-per-site 时，必须提供有效的 ne_graph 文件")
-        site_has_transmission = build_site_has_domain_map(ne_graph_data, "TRANSMISSION")
-        filtered_ticket_sites = filter_ticket_sites_by_site_flag(ticket_sites, site_has_transmission)
+            raise ValueError("开启 require-domain-per-site 时，必须提供有效的 ne_graph 文件")
+        site_has_required_domain = build_site_has_domain_map(ne_graph_data, require_domain_per_site)
+        filtered_ticket_sites = filter_ticket_sites_by_site_flag(ticket_sites, site_has_required_domain)
         for ticket_id, site_list in ticket_sites.items():
             filtered_site_list = filtered_ticket_sites.get(ticket_id, [])
             filtered_site_set = set(filtered_site_list)
@@ -692,24 +709,24 @@ def compute_ticket_site_recall(
                 if normalized_site_id and normalized_site_id not in filtered_site_set
             ]
             if ticket_id in debug_ticket_details:
-                debug_ticket_details[ticket_id]["transmission_removed_sites"] = removed_sites
+                debug_ticket_details[ticket_id]["require_domain_removed_sites"] = removed_sites
             if not filtered_site_list:
                 if debug_enabled:
                     _append_debug_example(
                         debug_summary["example_ticket_ids"],
-                        "filtered_by_require_transmission",
+                        "filtered_by_require_domain_per_site",
                         ticket_id,
                         debug_sample_limit,
                     )
                 if ticket_id in debug_ticket_details:
                     debug_ticket_details[ticket_id]["excluded_reasons"].append(
-                        "filtered_by_require_transmission"
+                        "filtered_by_require_domain_per_site"
                     )
         ticket_sites = filtered_ticket_sites
     if debug_enabled:
-        debug_summary["after_require_transmission_count"] = len(ticket_sites)
+        debug_summary["after_require_domain_per_site_count"] = len(ticket_sites)
     if debug_ticket_id_set:
-        _snapshot_debug_sites("sites_after_require_transmission", ticket_sites)
+        _snapshot_debug_sites("sites_after_require_domain_per_site", ticket_sites)
         _snapshot_debug_sites("sites_before_min_site_num", ticket_sites)
 
     if min_site_num > 0:
@@ -888,7 +905,7 @@ def compute_ticket_site_recall(
         debug_summary["ticket_with_predicted_sites_count"] = 0
         debug_summary["ticket_with_recalled_sites_count"] = 0
         debug_summary["filtered_by_only_offline_count"] = 0
-        debug_summary["filtered_by_no_data_alarm_count"] = 0
+        debug_summary["filtered_by_no_domain_alarm_count"] = 0
         debug_summary["final_output_count"] = 0
 
     for ticket_id in sorted(ticket_sites.keys()):
@@ -960,7 +977,10 @@ def compute_ticket_site_recall(
             for site_id in sorted(unrecalled_sites)
         }
         upper_bound_has_offline_evidence = _site_alarm_map_contains_offline(upper_site_evidence)
-        upper_bound_has_data_alarm = site_alarm_map_contains_domain(upper_site_evidence, ne_to_domain, "DATA")
+        upper_bound_has_no_domain_alarm = bool(
+            no_domain_alarm
+            and site_alarm_map_contains_domain(upper_site_evidence, ne_to_domain, no_domain_alarm)
+        )
 
         if ticket_id in debug_ticket_details:
             debug_ticket_details[ticket_id].update({
@@ -976,7 +996,7 @@ def compute_ticket_site_recall(
                 "associated_sites": sorted(recalled_sites),
                 "missing_sites": sorted(unrecalled_sites),
                 "upper_bound_has_offline_evidence": upper_bound_has_offline_evidence,
-                "upper_bound_has_data_alarm": upper_bound_has_data_alarm,
+                "upper_bound_has_no_domain_alarm": upper_bound_has_no_domain_alarm,
                 "recall": recall,
                 "precision": precision,
                 "f1": f1,
@@ -994,17 +1014,17 @@ def compute_ticket_site_recall(
             if ticket_id in debug_ticket_details:
                 debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_only_offline")
             continue
-        if no_data_alarm and upper_bound_has_data_alarm:
+        if no_domain_alarm and upper_bound_has_no_domain_alarm:
             if debug_enabled:
-                debug_summary["filtered_by_no_data_alarm_count"] += 1
+                debug_summary["filtered_by_no_domain_alarm_count"] += 1
                 _append_debug_example(
                     debug_summary["example_ticket_ids"],
-                    "filtered_by_no_data_alarm",
+                    "filtered_by_no_domain_alarm",
                     ticket_id,
                     debug_sample_limit,
                 )
             if ticket_id in debug_ticket_details:
-                debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_data_alarm")
+                debug_ticket_details[ticket_id]["excluded_reasons"].append("filtered_by_no_domain_alarm")
             continue
 
         total_recall += recall
@@ -1069,9 +1089,12 @@ def compute_ticket_site_recall(
         "ticket_site_source": ticket_site_source,
         "upper_bound_source": upper_bound_file,
         "only_offline_mode": only_offline,
-        "no_data_alarm_mode": no_data_alarm,
-        "no_data_site_mode": no_data_site,
-        "require_transmission_per_site_mode": require_transmission_per_site,
+        "no_domain_alarm": no_domain_alarm,
+        "no_domain_alarm_mode": bool(no_domain_alarm),
+        "no_domain_site": no_domain_site,
+        "no_domain_site_mode": bool(no_domain_site),
+        "require_domain_per_site": require_domain_per_site,
+        "require_domain_per_site_mode": bool(require_domain_per_site),
         "loose_mode": loose,
         "potential_mode": potential,
         "only_one_mode": only_one,
@@ -1153,19 +1176,19 @@ def main():
         help="仅保留 upper bound evidence 中出现过 OFFLINE_ALARMS 的工单样本",
     )
     parser.add_argument(
-        "--no-data-alarm",
-        action="store_true",
-        help="如果 upper bound evidence 中存在来自 Data 设备的告警，则跳过该工单样本",
+        "--no-domain-alarm",
+        metavar="DOMAIN",
+        help="如果 upper bound evidence 中存在来自指定 domain 的告警，则跳过该工单样本，例如: --no-domain-alarm DATA",
     )
     parser.add_argument(
-        "--no-data-site",
-        action="store_true",
-        help="如果当前工单站点里存在包含 Data 设备的站点，则跳过该工单样本",
+        "--no-domain-site",
+        metavar="DOMAIN",
+        help="如果当前工单站点里存在包含指定 domain 设备的站点，则跳过该工单样本，例如: --no-domain-site DATA",
     )
     parser.add_argument(
-        "--require-transmission-per-site",
-        action="store_true",
-        help="先从工单站点里剔除不包含 Transmission 设备的站点；过滤后若站点数不足 min-site-num，则跳过该工单",
+        "--require-domain-per-site",
+        metavar="DOMAIN",
+        help="先从工单站点里剔除不包含指定 domain 设备的站点；过滤后若站点数不足 min-site-num，则跳过该工单，例如: --require-domain-per-site TRANSMISSION",
     )
     parser.add_argument(
         "--loose",
@@ -1242,9 +1265,9 @@ def main():
             output_file=args.output,
             case_jsonl_output_file=args.case_jsonl_output,
             only_offline=args.only_offline,
-            no_data_alarm=args.no_data_alarm,
-            no_data_site=args.no_data_site,
-            require_transmission_per_site=args.require_transmission_per_site,
+            no_domain_alarm=args.no_domain_alarm,
+            no_domain_site=args.no_domain_site,
+            require_domain_per_site=args.require_domain_per_site,
             loose=args.loose,
             potential=args.potential,
             only_one=args.only_one,
