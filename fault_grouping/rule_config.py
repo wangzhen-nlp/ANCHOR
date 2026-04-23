@@ -38,7 +38,6 @@ REQUIRED_OFFLINE_DATA_NODE = {
       "include": ["Data"],
       "expected_alarms": {
         "required_alarms": OFFLINE_ALARMS,
-        "required_alarm_source_domains": ["Data"],
         "optional_alarms": LINK_ALARMS | POWER_ALARMS,
         "optional_alarm_source_domains": ["Data"]
       }
