@@ -1354,8 +1354,8 @@ class TemporalGraphEngine:
             self.active_event_to_period.pop(node, None)
         self._rebuild_node_event_cache(node)
 
-    def _prune_node_alarm_history_before(self, node, alarm_type, cutoff_by_rule):
-        """把某节点同告警名下不晚于各 rule cutoff 的活跃告警时段标记为已消费并移出对应 trigger 候选。"""
+    def _prune_node_alarm_history_before(self, node, alarm_type, alarm_source, cutoff_by_rule):
+        """把某节点同告警名/告警源下不晚于各 rule cutoff 的活跃告警时段标记为已消费并移出对应 trigger 候选。"""
         periods = self.active_alarm_periods.get(node)
         if not periods:
             return
@@ -1364,6 +1364,8 @@ class TemporalGraphEngine:
         changed = False
         for period in periods.values():
             if period["alarm_type"] != alarm_type:
+                continue
+            if period.get("alarm_source", "") != str(alarm_source or ""):
                 continue
             active_event_ids = self._ensure_ordered_active_event_ids(period)
             if not active_event_ids:
@@ -1440,18 +1442,20 @@ class TemporalGraphEngine:
                     continue
                 node = symptom.get("node")
                 alarm_type = symptom.get("alarm")
+                alarm_source = symptom.get("alarm_source", "")
                 ts = symptom.get("ts")
                 if node in (None, "") or alarm_type in (None, "") or ts is None:
                     continue
-                key = (node, alarm_type)
+                key = (node, alarm_type, str(alarm_source or ""))
                 entry = prune_points.setdefault(key, {})
                 for rule_name in matched_rule_names:
                     entry[rule_name] = max(entry.get(rule_name, float("-inf")), ts)
 
-        for (node, alarm_type), cutoff_by_rule in prune_points.items():
+        for (node, alarm_type, alarm_source), cutoff_by_rule in prune_points.items():
             self._prune_node_alarm_history_before(
                 node,
                 alarm_type,
+                alarm_source,
                 cutoff_by_rule,
             )
 
