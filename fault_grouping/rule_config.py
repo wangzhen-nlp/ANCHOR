@@ -310,8 +310,8 @@ data_link_adjacent_no_offline_rule = {
   "max_stay_time_sec": 3600,
   "trigger_role": "data_link_underneath_compound_node",
   "nodes": {
-    "data_link_parent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
-    "data_link_adjacent_data_neighbor_node": NO_OFFLINE_DATA_NODE,
+    "data_link_adjacent_data_neighbor_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_parent_data_node": NO_OFFLINE_DATA_NODE,
     "data_link_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
@@ -335,10 +335,10 @@ data_link_adjacent_offline_rule = {
   "pattern_name": "data_link_adjacent_offline_context",
   "description": "本路由Data link且无Data offline，邻接路由Data offline，下挂断站可有可无",
   "max_stay_time_sec": 3600,
-  "trigger_role": "data_link_offline_adjacent_data_node",
+  "trigger_role": "data_link_offline_parent_data_node",
   "nodes": {
-    "data_link_offline_parent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
-    "data_link_offline_adjacent_data_node": REQUIRED_OFFLINE_DATA_NODE,
+    "data_link_offline_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_offline_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
     "data_link_offline_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
   "edges": [
@@ -351,7 +351,7 @@ data_link_adjacent_offline_rule = {
     },
     {
       "source": "data_link_offline_underneath_compound_node",
-      "target": "data_link_offline_adjacent_data_node",
+      "target": "data_link_offline_parent_data_node",
       "direction": "upstream",
       "time_window_sec": 900,
       "optional": True
