@@ -33,6 +33,7 @@ from fault_grouping.rule_config import (
     data_rule,
     data_link_adjacent_no_offline_rule,
     data_link_adjacent_offline_rule,
+    data_link_adjacent_link_rule,
     data_no_offline_adjacent_optional_offline_rule,
     data_offline_adjacent_offline_rule,
 )
@@ -1579,6 +1580,7 @@ def main():
         "data_rule": data_rule,
         "data_link_adjacent_no_offline_rule": data_link_adjacent_no_offline_rule,
         "data_link_adjacent_offline_rule": data_link_adjacent_offline_rule,
+        "data_link_adjacent_link_rule": data_link_adjacent_link_rule,
         "data_no_offline_adjacent_optional_offline_rule": data_no_offline_adjacent_optional_offline_rule,
         "data_offline_adjacent_offline_rule": data_offline_adjacent_offline_rule,
     }

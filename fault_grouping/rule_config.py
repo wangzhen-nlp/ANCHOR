@@ -355,6 +355,33 @@ data_link_adjacent_offline_rule = {
   ]
 }
 
+data_link_adjacent_link_rule = {
+  "pattern_name": "data_link_adjacent_link_context",
+  "description": "本路由Data link且无Data offline，邻接路由Data link且无Data offline",
+  "max_stay_time_sec": 3600,
+  "trigger_role": "data_link_pair_current_data_node",
+  "exclusive_site_roles": [
+    "data_link_pair_current_data_node",
+    "data_link_pair_adjacent_data_node"
+  ],
+  "nodes": {
+    "data_link_pair_current_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_pair_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE
+  },
+  "edges": [
+    {
+      "source": "data_link_pair_current_data_node",
+      "target": "data_link_pair_adjacent_data_node",
+      "direction": ["bidirection", "upstream", "downstream"],
+      "time_window_sec": 900,
+      "max_hops": 1,
+      "constraints": {
+        "dedupe_symmetric_pair": True
+      }
+    }
+  ]
+}
+
 data_no_offline_adjacent_optional_offline_rule = {
   "pattern_name": "data_no_offline_adjacent_optional_offline_context",
   "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",

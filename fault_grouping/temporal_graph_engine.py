@@ -802,8 +802,12 @@ class TemporalGraphEngine:
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear and register_trigger:
+                alarm_source_domain = self.alarm_source_domain_map.get(alarm_source, "")
                 for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
-                    if any(matches_expected_alarm(alarm_type, expected) for expected in expected_list):
+                    if any(
+                        matches_expected_alarm(alarm_type, expected, alarm_source_domain)
+                        for expected in expected_list
+                    ):
                         trigger_key = (node, rule_name)
                         self._trigger_seq += 1
                         trigger_seq = self._trigger_seq

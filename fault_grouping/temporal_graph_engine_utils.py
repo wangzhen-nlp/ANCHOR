@@ -95,7 +95,39 @@ def build_pattern_adj(edges_cfg):
     return pattern_adj
 
 
-def matches_expected_alarm(alarm_type, expected):
+def _normalize_domain_filter(domain_filter):
+    if domain_filter is None:
+        return None
+    if isinstance(domain_filter, str):
+        return [domain_filter]
+    if isinstance(domain_filter, Iterable):
+        return list(domain_filter)
+    return None
+
+
+def _has_domain(source_domain, expected_domain):
+    if isinstance(source_domain, dict):
+        value = source_domain.get(expected_domain)
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, str):
+            return value not in ("", "0")
+        if isinstance(value, (list, tuple, set, dict)):
+            return len(value) > 0
+        return bool(value)
+    if isinstance(source_domain, (list, tuple, set)):
+        return expected_domain in source_domain
+    return str(expected_domain).strip().lower() == str(source_domain or "").strip().lower()
+
+
+def _matches_source_domain(source_domain, domain_filter):
+    domains = _normalize_domain_filter(domain_filter)
+    if domains is None:
+        return domain_filter is None
+    return any(_has_domain(source_domain, domain) for domain in domains)
+
+
+def matches_expected_alarm(alarm_type, expected, alarm_source_domain=None):
     """判断单条告警类型是否满足 expected_alarms 定义。"""
     if expected in (None, "NONE"):
         return False
@@ -103,11 +135,16 @@ def matches_expected_alarm(alarm_type, expected):
         return True
     if isinstance(expected, dict):
         required_alarms = expected.get("required_alarms")
-        return (
+        if not (
             isinstance(required_alarms, Iterable)
             and not isinstance(required_alarms, str)
             and alarm_type in required_alarms
-        )
+        ):
+            return False
+        required_source_domains = expected.get("required_alarm_source_domains")
+        if required_source_domains is None:
+            return True
+        return _matches_source_domain(alarm_source_domain, required_source_domains)
     return isinstance(expected, Iterable) and alarm_type in expected
 
 
