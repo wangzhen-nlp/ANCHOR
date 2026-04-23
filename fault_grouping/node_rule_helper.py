@@ -1,3 +1,4 @@
+from bisect import bisect_left, bisect_right
 from datetime import datetime
 from collections.abc import Iterable
 
@@ -23,24 +24,100 @@ class NodeRuleHelper:
         return win, win
 
     def events_in_window(self, physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
-        """获取某个节点在指定时间窗口内的缓存事件。"""
+        """获取某个节点在指定时间窗口内命中的告警发生事件。
+
+        event_cache 现在按活跃时段缓存，但窗口判断仍保持原语义：
+        只看“告警发生时间是否落在窗口里”，而不是时段是否与窗口重叠。
+        """
         before_sec, after_sec = self.normalize_edge_window(edge_window)
-        return [
-            {
+        window_start = reference_ts - before_sec
+        window_end = reference_ts + after_sec
+        matched_events = []
+
+        for cached_event in self.event_getter(physical_node):
+            ts = None
+            eid = None
+            alarm = None
+            alarm_source = ""
+            consumed_trigger_rules = ()
+            end_ts = None
+            raw_event_items = None
+            raw_event_ts_list = None
+            consumed_cutoff_by_rule = {}
+
+            if isinstance(cached_event, dict):
+                ts = cached_event.get("ts")
+                eid = cached_event.get("eid")
+                alarm = cached_event.get("alarm")
+                alarm_source = cached_event.get("alarm_source", "")
+                consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
+                end_ts = cached_event.get("end_ts")
+                raw_event_items = cached_event.get("_raw_event_items")
+                raw_event_ts_list = cached_event.get("_raw_event_ts_list")
+                consumed_cutoff_by_rule = cached_event.get("_consumed_cutoff_by_rule") or {}
+                segment_key = cached_event.get("_segment_key")
+                segment_start_ts = cached_event.get("_segment_start_ts")
+                segment_end_ts = cached_event.get("_segment_end_ts")
+            else:
+                try:
+                    ts, eid, alarm, alarm_source, consumed_trigger_rules = cached_event
+                except (TypeError, ValueError):
+                    continue
+                segment_key = None
+                segment_start_ts = None
+                segment_end_ts = None
+
+            if segment_end_ts is not None and segment_end_ts < window_start:
+                continue
+            if segment_start_ts is not None and segment_start_ts > window_end:
+                break
+
+            if raw_event_items:
+                if raw_event_ts_list is None:
+                    raw_event_ts_list = tuple(raw_ts for _raw_event_id, raw_ts in raw_event_items)
+                cutoff_ts = None
+                if exclude_consumed_trigger_rule:
+                    cutoff_ts = consumed_cutoff_by_rule.get(exclude_consumed_trigger_rule)
+
+                left_idx = bisect_left(raw_event_ts_list, window_start)
+                right_idx = bisect_right(raw_event_ts_list, window_end, left_idx)
+                if cutoff_ts is not None:
+                    left_idx = bisect_right(raw_event_ts_list, cutoff_ts, left_idx, right_idx)
+
+                for raw_event_id, raw_ts in raw_event_items[left_idx:right_idx]:
+                    matched_events.append({
+                        "node": physical_node,
+                        "ts": raw_ts,
+                        "eid": raw_event_id,
+                        "alarm": alarm,
+                        "alarm_source": alarm_source,
+                        "alarm_source_domain": self.alarm_source_domain_map.get(alarm_source, ""),
+                        "_segment_key": segment_key,
+                        "_segment_start_ts": segment_start_ts,
+                        "_segment_end_ts": segment_end_ts,
+                    })
+                continue
+
+            if ts is None:
+                continue
+            if exclude_consumed_trigger_rule and exclude_consumed_trigger_rule in consumed_trigger_rules:
+                continue
+            if ts < window_start or ts > window_end:
+                continue
+
+            matched_events.append({
                 "node": physical_node,
                 "ts": ts,
                 "eid": eid,
                 "alarm": alarm,
                 "alarm_source": alarm_source,
                 "alarm_source_domain": self.alarm_source_domain_map.get(alarm_source, ""),
-            }
-            for ts, eid, alarm, alarm_source, consumed_trigger_rules in self.event_getter(physical_node)
-            if (reference_ts - before_sec) <= ts <= (reference_ts + after_sec)
-            and not (
-                exclude_consumed_trigger_rule
-                and exclude_consumed_trigger_rule in consumed_trigger_rules
-            )
-        ]
+                "_segment_key": segment_key,
+                "_segment_start_ts": segment_start_ts,
+                "_segment_end_ts": segment_end_ts,
+            })
+
+        return matched_events
 
     @staticmethod
     def format_events_for_reason(events):

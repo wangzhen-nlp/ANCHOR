@@ -685,8 +685,12 @@ class TemporalGraphEngine:
                 self.topo_up[down].append(up)
         self.site_chain_index = self._normalize_site_chain_index(site_chain_index)
 
-        # 状态缓存: { node: deque([(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]) }
+        # 状态缓存:
+        # - event_cache 对外仍暴露为站点 -> 活跃告警时段摘要 deque
+        # - active_alarm_periods / active_event_to_period 在锁内维护“同设备同告警”的在线活跃时段
         self.event_cache = collections.defaultdict(collections.deque)
+        self.active_alarm_periods = collections.defaultdict(dict)
+        self.active_event_to_period = collections.defaultdict(dict)
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
@@ -773,6 +777,180 @@ class TemporalGraphEngine:
         # 当 heap 脏条目过多时触发重建的倍率阈值
         self._pending_heap_rebuild_factor = 3
 
+    @staticmethod
+    def _make_alarm_period_key(alarm_type, alarm_source):
+        return str(alarm_type or ""), str(alarm_source or "")
+
+    @staticmethod
+    def _build_output_symptom_interval_key(symptom):
+        node = symptom.get("node")
+        alarm = symptom.get("alarm")
+        alarm_source = symptom.get("alarm_source", "")
+        start_ts = symptom.get("_segment_start_ts")
+        end_ts = symptom.get("_segment_end_ts")
+        if start_ts is None:
+            start_ts = symptom.get("ts")
+        if end_ts is None:
+            end_ts = start_ts
+
+        if (
+            node not in (None, "")
+            and alarm not in (None, "")
+            and start_ts is not None
+            and end_ts is not None
+        ):
+            return f"{node}|{alarm_source}|{alarm}|{start_ts:.6f}|{end_ts:.6f}"
+
+        return (
+            symptom.get("_segment_key")
+            or symptom.get("eid")
+            or (symptom.get("node"), symptom.get("ts"), symptom.get("alarm"), symptom.get("alarm_source"))
+        )
+
+    @staticmethod
+    def _period_state_to_cached_event(node, period_state):
+        raw_event_items = tuple(period_state.get("active_event_ids", {}).items())
+        return {
+            "node": node,
+            "ts": period_state["ts"],
+            "end_ts": period_state.get("end_ts"),
+            "eid": period_state["eid"],
+            "alarm": period_state["alarm_type"],
+            "alarm_source": period_state["alarm_source"],
+            "consumed_trigger_rules": period_state["consumed_trigger_rules"],
+            "_segment_key": period_state["segment_key"],
+            "_segment_start_ts": period_state["ts"],
+            "_segment_end_ts": period_state.get("end_ts"),
+            "_raw_event_items": raw_event_items,
+            "_raw_event_ts_list": tuple(raw_ts for _raw_event_id, raw_ts in raw_event_items),
+            "_consumed_cutoff_by_rule": dict(period_state.get("consumed_trigger_cutoff_by_rule", {})),
+        }
+
+    @staticmethod
+    def _ensure_ordered_active_event_ids(period_state):
+        active_event_ids = period_state.get("active_event_ids")
+        if isinstance(active_event_ids, collections.OrderedDict):
+            return active_event_ids
+        ordered_active_event_ids = collections.OrderedDict()
+        if active_event_ids:
+            for raw_event_id, raw_ts in active_event_ids.items():
+                ordered_active_event_ids[raw_event_id] = raw_ts
+        period_state["active_event_ids"] = ordered_active_event_ids
+        return ordered_active_event_ids
+
+    @classmethod
+    def _refresh_alarm_period_state(cls, node, period_state):
+        active_event_ids = cls._ensure_ordered_active_event_ids(period_state)
+        if not active_event_ids:
+            return False
+
+        leader_event_id = next(iter(active_event_ids))
+        leader_ts = active_event_ids[leader_event_id]
+        tail_event_id = next(reversed(active_event_ids))
+        tail_ts = active_event_ids[tail_event_id]
+        period_state["ts"] = leader_ts
+        period_state["eid"] = leader_event_id
+        period_state["latest_active_ts"] = tail_ts
+        period_state["end_ts"] = tail_ts
+        period_state["consumed_trigger_rules"] = frozenset(
+            period_state.get("consumed_trigger_cutoff_by_rule", {}).keys()
+        )
+        period_state["segment_key"] = (
+            f"{node}|{period_state['alarm_source']}|{period_state['alarm_type']}|"
+            f"{leader_ts:.6f}|{tail_ts:.6f}|{leader_event_id}"
+        )
+        return True
+
+    def _rebuild_node_event_cache(self, node):
+        periods = self.active_alarm_periods.get(node)
+        if not periods:
+            self.event_cache.pop(node, None)
+            self.active_alarm_periods.pop(node, None)
+            self.active_event_to_period.pop(node, None)
+            return
+
+        ordered_periods = sorted(
+            periods.values(),
+            key=lambda period: (
+                period["ts"],
+                str(period["eid"]),
+                period["alarm_type"],
+                period["alarm_source"],
+            )
+        )
+        self.event_cache[node] = collections.deque(
+            self._period_state_to_cached_event(node, period)
+            for period in ordered_periods
+        )
+
+    def _register_alarm_period_occurrence(self, node, alarm_type, ts, event_id, alarm_source=""):
+        period_key = self._make_alarm_period_key(alarm_type, alarm_source)
+        periods = self.active_alarm_periods[node]
+        period = periods.get(period_key)
+        created = False
+        if period is None:
+            created = True
+            period = {
+                "ts": ts,
+                "end_ts": None,
+                "eid": event_id,
+                "alarm_type": alarm_type,
+                "alarm_source": alarm_source,
+                "consumed_trigger_rules": frozenset(),
+                "consumed_trigger_cutoff_by_rule": {},
+                "active_event_ids": collections.OrderedDict(),
+                "latest_active_ts": ts,
+                "segment_key": "",
+            }
+            periods[period_key] = period
+
+        if event_id not in (None, ""):
+            active_event_ids = self._ensure_ordered_active_event_ids(period)
+            active_event_ids[event_id] = ts
+            self.active_event_to_period[node][event_id] = period_key
+
+        if self._refresh_alarm_period_state(node, period):
+            self._rebuild_node_event_cache(node)
+        return created
+
+    def _prune_expired_alarm_periods(self, node, current_ts):
+        periods = self.active_alarm_periods.get(node)
+        if not periods:
+            self.event_cache.pop(node, None)
+            return
+
+        changed = False
+        for period_key, period in list(periods.items()):
+            ttl = self._get_event_ttl(period["alarm_type"])
+            active_event_ids = self._ensure_ordered_active_event_ids(period)
+            expired_event_ids = []
+            while active_event_ids:
+                leader_event_id = next(iter(active_event_ids))
+                leader_ts = active_event_ids[leader_event_id]
+                if (current_ts - leader_ts) <= ttl:
+                    break
+                expired_event_ids.append(leader_event_id)
+                active_event_ids.popitem(last=False)
+            if not expired_event_ids:
+                continue
+
+            changed = True
+            for raw_event_id in expired_event_ids:
+                if raw_event_id not in (None, ""):
+                    self.active_event_to_period.get(node, {}).pop(raw_event_id, None)
+
+            if self._refresh_alarm_period_state(node, period):
+                continue
+
+            removed_event = self._period_state_to_cached_event(node, period)
+            self._log_debug_event_removal(node, removed_event, "ttl", current_ts=current_ts)
+            periods.pop(period_key, None)
+
+        if changed:
+            if not self.active_event_to_period.get(node):
+                self.active_event_to_period.pop(node, None)
+            self._rebuild_node_event_cache(node)
+
     def process_event(self, node, alarm_type, ts, event_id, alarm_source="", is_clear=False, collect_matches=False, register_trigger=True):
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
@@ -782,10 +960,7 @@ class TemporalGraphEngine:
             self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
             # 2. 先清理过期缓存，再按上报/清除事件更新状态。
-            q = self.event_cache[node]
-            while q and (ts - q[0][0]) > self._get_event_ttl(q[0][2]):
-                expired_event = q.popleft()
-                self._log_debug_event_removal(node, expired_event, "ttl", current_ts=ts)
+            self._prune_expired_alarm_periods(node, ts)
             self._prune_expired_trigger_index(node, ts)
 
             if is_clear:
@@ -798,7 +973,13 @@ class TemporalGraphEngine:
                         affected_rule_names=affected_rule_names
                     )
             else:
-                q.append((ts, event_id, alarm_type, alarm_source, frozenset()))
+                self._register_alarm_period_occurrence(
+                    node,
+                    alarm_type,
+                    ts,
+                    event_id,
+                    alarm_source=alarm_source,
+                )
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear and register_trigger:
@@ -829,7 +1010,14 @@ class TemporalGraphEngine:
         if not self.debug_event_logger:
             return
 
-        ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
+        if isinstance(event, dict):
+            ts = event.get("ts")
+            event_id = event.get("eid")
+            alarm_type = event.get("alarm")
+            alarm_source = event.get("alarm_source", "")
+            consumed_trigger_rules = event.get("consumed_trigger_rules", ())
+        else:
+            ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
         payload = {
             "node": node,
             "ts": ts,
@@ -1124,50 +1312,87 @@ class TemporalGraphEngine:
             self._harvest_stop_event.wait(self._harvest_interval_sec)
 
     def _remove_cleared_events(self, node, event_id):
-        """按 event_id 从节点事件缓存中移除已清除的告警实例。"""
-        q = self.event_cache[node]
-        kept = collections.deque()
+        """按 event_id 从节点活跃告警时段中移除对应实例；仅在时段彻底结束时移出缓存。"""
+        if event_id in (None, ""):
+            return
 
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
-            if event_id and cached_eid == event_id:
-                self._log_debug_event_removal(
-                    node,
-                    (cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules),
-                    "clear",
-                    cleared_event_id=event_id,
-                )
-                continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
+        period_key = self.active_event_to_period.get(node, {}).pop(event_id, None)
+        if period_key is None:
+            return
 
-        self.event_cache[node] = kept
+        periods = self.active_alarm_periods.get(node)
+        if not periods:
+            self.active_event_to_period.pop(node, None)
+            self.event_cache.pop(node, None)
+            return
+
+        period = periods.get(period_key)
+        if period is None:
+            if not self.active_event_to_period.get(node):
+                self.active_event_to_period.pop(node, None)
+            return
+
+        active_event_ids = self._ensure_ordered_active_event_ids(period)
+        active_event_ids.pop(event_id, None)
+        if active_event_ids:
+            self._refresh_alarm_period_state(node, period)
+            self._rebuild_node_event_cache(node)
+            if not self.active_event_to_period.get(node):
+                self.active_event_to_period.pop(node, None)
+            return
+
+        removed_event = self._period_state_to_cached_event(node, period)
+        periods.pop(period_key, None)
+        self._log_debug_event_removal(
+            node,
+            removed_event,
+            "clear",
+            cleared_event_id=event_id,
+        )
+
+        if not self.active_event_to_period.get(node):
+            self.active_event_to_period.pop(node, None)
+        self._rebuild_node_event_cache(node)
 
     def _prune_node_alarm_history_before(self, node, alarm_type, cutoff_by_rule):
-        """把某节点同告警名下不晚于各 rule cutoff 的事件标记为已被对应 rule 消费并移出对应 trigger 候选。"""
-        q = self.event_cache.get(node)
-        if not q:
+        """把某节点同告警名下不晚于各 rule cutoff 的活跃告警时段标记为已消费并移出对应 trigger 候选。"""
+        periods = self.active_alarm_periods.get(node)
+        if not periods:
             return
 
         removed_event_ids_by_rule = collections.defaultdict(set)
-        kept = collections.deque()
-        for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
-            if cached_alarm_type == alarm_type:
-                matched_rules = {
-                    rule_name
-                    for rule_name, cutoff_ts in cutoff_by_rule.items()
-                    if cached_ts <= cutoff_ts
-                }
-            else:
-                matched_rules = set()
-
-            if matched_rules:
-                if cached_eid not in (None, ""):
-                    for rule_name in matched_rules:
-                        removed_event_ids_by_rule[rule_name].add(cached_eid)
-                updated_consumed_rules = frozenset(set(consumed_trigger_rules) | matched_rules)
-                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, updated_consumed_rules))
+        changed = False
+        for period in periods.values():
+            if period["alarm_type"] != alarm_type:
                 continue
-            kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
-        self.event_cache[node] = kept
+            active_event_ids = self._ensure_ordered_active_event_ids(period)
+            if not active_event_ids:
+                continue
+
+            consumed_cutoff_by_rule = period.setdefault("consumed_trigger_cutoff_by_rule", {})
+            for rule_name, cutoff_ts in cutoff_by_rule.items():
+                removable_event_ids = set()
+                for raw_event_id, raw_ts in active_event_ids.items():
+                    if raw_ts > cutoff_ts:
+                        break
+                    if raw_event_id not in (None, ""):
+                        removable_event_ids.add(raw_event_id)
+                if not removable_event_ids:
+                    continue
+
+                removed_event_ids_by_rule[rule_name].update(removable_event_ids)
+                previous_cutoff_ts = consumed_cutoff_by_rule.get(rule_name)
+                if previous_cutoff_ts is None or cutoff_ts > previous_cutoff_ts:
+                    consumed_cutoff_by_rule[rule_name] = cutoff_ts
+                    changed = True
+
+            updated_consumed_rules = frozenset(consumed_cutoff_by_rule.keys())
+            if updated_consumed_rules != period["consumed_trigger_rules"]:
+                period["consumed_trigger_rules"] = updated_consumed_rules
+                changed = True
+
+        if changed:
+            self._rebuild_node_event_cache(node)
 
         if not removed_event_ids_by_rule:
             return
@@ -1341,17 +1566,7 @@ class TemporalGraphEngine:
 
         for offset in range(batch_size):
             node = nodes[(start_idx + offset) % total_nodes]
-            q = self.event_cache.get(node)
-            if not q:
-                continue
-
-            while q and (current_ts - q[0][0]) > self._get_event_ttl(q[0][2]):
-                expired_event = q.popleft()
-                self._log_debug_event_removal(node, expired_event, "ttl", current_ts=current_ts)
-
-            if not q:
-                self.event_cache.pop(node, None)
-
+            self._prune_expired_alarm_periods(node, current_ts)
             self._prune_expired_trigger_index(node, current_ts)
 
         self._prune_cursor = (start_idx + batch_size) % max(total_nodes, 1)
@@ -1895,7 +2110,33 @@ class TemporalGraphEngine:
                         ev_enriched = dict(ev)  # 浅拷贝，防止污染原始缓存
                         ev_enriched["matched_role"] = role
                         ev_enriched["time_str"] = datetime.fromtimestamp(ev["ts"]).strftime('%Y-%m-%d %H:%M:%S')
-                        symp_dict[ev["eid"]] = ev_enriched
+                        source_segment_key = (
+                            ev.get("_segment_key")
+                            or ev.get("eid")
+                            or (ev.get("node"), ev.get("ts"), ev.get("alarm"), ev.get("alarm_source"))
+                        )
+                        ev_enriched["_segment_start_ts"] = ev["ts"]
+                        ev_enriched["_segment_end_ts"] = ev["ts"]
+                        ev_enriched["_segment_key"] = self._build_output_symptom_interval_key(ev_enriched)
+
+                        existing_symptom = symp_dict.get(source_segment_key)
+                        if existing_symptom is None:
+                            symp_dict[source_segment_key] = ev_enriched
+                            continue
+
+                        current_start_ts = existing_symptom.get("_segment_start_ts", existing_symptom.get("ts"))
+                        current_end_ts = existing_symptom.get("_segment_end_ts", current_start_ts)
+                        hit_ts = ev["ts"]
+
+                        if current_start_ts is None or hit_ts < current_start_ts:
+                            existing_symptom["ts"] = hit_ts
+                            existing_symptom["eid"] = ev.get("eid")
+                            existing_symptom["time_str"] = ev_enriched["time_str"]
+                            existing_symptom["_segment_start_ts"] = hit_ts
+                        if current_end_ts is None or hit_ts > current_end_ts:
+                            existing_symptom["_segment_end_ts"] = hit_ts
+
+                        existing_symptom["_segment_key"] = self._build_output_symptom_interval_key(existing_symptom)
 
                 if valid_phys_nodes:
                     role_mapping[role] = valid_phys_nodes

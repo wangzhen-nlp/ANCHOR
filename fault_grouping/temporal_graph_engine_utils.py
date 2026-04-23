@@ -151,10 +151,199 @@ def matches_expected_alarm(alarm_type, expected, alarm_source_domain=None):
 def get_match_alarm_keys(match_result):
     alarm_keys = set()
     for symptom in match_result.get("symptoms", []):
-        alarm_key = symptom.get("eid")
+        alarm_key = symptom.get("_segment_key")
+        if alarm_key in (None, ""):
+            alarm_key = symptom.get("eid")
         if alarm_key not in (None, ""):
             alarm_keys.add(alarm_key)
     return alarm_keys
+
+
+def get_symptom_overlap_base_key(symptom):
+    node = symptom.get("node")
+    alarm = symptom.get("alarm")
+    alarm_source = symptom.get("alarm_source", "")
+    if node not in (None, "") and alarm not in (None, ""):
+        return (node, alarm_source, alarm)
+
+    fallback_key = symptom.get("_segment_key")
+    if fallback_key in (None, ""):
+        fallback_key = symptom.get("eid")
+    if fallback_key in (None, ""):
+        return None
+    return ("__fallback__", str(fallback_key))
+
+
+def get_match_symptom_overlap_keys(match_result):
+    overlap_keys = set()
+    for symptom in match_result.get("symptoms", []):
+        overlap_key = get_symptom_overlap_base_key(symptom)
+        if overlap_key is not None:
+            overlap_keys.add(overlap_key)
+    return overlap_keys
+
+
+def get_symptom_interval(symptom):
+    start_ts = symptom.get("_segment_start_ts")
+    if start_ts is None:
+        start_ts = symptom.get("ts")
+    if start_ts is None:
+        return None, None
+
+    end_ts = symptom.get("_segment_end_ts")
+    if end_ts is None and "_segment_start_ts" not in symptom:
+        end_ts = symptom.get("ts")
+    return start_ts, end_ts
+
+
+def _interval_end_sort_value(end_ts):
+    return float("inf") if end_ts is None else end_ts
+
+
+def _merge_interval_end(left_end_ts, right_end_ts):
+    if left_end_ts is None or right_end_ts is None:
+        return None
+    return max(left_end_ts, right_end_ts)
+
+
+def symptoms_overlap(left_symptom, right_symptom):
+    if get_symptom_overlap_base_key(left_symptom) != get_symptom_overlap_base_key(right_symptom):
+        return False
+
+    left_start_ts, left_end_ts = get_symptom_interval(left_symptom)
+    right_start_ts, right_end_ts = get_symptom_interval(right_symptom)
+    if left_start_ts is None or right_start_ts is None:
+        return False
+
+    return (
+        left_start_ts <= _interval_end_sort_value(right_end_ts)
+        and right_start_ts <= _interval_end_sort_value(left_end_ts)
+    )
+
+
+def symptom_covers(cover_symptom, target_symptom):
+    if get_symptom_overlap_base_key(cover_symptom) != get_symptom_overlap_base_key(target_symptom):
+        return False
+
+    cover_start_ts, cover_end_ts = get_symptom_interval(cover_symptom)
+    target_start_ts, target_end_ts = get_symptom_interval(target_symptom)
+    if cover_start_ts is None or target_start_ts is None:
+        return False
+
+    return (
+        cover_start_ts <= target_start_ts
+        and _interval_end_sort_value(cover_end_ts) >= _interval_end_sort_value(target_end_ts)
+    )
+
+
+def _build_merged_segment_key(symptom):
+    base_key = get_symptom_overlap_base_key(symptom)
+    if not base_key:
+        return symptom.get("_segment_key") or symptom.get("eid")
+
+    start_ts, end_ts = get_symptom_interval(symptom)
+    if start_ts is None:
+        return symptom.get("_segment_key") or symptom.get("eid")
+
+    if len(base_key) == 3 and base_key[0] != "__fallback__":
+        node, alarm_source, alarm = base_key
+        return f"{node}|{alarm_source}|{alarm}|{start_ts:.6f}|{'open' if end_ts is None else f'{end_ts:.6f}'}"
+
+    return f"{base_key[0]}|{base_key[1]}|{start_ts:.6f}|{'open' if end_ts is None else f'{end_ts:.6f}'}"
+
+
+def merge_symptom_records(existing_symptom, incoming_symptom):
+    existing_start_ts, existing_end_ts = get_symptom_interval(existing_symptom)
+    incoming_start_ts, incoming_end_ts = get_symptom_interval(incoming_symptom)
+
+    if existing_start_ts is None:
+        merged = dict(incoming_symptom)
+    elif incoming_start_ts is None:
+        merged = dict(existing_symptom)
+    elif incoming_start_ts < existing_start_ts:
+        merged = dict(incoming_symptom)
+    else:
+        merged = dict(existing_symptom)
+
+    other_symptom = incoming_symptom if merged is not incoming_symptom else existing_symptom
+    if merged is existing_symptom:
+        other_symptom = incoming_symptom
+
+    merged_start_ts_candidates = [
+        ts for ts in (existing_start_ts, incoming_start_ts)
+        if ts is not None
+    ]
+    merged_start_ts = min(merged_start_ts_candidates) if merged_start_ts_candidates else None
+    merged_end_ts = _merge_interval_end(existing_end_ts, incoming_end_ts)
+
+    if merged_start_ts is not None:
+        merged["ts"] = merged_start_ts
+        merged["_segment_start_ts"] = merged_start_ts
+    merged["_segment_end_ts"] = merged_end_ts
+
+    for field_name in (
+        "node",
+        "alarm",
+        "alarm_source",
+        "alarm_source_domain",
+        "matched_role",
+        "time_str",
+    ):
+        if not merged.get(field_name) and other_symptom.get(field_name):
+            merged[field_name] = other_symptom[field_name]
+
+    if merged.get("eid") in (None, "") and other_symptom.get("eid") not in (None, ""):
+        merged["eid"] = other_symptom["eid"]
+
+    merged["_segment_key"] = _build_merged_segment_key(merged)
+    return merged
+
+
+def merge_overlapping_symptoms(symptoms):
+    if len(symptoms) <= 1:
+        return list(symptoms)
+
+    grouped_symptoms = collections.defaultdict(list)
+    passthrough_symptoms = []
+    for symptom in symptoms:
+        overlap_key = get_symptom_overlap_base_key(symptom)
+        start_ts, _end_ts = get_symptom_interval(symptom)
+        if overlap_key is None or start_ts is None:
+            passthrough_symptoms.append(dict(symptom))
+            continue
+        grouped_symptoms[overlap_key].append(dict(symptom))
+
+    merged_symptoms = list(passthrough_symptoms)
+    for grouped_items in grouped_symptoms.values():
+        grouped_items.sort(
+            key=lambda symptom: (
+                get_symptom_interval(symptom)[0],
+                _interval_end_sort_value(get_symptom_interval(symptom)[1]),
+                str(symptom.get("eid", "")),
+            )
+        )
+
+        current = None
+        for symptom in grouped_items:
+            if current is None:
+                current = symptom
+                continue
+            if symptoms_overlap(current, symptom):
+                current = merge_symptom_records(current, symptom)
+                continue
+            merged_symptoms.append(current)
+            current = symptom
+
+        if current is not None:
+            merged_symptoms.append(current)
+
+    merged_symptoms.sort(
+        key=lambda symptom: (
+            symptom.get("_segment_start_ts", symptom.get("ts", float("inf"))),
+            str(symptom.get("eid", "")),
+        )
+    )
+    return merged_symptoms
 
 
 def get_match_site_keys(match_result):
@@ -174,7 +363,7 @@ def get_match_site_keys(match_result):
 
 
 def merge_match_component(component_matches):
-    """合并一组通过 eid 连通的候选组。"""
+    """合并一组通过告警时段/时间段 overlap 连通的候选组。"""
     merged_rules = sorted({
         rule_name
         for match in component_matches
@@ -191,7 +380,7 @@ def merge_match_component(component_matches):
         "symptoms": []
     }
 
-    symptom_map = {}
+    collected_symptoms = []
     related_group_uuids = set()
     expire_ts_hint = None
 
@@ -208,15 +397,11 @@ def merge_match_component(component_matches):
             merged["role_mapping"].setdefault(role, [])
             merged["role_mapping"][role] = sorted(set(merged["role_mapping"][role]) | set(nodes))
 
-        for symptom in source.get("symptoms", []):
-            alarm_key = symptom.get("eid")
-            if alarm_key in (None, ""):
-                continue
-            symptom_map[alarm_key] = symptom
+        collected_symptoms.extend(source.get("symptoms", []))
 
         related_group_uuids.update(source.get("related_group_uuids", []))
 
-    merged["symptoms"] = list(symptom_map.values())
+    merged["symptoms"] = merge_overlapping_symptoms(collected_symptoms)
     if related_group_uuids:
         merged["related_group_uuids"] = sorted(related_group_uuids)
     if expire_ts_hint is not None:
@@ -227,7 +412,7 @@ def merge_match_component(component_matches):
 
 def build_empty_merge_stats():
     return {
-        "eid_merge_group_count": 0,
+        "alarm_overlap_merge_group_count": 0,
         "shared_site_merge_group_count": 0,
         "hop_merge_group_count": 0,
         "distance_merge_group_count": 0,
@@ -245,7 +430,7 @@ def add_merge_stats(*stats_list):
 
 
 def merge_match_batch(matches, site_merge_helper=None, return_stats=False):
-    """在同一轮收割内，先把共享 eid 的候选组合并后再输出。"""
+    """在同一轮收割内，先把共享告警时段/时间段重叠的候选组合并后再输出。"""
     merge_stats = build_empty_merge_stats()
     if len(matches) <= 1:
         return (matches, merge_stats) if return_stats else matches
@@ -270,20 +455,36 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False):
             return True
         return False
 
-    match_alarm_keys = [get_match_alarm_keys(match) for match in matches]
-    eid_to_match_indexes = collections.defaultdict(list)
-    for idx, alarm_keys in enumerate(match_alarm_keys):
-        if not alarm_keys:
-            continue
-        for alarm_key in alarm_keys:
-            eid_to_match_indexes[alarm_key].append(idx)
+    match_overlap_keys = [get_match_symptom_overlap_keys(match) for match in matches]
+    overlap_key_to_entries = collections.defaultdict(list)
+    for idx, match in enumerate(matches):
+        for symptom in match.get("symptoms", []):
+            overlap_key = get_symptom_overlap_base_key(symptom)
+            start_ts, end_ts = get_symptom_interval(symptom)
+            if overlap_key is None or start_ts is None:
+                continue
+            overlap_key_to_entries[overlap_key].append((start_ts, end_ts, idx))
 
-    for indexes in eid_to_match_indexes.values():
-        if len(indexes) < 2:
+    for entries in overlap_key_to_entries.values():
+        if len(entries) < 2:
             continue
-        head = indexes[0]
-        for idx in indexes[1:]:
-            union(head, idx, reason="eid")
+
+        entries.sort(key=lambda item: (item[0], _interval_end_sort_value(item[1]), item[2]))
+        component_head = None
+        component_end_ts = None
+        for start_ts, end_ts, idx in entries:
+            if component_head is None:
+                component_head = idx
+                component_end_ts = end_ts
+                continue
+
+            if start_ts <= _interval_end_sort_value(component_end_ts):
+                union(component_head, idx, reason="alarm_overlap")
+                component_end_ts = _merge_interval_end(component_end_ts, end_ts)
+                continue
+
+            component_head = idx
+            component_end_ts = end_ts
 
     if site_merge_helper is not None and site_merge_helper.enabled:
         match_site_keys = [get_match_site_keys(match) for match in matches]
@@ -310,7 +511,7 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False):
     merged_matches = []
     for root_idx, component_matches in groups.items():
         indexes = group_indexes[root_idx]
-        if len(component_matches) == 1 and not match_alarm_keys[indexes[0]]:
+        if len(component_matches) == 1 and not match_overlap_keys[indexes[0]]:
             merged_matches.append(matches[indexes[0]])
             continue
         merged_matches.append(merge_match_component(component_matches))

@@ -47,6 +47,7 @@ from fault_grouping.sorted_alarm_cache import (
     write_sorted_alarm_cache,
 )
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
+from fault_grouping.temporal_graph_engine_utils import get_match_alarm_keys
 
 
 def _parse_datetime_text(text, field_name="时间"):
@@ -658,6 +659,8 @@ def _enrich_match_symptoms(match, alarm_metadata_index):
     enriched_symptoms = []
     for symptom in match.get("symptoms", []):
         enriched_symptom = dict(symptom)
+        for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts"):
+            enriched_symptom.pop(internal_field, None)
         event_id = enriched_symptom.get("eid", "")
         if event_id:
             metadata = alarm_metadata_index.get(event_id, {})
@@ -786,7 +789,15 @@ def _format_debug_site_events(engine, site_id, limit=50):
         return json.dumps({"total": 0, "events": []}, ensure_ascii=False)
 
     formatted = []
-    for ts, eid, alarm_type, alarm_source, consumed_trigger_rules in events:
+    for cached_event in events:
+        if isinstance(cached_event, dict):
+            ts = cached_event.get("ts")
+            eid = cached_event.get("eid")
+            alarm_type = cached_event.get("alarm")
+            alarm_source = cached_event.get("alarm_source", "")
+            consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
+        else:
+            ts, eid, alarm_type, alarm_source, consumed_trigger_rules = cached_event
         formatted.append(
             {
                 "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
@@ -853,11 +864,7 @@ def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header
 
 
 def _get_debug_match_alarm_keys(match):
-    return {
-        symptom.get("eid")
-        for symptom in match.get("symptoms", [])
-        if symptom.get("eid") not in (None, "")
-    }
+    return get_match_alarm_keys(match)
 
 
 def _match_present_in_stage(raw_match, stage_matches):
@@ -945,13 +952,13 @@ def _print_debug_harvest_actions(snapshot, engine):
             )
             reason = profile.get("reason", "")
             if reason == "suppressed_by_fully_containing_history":
-                print("         - 最终未输出：当前候选组的 eid 已被历史故障组完全覆盖，只延长历史组停留时间")
+                print("         - 最终未输出：当前候选组的告警时段已被历史故障组完全覆盖，只延长历史组停留时间")
             elif reason == "merged_with_related_history":
                 print("         - 最终输出：与历史相关组做了合并后重新输出")
             elif reason == "no_related_history":
                 print("         - 最终输出：没有命中任何历史相关组")
             elif reason == "no_alarm_keys":
-                print("         - 最终阶段异常：候选组没有可用 eid，无法做历史合并判断")
+                print("         - 最终阶段异常：候选组没有可用告警时段键，无法做历史合并判断")
 
     if snapshot.get("finalized_matches"):
         print(
@@ -1163,7 +1170,7 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engi
     if merge_stats:
         print(
             "   ↳ 批内合并统计: "
-            f"eid={merge_stats.get('eid_merge_group_count', 0)}, "
+            f"alarm_overlap={merge_stats.get('alarm_overlap_merge_group_count', 0)}, "
             f"shared_site={merge_stats.get('shared_site_merge_group_count', 0)}, "
             f"hop={merge_stats.get('hop_merge_group_count', 0)}, "
             f"distance={merge_stats.get('distance_merge_group_count', 0)}"
@@ -1745,6 +1752,7 @@ def main():
         merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
         return (
             f"已汇聚故障组数: {match_count} | "
+            f"告警时段合并组数: {merge_stats.get('alarm_overlap_merge_group_count', 0)} | "
             f"hop合并组数: {merge_stats.get('hop_merge_group_count', 0)} | "
             f"距离合并组数: {merge_stats.get('distance_merge_group_count', 0)}"
         )
@@ -1807,6 +1815,7 @@ def main():
     print(
         f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，"
         f"生成 {match_count} 个故障组，"
+        f"告警时段合并组数 {final_merge_stats.get('alarm_overlap_merge_group_count', 0)}，"
         f"hop合并组数 {final_merge_stats.get('hop_merge_group_count', 0)}，"
         f"距离合并组数 {final_merge_stats.get('distance_merge_group_count', 0)}，"
         f"耗时 {elapsed:.4f} 秒。"
