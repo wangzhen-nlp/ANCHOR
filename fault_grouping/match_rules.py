@@ -1461,7 +1461,7 @@ def main():
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='offline', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=300.0, help='模拟时间下的定时收割周期，单位秒')
     parser.add_argument('--aggregation-wait-sec', type=float, default=420.0, help='trigger 成熟前的聚合等待时间，单位秒，默认 420')
-    parser.add_argument('--clear-delay-sec', type=float, default=0.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
+    parser.add_argument('--clear-delay-sec', type=float, default=420.0, help='清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间')
     parser.add_argument('--batch-merge-site-hops', type=int, default=0, help='批内候选组额外按站点邻接合并的 hop 数；0 表示关闭，2 表示两跳内可合并')
     parser.add_argument('--batch-merge-density-knn', type=int, default=0, help='批内候选组额外按站点局部密度自适应合并时使用的近邻数；0 表示关闭')
     parser.add_argument('--batch-merge-density-scale', type=float, default=1.0, help='局部密度半径放大倍数，实际阈值=scale * 第k近邻距离')
