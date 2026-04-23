@@ -24,8 +24,7 @@ NO_OFFLINE_DATA_NODE = {
       "expected_alarms": {
         "optional_alarms": LINK_ALARMS | POWER_ALARMS,
         "optional_alarm_source_domains": ["Data"],
-        "forbidden_alarms": OFFLINE_ALARMS,
-        "forbidden_alarm_source_domains": ["Data"]
+        "forbidden_alarms": OFFLINE_ALARMS
       }
     }
   ]
@@ -51,8 +50,7 @@ OPTIONAL_OFFLINE_DATA_NODE = {
     {
       "include": ["Data"],
       "expected_alarms": {
-        "optional_alarms": OFFLINE_ALARMS | LINK_ALARMS | POWER_ALARMS,
-        "optional_alarm_source_domains": ["Data"]
+        "optional_alarms": OFFLINE_ALARMS | LINK_ALARMS | POWER_ALARMS
       }
     }
   ]
@@ -68,8 +66,7 @@ REQUIRED_LINK_NO_OFFLINE_DATA_NODE = {
         "required_alarm_source_domains": ["Data"],
         "optional_alarms": POWER_ALARMS,
         "optional_alarm_source_domains": ["Data"],
-        "forbidden_alarms": OFFLINE_ALARMS,
-        "forbidden_alarm_source_domains": ["Data"]
+        "forbidden_alarms": OFFLINE_ALARMS
       }
     }
   ]
