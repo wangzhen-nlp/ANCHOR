@@ -2,7 +2,7 @@
 """
 筛选Incident Ticket记录：
 1. 行的内容包含至少两个站点ID
-2. 至少两个匹配站点包含Transmission设备
+2. 至少两个匹配站点包含指定场景对应的设备
 """
 import argparse
 import json
@@ -34,6 +34,23 @@ DATETIME_TEXT_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
 DATETIME_FULLMATCH_PATTERN = re.compile(r"^\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*$")
 TICKET_DATE_PATTERN = re.compile(r"-(\d{8})-")
 FALLBACK_TICKET_DATE_PATTERN = re.compile(r"(?<!\d)(\d{8})(?!\d)")
+
+SCENARIO_DEVICE_DOMAINS = {
+    "transmission": ("TRANSMISSION", "Transmission"),
+    "data": ("DATA", "Data"),
+}
+
+
+def _get_scenario_device_domain(scenario: str) -> tuple:
+    normalized_scenario = str(scenario or "transmission").strip().lower()
+    if normalized_scenario not in SCENARIO_DEVICE_DOMAINS:
+        supported = ", ".join(sorted(SCENARIO_DEVICE_DOMAINS))
+        raise ValueError(f"不支持的场景: {scenario}; 可选值: {supported}")
+    return SCENARIO_DEVICE_DOMAINS[normalized_scenario]
+
+
+def _empty_filter_stats() -> dict:
+    return {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_required_device': 0}
 
 
 def load_site_device_mapping(json_file: str) -> dict:
@@ -177,18 +194,19 @@ def extract_site_ids_from_text(text: str, site_matcher: dict) -> list:
     return extract_outputs_from_text(text, site_matcher)
 
 
-def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
+def check_site_devices(site_ids: list, site_device_mapping: dict, required_device_domain: str) -> tuple:
     """
     检查站点列表是否满足条件：
     - 至少2个站点
-    - 至少2个站点包含Transmission设备
-    返回: (是否满足条件, 涉及的设备类型, 包含Transmission设备的站点)
+    - 至少2个站点包含指定设备域
+    返回: (是否满足条件, 涉及的设备类型, 包含指定设备域的站点)
     """
     if len(site_ids) < 2:
         return False, set(), []
 
     all_devices = set()
-    transmission_sites = []
+    required_device_domain = str(required_device_domain or "").strip().upper()
+    required_domain_sites = []
 
     for site_id in site_ids:
         if site_id not in site_device_mapping:
@@ -197,11 +215,11 @@ def check_site_devices(site_ids: list, site_device_mapping: dict) -> tuple:
         devices = site_device_mapping[site_id]
         all_devices.update(devices)
 
-        if 'TRANSMISSION' not in devices:
+        if required_device_domain not in devices:
             continue
-        transmission_sites.append(site_id)
+        required_domain_sites.append(site_id)
 
-    return len(transmission_sites) >= 2, all_devices, transmission_sites
+    return len(required_domain_sites) >= 2, all_devices, required_domain_sites
 
 
 def build_known_site_ids(site_device_mapping: dict) -> list:
@@ -232,13 +250,13 @@ def _print_file_start(input_file: str, total_rows: int = None):
     print("开始逐行筛选...")
 
 
-def _print_stats(title: str, stats: dict):
+def _print_stats(title: str, stats: dict, scenario_device_label: str):
     _print_section(title)
     _print_key_values([
         ("总记录数", stats['total']),
         ("命中记录数", stats['valid']),
         ("不足 2 个站点", stats['only_one_site']),
-        ("具备 Transmission 的站点不足 2 个", stats['missing_transmission_device']),
+        (f"具备 {scenario_device_label} 的站点不足 2 个", stats['missing_required_device']),
     ])
 
 
@@ -580,14 +598,16 @@ def _filter_incident_tickets_rows(
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
     progress_label: str = None,
 ):
     """筛选流式行数据，并仅保留命中的记录。"""
+    required_device_domain, _scenario_device_label = _get_scenario_device_domain(scenario)
     filtered_indices = []
     filtered_rows = []
     matched_sites_by_row = []
     matched_time_entries_by_row = []
-    stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}
+    stats = _empty_filter_stats()
     row_progress = ProgressBar(total_rows, progress_label or "处理工单记录", min_interval=0.05)
     ticket_col_idx = None
     try:
@@ -643,10 +663,14 @@ def _filter_incident_tickets_rows(
                 continue
 
             # 检查设备类型
-            valid, devices, transmission_sites = check_site_devices(site_ids, site_device_mapping)
+            valid, _devices, _required_domain_sites = check_site_devices(
+                site_ids,
+                site_device_mapping,
+                required_device_domain,
+            )
 
             if not valid:
-                stats['missing_transmission_device'] += 1
+                stats['missing_required_device'] += 1
                 row_progress.update()
                 continue
 
@@ -673,6 +697,7 @@ def _filter_incident_tickets_df(
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
     progress_label: str = None,
 ):
     """筛选单个 DataFrame。"""
@@ -689,6 +714,7 @@ def _filter_incident_tickets_df(
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
         ticket_field=ticket_field,
+        scenario=scenario,
         progress_label=progress_label,
     )
 
@@ -703,6 +729,7 @@ def _filter_incident_tickets_xlsx_stream(
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
     progress_label: str = None,
 ):
     """使用 openpyxl 只读模式流式读取 xlsx，避免一次性把整表读入内存。"""
@@ -721,7 +748,7 @@ def _filter_incident_tickets_xlsx_stream(
         row_iter = worksheet.iter_rows(values_only=True)
         header_row = next(row_iter, None)
         if header_row is None:
-            return None, {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}, [], []
+            return None, _empty_filter_stats(), [], []
 
         columns = _normalize_header_row(header_row)
         total_rows = max((worksheet.max_row or 1) - 1, 0)
@@ -737,6 +764,7 @@ def _filter_incident_tickets_xlsx_stream(
             ticket_match_cache_input=ticket_match_cache_input,
             ticket_match_cache_output=ticket_match_cache_output,
             ticket_field=ticket_field,
+            scenario=scenario,
             progress_label=progress_label,
         )
     finally:
@@ -753,6 +781,7 @@ def _filter_incident_tickets_excel(
     ticket_match_cache_input: dict = None,
     ticket_match_cache_output: dict = None,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
     progress_label: str = None,
 ):
     """按文件类型选择合适的 Excel 读取方式。"""
@@ -768,6 +797,7 @@ def _filter_incident_tickets_excel(
             ticket_match_cache_input=ticket_match_cache_input,
             ticket_match_cache_output=ticket_match_cache_output,
             ticket_field=ticket_field,
+            scenario=scenario,
             progress_label=progress_label,
         )
 
@@ -783,6 +813,7 @@ def _filter_incident_tickets_excel(
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
         ticket_field=ticket_field,
+        scenario=scenario,
         progress_label=progress_label,
     )
 
@@ -834,9 +865,11 @@ def _filter_incident_tickets_file(
     expand_sites_by_device: bool = False,
     json_only: bool = False,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
 ):
     """筛选单个 Excel 文件。"""
     _print_file_start(input_file)
+    _required_device_domain, scenario_device_label = _get_scenario_device_domain(scenario)
 
     result_df, stats, matched_sites_by_row, matched_time_entries_by_row = _filter_incident_tickets_excel(
         input_file,
@@ -848,10 +881,11 @@ def _filter_incident_tickets_file(
         ticket_match_cache_input=ticket_match_cache_input,
         ticket_match_cache_output=ticket_match_cache_output,
         ticket_field=ticket_field,
+        scenario=scenario,
         progress_label=f"处理记录 {os.path.basename(input_file)}",
     )
 
-    _print_stats("筛选统计", stats)
+    _print_stats("筛选统计", stats, scenario_device_label)
 
     # 输出结果
     if result_df is not None:
@@ -899,8 +933,10 @@ def filter_incident_tickets(
     expand_sites_by_device: bool = False,
     json_only: bool = False,
     ticket_field: str = "工单ID",
+    scenario: str = "transmission",
 ):
     """筛选满足条件的Incident Ticket记录"""
+    _required_device_domain, scenario_device_label = _get_scenario_device_domain(scenario)
     # 加载站点设备映射
     site_device_mapping = load_site_device_mapping(site_device_file)
     known_site_ids = build_known_site_ids(site_device_mapping)
@@ -917,7 +953,11 @@ def filter_incident_tickets(
     if not match_cache_output_file:
         match_cache_output_file = _derive_match_cache_output_path(output_file)
     _print_section("初始化")
-    init_items = [("已加载站点数", len(site_device_mapping))]
+    init_items = [
+        ("筛选场景", scenario),
+        ("要求设备域", scenario_device_label),
+        ("已加载站点数", len(site_device_mapping)),
+    ]
     if expand_sites_by_device:
         init_items.extend([
             ("设备补站点", "开启"),
@@ -943,6 +983,7 @@ def filter_incident_tickets(
         expand_sites_by_device=expand_sites_by_device,
         json_only=json_only,
         ticket_field=ticket_field,
+        scenario=scenario,
     )
 
 
@@ -984,6 +1025,12 @@ def main():
         help='输入 Excel 中的工单字段列名，默认: 工单ID'
     )
     parser.add_argument(
+        '--scenario',
+        choices=sorted(SCENARIO_DEVICE_DOMAINS),
+        default='transmission',
+        help='筛选场景：transmission 要求至少两个匹配站点包含 Transmission 设备；data 要求至少两个匹配站点包含 Data 设备'
+    )
+    parser.add_argument(
         '--ne-graph',
         default=NE_GRAPH_JSON,
         help=f'ne_graph.json 文件；默认: {resource_display("ne_graph.json")}；开启设备补站点时需要可用'
@@ -1008,6 +1055,7 @@ def main():
     )
 
     args = parser.parse_args()
+    _required_device_domain, scenario_device_label = _get_scenario_device_domain(args.scenario)
 
     site_device_mapping = load_site_device_mapping(args.site_device)
     known_site_ids = build_known_site_ids(site_device_mapping)
@@ -1022,7 +1070,11 @@ def main():
     ticket_match_cache_input = _load_match_cache(args.match_cache_input) if args.match_cache_input else {}
     match_cache_output_file = args.match_cache_output or _derive_match_cache_output_path(args.output)
     _print_section("初始化")
-    init_items = [("已加载站点数", len(site_device_mapping))]
+    init_items = [
+        ("筛选场景", args.scenario),
+        ("要求设备域", scenario_device_label),
+        ("已加载站点数", len(site_device_mapping)),
+    ]
     if args.expand_sites_by_device:
         init_items.extend([
             ("设备补站点", "开启"),
@@ -1042,7 +1094,7 @@ def main():
         return
 
     if os.path.isdir(args.input):
-        aggregate_stats = {'total': 0, 'valid': 0, 'only_one_site': 0, 'missing_transmission_device': 0}
+        aggregate_stats = _empty_filter_stats()
         processed_files = 0
         aggregated_result_dfs = []
         aggregated_json = {}
@@ -1063,10 +1115,11 @@ def main():
                     ticket_match_cache_input=aggregated_match_cache,
                     ticket_match_cache_output=aggregated_match_cache,
                     ticket_field=args.ticket_field,
+                    scenario=args.scenario,
                     progress_label=f"处理记录 {os.path.basename(input_file)}",
                 )
 
-                _print_stats("筛选统计", stats)
+                _print_stats("筛选统计", stats, scenario_device_label)
 
                 processed_files += 1
                 for key in aggregate_stats:
@@ -1091,7 +1144,7 @@ def main():
             ("总记录数", aggregate_stats['total']),
             ("命中记录数", aggregate_stats['valid']),
             ("不足 2 个站点", aggregate_stats['only_one_site']),
-            ("具备 Transmission 的站点不足 2 个", aggregate_stats['missing_transmission_device']),
+            (f"具备 {scenario_device_label} 的站点不足 2 个", aggregate_stats['missing_required_device']),
             ("输出记录关联站点总数", _count_total_sites_from_ticket_json(aggregated_json)),
         ])
 
@@ -1125,6 +1178,7 @@ def main():
         expand_sites_by_device=args.expand_sites_by_device,
         json_only=args.json_only,
         ticket_field=args.ticket_field,
+        scenario=args.scenario,
     )
 
 
