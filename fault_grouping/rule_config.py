@@ -59,21 +59,6 @@ OPTIONAL_OFFLINE_DATA_NODE = {
   ]
 }
 
-OPTIONAL_LINK_NO_OFFLINE_DATA_NODE = {
-  "type": "primitive",
-  "site_rules": [
-    {
-      "include": ["Data"],
-      "expected_alarms": {
-        "optional_alarms": LINK_ALARMS | POWER_ALARMS,
-        "optional_alarm_source_domains": ["Data"],
-        "forbidden_alarms": OFFLINE_ALARMS,
-        "forbidden_alarm_source_domains": ["Data"]
-      }
-    }
-  ]
-}
-
 REQUIRED_LINK_NO_OFFLINE_DATA_NODE = {
   "type": "primitive",
   "site_rules": [
