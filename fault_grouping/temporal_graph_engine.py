@@ -361,36 +361,109 @@ class TemporalGraphEngine:
             return min(distance_candidates)[2]
         return min(roles, key=lambda role: role_order[role])
 
+    @staticmethod
+    def _normalize_exclusive_site_role_groups(raw_config, available_roles):
+        if not raw_config:
+            return []
+
+        available_role_set = set(available_roles)
+
+        def normalize_role_group(raw_group):
+            if raw_group is True:
+                return list(available_roles)
+            if isinstance(raw_group, str):
+                if raw_group.strip().lower() in {"all", "*"}:
+                    return list(available_roles)
+                raw_group = [part.strip() for part in raw_group.split(",")]
+            if isinstance(raw_group, dict):
+                raw_group = raw_group.get("roles", raw_group.get("role", []))
+            if not isinstance(raw_group, (list, tuple, set)):
+                return []
+
+            roles = []
+            seen = set()
+            for role in raw_group:
+                if not isinstance(role, str):
+                    continue
+                role = role.strip()
+                if not role or role not in available_role_set or role in seen:
+                    continue
+                seen.add(role)
+                roles.append(role)
+            return roles
+
+        if raw_config is True or isinstance(raw_config, str):
+            raw_groups = [raw_config]
+        elif isinstance(raw_config, dict):
+            if "groups" in raw_config:
+                raw_groups = raw_config.get("groups") or []
+            else:
+                raw_groups = [raw_config]
+        elif isinstance(raw_config, (list, tuple, set)):
+            if all(isinstance(item, str) for item in raw_config):
+                raw_groups = [raw_config]
+            else:
+                raw_groups = raw_config
+        else:
+            raw_groups = []
+
+        groups = []
+        seen_groups = set()
+        for raw_group in raw_groups:
+            group = normalize_role_group(raw_group)
+            if len(group) <= 1:
+                continue
+            group_key = tuple(group)
+            if group_key in seen_groups:
+                continue
+            seen_groups.add(group_key)
+            groups.append(group)
+        return groups
+
+    def _get_exclusive_site_role_groups_for_output(self, match_result, available_roles):
+        groups = []
+        merged_rules = match_result.get("merged_rules", [match_result.get("rule")])
+        for rule_name in merged_rules:
+            rule = self.rules.get(rule_name)
+            if not rule:
+                continue
+            groups.extend(
+                self._normalize_exclusive_site_role_groups(
+                    rule.get("exclusive_site_roles"),
+                    available_roles,
+                )
+            )
+        return groups
+
     def _apply_default_output_site_role_ownership(self, match_result):
         role_mapping = match_result.get("role_mapping", {})
         if len(role_mapping) <= 1:
             return match_result
 
-        owned_roles = [
-            role for role, nodes in role_mapping.items()
-            if nodes and self._participates_in_default_site_role_ownership(
-                self._get_role_node_config_for_output(role, match_result)
-            )
-        ]
-        if len(owned_roles) <= 1:
+        exclusive_role_groups = self._get_exclusive_site_role_groups_for_output(
+            match_result,
+            list(role_mapping.keys()),
+        )
+        if not exclusive_role_groups:
             return match_result
 
         role_order = {role: idx for idx, role in enumerate(role_mapping.keys())}
-        site_to_roles = collections.defaultdict(list)
-        for role in owned_roles:
-            for site in role_mapping.get(role, []):
-                site_to_roles[site].append(role)
-
         remove_by_role = collections.defaultdict(set)
-        owner_by_site = {}
-        for site, site_roles in site_to_roles.items():
-            if len(site_roles) <= 1:
-                continue
-            owner_role = self._choose_match_site_owner_role(match_result, site, site_roles, role_order)
-            owner_by_site[site] = owner_role
-            for role in site_roles:
-                if role != owner_role:
-                    remove_by_role[role].add(site)
+        owner_by_removed_role_site = {}
+        for exclusive_roles in exclusive_role_groups:
+            site_to_roles = collections.defaultdict(list)
+            for role in exclusive_roles:
+                for site in role_mapping.get(role, []):
+                    site_to_roles[site].append(role)
+
+            for site, site_roles in site_to_roles.items():
+                if len(site_roles) <= 1:
+                    continue
+                owner_role = self._choose_match_site_owner_role(match_result, site, site_roles, role_order)
+                for role in site_roles:
+                    if role != owner_role:
+                        remove_by_role[role].add(site)
+                        owner_by_removed_role_site[(role, site)] = owner_role
 
         if not remove_by_role:
             return match_result
@@ -418,7 +491,7 @@ class TemporalGraphEngine:
             role = symptom.get("matched_role")
             node = symptom.get("node")
             if role in remove_by_role and node in remove_by_role.get(role, set()):
-                owner_role = owner_by_site.get(node)
+                owner_role = owner_by_removed_role_site.get((role, node))
                 if owner_role and node in filtered_role_mapping.get(owner_role, []):
                     symptom = {**symptom, "matched_role": owner_role}
                 else:
@@ -439,11 +512,6 @@ class TemporalGraphEngine:
             self._apply_default_output_site_role_ownership(match_result)
             for match_result in matches
         ]
-
-    @staticmethod
-    def _participates_in_default_site_role_ownership(node_config):
-        """默认只对 compound role 做站点归属去重，保留 primitive 同站多语义匹配。"""
-        return (node_config or {}).get("type") == "compound"
 
     @staticmethod
     def _get_optional_only_roles(rule):
@@ -497,7 +565,7 @@ class TemporalGraphEngine:
         return best_hop
 
     def _choose_site_owner_role(self, inst, site, roles, role_order):
-        """同一站点命中多个 compound role 时，优先归属到 parent->child hop 最近的一边。"""
+        """同一站点命中多个互斥 role 时，优先归属到 parent->child hop 最近的一边。"""
         distance_candidates = []
         for role in roles:
             distance = self._get_role_site_owner_distance(inst, role, site)
@@ -511,33 +579,33 @@ class TemporalGraphEngine:
         return min(roles, key=lambda role: role_order[role])
 
     def _apply_default_site_role_ownership(self, inst, rule, nodes_cfg):
-        """默认裁剪 compound role 的重复站点归属，避免环/双向边导致下挂站点串到多侧。"""
+        """按 rule.exclusive_site_roles 裁剪重复站点归属，避免环/双向边导致角色串位。"""
         roles = inst.get("roles", {})
         if len(roles) <= 1:
             return inst
 
-        owned_roles = [
-            role for role, role_state in roles.items()
-            if self._participates_in_default_site_role_ownership(nodes_cfg.get(role, {}))
-            and role_state.get("nodes")
-        ]
-        if len(owned_roles) <= 1:
+        exclusive_role_groups = self._normalize_exclusive_site_role_groups(
+            rule.get("exclusive_site_roles"),
+            list(roles.keys()),
+        )
+        if not exclusive_role_groups:
             return inst
 
         role_order = {role: idx for idx, role in enumerate(roles.keys())}
-        site_to_roles = collections.defaultdict(list)
-        for role in owned_roles:
-            for site in roles[role].get("nodes", {}):
-                site_to_roles[site].append(role)
-
         remove_by_role = collections.defaultdict(set)
-        for site, site_roles in site_to_roles.items():
-            if len(site_roles) <= 1:
-                continue
-            owner_role = self._choose_site_owner_role(inst, site, site_roles, role_order)
-            for role in site_roles:
-                if role != owner_role:
-                    remove_by_role[role].add(site)
+        for exclusive_roles in exclusive_role_groups:
+            site_to_roles = collections.defaultdict(list)
+            for role in exclusive_roles:
+                for site in roles.get(role, {}).get("nodes", {}):
+                    site_to_roles[site].append(role)
+
+            for site, site_roles in site_to_roles.items():
+                if len(site_roles) <= 1:
+                    continue
+                owner_role = self._choose_site_owner_role(inst, site, site_roles, role_order)
+                for role in site_roles:
+                    if role != owner_role:
+                        remove_by_role[role].add(site)
 
         if not remove_by_role:
             return inst

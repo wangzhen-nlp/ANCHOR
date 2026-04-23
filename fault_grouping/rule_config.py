@@ -123,6 +123,7 @@ transmission_rule = {
   "description": "无告警 -> 断站? -> 断站?",
   "max_stay_time_sec": 3600,
   "trigger_role": "downstream_compound_node",
+  "exclusive_site_roles": ["grandparent_node", "downstream_compound_node"],
   "nodes": {
     "grandparent_node": {
       "type": "compound",
@@ -309,6 +310,11 @@ data_link_adjacent_no_offline_rule = {
   "description": "本路由Data link且无Data offline，邻接路由无Data offline -> 下挂断站",
   "max_stay_time_sec": 3600,
   "trigger_role": "data_link_underneath_compound_node",
+  "exclusive_site_roles": [
+    "data_link_adjacent_data_neighbor_node",
+    "data_link_parent_data_node",
+    "data_link_underneath_compound_node"
+  ],
   "nodes": {
     "data_link_adjacent_data_neighbor_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
     "data_link_parent_data_node": NO_OFFLINE_DATA_NODE,
@@ -336,6 +342,11 @@ data_link_adjacent_offline_rule = {
   "description": "本路由Data link且无Data offline，邻接路由Data offline，下挂断站可有可无",
   "max_stay_time_sec": 3600,
   "trigger_role": "data_link_offline_parent_data_node",
+  "exclusive_site_roles": [
+    "data_link_offline_adjacent_data_node",
+    "data_link_offline_parent_data_node",
+    "data_link_offline_underneath_compound_node"
+  ],
   "nodes": {
     "data_link_offline_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
     "data_link_offline_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
@@ -364,6 +375,12 @@ data_no_offline_adjacent_optional_offline_rule = {
   "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",
   "max_stay_time_sec": 3600,
   "trigger_role": "current_underneath_compound_node",
+  "exclusive_site_roles": [
+    "current_parent_data_node",
+    "current_underneath_compound_node",
+    "adjacent_router_data_neighbor_node",
+    "adjacent_router_underneath_compound_node"
+  ],
   "nodes": {
     "current_parent_data_node": NO_OFFLINE_DATA_NODE,
     "current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
@@ -409,6 +426,12 @@ data_offline_adjacent_offline_rule = {
   "description": "本路由Data offline，双向相邻路由Data offline，本路由/相邻路由下挂offline可有可无",
   "max_stay_time_sec": 3600,
   "trigger_role": "offline_current_parent_data_node",
+  "exclusive_site_roles": [
+    "offline_current_parent_data_node",
+    "offline_current_underneath_compound_node",
+    "offline_adjacent_router_data_neighbor_node",
+    "offline_adjacent_router_underneath_compound_node"
+  ],
   "nodes": {
     "offline_current_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
     "offline_current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
