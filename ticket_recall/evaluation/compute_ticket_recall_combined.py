@@ -433,10 +433,18 @@ def main():
 
     print(f"整合工单数: {result['ticket_count']}")
     print(
+        "告警流保留工单召回站点数分布: "
+        f"{result['alarm_stream_summary'].get('ticket_site_count_distribution', {})}"
+    )
+    print(
         "告警流指标: "
         f"平均召回率={result['alarm_stream_summary']['average_recall']:.6f}, "
         f"平均准确率={result['alarm_stream_summary']['average_precision']:.6f}, "
         f"平均F1={result['alarm_stream_summary']['average_f1']:.6f}"
+    )
+    print(
+        "故障组输出保留工单召回站点数分布: "
+        f"{result['group_output_summary'].get('ticket_site_count_distribution', {})}"
     )
     print(
         "故障组输出指标: "

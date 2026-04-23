@@ -1303,7 +1303,7 @@ def main():
 
     print(f"工单数: {result['ticket_count']}")
     print(f"最终统计样本数: {result['final_sample_count']}")
-    print(f"样本 site 个数分布: {result['ticket_site_count_distribution']}")
+    print(f"保留工单召回站点数分布: {result['ticket_site_count_distribution']}")
     print(f"平均召回率: {result['average_recall']:.6f}")
     print(f"平均准确率: {result['average_precision']:.6f}")
     print(f"平均F1: {result['average_f1']:.6f}")
