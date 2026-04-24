@@ -3421,8 +3421,12 @@
         }
 
         function convertSymptomToNodeAlarm(symptom) {
+            const alarmIdList = Array.isArray(symptom?.eid_list)
+                ? symptom.eid_list.filter(value => value !== null && value !== undefined && String(value).trim() !== '')
+                : [];
             return {
-                alarm_id: symptom.eid || symptom.alarm_id || '',
+                alarm_id: symptom.eid || alarmIdList[0] || symptom.alarm_id || '',
+                alarm_id_list: alarmIdList,
                 alarm_type: symptom.alarm || symptom.alarm_type || symptom.title || '',
                 alarm_time: symptom.alarm_time || formatTimestampSeconds(symptom.ts),
                 alarm_clear_time: symptom['告警清除时间'] || symptom.alarm_clear_time || '',

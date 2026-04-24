@@ -295,6 +295,20 @@ def merge_symptom_records(existing_symptom, incoming_symptom):
     if merged.get("eid") in (None, "") and other_symptom.get("eid") not in (None, ""):
         merged["eid"] = other_symptom["eid"]
 
+    merged_eid_list = []
+    for symptom in (existing_symptom, incoming_symptom):
+        raw_eid_list = symptom.get("eid_list")
+        if not isinstance(raw_eid_list, list):
+            raw_eid_list = [symptom.get("eid")] if symptom.get("eid") not in (None, "") else []
+        for event_id in raw_eid_list:
+            if event_id in (None, "") or event_id in merged_eid_list:
+                continue
+            merged_eid_list.append(event_id)
+    if merged_eid_list:
+        merged["eid_list"] = merged_eid_list
+        if merged.get("eid") in (None, ""):
+            merged["eid"] = merged_eid_list[0]
+
     merged["_segment_key"] = _build_merged_segment_key(merged)
     return merged
 

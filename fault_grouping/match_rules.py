@@ -540,6 +540,12 @@ def _build_group_output(
         ne_id = symptom.get("alarm_source")
         if not ne_id:
             continue
+        eid_list = [
+            event_id
+            for event_id in (symptom.get("eid_list") or [])
+            if event_id not in (None, "")
+        ]
+        representative_eid = symptom.get("eid", "") or (eid_list[0] if eid_list else "")
 
         ne_graph_entry = ne_graph_data.get(ne_id, {})
         if site_id:
@@ -547,7 +553,8 @@ def _build_group_output(
         site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
 
         ne_alarms[ne_id].append({
-            "alarm_id": symptom.get("eid", ""),
+            "alarm_id": representative_eid,
+            "alarm_id_list": eid_list,
             "alarm_type": symptom.get("alarm", ""),
             "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
             "alarm_clear_time": symptom.get("告警清除时间", ""),
@@ -661,7 +668,16 @@ def _enrich_match_symptoms(match, alarm_metadata_index):
         enriched_symptom = dict(symptom)
         for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts"):
             enriched_symptom.pop(internal_field, None)
-        event_id = enriched_symptom.get("eid", "")
+        eid_list = [
+            event_id
+            for event_id in (enriched_symptom.get("eid_list") or [])
+            if event_id not in (None, "")
+        ]
+        if eid_list:
+            enriched_symptom["eid_list"] = eid_list
+        event_id = enriched_symptom.get("eid", "") or (eid_list[0] if eid_list else "")
+        if event_id and not enriched_symptom.get("eid"):
+            enriched_symptom["eid"] = event_id
         if event_id:
             metadata = alarm_metadata_index.get(event_id, {})
             for field_name in ("工单号", "故障组ID", "告警清除时间"):

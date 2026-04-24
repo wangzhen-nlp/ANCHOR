@@ -2114,6 +2114,8 @@ class TemporalGraphEngine:
                         ev_enriched = dict(ev)  # 浅拷贝，防止污染原始缓存
                         ev_enriched["matched_role"] = role
                         ev_enriched["time_str"] = datetime.fromtimestamp(ev["ts"]).strftime('%Y-%m-%d %H:%M:%S')
+                        hit_event_id = ev.get("eid")
+                        ev_enriched["eid_list"] = [hit_event_id] if hit_event_id not in (None, "") else []
                         source_segment_key = (
                             ev.get("_segment_key")
                             or ev.get("eid")
@@ -2131,10 +2133,14 @@ class TemporalGraphEngine:
                         current_start_ts = existing_symptom.get("_segment_start_ts", existing_symptom.get("ts"))
                         current_end_ts = existing_symptom.get("_segment_end_ts", current_start_ts)
                         hit_ts = ev["ts"]
+                        if hit_event_id not in (None, ""):
+                            existing_eid_list = existing_symptom.setdefault("eid_list", [])
+                            if hit_event_id not in existing_eid_list:
+                                existing_eid_list.append(hit_event_id)
 
                         if current_start_ts is None or hit_ts < current_start_ts:
                             existing_symptom["ts"] = hit_ts
-                            existing_symptom["eid"] = ev.get("eid")
+                            existing_symptom["eid"] = hit_event_id
                             existing_symptom["time_str"] = ev_enriched["time_str"]
                             existing_symptom["_segment_start_ts"] = hit_ts
                         if current_end_ts is None or hit_ts > current_end_ts:
