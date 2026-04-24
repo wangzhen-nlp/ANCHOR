@@ -847,8 +847,33 @@
             return timestamps[timestamps.length - 1] - timestamps[0];
         }
 
+        function mergeStringLists(...lists) {
+            const values = [];
+            const seen = new Set();
+            lists.forEach(list => {
+                const items = Array.isArray(list) ? list : (list ? [list] : []);
+                items.forEach(item => {
+                    const text = String(item || '').trim();
+                    if (!text || seen.has(text)) {
+                        return;
+                    }
+                    seen.add(text);
+                    values.push(text);
+                });
+            });
+            return values;
+        }
+
+        function getGroupMergedRules(group) {
+            const mergedRules = mergeStringLists(group.merged_rules, group.match_info?.merged_rules);
+            if (Array.isArray(group._merged_alarm_groups) && group._merged_alarm_groups.length > 0) {
+                return mergeStringLists(mergedRules, ['alarm_group_rule']);
+            }
+            return mergedRules;
+        }
+
         function getGroupRuleText(group) {
-            const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
+            const mergedRules = getGroupMergedRules(group);
             if (mergedRules.length > 0) {
                 return mergedRules.join(' + ');
             }
@@ -856,12 +881,12 @@
         }
 
         function getRelatedGroupText(group) {
-            const related = group.related_group_uuids || group.match_info?.related_group_uuids || [];
+            const related = getRelatedGroups(group);
             return related.length > 0 ? related.join(', ') : '无';
         }
 
         function getRelatedGroups(group) {
-            return group.related_group_uuids || group.match_info?.related_group_uuids || [];
+            return mergeStringLists(group.related_group_uuids, group.match_info?.related_group_uuids);
         }
 
         function getGroupUuid(group) {
@@ -977,7 +1002,7 @@
             if (!normalizedRuleName) {
                 return true;
             }
-            const mergedRules = group.merged_rules || group.match_info?.merged_rules || [];
+            const mergedRules = getGroupMergedRules(group);
             const ruleValues = [
                 ...mergedRules,
                 group.rule,
