@@ -90,7 +90,19 @@ def _extract_eids_from_match_group(record):
         eid = _normalize_text(symptom.get("eid", ""))
         if eid:
             eids.add(eid)
+        for raw_eid in symptom.get("eid_list", []) or []:
+            normalized_eid = _normalize_text(raw_eid)
+            if normalized_eid:
+                eids.add(normalized_eid)
     return eids
+
+
+def _extract_eids_from_alarm_group(alarm_list):
+    return {
+        _normalize_text(alarm.get("告警编码ID", ""))
+        for alarm in alarm_list
+        if _normalize_text(alarm.get("告警编码ID", ""))
+    }
 
 
 def _load_alarm_groups(alarm_input, group_field="故障组ID"):
@@ -212,62 +224,302 @@ def _build_group_output_from_alarms(group_id, alarm_list):
     }
 
 
-def _merge_alarm_list_into_match_group(record, alarm_list):
-    """将原始告警列表合并进已有的 match_rules 输出记录。"""
-    # 1. symptoms 合并（按 eid 去重，已有 eid 保留原 symptom，缺失的追加）
-    existing_eids = {s.get("eid") for s in record.get("symptoms", []) if s.get("eid")}
-    new_symptoms = []
-    for alarm in alarm_list:
-        eid = _normalize_text(alarm.get("告警编码ID", ""))
-        if eid and eid not in existing_eids:
-            new_symptoms.append(_alarm_to_symptom(alarm))
-            existing_eids.add(eid)
+def _symptom_merge_key(symptom):
+    matched_role = _normalize_text(symptom.get("matched_role", ""))
+    eid_list = tuple(
+        eid for eid in (_normalize_text(x) for x in (symptom.get("eid_list") or []))
+        if eid
+    )
+    if eid_list:
+        return ("eid_list", eid_list, matched_role)
 
-    if new_symptoms:
-        record.setdefault("symptoms", []).extend(new_symptoms)
-        # 重新排序 symptoms
-        record["symptoms"].sort(key=lambda s: (s.get("ts") or float("inf"), s.get("eid", "")))
-        # 更新 anchor_ts
-        timestamps = [s["ts"] for s in record["symptoms"] if s.get("ts") is not None]
-        if timestamps:
-            anchor_ts = min(timestamps)
-            record["group_anchor_ts"] = anchor_ts
-            record["group_anchor_time"] = datetime.fromtimestamp(anchor_ts).strftime("%Y-%m-%d %H:%M:%S")
+    eid = _normalize_text(symptom.get("eid", ""))
+    if eid:
+        return ("eid", eid, matched_role)
 
-    # 2. group_info 合并站点 / NE
-    group_info = record.get("group_info", {})
-    for gid, gmeta in group_info.items():
-        if not isinstance(gmeta, dict):
+    return (
+        "fallback",
+        _normalize_text(symptom.get("node", "")),
+        _normalize_text(symptom.get("alarm", "")),
+        symptom.get("ts"),
+        _normalize_text(symptom.get("alarm_source", "")),
+        matched_role,
+    )
+
+
+def _alarm_record_merge_key(alarm_record):
+    matched_role = _normalize_text(alarm_record.get("matched_role", ""))
+    alarm_id_list = tuple(
+        alarm_id
+        for alarm_id in (_normalize_text(x) for x in (alarm_record.get("alarm_id_list") or []))
+        if alarm_id
+    )
+    if alarm_id_list:
+        return ("alarm_id_list", alarm_id_list, matched_role)
+
+    alarm_id = _normalize_text(alarm_record.get("alarm_id", ""))
+    if alarm_id:
+        return ("alarm_id", alarm_id, matched_role)
+
+    return (
+        "fallback",
+        _normalize_text(alarm_record.get("alarm_type", "")),
+        _normalize_text(alarm_record.get("alarm_time", "")),
+        _normalize_text(alarm_record.get("site_id", "")),
+        matched_role,
+    )
+
+
+def _merge_alarm_record_lists(existing_list, incoming_list):
+    merged = {}
+    ordered_keys = []
+    for alarm_record in list(existing_list or []) + list(incoming_list or []):
+        key = _alarm_record_merge_key(alarm_record)
+        if key not in merged:
+            merged[key] = copy.deepcopy(alarm_record)
+            ordered_keys.append(key)
             continue
-        existing_sites = set(gmeta.get("site_list", []))
-        existing_nes = set(gmeta.get("ne_list", []))
-        for alarm in alarm_list:
-            site_id = _normalize_text(alarm.get("站点ID", ""))
-            ne_id = _normalize_text(alarm.get("告警源", ""))
-            if site_id:
-                existing_sites.add(site_id)
-            if ne_id:
-                existing_nes.add(ne_id)
-        gmeta["site_list"] = sorted(existing_sites)
-        gmeta["ne_list"] = sorted(existing_nes)
+        target = merged[key]
+        for field, value in alarm_record.items():
+            if field == "alarm_id_list":
+                merged_ids = [
+                    alarm_id
+                    for alarm_id in list(target.get("alarm_id_list") or []) + list(value or [])
+                    if _normalize_text(alarm_id)
+                ]
+                deduped_ids = []
+                seen = set()
+                for alarm_id in merged_ids:
+                    normalized_alarm_id = _normalize_text(alarm_id)
+                    if normalized_alarm_id in seen:
+                        continue
+                    seen.add(normalized_alarm_id)
+                    deduped_ids.append(normalized_alarm_id)
+                if deduped_ids:
+                    target["alarm_id_list"] = deduped_ids
+            elif not target.get(field) and value not in ("", None, [], {}):
+                target[field] = copy.deepcopy(value)
+    return [merged[key] for key in ordered_keys]
 
-    # 3. ne_info 补充
-    existing_ne_info = record.get("ne_info", {})
-    new_ne_info = _build_ne_info_from_alarms(alarm_list)
-    for ne_id, ne_meta in new_ne_info.items():
+
+def _merge_ne_info(existing_ne_info, incoming_ne_info):
+    for ne_id, ne_meta in (incoming_ne_info or {}).items():
         if ne_id not in existing_ne_info:
-            existing_ne_info[ne_id] = ne_meta
-        else:
-            # 已有该 NE，追加 alarm
-            existing_ne_info[ne_id].setdefault("alarm", []).extend(ne_meta.get("alarm", []))
+            existing_ne_info[ne_id] = copy.deepcopy(ne_meta)
+            continue
 
-    # 4. 标记来源
+        target_meta = existing_ne_info[ne_id]
+        for field, value in ne_meta.items():
+            if field == "alarm":
+                target_meta["alarm"] = _merge_alarm_record_lists(
+                    target_meta.get("alarm", []),
+                    value or [],
+                )
+            elif field == "link":
+                target_links = target_meta.setdefault("link", {})
+                for neighbor_id, link_meta in (value or {}).items():
+                    if neighbor_id not in target_links:
+                        target_links[neighbor_id] = copy.deepcopy(link_meta)
+            elif not target_meta.get(field) and value not in ("", None, [], {}):
+                target_meta[field] = copy.deepcopy(value)
+
+
+def _merge_group_info(existing_group_info, incoming_group_info):
+    for group_id, group_meta in (incoming_group_info or {}).items():
+        if group_id not in existing_group_info:
+            existing_group_info[group_id] = copy.deepcopy(group_meta)
+            continue
+
+        target_meta = existing_group_info[group_id]
+        if not isinstance(target_meta, dict) or not isinstance(group_meta, dict):
+            continue
+        target_meta["site_list"] = sorted(
+            set(target_meta.get("site_list", [])) | set(group_meta.get("site_list", []))
+        )
+        target_meta["ne_list"] = sorted(
+            set(target_meta.get("ne_list", [])) | set(group_meta.get("ne_list", []))
+        )
+
+
+def _merge_match_info(base_record, incoming_record):
+    base_info = base_record.setdefault("match_info", {})
+    incoming_info = incoming_record.get("match_info", {}) or {}
+
+    related_group_uuids = set(base_info.get("related_group_uuids", []) or [])
+    incoming_uuid = _normalize_text(incoming_info.get("uuid", ""))
+    base_uuid = _normalize_text(base_info.get("uuid", ""))
+    if incoming_uuid and incoming_uuid != base_uuid:
+        related_group_uuids.add(incoming_uuid)
+    related_group_uuids.update(
+        _normalize_text(uuid_text)
+        for uuid_text in (incoming_info.get("related_group_uuids", []) or [])
+        if _normalize_text(uuid_text)
+    )
+    if related_group_uuids:
+        base_info["related_group_uuids"] = sorted(related_group_uuids)
+
+    merged_rules = []
+    seen_rules = set()
+    for rule_name in (
+        [base_info.get("rule", "")]
+        + list(base_info.get("merged_rules", []) or [])
+        + [incoming_info.get("rule", "")]
+        + list(incoming_info.get("merged_rules", []) or [])
+    ):
+        normalized_rule = _normalize_text(rule_name)
+        if not normalized_rule or normalized_rule in seen_rules:
+            continue
+        seen_rules.add(normalized_rule)
+        merged_rules.append(normalized_rule)
+    if merged_rules:
+        base_info["merged_rules"] = merged_rules
+
+    for field_name in ("inferred_roots", "role_mapping"):
+        target_value = base_info.setdefault(field_name, {})
+        incoming_value = incoming_info.get(field_name, {}) or {}
+        if isinstance(target_value, dict) and isinstance(incoming_value, dict):
+            for key, value in incoming_value.items():
+                if key not in target_value:
+                    target_value[key] = copy.deepcopy(value)
+
+
+def _recompute_group_anchor(record):
+    timestamps = [symptom.get("ts") for symptom in record.get("symptoms", []) if symptom.get("ts") is not None]
+    if not timestamps:
+        record["group_anchor_ts"] = None
+        record["group_anchor_time"] = ""
+        return
+    anchor_ts = min(timestamps)
+    record["group_anchor_ts"] = anchor_ts
+    record["group_anchor_time"] = datetime.fromtimestamp(anchor_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _merge_match_group_records(base_record, incoming_record):
+    merged_symptoms = {}
+    ordered_keys = []
+    for symptom in list(base_record.get("symptoms", [])) + list(incoming_record.get("symptoms", [])):
+        key = _symptom_merge_key(symptom)
+        if key not in merged_symptoms:
+            merged_symptoms[key] = copy.deepcopy(symptom)
+            ordered_keys.append(key)
+            continue
+        target = merged_symptoms[key]
+        if not target.get("eid") and symptom.get("eid"):
+            target["eid"] = symptom.get("eid")
+        if not target.get("eid_list") and symptom.get("eid_list"):
+            target["eid_list"] = copy.deepcopy(symptom.get("eid_list"))
+        for field_name in ("工单号", "故障组ID", "告警清除时间"):
+            if not target.get(field_name) and symptom.get(field_name):
+                target[field_name] = symptom.get(field_name)
+
+    base_record["symptoms"] = [merged_symptoms[key] for key in ordered_keys]
+    base_record["symptoms"].sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
+
+    _merge_group_info(
+        base_record.setdefault("group_info", {}),
+        incoming_record.get("group_info", {}),
+    )
+    _merge_ne_info(
+        base_record.setdefault("ne_info", {}),
+        incoming_record.get("ne_info", {}),
+    )
+    _merge_match_info(base_record, incoming_record)
+    _recompute_group_anchor(base_record)
+    return base_record
+
+
+def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
+    """将原始告警列表合并进已有的 match_rules 输出记录。"""
+    existing_symptoms = list(record.get("symptoms", []))
+    for alarm in alarm_list:
+        existing_symptoms.append(_alarm_to_symptom(alarm))
+
+    merged_symptoms = {}
+    ordered_keys = []
+    for symptom in existing_symptoms:
+        key = _symptom_merge_key(symptom)
+        if key in merged_symptoms:
+            continue
+        merged_symptoms[key] = copy.deepcopy(symptom)
+        ordered_keys.append(key)
+    record["symptoms"] = [merged_symptoms[key] for key in ordered_keys]
+    record["symptoms"].sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
+
+    alarm_group_uuid = f"alarm-{alarm_group_id}" if alarm_group_id else f"alarm-{uuid.uuid4().hex[:12]}"
+    site_list, ne_list = _extract_alarm_group_meta(alarm_list)
+    _merge_group_info(
+        record.setdefault("group_info", {}),
+        {
+            alarm_group_uuid: {
+                "site_list": site_list,
+                "ne_list": ne_list,
+            }
+        },
+    )
+    _merge_ne_info(
+        record.setdefault("ne_info", {}),
+        _build_ne_info_from_alarms(alarm_list),
+    )
+
     record.setdefault("_merged_alarm_groups", []).append({
         "source": "alarm_group",
+        "group_id": alarm_group_id,
         "alarm_count": len(alarm_list),
     })
-
+    _recompute_group_anchor(record)
     return record
+
+
+def _build_connected_components(match_group_eids, alarm_group_eids, eid_to_match_indices):
+    eid_to_alarm_group_ids = defaultdict(set)
+    for alarm_group_id, eids in alarm_group_eids.items():
+        for eid in eids:
+            eid_to_alarm_group_ids[eid].add(alarm_group_id)
+
+    visited_match_indices = set()
+    visited_alarm_group_ids = set()
+    components = []
+
+    for start_idx, eids in enumerate(match_group_eids):
+        if start_idx in visited_match_indices:
+            continue
+        queue = [("match", start_idx)]
+        visited_match_indices.add(start_idx)
+        component_match_indices = set()
+        component_alarm_group_ids = set()
+
+        while queue:
+            node_type, node_value = queue.pop()
+            if node_type == "match":
+                component_match_indices.add(node_value)
+                current_eids = match_group_eids[node_value]
+                for eid in current_eids:
+                    for alarm_group_id in eid_to_alarm_group_ids.get(eid, ()):
+                        if alarm_group_id in visited_alarm_group_ids:
+                            continue
+                        visited_alarm_group_ids.add(alarm_group_id)
+                        queue.append(("alarm", alarm_group_id))
+            else:
+                component_alarm_group_ids.add(node_value)
+                current_eids = alarm_group_eids.get(node_value, set())
+                for eid in current_eids:
+                    for match_idx in eid_to_match_indices.get(eid, ()):
+                        if match_idx in visited_match_indices:
+                            continue
+                        visited_match_indices.add(match_idx)
+                        queue.append(("match", match_idx))
+
+        components.append({
+            "match_indices": sorted(component_match_indices),
+            "alarm_group_ids": sorted(component_alarm_group_ids),
+        })
+
+    standalone_alarm_group_ids = [
+        alarm_group_id
+        for alarm_group_id in sorted(alarm_group_eids)
+        if alarm_group_id not in visited_alarm_group_ids
+    ]
+    return components, standalone_alarm_group_ids
 
 
 def merge(match_output_path, alarm_input_path, output_path, group_field="故障组ID"):
@@ -277,10 +529,13 @@ def merge(match_output_path, alarm_input_path, output_path, group_field="故障�
 
     print("构建 eid -> 输出组索引...")
     eid_progress = ProgressBar(len(match_groups), "构建 eid 索引")
+    match_group_eids = []
     eid_to_match_indices = defaultdict(list)
     for idx, record in enumerate(match_groups):
         eid_progress.update()
-        for eid in _extract_eids_from_match_group(record):
+        current_eids = _extract_eids_from_match_group(record)
+        match_group_eids.append(current_eids)
+        for eid in current_eids:
             eid_to_match_indices[eid].append(idx)
     eid_progress.close()
 
@@ -288,71 +543,69 @@ def merge(match_output_path, alarm_input_path, output_path, group_field="故障�
     alarm_groups = _load_alarm_groups(alarm_input_path, group_field=group_field)
     print(f"  原始告警故障组数: {len(alarm_groups)}")
 
-    # idx -> merged_record（深拷贝后的输出组，可能被多次累积合并）
-    merged_match_records = {}
-    matched_match_indices = set()
-    standalone_alarm_records = []
+    alarm_group_eids = {
+        alarm_group_id: _extract_eids_from_alarm_group(alarm_list)
+        for alarm_group_id, alarm_list in alarm_groups.items()
+    }
 
-    merge_progress = ProgressBar(len(alarm_groups), "匹配并合并故障组")
-    for alarm_group_id, alarm_list in sorted(alarm_groups.items()):
+    print("构建输出组-原始组连通关系...")
+    components, standalone_alarm_group_ids = _build_connected_components(
+        match_group_eids,
+        alarm_group_eids,
+        eid_to_match_indices,
+    )
+
+    final_records = []
+    merge_progress = ProgressBar(len(components), "按连通分量合并故障组")
+    merged_output_component_count = 0
+    merged_alarm_group_count = 0
+
+    for component in components:
         merge_progress.update()
+        match_indices = component["match_indices"]
+        component_alarm_group_ids = component["alarm_group_ids"]
 
-        # 收集该原始告警组的所有 eid
-        alarm_eids = {
-            _normalize_text(a.get("告警编码ID", ""))
-            for a in alarm_list
-            if _normalize_text(a.get("告警编码ID", ""))
-        }
-        if not alarm_eids:
-            # 没有 eid 的告警组无法匹配，直接按新记录输出
-            standalone_alarm_records.append(_build_group_output_from_alarms(alarm_group_id, alarm_list))
+        if not match_indices:
             continue
 
-        # 统计与每个输出组的重合 eid 数
-        match_counter = defaultdict(int)
-        for eid in alarm_eids:
-            for idx in eid_to_match_indices.get(eid, []):
-                match_counter[idx] += 1
+        base_idx = match_indices[0]
+        merged_record = copy.deepcopy(match_groups[base_idx])
 
-        if match_counter:
-            # 取重合 eid 数最多的输出组
-            best_idx = max(match_counter, key=lambda i: (match_counter[i], i))
-            best_record = match_groups[best_idx]
-            matched_match_indices.add(best_idx)
+        for match_idx in match_indices[1:]:
+            _merge_match_group_records(merged_record, match_groups[match_idx])
 
-            if best_idx not in merged_match_records:
-                # 第一次匹配到该输出组：深拷贝并初始化
-                merged_match_records[best_idx] = copy.deepcopy(best_record)
-
-            merge_progress.set_extra_text(
-                f"原始组 {alarm_group_id} -> 输出组 "
-                f"{best_record.get('match_info', {}).get('uuid', '')[:16]}... "
-                f"(重合 {match_counter[best_idx]} 个 eid)"
+        for alarm_group_id in component_alarm_group_ids:
+            _merge_alarm_list_into_match_group(
+                merged_record,
+                alarm_group_id,
+                alarm_groups[alarm_group_id],
             )
-            _merge_alarm_list_into_match_group(merged_match_records[best_idx], alarm_list)
-        else:
-            # 无重合，按输出格式新建
-            standalone_alarm_records.append(_build_group_output_from_alarms(alarm_group_id, alarm_list))
+
+        if component_alarm_group_ids:
+            representative_uuid = merged_record.get("match_info", {}).get("uuid", "")
+            merge_progress.set_extra_text(
+                f"输出组 {representative_uuid[:16]}... "
+                f"合并 {len(match_indices)} 个输出组 + {len(component_alarm_group_ids)} 个原始组"
+            )
+
+        final_records.append(merged_record)
+        if len(match_indices) > 1:
+            merged_output_component_count += 1
+        merged_alarm_group_count += len(component_alarm_group_ids)
+
     merge_progress.close()
 
-    # 组装最终输出
-    final_records = []
-
-    # 先放已合并的输出组（保持原始顺序）
-    for idx, record in enumerate(match_groups):
-        if idx in merged_match_records:
-            final_records.append(merged_match_records[idx])
-        elif idx not in matched_match_indices:
-            # 未匹配的输出组原样保留
-            final_records.append(record)
-
-    # 再放独立的新建记录
+    standalone_alarm_records = [
+        _build_group_output_from_alarms(alarm_group_id, alarm_groups[alarm_group_id])
+        for alarm_group_id in standalone_alarm_group_ids
+    ]
     final_records.extend(standalone_alarm_records)
 
     print(
         f"  合并后记录数: {len(final_records)} "
-        f"(合并输出组: {len(merged_match_records)}, "
-        f"未匹配输出组: {len(match_groups) - len(matched_match_indices)}, "
+        f"(输出连通分量: {len(components)}, "
+        f"跨输出组合并分量: {merged_output_component_count}, "
+        f"并入原始组数: {merged_alarm_group_count}, "
         f"独立原始组: {len(standalone_alarm_records)})"
     )
 
