@@ -909,16 +909,34 @@
             return referenced;
         }
 
-        function getSiteCount(group) {
+        function getPrimaryGroupInfo(group) {
             const groupInfo = group.group_info || {};
-            const firstGroup = Object.values(groupInfo)[0] || {};
-            return (firstGroup.site_list || []).length;
+            const groupUuid = getGroupUuid(group);
+            if (groupUuid && groupInfo[groupUuid]) {
+                return groupInfo[groupUuid];
+            }
+            return Object.values(groupInfo)[0] || {};
+        }
+
+        function getSiteCount(group) {
+            const primaryGroup = getPrimaryGroupInfo(group);
+            const neInfo = group.ne_info || {};
+            const siteIdsFromNodes = new Set();
+            (primaryGroup.ne_list || []).forEach(neId => {
+                const siteId = String(neInfo[neId]?.site_id || '').trim();
+                if (siteId) {
+                    siteIdsFromNodes.add(siteId);
+                }
+            });
+            if (siteIdsFromNodes.size > 0) {
+                return siteIdsFromNodes.size;
+            }
+            return (primaryGroup.site_list || []).length;
         }
 
         function getNodeCount(group) {
-            const groupInfo = group.group_info || {};
-            const firstGroup = Object.values(groupInfo)[0] || {};
-            return (firstGroup.ne_list || []).length;
+            const primaryGroup = getPrimaryGroupInfo(group);
+            return (primaryGroup.ne_list || []).length;
         }
 
         function getSymptomCount(group) {

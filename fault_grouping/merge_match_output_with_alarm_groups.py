@@ -23,6 +23,8 @@
     python fault_grouping/merge_match_output_with_alarm_groups.py \
         --match-output match_groups.jsonl \
         --alarms alarms.jsonl \
+        --ne-graph topology_resources/ne_graph.json \
+        --site-graph topology_resources/site_graph.json \
         -o merged_groups.jsonl
 """
 
@@ -42,6 +44,7 @@ if __package__ in (None, ""):
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from alarm_tools.progress_utils import ProgressBar
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import _normalize_text, _parse_group_ids
 
 
@@ -54,6 +57,63 @@ def _build_alarm_group_rule_name(group_id):
     if not normalized_group_id:
         normalized_group_id = "unknown"
     return f"{ALARM_GROUP_RULE_PREFIX}{normalized_group_id}{ALARM_GROUP_RULE_SUFFIX}"
+
+
+def _load_json_file_if_exists(filepath):
+    path = Path(filepath) if filepath else None
+    if not path or not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_alarm_site_id(alarm, ne_graph_data):
+    site_id = _normalize_text(alarm.get("站点ID", ""))
+    if site_id:
+        return site_id
+
+    alarm_source = _normalize_text(alarm.get("告警源", ""))
+    if not alarm_source:
+        return ""
+
+    ne_info = ne_graph_data.get(alarm_source, {}) if isinstance(ne_graph_data, dict) else {}
+    return _normalize_text(ne_info.get("site_id", ""))
+
+
+def _build_site_placeholder_ne_id(site_id):
+    return f"SITE::{site_id}"
+
+
+def _resolve_alarm_ne_id(alarm, site_id):
+    alarm_source = _normalize_text(alarm.get("告警源", ""))
+    if alarm_source:
+        return alarm_source
+    if site_id:
+        return _build_site_placeholder_ne_id(site_id)
+    return ""
+
+
+def _build_ne_meta_from_context(ne_id, site_id, ne_graph_data, site_graph_data):
+    ne_graph_entry = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+    site_graph_entry = site_graph_data.get(site_id, {}) if site_id and isinstance(site_graph_data, dict) else {}
+    is_placeholder = ne_id.startswith("SITE::")
+    return {
+        "link": copy.deepcopy(ne_graph_entry.get("link", {})) if isinstance(ne_graph_entry.get("link", {}), dict) else {},
+        "group": "",
+        "name": ne_graph_entry.get("name", ne_id if not is_placeholder else site_id),
+        "site_id": site_id,
+        "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", "") or site_id,
+        "type": str(ne_graph_entry.get("type", "")).upper(),
+        "network_type": str(ne_graph_entry.get("network_type", "")).upper(),
+        "manufacturer": str(ne_graph_entry.get("manufacturer", "")).upper(),
+        "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
+        "domain": str(ne_graph_entry.get("domain", "")).upper(),
+        "region_id": ne_graph_entry.get("region_id", "") or site_graph_entry.get("region_id", ""),
+        "longitude": ne_graph_entry.get("longitude", "") or site_graph_entry.get("longitude", ""),
+        "latitude": ne_graph_entry.get("latitude", "") or site_graph_entry.get("latitude", ""),
+        "alarm": [],
+    }
 
 
 def _parse_datetime_to_ts(text):
@@ -139,15 +199,17 @@ def _load_alarm_groups(alarm_input, group_field="故障组ID"):
     return alarm_groups
 
 
-def _alarm_to_symptom(alarm):
+def _alarm_to_symptom(alarm, ne_graph_data=None):
     """把原始告警转换为 match_rules 输出中的 symptom 格式。"""
     ts = _parse_datetime_to_ts(alarm.get("告警首次发生时间", ""))
+    site_id = _resolve_alarm_site_id(alarm, ne_graph_data or {})
+    ne_id = _resolve_alarm_ne_id(alarm, site_id)
     return {
-        "node": _normalize_text(alarm.get("站点ID", "")),
+        "node": site_id,
         "alarm": _normalize_text(alarm.get("告警标题", "")),
         "ts": ts,
         "eid": _normalize_text(alarm.get("告警编码ID", "")),
-        "alarm_source": _normalize_text(alarm.get("告警源", "")),
+        "alarm_source": ne_id,
         "matched_role": "",
         "工单号": _normalize_text(alarm.get("工单号", "")),
         "故障组ID": _normalize_text(alarm.get("故障组ID", "")),
@@ -155,13 +217,14 @@ def _alarm_to_symptom(alarm):
     }
 
 
-def _extract_alarm_group_meta(alarm_list):
+def _extract_alarm_group_meta(alarm_list, ne_graph_data=None):
     """从原始告警列表中提取站点列表、NE 列表等元信息。"""
+    ne_graph_data = ne_graph_data or {}
     site_set = set()
     ne_set = set()
     for alarm in alarm_list:
-        site_id = _normalize_text(alarm.get("站点ID", ""))
-        ne_id = _normalize_text(alarm.get("告警源", ""))
+        site_id = _resolve_alarm_site_id(alarm, ne_graph_data)
+        ne_id = _resolve_alarm_ne_id(alarm, site_id)
         if site_id:
             site_set.add(site_id)
         if ne_id:
@@ -169,38 +232,28 @@ def _extract_alarm_group_meta(alarm_list):
     return sorted(site_set), sorted(ne_set)
 
 
-def _build_ne_info_from_alarms(alarm_list):
+def _build_ne_info_from_alarms(alarm_list, ne_graph_data=None, site_graph_data=None):
     """根据原始告警构造简化的 ne_info（与 match_rules 输出格式对齐）。"""
+    ne_graph_data = ne_graph_data or {}
+    site_graph_data = site_graph_data or {}
     ne_info = {}
     for alarm in alarm_list:
-        ne_id = _normalize_text(alarm.get("告警源", ""))
+        site_id = _resolve_alarm_site_id(alarm, ne_graph_data)
+        ne_id = _resolve_alarm_ne_id(alarm, site_id)
         if not ne_id:
             continue
         if ne_id not in ne_info:
-            ne_info[ne_id] = {
-                "link": {},
-                "group": "",
-                "name": ne_id,
-                "site_id": _normalize_text(alarm.get("站点ID", "")),
-                "site_name": "",
-                "type": "",
-                "network_type": "",
-                "manufacturer": "",
-                "running_status": "",
-                "domain": "",
-                "region_id": "",
-                "longitude": "",
-                "latitude": "",
-                "alarm": [],
-            }
+            ne_info[ne_id] = _build_ne_meta_from_context(ne_id, site_id, ne_graph_data, site_graph_data)
+        site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
+        ne_graph_entry = ne_graph_data.get(ne_id, {}) if ne_id else {}
         ne_info[ne_id]["alarm"].append({
             "alarm_id": _normalize_text(alarm.get("告警编码ID", "")),
             "alarm_type": _normalize_text(alarm.get("告警标题", "")),
             "alarm_time": _normalize_text(alarm.get("告警首次发生时间", "")),
             "alarm_clear_time": _normalize_text(alarm.get("告警清除时间", "")),
-            "domain": "",
-            "site_id": _normalize_text(alarm.get("站点ID", "")),
-            "site_name": "",
+            "domain": str(ne_graph_entry.get("domain", "")).upper(),
+            "site_id": site_id,
+            "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", "") or site_id,
             "matched_role": "",
             "工单号": _normalize_text(alarm.get("工单号", "")),
             "故障组ID": _normalize_text(alarm.get("故障组ID", "")),
@@ -208,10 +261,12 @@ def _build_ne_info_from_alarms(alarm_list):
     return ne_info
 
 
-def _build_group_output_from_alarms(group_id, alarm_list):
+def _build_group_output_from_alarms(group_id, alarm_list, ne_graph_data=None, site_graph_data=None):
     """当原始告警故障组没有匹配到输出组时，按输出格式构造一条新记录。"""
-    site_list, ne_list = _extract_alarm_group_meta(alarm_list)
-    symptoms = [_alarm_to_symptom(a) for a in alarm_list]
+    ne_graph_data = ne_graph_data or {}
+    site_graph_data = site_graph_data or {}
+    site_list, ne_list = _extract_alarm_group_meta(alarm_list, ne_graph_data=ne_graph_data)
+    symptoms = [_alarm_to_symptom(a, ne_graph_data=ne_graph_data) for a in alarm_list]
     timestamps = [s["ts"] for s in symptoms if s["ts"] is not None]
     anchor_ts = min(timestamps) if timestamps else None
     new_uuid = f"alarm-{group_id}" if group_id else f"alarm-{uuid.uuid4().hex[:12]}"
@@ -226,7 +281,11 @@ def _build_group_output_from_alarms(group_id, alarm_list):
             "inferred_roots": {},
             "role_mapping": {},
         },
-        "ne_info": _build_ne_info_from_alarms(alarm_list),
+        "ne_info": _build_ne_info_from_alarms(
+            alarm_list,
+            ne_graph_data=ne_graph_data,
+            site_graph_data=site_graph_data,
+        ),
         "group_info": {
             new_uuid: {
                 "ne_list": ne_list,
@@ -498,8 +557,10 @@ def _merge_match_group_records(base_record, incoming_record):
     return base_record
 
 
-def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
+def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list, ne_graph_data=None, site_graph_data=None):
     """将原始告警列表合并进已有的 match_rules 输出记录。"""
+    ne_graph_data = ne_graph_data or {}
+    site_graph_data = site_graph_data or {}
     match_info = record.setdefault("match_info", {})
     alarm_group_rule = _build_alarm_group_rule_name(alarm_group_id)
     merged_rules = []
@@ -519,7 +580,7 @@ def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
 
     existing_symptoms = list(record.get("symptoms", []))
     for alarm in alarm_list:
-        existing_symptoms.append(_alarm_to_symptom(alarm))
+        existing_symptoms.append(_alarm_to_symptom(alarm, ne_graph_data=ne_graph_data))
 
     merged_symptoms = {}
     ordered_keys = []
@@ -533,7 +594,7 @@ def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
     record["symptoms"].sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
 
     alarm_group_uuid = f"alarm-{alarm_group_id}" if alarm_group_id else f"alarm-{uuid.uuid4().hex[:12]}"
-    site_list, ne_list = _extract_alarm_group_meta(alarm_list)
+    site_list, ne_list = _extract_alarm_group_meta(alarm_list, ne_graph_data=ne_graph_data)
     _merge_group_info(
         record.setdefault("group_info", {}),
         {
@@ -545,7 +606,11 @@ def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
     )
     _merge_ne_info(
         record.setdefault("ne_info", {}),
-        _build_ne_info_from_alarms(alarm_list),
+        _build_ne_info_from_alarms(
+            alarm_list,
+            ne_graph_data=ne_graph_data,
+            site_graph_data=site_graph_data,
+        ),
     )
 
     record.setdefault("_merged_alarm_groups", []).append({
@@ -610,7 +675,18 @@ def _build_connected_components(match_group_eids, alarm_group_eids, eid_to_match
     return components, standalone_alarm_group_ids
 
 
-def merge(match_output_path, alarm_input_path, output_path, group_field="故障组ID", retain_output=False):
+def merge(
+    match_output_path,
+    alarm_input_path,
+    output_path,
+    group_field="故障组ID",
+    retain_output=False,
+    ne_graph_file=NE_GRAPH_JSON,
+    site_graph_file=SITE_GRAPH_JSON,
+):
+    ne_graph_data = _load_json_file_if_exists(ne_graph_file)
+    site_graph_data = _load_json_file_if_exists(site_graph_file)
+
     print("加载 match_rules 输出...")
     match_groups = _load_match_groups(match_output_path)
     print(f"  输出故障组数: {len(match_groups)}")
@@ -667,6 +743,8 @@ def merge(match_output_path, alarm_input_path, output_path, group_field="故障�
                 merged_record,
                 alarm_group_id,
                 alarm_groups[alarm_group_id],
+                ne_graph_data=ne_graph_data,
+                site_graph_data=site_graph_data,
             )
 
         if component_alarm_group_ids:
@@ -686,7 +764,12 @@ def merge(match_output_path, alarm_input_path, output_path, group_field="故障�
     standalone_alarm_records = []
     if not retain_output:
         standalone_alarm_records = [
-            _build_group_output_from_alarms(alarm_group_id, alarm_groups[alarm_group_id])
+            _build_group_output_from_alarms(
+                alarm_group_id,
+                alarm_groups[alarm_group_id],
+                ne_graph_data=ne_graph_data,
+                site_graph_data=site_graph_data,
+            )
             for alarm_group_id in standalone_alarm_group_ids
         ]
     final_records.extend(standalone_alarm_records)
@@ -718,6 +801,16 @@ def main():
     parser.add_argument("-o", "--output", required=True, help="输出 JSONL 文件路径")
     parser.add_argument("--group-field", default="故障组ID", help="告警中的故障组字段名，默认: 故障组ID")
     parser.add_argument(
+        "--ne-graph",
+        default=NE_GRAPH_JSON,
+        help=f"用于补齐原始告警 NE/site 信息的 ne_graph，默认: {resource_display('ne_graph.json')}",
+    )
+    parser.add_argument(
+        "--site-graph",
+        default=SITE_GRAPH_JSON,
+        help=f"用于补齐站点坐标的 site_graph，默认: {resource_display('site_graph.json')}",
+    )
+    parser.add_argument(
         "--retain-output",
         action="store_true",
         help="只保留包含 match_rules 输出故障组的记录，丢弃独立原始告警故障组",
@@ -730,6 +823,8 @@ def main():
         args.output,
         group_field=args.group_field,
         retain_output=args.retain_output,
+        ne_graph_file=args.ne_graph,
+        site_graph_file=args.site_graph,
     )
 
 
