@@ -3,6 +3,14 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
+from alarm_tools.alarm_types import POWER_ALARMS
+from fault_grouping.alarm_event_io import is_clear_alarm
+from fault_grouping.alarm_event_stream import (
+    build_simulated_now_ts_getter,
+    process_alarm,
+    refresh_process_progress,
+    stream_alarms_by_ts,
+)
 from fault_grouping.temporal_graph_engine_utils import get_match_alarm_keys
 
 
@@ -528,3 +536,207 @@ def print_debug_event_removal(payload, debug_sites):
             f"time={removed_time_str}, eid={payload.get('event_id', '')}, "
             f"cleared_event_id={payload.get('cleared_event_id', '')}"
         )
+
+
+def is_debug_trigger_item(item, debug_targets):
+    return (
+        (item.get("site_id"), item.get("alarm_title")) in debug_targets
+        and not is_clear_alarm(item.get("alarm", {}))
+    )
+
+
+def is_debug_site_power_alarm(item, debug_sites):
+    return (
+        item.get("site_id") in debug_sites
+        and item.get("alarm_title") in POWER_ALARMS
+        and not is_clear_alarm(item.get("alarm", {}))
+    )
+
+
+def is_debug_site_clear(item, debug_sites):
+    return (
+        item.get("site_id") in debug_sites
+        and is_clear_alarm(item.get("alarm", {}))
+    )
+
+
+def get_debug_item_kind(item, debug_context):
+    if is_debug_trigger_item(item, debug_context.debug_targets):
+        return "trigger"
+    if is_debug_site_power_alarm(item, debug_context.debug_sites):
+        return "power"
+    if is_debug_site_clear(item, debug_context.debug_sites):
+        return "clear"
+    return None
+
+
+def print_debug_item_state(engine, item, item_kind, matches=None):
+    debug_site = item.get("site_id", "")
+    debug_alarm = item.get("alarm_title", "")
+    debug_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+    debug_eid = item['alarm'].get('告警编码ID', '')
+
+    if item_kind == "trigger":
+        print(
+            f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
+        )
+        print(f"   ↳ 当前站点最近事件: {format_debug_site_events(engine, debug_site)}")
+        print(f"   ↳ 当前 trigger_index: {format_debug_trigger_index(engine, debug_site)}")
+        print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
+        if matches is not None and not matches:
+            print("   ↳ 当前触发点暂未产出故障组")
+        return
+
+    if item_kind == "power":
+        print(
+            f"⚡ 电告警进入缓存: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
+        )
+        print(f"   ↳ 当前站点最近事件: {format_debug_site_events(engine, debug_site)}")
+        return
+
+    if item_kind == "clear":
+        print(
+            f"🧹 清除告警输入: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
+        )
+        print(f"   ↳ 清除后站点最近事件: {format_debug_site_events(engine, debug_site)}")
+        print(f"   ↳ 清除后 trigger_index: {format_debug_trigger_index(engine, debug_site)}")
+        print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
+
+
+def build_debug_match_callback(on_matches, debug_targets, rules_config):
+    def on_debug_matches(matches, source="收割"):
+        debug_matches = [
+            match for match in matches
+            if match_debug_trigger(match, debug_targets, rules_config)
+        ]
+        if debug_matches:
+            print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
+            for match in debug_matches:
+                print_debug_match_details(match)
+        on_matches(matches)
+
+    return on_debug_matches
+
+
+def run_debug_live_loop(
+    engine,
+    valid_alarms,
+    speedup,
+    process_progress,
+    debug_context,
+):
+    for item in stream_alarms_by_ts(valid_alarms, speedup=speedup):
+        item_kind = get_debug_item_kind(item, debug_context)
+        process_alarm(
+            engine,
+            item,
+            collect_matches=False,
+            register_trigger=True
+        )
+        print_debug_trigger_changes(
+            engine,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
+            "🔁 告警处理后关注站点 trigger 变化",
+        )
+        if item_kind is not None:
+            print_debug_item_state(engine, item, item_kind)
+        refresh_process_progress(process_progress)
+
+
+def run_debug_offline_loop(
+    engine,
+    valid_alarms,
+    process_progress,
+    debug_context,
+    on_debug_matches,
+):
+    for item in valid_alarms:
+        item_kind = get_debug_item_kind(item, debug_context)
+        matches = process_alarm(
+            engine,
+            item,
+            collect_matches=True,
+            register_trigger=True
+        )
+        print_debug_trigger_changes(
+            engine,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
+            "🔁 告警处理后关注站点 trigger 变化",
+        )
+        if item_kind is not None:
+            print_debug_item_state(engine, item, item_kind, matches=matches)
+        if matches:
+            on_debug_matches(matches, "同步检查")
+        refresh_process_progress(process_progress)
+
+
+def run_debug_mode(
+    engine,
+    valid_alarms,
+    on_matches,
+    process_progress,
+    debug_targets,
+    rules_config,
+    mode,
+    speedup,
+    real_harvest_interval_sec,
+):
+    """不改变原始 trigger 行为，只额外观察指定站点+告警相关的中间过程。"""
+    debug_target_text = ", ".join(f"{site} / {alarm}" for site, alarm in sorted(debug_targets))
+    print(
+        f"🔎 Debug 模式({mode}): 观察 {debug_target_text}，"
+        "所有 trigger 仍按原始逻辑正常运行"
+    )
+    debug_context = build_debug_run_context(engine, debug_targets)
+
+    def on_debug_snapshot(snapshot):
+        print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine)
+        print_debug_trigger_changes(
+            engine,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
+            "🔁 收割后关注站点 trigger 变化",
+            harvest_snapshot=snapshot,
+        )
+
+    engine.debug_observer = on_debug_snapshot
+    engine.debug_event_logger = lambda payload: print_debug_event_removal(payload, debug_context.debug_sites)
+    on_debug_matches = build_debug_match_callback(on_matches, debug_targets, rules_config)
+
+    if mode == 'live':
+        now_ts_getter = build_simulated_now_ts_getter(valid_alarms, speedup)
+        engine.start_periodic_harvest(
+            interval_sec=real_harvest_interval_sec,
+            on_matches=lambda matches: on_debug_matches(matches, "定时收割"),
+            now_ts_getter=now_ts_getter
+        )
+        try:
+            run_debug_live_loop(
+                engine,
+                valid_alarms,
+                speedup,
+                process_progress,
+                debug_context,
+            )
+        finally:
+            process_progress.close()
+            engine.stop_periodic_harvest()
+            engine.debug_event_logger = None
+        return
+
+    try:
+        run_debug_offline_loop(
+            engine,
+            valid_alarms,
+            process_progress,
+            debug_context,
+            on_debug_matches,
+        )
+    finally:
+        process_progress.close()
+        engine.debug_event_logger = None

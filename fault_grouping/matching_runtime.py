@@ -2,17 +2,28 @@ import json
 import os
 import time
 
-from collections import defaultdict
 from dataclasses import dataclass
 
 from alarm_tools.alarm_types import CRITICAL_ALARMS
-from fault_grouping.match_rules_alarm_io import (
+from alarm_tools.progress_utils import ProgressBar
+from fault_grouping.alarm_event_io import (
     count_alarm_event_types,
     load_sorted_alarm_cache_with_stats,
     load_valid_alarms,
     parse_datetime_text,
     trim_trailing_clear_alarms,
     warn_sorted_alarm_cache_option_mismatch,
+)
+from fault_grouping.alarm_event_stream import (
+    build_simulated_now_ts_getter,
+    process_alarm,
+    refresh_process_progress,
+    stream_alarms_by_ts,
+)
+from fault_grouping.matching_debug import (
+    match_debug_trigger,
+    print_debug_match_details,
+    run_debug_mode,
 )
 from fault_grouping.rule_config import (
     data_link_adjacent_link_rule,
@@ -34,6 +45,11 @@ from fault_grouping.sorted_alarm_cache import (
     write_sorted_alarm_cache,
 )
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
+from fault_grouping.site_topology import (
+    build_site_to_ne_ids,
+    build_site_topology_from_ne_graph,
+    load_site_chain_index,
+)
 
 
 @dataclass
@@ -61,132 +77,6 @@ class AlarmLoadResult:
     @property
     def filtered_count(self):
         return len(self.valid_alarms)
-
-
-def _extract_link_direction_values(link_meta):
-    if isinstance(link_meta, dict):
-        raw_values = link_meta.values()
-    elif isinstance(link_meta, (list, tuple, set)):
-        raw_values = link_meta
-    else:
-        raw_values = [link_meta]
-
-    direction_values = set()
-    for raw_value in raw_values:
-        text = str(raw_value).strip()
-        if text:
-            direction_values.add(text)
-    return direction_values
-
-
-def build_site_topology_from_ne_graph(ne_graph_data):
-    """基于 ne_graph 原始连边构建站点级 downstream 拓扑。"""
-    ne_to_site = {}
-    all_sites = set()
-
-    for ne_id, ne_info in ne_graph_data.items():
-        site_id = str(ne_info.get("site_id", "")).strip()
-        if not site_id:
-            continue
-        ne_to_site[ne_id] = site_id
-        all_sites.add(site_id)
-
-    topo_downstream_map = defaultdict(set)
-    for site_id in all_sites:
-        topo_downstream_map[site_id]
-
-    for source_ne, source_info in ne_graph_data.items():
-        source_site = ne_to_site.get(source_ne)
-        if not source_site:
-            continue
-
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-
-        for target_ne, link_meta in raw_links.items():
-            target_site = ne_to_site.get(target_ne)
-            if not target_site or target_site == source_site:
-                continue
-
-            direction_values = _extract_link_direction_values(link_meta)
-            if not direction_values:
-                continue
-
-            if any("<-" in direction for direction in direction_values):
-                topo_downstream_map[source_site].add(target_site)
-            if any("->" in direction for direction in direction_values):
-                topo_downstream_map[target_site].add(source_site)
-
-    return {
-        site_id: sorted(downstream_sites)
-        for site_id, downstream_sites in topo_downstream_map.items()
-    }, all_sites
-
-
-def _normalize_site_chain_hops(hops_map):
-    normalized = {}
-    if not isinstance(hops_map, dict):
-        return normalized
-    for related_site, hop_value in hops_map.items():
-        related_site_id = str(related_site).strip()
-        if not related_site_id:
-            continue
-        try:
-            hop = int(hop_value)
-        except (TypeError, ValueError):
-            continue
-        if hop <= 0:
-            continue
-        normalized[related_site_id] = hop
-    return normalized
-
-
-def load_site_chain_index(site_chains_path):
-    """加载 generate_site_chains.py 产出的预计算上下游 hop 索引。"""
-    data = json.load(open(site_chains_path, 'r', encoding='utf-8'))
-    raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
-    site_chain_index = {}
-    valid_sites = set()
-
-    for raw_site_id, raw_info in raw_sites.items():
-        site_id = str(raw_site_id or "").strip()
-        if not site_id or not isinstance(raw_info, dict):
-            continue
-
-        downstream_hops = _normalize_site_chain_hops(raw_info.get("downstream_site_hops"))
-        upstream_hops = _normalize_site_chain_hops(raw_info.get("upstream_site_hops"))
-        bidirectional_sites = {
-            str(neighbor_site or "").strip()
-            for neighbor_site in raw_info.get("bidirectional_sites", [])
-            if str(neighbor_site or "").strip()
-        }
-
-        site_chain_index[site_id] = {
-            "downstream_site_hops": downstream_hops,
-            "upstream_site_hops": upstream_hops,
-            "bidirectional_sites": bidirectional_sites,
-        }
-        valid_sites.add(site_id)
-        valid_sites.update(downstream_hops)
-        valid_sites.update(upstream_hops)
-        valid_sites.update(bidirectional_sites)
-
-    return site_chain_index, valid_sites
-
-
-def build_site_to_ne_ids(ne_graph_data):
-    site_to_ne_ids = defaultdict(list)
-    for ne_id, ne_info in ne_graph_data.items():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = str(ne_info.get("site_id", "")).strip()
-        if site_id:
-            site_to_ne_ids[site_id].append(ne_id)
-    return {
-        site_id: tuple(sorted(ne_ids))
-        for site_id, ne_ids in site_to_ne_ids.items()
-    }
 
 
 def parse_selected_rule_names(rule_args, valid_rule_names):
@@ -488,3 +378,122 @@ def print_alarm_load_summary(alarm_load_result):
 
 def default_valid_alarm_titles():
     return CRITICAL_ALARMS
+
+
+def run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
+    """按 ts 差值模拟实时告警流，并由后台定时线程异步收割成熟故障组。"""
+    print(
+        f"⏱️ 运行模式: live, speedup={speedup:g}x, "
+        f"模拟收割周期={real_harvest_interval_sec * speedup:g}s, "
+        f"真实收割周期={real_harvest_interval_sec:.3f}s"
+    )
+    now_ts_getter = build_simulated_now_ts_getter(valid_alarms, speedup)
+    engine.start_periodic_harvest(
+        interval_sec=real_harvest_interval_sec,
+        on_matches=on_matches,
+        now_ts_getter=now_ts_getter
+    )
+
+    try:
+        for item in stream_alarms_by_ts(valid_alarms, speedup=speedup):
+            process_alarm(engine, item, collect_matches=False)
+            refresh_process_progress(process_progress)
+    finally:
+        process_progress.close()
+        engine.stop_periodic_harvest()
+
+
+def run_offline_mode(engine, valid_alarms, on_matches, process_progress):
+    """按时间排序顺序处理告警，并在每条告警后立即同步收割一次成熟故障组。"""
+    print("⏱️ 运行模式: offline, 每条告警到来时直接触发检查")
+    try:
+        for item in valid_alarms:
+            matches = process_alarm(engine, item, collect_matches=True)
+            if matches:
+                on_matches(matches)
+            refresh_process_progress(process_progress)
+    finally:
+        process_progress.close()
+
+
+def run_matching_pipeline(
+    args,
+    engine,
+    valid_alarms,
+    output_session,
+    debug_targets,
+    rules_config,
+):
+    debug_enabled = bool(debug_targets)
+    if debug_enabled:
+        print("🔎 Debug 模式已开启:")
+        for site_id, alarm_name in sorted(debug_targets):
+            print(f"   - {site_id} / {alarm_name}")
+
+    speedup = max(float(args.speedup), 1e-9)
+    real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
+    process_progress = ProgressBar(len(valid_alarms), "处理有效告警")
+    process_progress._refresh_extra_text = output_session.refresh_progress_extra_text
+    output_session.process_progress = process_progress
+    output_session.refresh_progress_extra_text(force=True)
+
+    if debug_enabled:
+        run_debug_mode(
+            engine,
+            valid_alarms,
+            output_session.write_matches,
+            process_progress,
+            debug_targets,
+            rules_config,
+            args.mode,
+            speedup,
+            real_harvest_interval_sec,
+        )
+    elif args.mode == 'live':
+        run_live_mode(
+            engine,
+            valid_alarms,
+            speedup,
+            real_harvest_interval_sec,
+            output_session.write_matches,
+            process_progress
+        )
+    else:
+        run_offline_mode(engine, valid_alarms, output_session.write_matches, process_progress)
+
+    output_session.process_progress = None
+
+    print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
+    final_matches = engine.flush_pending()
+    if final_matches:
+        if debug_enabled:
+            debug_final_matches = [
+                match for match in final_matches
+                if match_debug_trigger(match, debug_targets, rules_config)
+            ]
+            if debug_final_matches:
+                print(f"🔎 Flush 阶段额外产出 {len(debug_final_matches)} 个故障组")
+                for match in debug_final_matches:
+                    print_debug_match_details(match)
+        output_session.write_matches(final_matches)
+
+    if debug_enabled:
+        engine.debug_observer = None
+
+
+def print_final_summary(args, engine, processed_count, filtered_count, match_count, elapsed):
+    final_merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
+    primary_merge_count = (
+        final_merge_stats.get('alarm_overlap_merge_group_count', 0)
+        if args.use_alarm_period_cache
+        else final_merge_stats.get('eid_merge_group_count', 0)
+    )
+    primary_merge_label = "告警时段合并组数" if args.use_alarm_period_cache else "eid合并组数"
+    print(
+        f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，"
+        f"生成 {match_count} 个故障组，"
+        f"{primary_merge_label} {primary_merge_count}，"
+        f"hop合并组数 {final_merge_stats.get('hop_merge_group_count', 0)}，"
+        f"距离合并组数 {final_merge_stats.get('distance_merge_group_count', 0)}，"
+        f"耗时 {elapsed:.4f} 秒。"
+    )

@@ -9,12 +9,14 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_tools.alarm_types import CRITICAL_ALARMS
-from fault_grouping.match_rules import (
-    _build_site_topology_from_ne_graph,
-    _is_clear_alarm,
-    _load_valid_alarms,
-    _parse_datetime_text,
-    _trim_trailing_clear_alarms,
+from fault_grouping.alarm_event_io import (
+    is_clear_alarm,
+    load_valid_alarms,
+    parse_datetime_text,
+    trim_trailing_clear_alarms,
+)
+from fault_grouping.site_topology import (
+    build_site_topology_from_ne_graph,
 )
 from fault_grouping.sorted_alarm_cache import write_sorted_alarm_cache
 from topology_resources import (
@@ -35,7 +37,7 @@ def _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path):
             elif isinstance(connected_sites, dict):
                 valid_sites.update(connected_sites.keys())
     else:
-        _topo_downstream_map, valid_sites = _build_site_topology_from_ne_graph(ne_graph_data)
+        _topo_downstream_map, valid_sites = build_site_topology_from_ne_graph(ne_graph_data)
 
     ne_to_site = {
         ne_id: str(ne_info.get("site_id", "")).strip()
@@ -54,13 +56,13 @@ def build_sorted_alarms(
     end_time=None,
     clear_delay_sec=0.0,
 ):
-    start_ts = _parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
-    end_ts = _parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
+    start_ts = parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
+    end_ts = parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("start_time 不能晚于 end_time")
 
     valid_sites, ne_to_site = _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path)
-    processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = _load_valid_alarms(
+    processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = load_valid_alarms(
         alarm_input,
         CRITICAL_ALARMS,
         valid_sites,
@@ -70,10 +72,10 @@ def build_sorted_alarms(
         clear_delay_sec=clear_delay_sec,
     )
     valid_alarms.sort(key=lambda item: item["ts"])
-    valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
+    valid_alarms = trim_trailing_clear_alarms(valid_alarms)
 
     cached_normal_alarm_count = sum(
-        1 for item in valid_alarms if not _is_clear_alarm(item.get("alarm", {}))
+        1 for item in valid_alarms if not is_clear_alarm(item.get("alarm", {}))
     )
     cached_clear_alarm_count = len(valid_alarms) - cached_normal_alarm_count
     metadata = {

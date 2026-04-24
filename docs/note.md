@@ -432,12 +432,12 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 除了 `traverse_graph()` 使用的全局拓扑缓存外，当前规则评估过程里还有两层“局部缓存”：
 
-1. 事件快照缓存  
+1. 事件快照缓存
    在进入一轮 `_evaluate_rule()` 之前，会先从当前 `event_cache` 拍一个与种子节点相关的快照；
    后续如果规则评估中又访问到新的节点，会通过 `_build_snapshot_helper()` 按需把这些节点的事件读出来并补进同一个快照。
    这样 `NodeRuleHelper.events_in_window()` 读到的是“本轮评估视角下的一致快照”，而不是边算边直接读实时 `event_cache`。
 
-2. `validate_node()` 结果缓存  
+2. `validate_node()` 结果缓存
    在 `_evaluate_rule()` 内部有一个 `validation_cache`；
    当某个候选节点在同一轮规则评估里，被用相同的 role、参考时间和窗口重复校验时，会直接复用上一次 `validate_node()` 的结果，
    避免重复做站点画像匹配和窗口告警过滤。
@@ -491,10 +491,10 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 `main()` 的整体执行顺序可以概括为：
 
-1. 解析命令行参数  
+1. 解析命令行参数
    读取输入告警文件、拓扑文件、站点画像文件、运行模式、speedup、debug 目标等参数。
 
-2. 加载静态数据  
+2. 加载静态数据
    包括：
    - 站点拓扑 `site_graph_by_ne.json`
    - 站点画像 `site_device_counts.json`
@@ -502,21 +502,21 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 有效站点集合
    - `ne -> site` 映射
 
-3. 初始化引擎  
+3. 初始化引擎
    用拓扑、规则配置、站点画像构造 `TemporalGraphEngine`。
 
-4. 加载并标准化告警  
+4. 加载并标准化告警
    调用 `_load_valid_alarms()` 生成 `valid_alarms`，排序后再做尾部清除告警裁剪。
 
-5. 根据模式选择运行方式  
-   - debug 模式：走 `_run_debug_mode()`
-   - live 模式：走 `_run_live_mode()`
-   - offline 模式：走 `_run_offline_mode()`
+5. 根据模式选择运行方式
+   - debug 模式：走 `matching_debug.run_debug_mode()`
+   - live 模式：走 `matching_runtime.run_live_mode()`
+   - offline 模式：走 `matching_runtime.run_offline_mode()`
 
-6. 数据流结束后做最终收尾  
+6. 数据流结束后做最终收尾
    调用 `engine.flush_pending()`，把最后还挂着的 pending 做一次收尾收割。
 
-7. 输出统计信息  
+7. 输出统计信息
    最后打印：
    - 原始处理告警数
    - 过滤后有效告警数
@@ -537,13 +537,13 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 **【逻辑】**
 
-引擎内部生成的故障组，最终不会原样直接写文件，而是会在 `match_rules.py` 里再做一层输出增强：
+引擎内部生成的故障组，最终不会原样直接写文件，而是由 `group_output_session.py` 调度，并在 `group_output_builder.py` 里做一层输出增强：
 
-1. `on_matches(matches)` 统一处理每一批新产出的故障组  
-   对每个故障组会先调用 `generate_incident_report(match)` 生成控制台报告，
-   再调用 `_build_jsonl_match_output(match, ne_graph_data)` 组装最终落盘结构。
+1. `MatchOutputSession.write_matches(matches)` 统一处理每一批新产出的故障组
+   对每个故障组会先按需调用 `generate_incident_report(match)` 生成控制台报告，
+   再调用 `group_output_builder.build_jsonl_match_output(...)` 组装最终落盘结构。
 
-2. `_build_jsonl_match_output()` 会在原始 match 基础上补充：
+2. `build_jsonl_match_output()` 会在原始 match 基础上补充：
    - `group_anchor_ts`
    - `group_anchor_time`
    - `match_info`
@@ -585,27 +585,27 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 这份脚本不是算当前方法的真实召回，而是算“基于原始告警流与时间窗关系，工单站点召回率的上限”。
 当前逻辑是：
 
-1. 输入工单站点映射和原始告警流  
+1. 输入工单站点映射和原始告警流
    当前 `--ticket-sites` 支持两种格式：
    - 旧格式：`{工单: [站点列表]}`
    - 新格式：`filter_incident_tickets.py` 输出的
      `{工单: {site_ids, extracted_times, time_details}}`
    脚本会统一读取其中的 `site_ids` 作为该工单的目标站点集合。
 
-2. 第一遍流式扫描告警  
+2. 第一遍流式扫描告警
    - 过滤掉 `FAN FAIL`；
    - 统计每个工单通过 `ticket_field` 直接命中的告警数；
    - 收集每个工单自己的 anchor 告警时间；
    - 收集这些工单已经显式命中的站点。
 
-3. 基于 anchor 时间，为每个工单生成 `±window_seconds` 的时间窗  
+3. 基于 anchor 时间，为每个工单生成 `±window_seconds` 的时间窗
    然后找出该工单目标站点里还没有显式出现的缺失站点。
 
-4. 第二遍流式扫描告警  
+4. 第二遍流式扫描告警
    检查缺失站点上的告警时间，是否能落入该工单任一 anchor 时间窗内；
    如果可以，就把这个站点视为“通过时间窗补关联成功”。
 
-5. 计算上限召回率  
+5. 计算上限召回率
    - 直接命中的站点 + 时间窗补回的站点 = `associated_sites`；
    - 按：
      `associated_site_count / ticket_site_count`
@@ -615,7 +615,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
      - `f1_upper_bound`
      作为与其它评测脚本一致的补充指标。
 
-6. 从 `--ticket-sites` 里的 `extracted_times` 解析工单记录时间  
+6. 从 `--ticket-sites` 里的 `extracted_times` 解析工单记录时间
    - 如果是新格式输入，脚本会读取 `extracted_times`；
    - 解析成功后，按时间排序，取：
      - `min_time`
@@ -624,14 +624,14 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 如果 `extracted_times` 为空，或都无法解析，则这一块为空；
    - 如果只有一项，则 `min_time == max_time`，形成单点闭区间。
 
-7. 第三遍流式扫描告警，补证据  
+7. 第三遍流式扫描告警，补证据
    输出：
    - `direct_site_alarms`
    - `inferred_site_alarms`
    - `ticket_recorded_range_site_alarms`
    作为“这些站点为什么能被关联上”的证据。
 
-8. 可选地把 `ticket_recorded_range_site_alarms` 命中的站点并入 recall 计算  
+8. 可选地把 `ticket_recorded_range_site_alarms` 命中的站点并入 recall 计算
    - 默认不开启时：
      `associated_sites` 仍然只来自 `direct_sites + inferred_sites`
    - 开启 `--include-ticket-recorded-range-sites` 后：
@@ -639,7 +639,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - 但并入时仍然只保留目标站点范围内的站点，
      不会把工单 `ticket_sites` 之外的站点算进 recall。
 
-9. 最终哪些工单会进入结果  
+9. 最终哪些工单会进入结果
    当前不再要求“必须存在带工单号的原始告警”。
    一个工单只要满足下面任一条件，就会进入最终 `details / ticket_count`：
    - `ticket_alarm_count > 0`
@@ -671,7 +671,7 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 ### 1. 工单时间窗怎么计算
 
-1. 先扫描原始告警流，只看“带当前工单号”的告警  
+1. 先扫描原始告警流，只看“带当前工单号”的告警
    这些告警的时间来自 `time_field`，默认是 `告警首次发生时间`。
 
 2. 把这些时间解析成时间戳后，按工单聚合成 `ticket_alarm_times[ticket_id]`。
@@ -863,20 +863,20 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 
 具体过程是：
 
-1. 读取真实召回率结果  
+1. 读取真实召回率结果
    来源可以是：
    - `compute_ticket_site_recall.py`
    - 或 `compute_group_output_ticket_recall.py`
 
-2. 读取上限结果  
+2. 读取上限结果
    来源是 `compute_ticket_site_recall_upper_bound.py`。
 
-3. 用上限结果筛工单  
+3. 用上限结果筛工单
    只保留满足：
    `associated_site_count == ticket_site_count`
    的工单，也就是“理论上所有目标站点都已经可以被关联出来”的工单。
 
-4. 对这些工单重新计算真实平均召回率  
+4. 对这些工单重新计算真实平均召回率
    输出：
    - 原始工单数；
    - 具备比较资格的工单数；
@@ -898,22 +898,22 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
 这两份脚本是当前正式使用的工单站点评测脚本。
 它们共同的思路是：
 
-1. 先读取 `compute_ticket_site_recall_upper_bound.py` 的输出  
+1. 先读取 `compute_ticket_site_recall_upper_bound.py` 的输出
    以 upper bound 结果作为样本入口：
    - 默认口径下，只保留 `fully_associable` 的工单
    - 开 `--upper-bound-associated-as-gold` 时，则保留 `associated_site_count > 0` 的工单
 
-2. 再跑各自的真实方法  
+2. 再跑各自的真实方法
    - `compute_ticket_site_recall.py`：
      仍然基于原始告警里的 `工单号 + 故障组ID`；
    - `compute_group_output_ticket_recall.py`：
      仍然基于 `match_rules.py` 聚合输出的故障组。
 
-3. 对每个保留下来的工单，把站点拆成两类  
+3. 对每个保留下来的工单，把站点拆成两类
    - `associated_sites`：当前方法已经关联上的站点；
    - `missing_sites`：当前方法还没关联上的站点。
 
-4. 同时输出两类站点对应的告警证据  
+4. 同时输出两类站点对应的告警证据
    - `associated_site_alarms`：当前方法已经真正关联到的站点告警；
    - `missing_site_alarms`：上限里明明可以补出来、但当前方法仍未关联的站点告警。
    这里读取的是 `upper bound -> site_evidence`，而当前 `site_evidence` 已经统一合并了：
@@ -921,14 +921,14 @@ debug 模式的作用，是在不改变正常匹配语义的前提下，
    - `inferred_site_alarms`
    - `ticket_recorded_range_site_alarms`
 
-5. 两份脚本统一输出字段  
+5. 两份脚本统一输出字段
    包括：
    - `associated_site_count / associated_sites / associated_site_alarms`
    - `missing_site_count / missing_sites / missing_site_alarms`
    - `group_site_count / group_sites`
    - `recall / precision / f1`
 
-6. 当前不会再额外要求“工单必须在原始告警里带工单号出现过”  
+6. 当前不会再额外要求“工单必须在原始告警里带工单号出现过”
    也就是说，只要这个工单已经通过上一步 upper bound 口径进入样本，
    这两份脚本就不会再因为 `ticket_alarm_count = 0` 或 `ticket_occurrence_count = 0`
    把它二次过滤掉。
