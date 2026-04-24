@@ -45,7 +45,15 @@ from alarm_tools.progress_utils import ProgressBar
 from ticket_recall.evaluation.recall_common import _normalize_text, _parse_group_ids
 
 
-ALARM_GROUP_RULE = "alarm_group_rule"
+ALARM_GROUP_RULE_PREFIX = "alarm_group_"
+ALARM_GROUP_RULE_SUFFIX = "_rule"
+
+
+def _build_alarm_group_rule_name(group_id):
+    normalized_group_id = _normalize_text(group_id)
+    if not normalized_group_id:
+        normalized_group_id = "unknown"
+    return f"{ALARM_GROUP_RULE_PREFIX}{normalized_group_id}{ALARM_GROUP_RULE_SUFFIX}"
 
 
 def _parse_datetime_to_ts(text):
@@ -207,11 +215,12 @@ def _build_group_output_from_alarms(group_id, alarm_list):
     timestamps = [s["ts"] for s in symptoms if s["ts"] is not None]
     anchor_ts = min(timestamps) if timestamps else None
     new_uuid = f"alarm-{group_id}" if group_id else f"alarm-{uuid.uuid4().hex[:12]}"
+    alarm_group_rule = _build_alarm_group_rule_name(group_id)
 
     return {
         "match_info": {
             "uuid": new_uuid,
-            "rule": ALARM_GROUP_RULE,
+            "rule": alarm_group_rule,
             "merged_rules": [],
             "related_group_uuids": [],
             "inferred_roots": {},
@@ -492,12 +501,13 @@ def _merge_match_group_records(base_record, incoming_record):
 def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
     """将原始告警列表合并进已有的 match_rules 输出记录。"""
     match_info = record.setdefault("match_info", {})
+    alarm_group_rule = _build_alarm_group_rule_name(alarm_group_id)
     merged_rules = []
     seen_rules = set()
     for rule_name in (
         [match_info.get("rule", "")]
         + list(match_info.get("merged_rules", []) or [])
-        + [ALARM_GROUP_RULE]
+        + [alarm_group_rule]
     ):
         normalized_rule = _normalize_text(rule_name)
         if not normalized_rule or normalized_rule in seen_rules:

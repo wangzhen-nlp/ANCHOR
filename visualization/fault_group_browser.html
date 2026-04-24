@@ -867,7 +867,11 @@
         function getGroupMergedRules(group) {
             const mergedRules = mergeStringLists(group.merged_rules, group.match_info?.merged_rules);
             if (Array.isArray(group._merged_alarm_groups) && group._merged_alarm_groups.length > 0) {
-                return mergeStringLists(mergedRules, ['alarm_group_rule']);
+                const alarmGroupRules = group._merged_alarm_groups.map(item => {
+                    const groupId = String(item?.group_id || 'unknown').trim() || 'unknown';
+                    return `alarm_group_${groupId}_rule`;
+                });
+                return mergeStringLists(mergedRules, alarmGroupRules);
             }
             return mergedRules;
         }
