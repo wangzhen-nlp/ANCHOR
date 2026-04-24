@@ -2,6 +2,7 @@ import copy
 import collections
 
 from fault_grouping.temporal_graph_engine_utils import (
+    get_match_alarm_keys,
     get_match_symptom_overlap_keys,
     get_symptom_overlap_base_key,
     merge_overlapping_symptoms,
@@ -11,12 +12,14 @@ from fault_grouping.temporal_graph_engine_utils import (
 
 
 class EmittedGroupStore:
-    """管理历史故障组的保留、按告警时段/代表 eid 合并和重新落库。"""
+    """管理历史故障组的保留，并按 eid 或告警时段重新合并落库。"""
 
-    def __init__(self, rules, default_stay_time):
+    def __init__(self, rules, default_stay_time, use_alarm_period_cache=False):
         self.rules = rules
         self.default_stay_time = default_stay_time
+        self.use_alarm_period_cache = bool(use_alarm_period_cache)
         self.groups = []
+        self.eid_to_group_indexes = collections.defaultdict(set)
         self.symptom_overlap_to_group_indexes = collections.defaultdict(set)
         self.deleted_group_count = 0
 
@@ -44,7 +47,86 @@ class EmittedGroupStore:
         return rule.get("max_stay_time_sec", self.default_stay_time)
 
     def merge_with_related(self, match_result):
-        """按告警时段/代表 eid 与历史故障组合并，生成更完整的当前故障组。"""
+        """按当前模式与历史故障组合并，生成更完整的当前故障组。"""
+        if not self.use_alarm_period_cache:
+            return self._merge_with_related_by_eid(match_result)
+        return self._merge_with_related_by_overlap(match_result)
+
+    def _merge_with_related_by_eid(self, match_result):
+        related_groups = []
+        current_alarm_keys = self._get_alarm_keys(match_result.get("symptoms", []))
+
+        if not current_alarm_keys:
+            return match_result, set(), set(), True, "no_alarm_keys"
+
+        related_indexes = sorted({
+            idx
+            for alarm_key in current_alarm_keys
+            for idx in self.eid_to_group_indexes.get(alarm_key, set())
+            if 0 <= idx < len(self.groups) and self.groups[idx] is not None
+        })
+        for idx in related_indexes:
+            related_groups.append((idx, self.groups[idx]))
+
+        if not related_groups:
+            return match_result, set(), set(), True, "no_related_history"
+
+        merged = {
+            "uuid": match_result.get("uuid"),
+            "rule": match_result.get("rule"),
+            "merged_rules": list(match_result.get("merged_rules", [match_result.get("rule")])),
+            "inferred_roots": copy.deepcopy(match_result.get("inferred_roots", {})),
+            "role_mapping": copy.deepcopy(match_result.get("role_mapping", {})),
+            "symptoms": list(match_result.get("symptoms", []))
+        }
+        if "_expire_ts_hint" in match_result:
+            merged["_expire_ts_hint"] = match_result["_expire_ts_hint"]
+
+        symptom_map = {}
+        for symptom in merged["symptoms"]:
+            alarm_key = self._get_alarm_key(symptom)
+            if alarm_key is not None:
+                symptom_map[alarm_key] = symptom
+
+        merged_group_indexes = set()
+        related_group_uuids = set()
+        fully_containing_history_exists = False
+        for idx, item in related_groups:
+            merged_group_indexes.add(idx)
+            previous_match = item["match"]
+            previous_alarm_keys = item.get("alarm_keys")
+            if previous_alarm_keys is None:
+                previous_alarm_keys = self._get_alarm_keys(previous_match.get("symptoms", []))
+                item["alarm_keys"] = previous_alarm_keys
+            if current_alarm_keys.issubset(previous_alarm_keys):
+                fully_containing_history_exists = True
+            previous_uuid = previous_match.get("uuid")
+            if previous_uuid:
+                related_group_uuids.add(previous_uuid)
+            related_group_uuids.update(previous_match.get("related_group_uuids", []))
+            previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
+            merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
+            for role, nodes in previous_match.get("inferred_roots", {}).items():
+                merged["inferred_roots"].setdefault(role, [])
+                merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
+
+            for role, nodes in previous_match.get("role_mapping", {}).items():
+                merged["role_mapping"].setdefault(role, [])
+                merged["role_mapping"][role] = sorted(set(merged["role_mapping"][role]) | set(nodes))
+
+            for symptom in previous_match.get("symptoms", []):
+                alarm_key = self._get_alarm_key(symptom)
+                if alarm_key is not None:
+                    symptom_map[alarm_key] = symptom
+
+        merged["symptoms"] = list(symptom_map.values())
+
+        if fully_containing_history_exists:
+            return merged, merged_group_indexes, related_group_uuids, False, "suppressed_by_fully_containing_history"
+
+        return merged, merged_group_indexes, related_group_uuids, True, "merged_with_related_history"
+
+    def _merge_with_related_by_overlap(self, match_result):
         related_groups = []
         current_symptoms = list(match_result.get("symptoms", []))
         current_overlap_keys = get_match_symptom_overlap_keys(match_result)
@@ -138,12 +220,20 @@ class EmittedGroupStore:
                     self.deleted_group_count += 1
 
         stored_match = copy.deepcopy(match_result)
-        group_item = {
-            "anchor_ts": anchor_ts,
-            "expire_ts": max(current_expire_ts, merged_expire_ts),
-            "match": stored_match,
-            "symptom_overlap_keys": get_match_symptom_overlap_keys(stored_match),
-        }
+        if self.use_alarm_period_cache:
+            group_item = {
+                "anchor_ts": anchor_ts,
+                "expire_ts": max(current_expire_ts, merged_expire_ts),
+                "match": stored_match,
+                "symptom_overlap_keys": get_match_symptom_overlap_keys(stored_match),
+            }
+        else:
+            group_item = {
+                "anchor_ts": anchor_ts,
+                "expire_ts": max(current_expire_ts, merged_expire_ts),
+                "match": stored_match,
+                "alarm_keys": self._get_alarm_keys(stored_match.get("symptoms", [])),
+            }
         self.groups.append(group_item)
         self._add_group_to_index(len(self.groups) - 1, group_item)
         self._maybe_compact_groups()
@@ -162,27 +252,47 @@ class EmittedGroupStore:
                 self.groups[idx]["expire_ts"] = max(self.groups[idx]["expire_ts"], current_expire_ts)
 
     def _add_group_to_index(self, idx, group_item):
-        for overlap_key in group_item.get("symptom_overlap_keys", set()):
-            self.symptom_overlap_to_group_indexes[overlap_key].add(idx)
+        if self.use_alarm_period_cache:
+            for overlap_key in group_item.get("symptom_overlap_keys", set()):
+                self.symptom_overlap_to_group_indexes[overlap_key].add(idx)
+        else:
+            for alarm_key in group_item.get("alarm_keys", set()):
+                self.eid_to_group_indexes[alarm_key].add(idx)
 
     def _remove_group_from_index(self, idx, group_item):
-        for overlap_key in group_item.get("symptom_overlap_keys", set()):
-            indexes = self.symptom_overlap_to_group_indexes.get(overlap_key)
-            if not indexes:
-                continue
-            indexes.discard(idx)
-            if not indexes:
-                self.symptom_overlap_to_group_indexes.pop(overlap_key, None)
+        if self.use_alarm_period_cache:
+            for overlap_key in group_item.get("symptom_overlap_keys", set()):
+                indexes = self.symptom_overlap_to_group_indexes.get(overlap_key)
+                if not indexes:
+                    continue
+                indexes.discard(idx)
+                if not indexes:
+                    self.symptom_overlap_to_group_indexes.pop(overlap_key, None)
+        else:
+            for alarm_key in group_item.get("alarm_keys", set()):
+                indexes = self.eid_to_group_indexes.get(alarm_key)
+                if not indexes:
+                    continue
+                indexes.discard(idx)
+                if not indexes:
+                    self.eid_to_group_indexes.pop(alarm_key, None)
 
     def _rebuild_alarm_index(self):
+        self.eid_to_group_indexes = collections.defaultdict(set)
         self.symptom_overlap_to_group_indexes = collections.defaultdict(set)
         for idx, group_item in enumerate(self.groups):
             if group_item is None:
                 continue
-            overlap_keys = group_item.get("symptom_overlap_keys")
-            if overlap_keys is None:
-                overlap_keys = get_match_symptom_overlap_keys(group_item.get("match", {}))
-                group_item["symptom_overlap_keys"] = overlap_keys
+            if self.use_alarm_period_cache:
+                overlap_keys = group_item.get("symptom_overlap_keys")
+                if overlap_keys is None:
+                    overlap_keys = get_match_symptom_overlap_keys(group_item.get("match", {}))
+                    group_item["symptom_overlap_keys"] = overlap_keys
+            else:
+                alarm_keys = group_item.get("alarm_keys")
+                if alarm_keys is None:
+                    alarm_keys = self._get_alarm_keys(group_item.get("match", {}).get("symptoms", []))
+                    group_item["alarm_keys"] = alarm_keys
             self._add_group_to_index(idx, group_item)
 
     def _maybe_compact_groups(self):
@@ -234,3 +344,14 @@ class EmittedGroupStore:
                 return False
 
         return True
+
+    @staticmethod
+    def _get_alarm_keys(symptoms):
+        return set(get_match_alarm_keys({"symptoms": list(symptoms)}, use_alarm_period_cache=False))
+
+    @staticmethod
+    def _get_alarm_key(symptom):
+        eid = symptom.get("eid")
+        if eid in (None, ""):
+            return None
+        return eid

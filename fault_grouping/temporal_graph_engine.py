@@ -672,6 +672,7 @@ class TemporalGraphEngine:
         aggregation_wait_sec=420,
         site_merge_helper=None,
         site_chain_index=None,
+        use_alarm_period_cache=False,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -685,10 +686,12 @@ class TemporalGraphEngine:
                 self.topo_up[down].append(up)
         self.site_chain_index = self._normalize_site_chain_index(site_chain_index)
 
-        # 状态缓存:
-        # - event_cache 对外仍暴露为站点 -> 活跃告警时段摘要 deque
-        # - active_alarm_periods / active_event_to_period 在锁内维护“同设备同告警”的在线活跃时段
+        # event_cache 的两种运行模式:
+        # - 默认(raw): 站点 -> deque[(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]
+        # - 可选(period): 站点 -> 活跃告警时段摘要 deque
+        self.use_alarm_period_cache = bool(use_alarm_period_cache)
         self.event_cache = collections.defaultdict(collections.deque)
+        # 仅在 period 模式下使用；raw 模式保持为空。
         self.active_alarm_periods = collections.defaultdict(dict)
         self.active_event_to_period = collections.defaultdict(dict)
         # 默认告警缓存保留时长，单位秒
@@ -730,7 +733,11 @@ class TemporalGraphEngine:
         self._trigger_seq = 0
 
         # 负责历史组保留、按 eid 合并和替换落库
-        self.emitted_group_store = EmittedGroupStore(self.rules, self.global_ttl)
+        self.emitted_group_store = EmittedGroupStore(
+            self.rules,
+            self.global_ttl,
+            use_alarm_period_cache=self.use_alarm_period_cache,
+        )
 
         # 负责站点结构匹配、告警窗口校验和失败原因解释
         self.node_rule_helper = NodeRuleHelper(
@@ -913,6 +920,18 @@ class TemporalGraphEngine:
             self._rebuild_node_event_cache(node)
         return created
 
+    def _prune_expired_raw_events_in_place(self, node, current_ts):
+        q = self.event_cache.get(node)
+        if not q:
+            return
+
+        while q and (current_ts - q[0][0]) > self._get_event_ttl(q[0][2]):
+            expired_event = q.popleft()
+            self._log_debug_event_removal(node, expired_event, "ttl", current_ts=current_ts)
+
+        if not q:
+            self.event_cache.pop(node, None)
+
     def _prune_expired_alarm_periods(self, node, current_ts):
         periods = self.active_alarm_periods.get(node)
         if not periods:
@@ -960,26 +979,43 @@ class TemporalGraphEngine:
             self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
             # 2. 先清理过期缓存，再按上报/清除事件更新状态。
-            self._prune_expired_alarm_periods(node, ts)
+            if self.use_alarm_period_cache:
+                self._prune_expired_alarm_periods(node, ts)
+            else:
+                self._prune_expired_raw_events_in_place(node, ts)
             self._prune_expired_trigger_index(node, ts)
 
-            if is_clear:
-                # 清除事件只按 event_id 删除对应实例，并联动修正 trigger / pending 状态。
-                self._remove_cleared_events(node, event_id)
-                affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
-                if affected_rule_names:
-                    self._refresh_pending_triggers_for_node(
+            if self.use_alarm_period_cache:
+                if is_clear:
+                    # 清除事件只按 event_id 删除对应实例，并联动修正 trigger / pending 状态。
+                    self._remove_cleared_events(node, event_id)
+                    affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
+                    if affected_rule_names:
+                        self._refresh_pending_triggers_for_node(
+                            node,
+                            affected_rule_names=affected_rule_names
+                        )
+                else:
+                    self._register_alarm_period_occurrence(
                         node,
-                        affected_rule_names=affected_rule_names
+                        alarm_type,
+                        ts,
+                        event_id,
+                        alarm_source=alarm_source,
                     )
             else:
-                self._register_alarm_period_occurrence(
-                    node,
-                    alarm_type,
-                    ts,
-                    event_id,
-                    alarm_source=alarm_source,
-                )
+                if is_clear:
+                    self._remove_cleared_events(node, event_id)
+                    affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
+                    if affected_rule_names:
+                        self._refresh_pending_triggers_for_node(
+                            node,
+                            affected_rule_names=affected_rule_names
+                        )
+                else:
+                    self.event_cache[node].append(
+                        (ts, event_id, alarm_type, alarm_source, frozenset())
+                    )
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear and register_trigger:
@@ -1192,6 +1228,7 @@ class TemporalGraphEngine:
             raw_matches,
             site_merge_helper=self.site_merge_helper,
             return_stats=True,
+            use_alarm_period_cache=self.use_alarm_period_cache,
         )
         expanded_matches, expanded_merge_stats = self._expand_matches_with_pending_context(
             merged_matches,
@@ -1218,6 +1255,7 @@ class TemporalGraphEngine:
 
         if self.debug_observer:
             self.debug_observer({
+                "use_alarm_period_cache": self.use_alarm_period_cache,
                 "force": force,
                 "watermark": current_watermark,
                 "effective_harvest_ts": effective_harvest_ts,
@@ -1312,6 +1350,25 @@ class TemporalGraphEngine:
             self._harvest_stop_event.wait(self._harvest_interval_sec)
 
     def _remove_cleared_events(self, node, event_id):
+        if not self.use_alarm_period_cache:
+            # raw 模式：按 event_id 从节点事件缓存中移除已清除的告警实例。
+            q = self.event_cache[node]
+            kept = collections.deque()
+
+            for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
+                if event_id and cached_eid == event_id:
+                    self._log_debug_event_removal(
+                        node,
+                        (cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules),
+                        "clear",
+                        cleared_event_id=event_id,
+                    )
+                    continue
+                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
+
+            self.event_cache[node] = kept
+            return
+
         """按 event_id 从节点活跃告警时段中移除对应实例；仅在时段彻底结束时移出缓存。"""
         if event_id in (None, ""):
             return
@@ -1355,6 +1412,64 @@ class TemporalGraphEngine:
         self._rebuild_node_event_cache(node)
 
     def _prune_node_alarm_history_before(self, node, alarm_type, alarm_source, cutoff_by_rule):
+        if not self.use_alarm_period_cache:
+            # raw 模式：把某节点同告警名下不晚于各 rule cutoff 的事件标记为已被对应 rule 消费。
+            q = self.event_cache.get(node)
+            if not q:
+                return
+
+            removed_event_ids_by_rule = collections.defaultdict(set)
+            kept = collections.deque()
+            target_alarm_source = str(alarm_source or "")
+            for cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules in q:
+                if (
+                    cached_alarm_type == alarm_type
+                    and str(cached_alarm_source or "") == target_alarm_source
+                ):
+                    matched_rules = {
+                        rule_name
+                        for rule_name, cutoff_ts in cutoff_by_rule.items()
+                        if cached_ts <= cutoff_ts
+                    }
+                else:
+                    matched_rules = set()
+
+                if matched_rules:
+                    if cached_eid not in (None, ""):
+                        for rule_name in matched_rules:
+                            removed_event_ids_by_rule[rule_name].add(cached_eid)
+                    updated_consumed_rules = frozenset(set(consumed_trigger_rules) | matched_rules)
+                    kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, updated_consumed_rules))
+                    continue
+                kept.append((cached_ts, cached_eid, cached_alarm_type, cached_alarm_source, consumed_trigger_rules))
+            self.event_cache[node] = kept
+
+            if not removed_event_ids_by_rule:
+                return
+
+            for rule_name, removed_event_ids in removed_event_ids_by_rule.items():
+                trigger_key = (node, rule_name)
+                trigger_events = self.trigger_event_index.get(trigger_key)
+                if not trigger_events:
+                    continue
+
+                kept_trigger_events = collections.deque()
+                for event_ts, indexed_event_id, indexed_seq, indexed_alarm_type in trigger_events:
+                    if indexed_event_id in removed_event_ids:
+                        continue
+                    kept_trigger_events.append((event_ts, indexed_event_id, indexed_seq, indexed_alarm_type))
+
+                if kept_trigger_events:
+                    self.trigger_event_index[trigger_key] = kept_trigger_events
+                else:
+                    self.trigger_event_index.pop(trigger_key, None)
+
+            self._refresh_pending_triggers_for_node(
+                node,
+                affected_rule_names=removed_event_ids_by_rule.keys()
+            )
+            return
+
         """把某节点同告警名/告警源下不晚于各 rule cutoff 的活跃告警时段标记为已消费并移出对应 trigger 候选。"""
         periods = self.active_alarm_periods.get(node)
         if not periods:
@@ -1570,7 +1685,10 @@ class TemporalGraphEngine:
 
         for offset in range(batch_size):
             node = nodes[(start_idx + offset) % total_nodes]
-            self._prune_expired_alarm_periods(node, current_ts)
+            if self.use_alarm_period_cache:
+                self._prune_expired_alarm_periods(node, current_ts)
+            else:
+                self._prune_expired_raw_events_in_place(node, current_ts)
             self._prune_expired_trigger_index(node, current_ts)
 
         self._prune_cursor = (start_idx + batch_size) % max(total_nodes, 1)
@@ -2116,6 +2234,13 @@ class TemporalGraphEngine:
                         ev_enriched["time_str"] = datetime.fromtimestamp(ev["ts"]).strftime('%Y-%m-%d %H:%M:%S')
                         hit_event_id = ev.get("eid")
                         ev_enriched["eid_list"] = [hit_event_id] if hit_event_id not in (None, "") else []
+                        if not self.use_alarm_period_cache:
+                            alarm_key = hit_event_id
+                            if alarm_key in (None, ""):
+                                continue
+                            symp_dict[alarm_key] = ev_enriched
+                            continue
+
                         source_segment_key = (
                             ev.get("_segment_key")
                             or ev.get("eid")

@@ -524,6 +524,7 @@ def _build_group_output(
     site_to_ne_ids=None,
     ne_link_info_cache=None,
     compact_output=False,
+    include_eid_list=False,
 ):
     group_id = match.get("uuid", "")
     ne_info = {}
@@ -554,7 +555,6 @@ def _build_group_output(
 
         ne_alarms[ne_id].append({
             "alarm_id": representative_eid,
-            "alarm_id_list": eid_list,
             "alarm_type": symptom.get("alarm", ""),
             "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
             "alarm_clear_time": symptom.get("告警清除时间", ""),
@@ -565,6 +565,8 @@ def _build_group_output(
             "工单号": symptom.get("工单号", ""),
             "故障组ID": symptom.get("故障组ID", ""),
         })
+        if include_eid_list and eid_list:
+            ne_alarms[ne_id][-1]["alarm_id_list"] = eid_list
 
     group_ne_id_set = set(ne_alarms.keys())
     if site_to_ne_ids is None:
@@ -662,18 +664,20 @@ def _build_alarm_metadata_index(valid_alarms):
     return alarm_metadata_index
 
 
-def _enrich_match_symptoms(match, alarm_metadata_index):
+def _enrich_match_symptoms(match, alarm_metadata_index, include_eid_list=False):
     enriched_symptoms = []
     for symptom in match.get("symptoms", []):
         enriched_symptom = dict(symptom)
         for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts"):
             enriched_symptom.pop(internal_field, None)
+        if not include_eid_list:
+            enriched_symptom.pop("eid_list", None)
         eid_list = [
             event_id
             for event_id in (enriched_symptom.get("eid_list") or [])
             if event_id not in (None, "")
         ]
-        if eid_list:
+        if include_eid_list and eid_list:
             enriched_symptom["eid_list"] = eid_list
         event_id = enriched_symptom.get("eid", "") or (eid_list[0] if eid_list else "")
         if event_id and not enriched_symptom.get("eid"):
@@ -695,9 +699,14 @@ def _build_jsonl_match_output(
     site_to_ne_ids=None,
     ne_link_info_cache=None,
     compact_output=False,
+    include_eid_list=False,
 ):
     enriched_match = dict(match)
-    enriched_match["symptoms"] = _enrich_match_symptoms(match, alarm_metadata_index)
+    enriched_match["symptoms"] = _enrich_match_symptoms(
+        match,
+        alarm_metadata_index,
+        include_eid_list=include_eid_list,
+    )
 
     group_output = _build_group_output(
         enriched_match,
@@ -706,6 +715,7 @@ def _build_jsonl_match_output(
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
         compact_output=compact_output,
+        include_eid_list=include_eid_list,
     )
     timestamps = [symptom["ts"] for symptom in enriched_match.get("symptoms", []) if symptom.get("ts") is not None]
     group_anchor_ts = min(timestamps) if timestamps else None
@@ -1184,9 +1194,15 @@ def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engi
     )
     merge_stats = snapshot.get("merge_stats", {})
     if merge_stats:
+        primary_merge_count = (
+            merge_stats.get('alarm_overlap_merge_group_count', 0)
+            if snapshot.get("use_alarm_period_cache")
+            else merge_stats.get('eid_merge_group_count', 0)
+        )
+        primary_merge_label = "alarm_overlap" if snapshot.get("use_alarm_period_cache") else "eid"
         print(
             "   ↳ 批内合并统计: "
-            f"alarm_overlap={merge_stats.get('alarm_overlap_merge_group_count', 0)}, "
+            f"{primary_merge_label}={primary_merge_count}, "
             f"shared_site={merge_stats.get('shared_site_merge_group_count', 0)}, "
             f"hop={merge_stats.get('hop_merge_group_count', 0)}, "
             f"distance={merge_stats.get('distance_merge_group_count', 0)}"
@@ -1503,6 +1519,7 @@ def main():
     parser.add_argument('--sorted-alarms-input', type=str, default='', help='直接加载 prepare_sorted_alarms.py 生成的排序告警缓存(JSONL/ZIP)；若 alarms 本身是该缓存格式，也会自动识别')
     parser.add_argument('--sorted-alarms-output', type=str, default='', help='从原始告警加载并排序后，额外写出排序告警缓存；后缀为 .zip 时写压缩包，供后续快速加载')
     parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
+    parser.add_argument('--use-alarm-period-cache', action='store_true', help='可选：把 event_cache 切换为“设备告警时段”模式；默认关闭，保持旧版逐条活跃告警缓存逻辑')
     args = parser.parse_args()
 
     start_ts = None
@@ -1647,6 +1664,10 @@ def main():
 
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
     print(f"聚合等待时间: {args.aggregation_wait_sec:g} 秒")
+    print(
+        "event_cache 模式: "
+        + ("设备告警时段(period)" if args.use_alarm_period_cache else "逐条活跃告警(raw, 默认)")
+    )
     engine = TemporalGraphEngine(
         topo_downstream_map,
         rules_config,
@@ -1655,6 +1676,7 @@ def main():
         aggregation_wait_sec=args.aggregation_wait_sec,
         site_merge_helper=batch_site_merge_helper,
         site_chain_index=site_chain_index,
+        use_alarm_period_cache=args.use_alarm_period_cache,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
 
@@ -1757,6 +1779,7 @@ def main():
                         site_to_ne_ids=site_to_ne_ids,
                         ne_link_info_cache=ne_link_info_cache,
                         compact_output=args.compact_output,
+                        include_eid_list=args.use_alarm_period_cache,
                     )
                     output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
                 fw.writelines(output_lines)
@@ -1766,9 +1789,15 @@ def main():
 
     def _build_progress_extra_text():
         merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
+        primary_merge_count = (
+            merge_stats.get('alarm_overlap_merge_group_count', 0)
+            if args.use_alarm_period_cache
+            else merge_stats.get('eid_merge_group_count', 0)
+        )
+        primary_merge_label = "告警时段合并组数" if args.use_alarm_period_cache else "eid合并组数"
         return (
             f"已汇聚故障组数: {match_count} | "
-            f"告警时段合并组数: {merge_stats.get('alarm_overlap_merge_group_count', 0)} | "
+            f"{primary_merge_label}: {primary_merge_count} | "
             f"hop合并组数: {merge_stats.get('hop_merge_group_count', 0)} | "
             f"距离合并组数: {merge_stats.get('distance_merge_group_count', 0)}"
         )
@@ -1828,10 +1857,16 @@ def main():
 
     elapsed = time.time() - start_time
     final_merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
+    primary_merge_count = (
+        final_merge_stats.get('alarm_overlap_merge_group_count', 0)
+        if args.use_alarm_period_cache
+        else final_merge_stats.get('eid_merge_group_count', 0)
+    )
+    primary_merge_label = "告警时段合并组数" if args.use_alarm_period_cache else "eid合并组数"
     print(
         f"🏁 告警流处理完毕。共处理 {processed_count} 条告警，过滤后 {filtered_count} 条，"
         f"生成 {match_count} 个故障组，"
-        f"告警时段合并组数 {final_merge_stats.get('alarm_overlap_merge_group_count', 0)}，"
+        f"{primary_merge_label} {primary_merge_count}，"
         f"hop合并组数 {final_merge_stats.get('hop_merge_group_count', 0)}，"
         f"距离合并组数 {final_merge_stats.get('distance_merge_group_count', 0)}，"
         f"耗时 {elapsed:.4f} 秒。"
