@@ -230,16 +230,18 @@ def _build_group_output_from_alarms(group_id, alarm_list):
 
 def _symptom_merge_key(symptom):
     matched_role = _normalize_text(symptom.get("matched_role", ""))
+    ticket_id = _normalize_text(symptom.get("工单号", ""))
+    alarm_group_id = _normalize_text(symptom.get("故障组ID", ""))
     eid_list = tuple(
         eid for eid in (_normalize_text(x) for x in (symptom.get("eid_list") or []))
         if eid
     )
     if eid_list:
-        return ("eid_list", eid_list, matched_role)
+        return ("eid_list", eid_list, matched_role, ticket_id, alarm_group_id)
 
     eid = _normalize_text(symptom.get("eid", ""))
     if eid:
-        return ("eid", eid, matched_role)
+        return ("eid", eid, matched_role, ticket_id, alarm_group_id)
 
     return (
         "fallback",
@@ -248,22 +250,26 @@ def _symptom_merge_key(symptom):
         symptom.get("ts"),
         _normalize_text(symptom.get("alarm_source", "")),
         matched_role,
+        ticket_id,
+        alarm_group_id,
     )
 
 
 def _alarm_record_merge_key(alarm_record):
     matched_role = _normalize_text(alarm_record.get("matched_role", ""))
+    ticket_id = _normalize_text(alarm_record.get("工单号", ""))
+    alarm_group_id = _normalize_text(alarm_record.get("故障组ID", ""))
     alarm_id_list = tuple(
         alarm_id
         for alarm_id in (_normalize_text(x) for x in (alarm_record.get("alarm_id_list") or []))
         if alarm_id
     )
     if alarm_id_list:
-        return ("alarm_id_list", alarm_id_list, matched_role)
+        return ("alarm_id_list", alarm_id_list, matched_role, ticket_id, alarm_group_id)
 
     alarm_id = _normalize_text(alarm_record.get("alarm_id", ""))
     if alarm_id:
-        return ("alarm_id", alarm_id, matched_role)
+        return ("alarm_id", alarm_id, matched_role, ticket_id, alarm_group_id)
 
     return (
         "fallback",
@@ -271,6 +277,8 @@ def _alarm_record_merge_key(alarm_record):
         _normalize_text(alarm_record.get("alarm_time", "")),
         _normalize_text(alarm_record.get("site_id", "")),
         matched_role,
+        ticket_id,
+        alarm_group_id,
     )
 
 
@@ -343,6 +351,49 @@ def _merge_group_info(existing_group_info, incoming_group_info):
         target_meta["ne_list"] = sorted(
             set(target_meta.get("ne_list", [])) | set(group_meta.get("ne_list", []))
         )
+
+
+def _synchronize_primary_group_info(record):
+    match_info = record.get("match_info", {}) or {}
+    primary_group_id = _normalize_text(match_info.get("uuid", ""))
+    if not primary_group_id:
+        return
+
+    group_info = record.setdefault("group_info", {})
+    all_site_ids = set()
+    all_ne_ids = set()
+    for group_meta in group_info.values():
+        if not isinstance(group_meta, dict):
+            continue
+        all_site_ids.update(
+            _normalize_text(site_id)
+            for site_id in group_meta.get("site_list", [])
+            if _normalize_text(site_id)
+        )
+        all_ne_ids.update(
+            _normalize_text(ne_id)
+            for ne_id in group_meta.get("ne_list", [])
+            if _normalize_text(ne_id)
+        )
+
+    if not all_site_ids:
+        all_site_ids.update(
+            _normalize_text(symptom.get("node", ""))
+            for symptom in record.get("symptoms", [])
+            if isinstance(symptom, dict) and _normalize_text(symptom.get("node", ""))
+        )
+
+    if not all_ne_ids:
+        all_ne_ids.update(
+            _normalize_text(ne_id)
+            for ne_id in (record.get("ne_info", {}) or {}).keys()
+            if _normalize_text(ne_id)
+        )
+
+    group_info[primary_group_id] = {
+        "site_list": sorted(all_site_ids),
+        "ne_list": sorted(all_ne_ids),
+    }
 
 
 def _merge_match_info(base_record, incoming_record):
@@ -428,6 +479,7 @@ def _merge_match_group_records(base_record, incoming_record):
         incoming_record.get("ne_info", {}),
     )
     _merge_match_info(base_record, incoming_record)
+    _synchronize_primary_group_info(base_record)
     _recompute_group_anchor(base_record)
     return base_record
 
@@ -470,6 +522,7 @@ def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list):
         "group_id": alarm_group_id,
         "alarm_count": len(alarm_list),
     })
+    _synchronize_primary_group_info(record)
     _recompute_group_anchor(record)
     return record
 
