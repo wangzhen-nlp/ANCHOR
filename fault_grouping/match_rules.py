@@ -3,19 +3,16 @@ import os
 import time
 import threading
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from argparse import ArgumentParser
-from collections import defaultdict
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
 
     ensure_repo_root(1)
 
-from alarm_tools.alarm_inputs import (
-    stream_alarm_inputs,
-)
-from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
+from alarm_tools.alarm_types import POWER_ALARMS
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_DEVICE_COUNTS_JSON,
@@ -26,53 +23,108 @@ from topology_resources import (
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
 from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.reports import generate_incident_report
-from fault_grouping.rule_config import (
-    transmission_rule,
-    link_rule,
-    power_rule,
-    data_rule,
-    data_link_adjacent_no_offline_rule,
-    data_link_adjacent_offline_rule,
-    data_link_adjacent_link_rule,
-    data_no_offline_adjacent_optional_offline_rule,
-    data_offline_adjacent_offline_rule,
+from fault_grouping.match_rules_debug import (
+    build_debug_run_context as _build_debug_run_context,
+    format_debug_site_events as _format_debug_site_events,
+    format_debug_trigger_index as _format_debug_trigger_index,
+    match_debug_trigger as _match_debug_trigger,
+    parse_debug_targets as _parse_debug_targets,
+    print_debug_collection_snapshot as _print_debug_collection_snapshot,
+    print_debug_event_removal as _print_debug_event_removal,
+    print_debug_match_details as _print_debug_match_details,
+    print_debug_pending_items as _print_debug_pending_items,
+    print_debug_trigger_changes as _print_debug_trigger_changes,
 )
-from fault_grouping.site_merge_helper import (
-    AdaptiveDensitySiteMergeHelper,
-    BatchSiteMergeHelper,
+from fault_grouping.match_rules_alarm_io import (
+    is_clear_alarm as _is_clear_alarm,
 )
-from fault_grouping.sorted_alarm_cache import (
-    is_sorted_alarm_cache_file,
-    load_sorted_alarm_cache,
-    write_sorted_alarm_cache,
+from fault_grouping.match_rules_runtime import (
+    AlarmLoadResult,
+    LoadedStaticContext,
+    build_rules_config as _build_rules_config,
+    default_valid_alarm_titles as _default_valid_alarm_titles,
+    initialize_engine as _initialize_engine,
+    load_alarm_data as _load_alarm_data,
+    load_static_context as _load_static_context,
+    print_alarm_load_summary as _print_alarm_load_summary,
+    print_run_configuration as _print_run_configuration,
+    validate_main_args as _validate_main_args,
+    build_batch_site_merge_helper as _build_batch_site_merge_helper,
 )
 from fault_grouping.temporal_graph_engine import TemporalGraphEngine
-from fault_grouping.temporal_graph_engine_utils import get_match_alarm_keys
 
 
-def _parse_datetime_text(text, field_name="时间"):
-    text = str(text).strip()
-    if not text:
-        raise ValueError(f"{field_name}为空")
+@dataclass
+class MatchOutputSession:
+    args: object
+    engine: TemporalGraphEngine
+    output_path: str
+    ne_graph_data: dict
+    site_graph_data: dict
+    alarm_metadata_index: dict
+    site_to_ne_ids: dict
+    ne_link_info_cache: dict
+    match_count: int = 0
+    process_progress: object = None
+    output_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
+    def reset_output_file(self):
+        with open(self.output_path, 'w', encoding='utf-8'):
+            pass
 
-    try:
-        return datetime.fromisoformat(text.replace("T", " "))
-    except ValueError as exc:
-        raise ValueError(f"{field_name}格式无法解析: {text}") from exc
+    def build_progress_extra_text(self):
+        merge_stats = self.engine.get_batch_merge_stats_snapshot().get("total", {})
+        primary_merge_count = (
+            merge_stats.get('alarm_overlap_merge_group_count', 0)
+            if self.args.use_alarm_period_cache
+            else merge_stats.get('eid_merge_group_count', 0)
+        )
+        primary_merge_label = "告警时段合并组数" if self.args.use_alarm_period_cache else "eid合并组数"
+        return (
+            f"已汇聚故障组数: {self.match_count} | "
+            f"{primary_merge_label}: {primary_merge_count} | "
+            f"hop合并组数: {merge_stats.get('hop_merge_group_count', 0)} | "
+            f"距离合并组数: {merge_stats.get('distance_merge_group_count', 0)}"
+        )
+
+    def refresh_progress_extra_text(self, force=False):
+        if self.process_progress is None:
+            return
+        self.process_progress.set_extra_text(self.build_progress_extra_text(), force=force)
+
+    def write_matches(self, matches):
+        with self.output_lock:
+            with open(self.output_path, 'a', encoding='utf-8') as fw:
+                output_lines = []
+                for match in matches:
+                    if self.args.verbose_groups:
+                        generate_incident_report(match)
+                    enriched_match = _build_jsonl_match_output(
+                        match,
+                        self.ne_graph_data,
+                        self.site_graph_data,
+                        self.alarm_metadata_index,
+                        site_to_ne_ids=self.site_to_ne_ids,
+                        ne_link_info_cache=self.ne_link_info_cache,
+                        compact_output=self.args.compact_output,
+                        include_eid_list=self.args.use_alarm_period_cache,
+                    )
+                    output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
+                fw.writelines(output_lines)
+            self.match_count += len(matches)
+            self.refresh_progress_extra_text()
 
 
-def _is_clear_alarm(alarm):
-    clear_value = alarm.get("清除告警", None)
-    if clear_value is None:
-        return False
-
-    return str(clear_value).strip().lower() in {"是", "yes", "true", "1", "y"}
+@dataclass
+class RuntimeExecutionPlan:
+    static_context: LoadedStaticContext
+    rules_config: dict
+    engine: TemporalGraphEngine
+    alarm_load_result: AlarmLoadResult
+    alarm_metadata_index: dict
+    debug_targets: set
+    output_session: MatchOutputSession
+    start_time: float
 
 
 def _stream_alarms_by_ts(valid_alarms, speedup=1.0):
@@ -90,173 +142,6 @@ def _stream_alarms_by_ts(valid_alarms, speedup=1.0):
         previous_ts = current_ts
 
 
-def _append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_str, is_clear=False):
-    dt_obj = _parse_datetime_text(event_time_str, "告警时间")
-    event_alarm = dict(alarm)
-    event_alarm["告警首次发生时间"] = event_time_str
-    if is_clear:
-        event_alarm["清除告警"] = "是"
-
-    valid_alarms.append({
-        "alarm": event_alarm,
-        "site_id": site_id,
-        "alarm_source": alarm.get("告警源", ""),
-        "alarm_title": alarm_title,
-        "ts": dt_obj.timestamp()
-    })
-
-
-def _apply_clear_delay(first_occurrence_str, clear_time_str, clear_delay_sec):
-    first_occurrence_dt = _parse_datetime_text(first_occurrence_str, "告警首次发生时间")
-    clear_time_dt = _parse_datetime_text(clear_time_str, "告警清除时间")
-
-    actual_delay_sec = max(0.0, (clear_time_dt - first_occurrence_dt).total_seconds())
-    effective_delay_sec = max(float(clear_delay_sec), actual_delay_sec)
-    effective_clear_dt = first_occurrence_dt.fromtimestamp(
-        first_occurrence_dt.timestamp() + effective_delay_sec
-    )
-    return effective_clear_dt.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _load_valid_alarms(
-    alarm_file_path,
-    valid_alarm_titles,
-    valid_sites,
-    ne_to_site,
-    start_ts=None,
-    end_ts=None,
-    clear_delay_sec=0.0,
-):
-    processed_count = 0
-    valid_alarms = []
-    normal_alarm_count = 0
-    clear_alarm_count = 0
-
-    for alarm in stream_alarm_inputs(alarm_file_path, show_progress=True):
-        processed_count += 1
-
-        alarm_title = alarm.get('告警标题', '')
-        if alarm_title not in valid_alarm_titles:
-            continue
-
-        site_id = alarm.get('站点ID', '')
-        if not site_id or site_id not in valid_sites:
-            alarm_source = alarm.get('告警源', '')
-            site_id = ne_to_site.get(alarm_source, '')
-
-        if not site_id or site_id not in valid_sites:
-            continue
-
-        first_occurrence_str = str(alarm.get("告警首次发生时间", "")).strip()
-        first_occurrence_dt = _parse_datetime_text(first_occurrence_str, "告警首次发生时间")
-        first_occurrence_ts = first_occurrence_dt.timestamp()
-        if start_ts is not None and first_occurrence_ts < start_ts:
-            continue
-        if end_ts is not None and first_occurrence_ts > end_ts:
-            continue
-
-        _append_alarm_event(
-            valid_alarms,
-            alarm,
-            site_id,
-            alarm_title,
-            first_occurrence_str,
-            is_clear=False
-        )
-        normal_alarm_count += 1
-
-        clear_time_str = str(alarm.get("告警清除时间", "")).strip()
-        if clear_time_str:
-            effective_clear_time_str = _apply_clear_delay(
-                first_occurrence_str,
-                clear_time_str,
-                clear_delay_sec,
-            )
-            _append_alarm_event(
-                valid_alarms,
-                alarm,
-                site_id,
-                alarm_title,
-                effective_clear_time_str,
-                is_clear=True
-            )
-            clear_alarm_count += 1
-
-    return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
-
-
-def _trim_trailing_clear_alarms(valid_alarms):
-    """删除尾部仅由清除告警组成的区段。"""
-    last_non_clear_index = -1
-    for idx, item in enumerate(valid_alarms):
-        if not _is_clear_alarm(item.get("alarm", {})):
-            last_non_clear_index = idx
-
-    if last_non_clear_index < 0:
-        return []
-
-    return valid_alarms[: last_non_clear_index + 1]
-
-
-def _count_alarm_event_types(valid_alarms):
-    clear_alarm_count = sum(
-        1 for item in valid_alarms if _is_clear_alarm(item.get("alarm", {}))
-    )
-    return len(valid_alarms) - clear_alarm_count, clear_alarm_count
-
-
-def _load_sorted_alarm_cache(cache_path):
-    metadata, valid_alarms = load_sorted_alarm_cache(cache_path, show_progress=True)
-    normal_alarm_count = int(
-        metadata.get("cached_normal_alarm_count")
-        if metadata.get("cached_normal_alarm_count") is not None
-        else metadata.get("normal_alarm_count", 0)
-    )
-    clear_alarm_count = int(
-        metadata.get("cached_clear_alarm_count")
-        if metadata.get("cached_clear_alarm_count") is not None
-        else metadata.get("clear_alarm_count", 0)
-    )
-    if normal_alarm_count + clear_alarm_count != len(valid_alarms):
-        normal_alarm_count, clear_alarm_count = _count_alarm_event_types(valid_alarms)
-    processed_count = int(metadata.get("processed_count", len(valid_alarms)))
-    return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count, metadata
-
-
-def _warn_sorted_alarm_cache_option_mismatch(metadata, args):
-    if not metadata:
-        return
-
-    mismatches = []
-    expected_start_time = str(metadata.get("start_time", "") or "")
-    expected_end_time = str(metadata.get("end_time", "") or "")
-    expected_clear_delay = float(metadata.get("clear_delay_sec", 0.0) or 0.0)
-    expected_topo = str(metadata.get("topo", "") or "")
-    expected_ne_graph = str(metadata.get("ne_graph", "") or "")
-    current_topo = os.path.abspath(args.topo) if args.topo else ""
-    current_ne_graph = os.path.abspath(args.ne_graph)
-    if expected_topo and expected_topo != current_topo:
-        mismatches.append(f"topo: 缓存={expected_topo}, 当前={current_topo or '-'}")
-    if expected_ne_graph and expected_ne_graph != current_ne_graph:
-        mismatches.append(f"ne_graph: 缓存={expected_ne_graph}, 当前={current_ne_graph}")
-    if (args.start_time or "") != expected_start_time:
-        mismatches.append(f"start_time: 缓存={expected_start_time or '-'}, 当前={args.start_time or '-'}")
-    if (args.end_time or "") != expected_end_time:
-        mismatches.append(f"end_time: 缓存={expected_end_time or '-'}, 当前={args.end_time or '-'}")
-    if abs(float(args.clear_delay_sec) - expected_clear_delay) > 1e-9:
-        mismatches.append(
-            f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(args.clear_delay_sec):g}"
-        )
-
-    if mismatches:
-        print(
-            "⚠️ 排序告警缓存已预先应用过滤/清除延迟参数，当前参数与缓存元信息不一致："
-        )
-        for item in mismatches:
-            print(f"   - {item}")
-        print("   如需使用新参数，请重新生成排序告警缓存。")
-
-
 def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
     alarm = item["alarm"]
     return engine.process_event(
@@ -269,127 +154,6 @@ def _process_alarm(engine, item, collect_matches=False, register_trigger=True):
         collect_matches=collect_matches,
         register_trigger=register_trigger
     )
-
-
-def _extract_link_direction_values(link_meta):
-    if isinstance(link_meta, dict):
-        raw_values = link_meta.values()
-    elif isinstance(link_meta, (list, tuple, set)):
-        raw_values = link_meta
-    else:
-        raw_values = [link_meta]
-
-    direction_values = set()
-    for raw_value in raw_values:
-        text = str(raw_value).strip()
-        if text:
-            direction_values.add(text)
-    return direction_values
-
-
-def _build_site_topology_from_ne_graph(ne_graph_data):
-    """基于 ne_graph 原始连边构建站点级 downstream 拓扑。
-
-    约定：
-    - extract_ne_graph.py 中 a_end 表示下行设备，z_end 表示上行设备
-    - 因此 source -> target 里如果当前 source 侧记录的是:
-      - '<-' : source 是上行，target 是下行，记作 source_site -> target_site
-      - '->' : source 是下行，target 是上行，记作 target_site -> source_site
-      - '<->': 两个方向都保留
-    """
-    ne_to_site = {}
-    all_sites = set()
-
-    for ne_id, ne_info in ne_graph_data.items():
-        site_id = str(ne_info.get("site_id", "")).strip()
-        if not site_id:
-            continue
-        ne_to_site[ne_id] = site_id
-        all_sites.add(site_id)
-
-    topo_downstream_map = defaultdict(set)
-    for site_id in all_sites:
-        topo_downstream_map[site_id]
-
-    for source_ne, source_info in ne_graph_data.items():
-        source_site = ne_to_site.get(source_ne)
-        if not source_site:
-            continue
-
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-
-        for target_ne, link_meta in raw_links.items():
-            target_site = ne_to_site.get(target_ne)
-            if not target_site or target_site == source_site:
-                continue
-
-            direction_values = _extract_link_direction_values(link_meta)
-            if not direction_values:
-                continue
-
-            if any("<-" in direction for direction in direction_values):
-                topo_downstream_map[source_site].add(target_site)
-            if any("->" in direction for direction in direction_values):
-                topo_downstream_map[target_site].add(source_site)
-
-    return {
-        site_id: sorted(neighbor_sites)
-        for site_id, neighbor_sites in topo_downstream_map.items()
-    }, all_sites
-
-
-def _normalize_site_chain_hops(raw_hops):
-    if not isinstance(raw_hops, dict):
-        return {}
-
-    normalized = {}
-    for raw_site_id, raw_hop in raw_hops.items():
-        site_id = str(raw_site_id or "").strip()
-        if not site_id:
-            continue
-        try:
-            hop = int(raw_hop)
-        except (TypeError, ValueError):
-            continue
-        if hop <= 0:
-            continue
-        normalized[site_id] = hop
-    return normalized
-
-
-def _load_site_chain_index(site_chains_path):
-    """加载 generate_site_chains.py 产出的预计算上下游 hop 索引。"""
-    data = json.load(open(site_chains_path, 'r', encoding='utf-8'))
-    raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
-    site_chain_index = {}
-    valid_sites = set()
-
-    for raw_site_id, raw_info in raw_sites.items():
-        site_id = str(raw_site_id or "").strip()
-        if not site_id or not isinstance(raw_info, dict):
-            continue
-
-        downstream_hops = _normalize_site_chain_hops(raw_info.get("downstream_site_hops"))
-        upstream_hops = _normalize_site_chain_hops(raw_info.get("upstream_site_hops"))
-        bidirectional_sites = {
-            str(neighbor_site or "").strip()
-            for neighbor_site in raw_info.get("bidirectional_sites", [])
-            if str(neighbor_site or "").strip()
-        }
-
-        site_chain_index[site_id] = {
-            "downstream_site_hops": downstream_hops,
-            "upstream_site_hops": upstream_hops,
-            "bidirectional_sites": bidirectional_sites,
-        }
-        valid_sites.add(site_id)
-        valid_sites.update(downstream_hops)
-        valid_sites.update(upstream_hops)
-        valid_sites.update(bidirectional_sites)
-
-    return site_chain_index, valid_sites
 
 
 def _build_simulated_now_ts_getter(valid_alarms, speedup):
@@ -405,21 +169,6 @@ def _build_simulated_now_ts_getter(valid_alarms, speedup):
         return simulated_start_ts + elapsed_real_sec * speedup
 
     return get_now_ts
-
-
-def _build_site_to_ne_ids(ne_graph_data):
-    site_to_ne_ids = defaultdict(list)
-    for ne_id, ne_info in ne_graph_data.items():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = str(ne_info.get("site_id", "")).strip()
-        if not site_id:
-            continue
-        site_to_ne_ids[site_id].append(ne_id)
-    return {
-        site_id: tuple(sorted(ne_ids))
-        for site_id, ne_ids in site_to_ne_ids.items()
-    }
 
 
 def _format_ne_link_info(ne_graph_entry, compact_output=False):
@@ -729,37 +478,6 @@ def _build_jsonl_match_output(
     return enriched_match
 
 
-def _match_debug_trigger(match, debug_targets, rules_config):
-    merged_rules = match.get("merged_rules", [match.get("rule")])
-    trigger_roles = {
-        rules_config[rule_name]["trigger_role"]
-        for rule_name in merged_rules
-        if rule_name in rules_config and rules_config[rule_name].get("trigger_role")
-    }
-    for symptom in match.get("symptoms", []):
-        target = (symptom.get("node"), symptom.get("alarm"))
-        if target not in debug_targets:
-            continue
-        if symptom.get("matched_role") in trigger_roles:
-            return True
-    return False
-
-
-def _build_match_time_range(match):
-    timestamps = sorted(
-        symptom["ts"]
-        for symptom in match.get("symptoms", [])
-        if symptom.get("ts") is not None
-    )
-    if not timestamps:
-        return "-"
-
-    def format_ts(ts):
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-    return f"{format_ts(timestamps[0])} ~ {format_ts(timestamps[-1])}"
-
-
 def _is_debug_trigger_item(item, debug_targets):
     return (
         (item.get("site_id"), item.get("alarm_title")) in debug_targets
@@ -767,500 +485,140 @@ def _is_debug_trigger_item(item, debug_targets):
     )
 
 
-def _parse_debug_targets(args):
-    debug_targets = set()
-
-    for raw_value in args.debug_trigger or []:
-        if "::" not in raw_value:
-            raise ValueError(f"无效的 --debug-trigger 参数: {raw_value}，应为 站点ID::告警名")
-        site_id, alarm_name = raw_value.split("::", 1)
-        site_id = site_id.strip()
-        alarm_name = alarm_name.strip()
-        if not site_id or not alarm_name:
-            raise ValueError(f"无效的 --debug-trigger 参数: {raw_value}，站点ID和告警名都不能为空")
-        debug_targets.add((site_id, alarm_name))
-
-    return debug_targets
+def _is_debug_site_power_alarm(item, debug_sites):
+    return (
+        item.get("site_id") in debug_sites
+        and item.get("alarm_title") in POWER_ALARMS
+        and not _is_clear_alarm(item.get("alarm", {}))
+    )
 
 
-def _parse_selected_rule_names(raw_values, available_rule_names):
-    if not raw_values:
-        return []
-
-    selected_rule_names = []
-    seen_rule_names = set()
-    available_rule_name_set = set(available_rule_names)
-
-    for raw_value in raw_values:
-        for part in str(raw_value).replace("，", ",").split(","):
-            rule_name = part.strip()
-            if not rule_name or rule_name in seen_rule_names:
-                continue
-            if rule_name not in available_rule_name_set:
-                raise ValueError(
-                    f"未知规则名: {rule_name}；可选值: {', '.join(sorted(available_rule_name_set))}"
-                )
-            seen_rule_names.add(rule_name)
-            selected_rule_names.append(rule_name)
-
-    return selected_rule_names
+def _is_debug_site_clear(item, debug_sites):
+    return (
+        item.get("site_id") in debug_sites
+        and _is_clear_alarm(item.get("alarm", {}))
+    )
 
 
-def _format_debug_site_events(engine, site_id, limit=50):
-    with engine._lock:
-        site_events = list(engine.event_cache.get(site_id, []))
+def _get_debug_item_kind(item, debug_context):
+    if _is_debug_trigger_item(item, debug_context.debug_targets):
+        return "trigger"
+    if _is_debug_site_power_alarm(item, debug_context.debug_sites):
+        return "power"
+    if _is_debug_site_clear(item, debug_context.debug_sites):
+        return "clear"
+    return None
 
-    events = site_events[-limit:]
-    if not events:
-        return json.dumps({"total": 0, "events": []}, ensure_ascii=False)
 
-    formatted = []
-    for cached_event in events:
-        if isinstance(cached_event, dict):
-            ts = cached_event.get("ts")
-            eid = cached_event.get("eid")
-            alarm_type = cached_event.get("alarm")
-            alarm_source = cached_event.get("alarm_source", "")
-            consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
-        else:
-            ts, eid, alarm_type, alarm_source, consumed_trigger_rules = cached_event
-        formatted.append(
-            {
-                "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-                "eid": eid,
-                "alarm": alarm_type,
-                "source": alarm_source,
-                "consumed_trigger_rules": sorted(consumed_trigger_rules),
-            }
+def _print_debug_item_state(engine, item, item_kind, matches=None):
+    debug_site = item.get("site_id", "")
+    debug_alarm = item.get("alarm_title", "")
+    debug_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+    debug_eid = item['alarm'].get('告警编码ID', '')
+
+    if item_kind == "trigger":
+        print(
+            f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
         )
-    return json.dumps({"total": len(site_events), "events": formatted}, ensure_ascii=False)
+        print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+        print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+        _print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
+        if matches is not None and not matches:
+            print("   ↳ 当前触发点暂未产出故障组")
+        return
+
+    if item_kind == "power":
+        print(
+            f"⚡ 电告警进入缓存: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
+        )
+        print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+        return
+
+    if item_kind == "clear":
+        print(
+            f"🧹 清除告警输入: site={debug_site}, alarm={debug_alarm}, "
+            f"time={debug_time}, eid={debug_eid}"
+        )
+        print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
+        print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
+        _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
 
 
-def _format_debug_trigger_index(engine, site_id):
-    entries = _snapshot_debug_trigger_index(engine, site_id)
-    return json.dumps(entries, ensure_ascii=False)
+def _refresh_process_progress(process_progress):
+    if hasattr(process_progress, "_refresh_extra_text"):
+        process_progress._refresh_extra_text()
+    process_progress.update()
 
 
-def _snapshot_debug_trigger_index(engine, site_id):
-    with engine._lock:
-        trigger_specs = tuple(engine.trigger_specs_by_node.get(site_id, ()))
-        trigger_index_snapshot = {
-            rule_name: list(engine.trigger_event_index.get((site_id, rule_name), ()))
-            for rule_name, _ in trigger_specs
-        }
-
-    entries = {}
-    for rule_name, _ in trigger_specs:
-        trigger_events = trigger_index_snapshot.get(rule_name, [])
-        if not trigger_events:
-            continue
-        entries[rule_name] = [
-            {
-                "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-                "eid": eid,
-                "seq": seq,
-                "alarm": alarm_type,
-            }
-            for ts, eid, seq, alarm_type in trigger_events
+def _build_debug_match_callback(on_matches, debug_targets, rules_config):
+    def on_debug_matches(matches, source="收割"):
+        debug_matches = [
+            match for match in matches
+            if _match_debug_trigger(match, debug_targets, rules_config)
         ]
-    return entries
+        if debug_matches:
+            print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
+            for match in debug_matches:
+                _print_debug_match_details(match)
+        on_matches(matches)
+
+    return on_debug_matches
 
 
-def _print_debug_trigger_changes(engine, debug_sites, previous_snapshots, header, harvest_snapshot=None):
-    changed_items = []
-    for site_id in sorted(debug_sites):
-        current_snapshot = _snapshot_debug_trigger_index(engine, site_id)
-        previous_snapshot = previous_snapshots.get(site_id, {})
-        if current_snapshot == previous_snapshot:
-            continue
-        changed_items.append((site_id, previous_snapshot, current_snapshot))
-
-    if not changed_items:
-        return False
-
-    if harvest_snapshot is not None:
-        _print_debug_harvest_actions(harvest_snapshot, engine)
-
-    for site_id, previous_snapshot, current_snapshot in changed_items:
-        print(f"{header}[{site_id}]")
-        print(f"   ↳ 变化前: {json.dumps(previous_snapshot, ensure_ascii=False)}")
-        print(f"   ↳ 变化后: {json.dumps(current_snapshot, ensure_ascii=False)}")
-        previous_snapshots[site_id] = current_snapshot
-    return True
-
-
-def _get_debug_match_alarm_keys(match):
-    return get_match_alarm_keys(match)
-
-
-def _match_present_in_stage(raw_match, stage_matches):
-    raw_alarm_keys = _get_debug_match_alarm_keys(raw_match)
-    if not raw_alarm_keys:
-        return False
-    for stage_match in stage_matches:
-        stage_alarm_keys = _get_debug_match_alarm_keys(stage_match)
-        if raw_alarm_keys.issubset(stage_alarm_keys):
-            return True
-    return False
-
-
-def _print_debug_harvest_actions(snapshot, engine):
-    mature_items = list(snapshot.get("mature_items", []))
-    finalize_profiles = list(snapshot.get("finalize_profiles", []))
-    profiles = {
-        (profile.get("node"), profile.get("rule"), profile.get("trigger_ts"), profile.get("trigger_seq")): profile
-        for profile in snapshot.get("pending_eval_profiles", [])
-    }
-    if not mature_items:
-        return
-
-    print("🔍 本次收割动作")
-    print(
-        "   ↳ 收割概览: "
-        f"mature={len(mature_items)}, "
-        f"raw={len(snapshot.get('raw_matches', []))}, "
-        f"batch_merged={len(snapshot.get('batch_merged_matches', []))}, "
-        f"expanded={len(snapshot.get('expanded_matches', []))}, "
-        f"finalized={len(snapshot.get('finalized_matches', []))}"
-    )
-    for idx, item in enumerate(mature_items, start=1):
-        site_id = item.get("node", "")
-        rule_name = item.get("rule", "")
-        trigger_ts = item.get("trigger_ts")
-        trigger_seq = item.get("trigger_seq")
-        trigger_time = (
-            datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S")
-            if trigger_ts is not None else "-"
+def _run_debug_live_loop(
+    engine,
+    valid_alarms,
+    speedup,
+    process_progress,
+    debug_context,
+):
+    for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
+        item_kind = _get_debug_item_kind(item, debug_context)
+        _process_alarm(
+            engine,
+            item,
+            collect_matches=False,
+            register_trigger=True
         )
-        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, (trigger_ts, trigger_seq))
-        profile = profiles.get((site_id, rule_name, trigger_ts, trigger_seq), {})
-        raw_match_count = profile.get("raw_match_count", 0)
-        print(
-            f"   ↳ [{idx}] mature_trigger: "
-            f"site={site_id}, rule={rule_name}, alarm={trigger_detail.get('alarm', '')}, "
-            f"eid={trigger_detail.get('eid', '')}, trigger_time={trigger_time}, "
-            f"trigger_seq={trigger_seq}, raw_match_count={raw_match_count}"
+        _print_debug_trigger_changes(
+            engine,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
+            "🔁 告警处理后关注站点 trigger 变化",
         )
-        if raw_match_count == 0:
-            debug_trace = profile.get("debug_trace") or {}
-            final_reason = debug_trace.get("final_reason", "")
-            if final_reason:
-                print(f"      未产出原始候选组原因: {final_reason}")
-            else:
-                print(
-                    "      未产出原始候选组，但未拿到 evaluate_rule 的 final_reason；"
-                    " 这更像是 debug 记录异常，而不是规则正常行为"
-                )
-        else:
-            print("      该 mature trigger 已产出原始候选组")
-            raw_matches = profile.get("raw_matches", [])
-            for raw_idx, raw_match in enumerate(raw_matches[:3], start=1):
-                present_in_batch = _match_present_in_stage(raw_match, snapshot.get("batch_merged_matches", []))
-                present_in_expanded = _match_present_in_stage(raw_match, snapshot.get("expanded_matches", []))
-                present_in_finalized = _match_present_in_stage(raw_match, snapshot.get("finalized_matches", []))
-                print(
-                    f"      raw_match[{raw_idx}] 去向: "
-                    f"batch_merged={present_in_batch}, "
-                    f"expanded={present_in_expanded}, "
-                    f"finalized={present_in_finalized}"
-                )
-                _print_debug_match_details(raw_match)
+        if item_kind is not None:
+            _print_debug_item_state(engine, item, item_kind)
+        _refresh_process_progress(process_progress)
 
-    if finalize_profiles:
-        print("   ↳ finalize 结果")
-        for idx, profile in enumerate(finalize_profiles, start=1):
-            print(
-                f"      [{idx}] action={profile.get('action', '')}, "
-                f"rule={profile.get('rule', '')}, "
-                f"uuid={profile.get('uuid', '')}, "
-                f"merged_group_count={profile.get('merged_group_count', 0)}, "
-                f"related_group_uuids={profile.get('related_group_uuids', [])}"
-            )
-            reason = profile.get("reason", "")
-            if reason == "suppressed_by_fully_containing_history":
-                print("         - 最终未输出：当前候选组的告警时段已被历史故障组完全覆盖，只延长历史组停留时间")
-            elif reason == "merged_with_related_history":
-                print("         - 最终输出：与历史相关组做了合并后重新输出")
-            elif reason == "no_related_history":
-                print("         - 最终输出：没有命中任何历史相关组")
-            elif reason == "no_alarm_keys":
-                print("         - 最终阶段异常：候选组没有可用告警时段键，无法做历史合并判断")
 
-    if snapshot.get("finalized_matches"):
-        print(
-            "   ↳ 提示: 本次收割进入了 finalize 阶段，后续会执行 "
-            "_prune_consumed_alarm_history -> _prune_node_alarm_history_before -> "
-            "_refresh_pending_triggers_for_node，"
-            "关注站点 trigger 的变化可能来自这里，而不一定是某个 mature trigger 未产出原始候选组"
+def _run_debug_offline_loop(
+    engine,
+    valid_alarms,
+    process_progress,
+    debug_context,
+    on_debug_matches,
+):
+    for item in valid_alarms:
+        item_kind = _get_debug_item_kind(item, debug_context)
+        matches = _process_alarm(
+            engine,
+            item,
+            collect_matches=True,
+            register_trigger=True
         )
-
-
-def _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
-    trigger_ts, trigger_seq = trigger_anchor
-    with engine._lock:
-        trigger_events = list(engine.trigger_event_index.get((site_id, rule_name), ()))
-
-    for event_ts, event_id, event_seq, alarm_type in trigger_events:
-        if event_ts == trigger_ts and event_seq == trigger_seq:
-            return {
-                "alarm": alarm_type,
-                "eid": event_id,
-                "seq": event_seq,
-            }
-    return {
-        "alarm": "",
-        "eid": "",
-        "seq": trigger_seq,
-    }
-
-
-def _format_debug_pending(engine, site_id):
-    with engine._lock:
-        pending_items = [
-            ((node, rule_name), trigger_anchor)
-            for (node, rule_name), trigger_anchor in engine.pending_triggers.items()
-            if node == site_id
-        ]
-
-    pending = {}
-    for (_node, rule_name), trigger_anchor in pending_items:
-        trigger_ts, trigger_seq = trigger_anchor
-        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor)
-        pending[rule_name] = {
-            "site": site_id,
-            "alarm": trigger_detail["alarm"],
-            "eid": trigger_detail["eid"],
-            "trigger_time": datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S"),
-            "trigger_seq": trigger_detail["seq"],
-            "ready_time": datetime.fromtimestamp(trigger_ts + engine.aggregation_wait_sec).strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    return json.dumps(pending, ensure_ascii=False)
-
-
-def _print_debug_pending_items(engine, site_id, header):
-    with engine._lock:
-        pending_items = [
-            ((node, rule_name), trigger_anchor)
-            for (node, rule_name), trigger_anchor in engine.pending_triggers.items()
-            if node == site_id
-        ]
-
-    if not pending_items:
-        print(f"{header}: 0 个")
-        return
-
-    print(f"{header}: {len(pending_items)} 个")
-    for idx, ((_node, rule_name), trigger_anchor) in enumerate(pending_items, start=1):
-        trigger_ts, _trigger_seq = trigger_anchor
-        trigger_detail = _find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor)
-        print(
-            f"      [{idx}] pending: "
-            f"site={site_id}, "
-            f"rule={rule_name}, "
-            f"alarm={trigger_detail['alarm']}, "
-            f"eid={trigger_detail['eid']}, "
-            f"trigger_time={datetime.fromtimestamp(trigger_ts).strftime('%Y-%m-%d %H:%M:%S')}, "
-            f"trigger_seq={trigger_detail['seq']}, "
-            f"ready_time={datetime.fromtimestamp(trigger_ts + engine.aggregation_wait_sec).strftime('%Y-%m-%d %H:%M:%S')}"
+        _print_debug_trigger_changes(
+            engine,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
+            "🔁 告警处理后关注站点 trigger 变化",
         )
-
-
-def _print_debug_match_details(match):
-    print(
-        "   ↳ 命中故障组: "
-        f"uuid={match.get('uuid', '')}, "
-        f"rules={'+'.join(match.get('merged_rules', [match.get('rule', '')]))}, "
-        f"time_range={_build_match_time_range(match)}"
-    )
-    print(f"      inferred_roots={json.dumps(match.get('inferred_roots', {}), ensure_ascii=False)}")
-    print(f"      role_mapping={json.dumps(match.get('role_mapping', {}), ensure_ascii=False)}")
-    symptom_preview = [
-        {
-            "time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "-",
-            "node": symptom.get("node", ""),
-            "alarm": symptom.get("alarm", ""),
-            "matched_role": symptom.get("matched_role", ""),
-            "eid": symptom.get("eid", ""),
-        }
-        for symptom in sorted(
-            match.get("symptoms", []),
-            key=lambda symptom: (symptom.get("ts", float("inf")), symptom.get("eid", ""))
-        )
-    ]
-    print(f"      symptoms={json.dumps(symptom_preview, ensure_ascii=False)}")
-
-
-def _print_debug_post_batch_state(engine, debug_sites):
-    for site_id in sorted(debug_sites):
-        print(f"   ↳ 本批完成后站点状态[{site_id}]")
-        print(f"      event_cache={_format_debug_site_events(engine, site_id)}")
-        print(f"      trigger_index={_format_debug_trigger_index(engine, site_id)}")
-        _print_debug_pending_items(engine, site_id, "      pending")
-
-
-def _print_debug_pending_eval_profiles(snapshot, debug_sites):
-    profiles = [
-        profile
-        for profile in snapshot.get("pending_eval_profiles", [])
-        if profile.get("node") in debug_sites
-    ]
-    if not profiles:
-        return
-
-    def print_debug_trace(trace):
-        if not trace:
-            return
-        trigger_validation = trace.get("trigger_validation") or {}
-        if trigger_validation:
-            print(
-                "      trigger校验: "
-                f"{'通过' if trigger_validation.get('valid') else '失败'}; "
-                f"{trigger_validation.get('reason', '')}"
-            )
-        for edge_trace in trace.get("edges", []):
-            print(
-                f"      边 {edge_trace.get('from_role')} -> {edge_trace.get('to_role')}: "
-                f"instances_in={edge_trace.get('instances_in', 0)}, "
-                f"instances_out={edge_trace.get('instances_out', 0)}"
-            )
-            for failure in edge_trace.get("failures", [])[:5]:
-                print(f"         - {failure}")
-        if trace.get("final_reason"):
-            print(f"      最终失败原因: {trace.get('final_reason')}")
-
-    for idx, profile in enumerate(profiles, start=1):
-        trigger_ts = profile.get("trigger_ts")
-        trigger_time = (
-            datetime.fromtimestamp(trigger_ts).strftime("%Y-%m-%d %H:%M:%S")
-            if trigger_ts is not None else "-"
-        )
-        print(
-            f"   ↳ [{idx}] pending 弹出后: "
-            f"site={profile.get('node', '')}, "
-            f"rule={profile.get('rule', '')}, "
-            f"trigger_time={trigger_time}, "
-            f"trigger_seq={profile.get('trigger_seq', '')}"
-        )
-        print(f"      evaluate_rule 原始候选组数: {profile.get('raw_match_count', 0)}")
-        raw_matches = profile.get("raw_matches", [])
-        if not raw_matches:
-            print("      ↳ 未产出原始候选组")
-            print_debug_trace(profile.get("debug_trace"))
-            continue
-        for match in raw_matches:
-            _print_debug_match_details(match)
-
-
-def _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine):
-    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
-    raw_debug_matches = [
-        match for match in snapshot.get("raw_matches", [])
-        if _match_debug_trigger(match, debug_targets, rules_config)
-    ]
-    batch_debug_matches = [
-        match for match in snapshot.get("batch_merged_matches", [])
-        if _match_debug_trigger(match, debug_targets, rules_config)
-    ]
-    finalized_debug_matches = [
-        match for match in snapshot.get("finalized_matches", [])
-        if _match_debug_trigger(match, debug_targets, rules_config)
-    ]
-    expanded_debug_matches = [
-        match for match in snapshot.get("expanded_matches", [])
-        if _match_debug_trigger(match, debug_targets, rules_config)
-    ]
-    mature_triggers = [
-        item for item in snapshot.get("mature_items", [])
-        if item.get("node") in debug_sites
-    ]
-
-    if not mature_triggers and not raw_debug_matches and not batch_debug_matches and not finalized_debug_matches and not expanded_debug_matches:
-        return
-
-    watermark = snapshot.get("watermark")
-    watermark_str = (
-        datetime.fromtimestamp(watermark).strftime("%Y-%m-%d %H:%M:%S")
-        if watermark is not None else "-"
-    )
-    effective_harvest_ts = snapshot.get("effective_harvest_ts")
-    effective_harvest_str = (
-        datetime.fromtimestamp(effective_harvest_ts).strftime("%Y-%m-%d %H:%M:%S")
-        if effective_harvest_ts is not None else "-"
-    )
-    print(
-        f"🔎 收割阶段快照: watermark={watermark_str}, "
-        f"effective_harvest_ts={effective_harvest_str}, "
-        f"force={snapshot.get('force', False)}"
-    )
-    merge_stats = snapshot.get("merge_stats", {})
-    if merge_stats:
-        primary_merge_count = (
-            merge_stats.get('alarm_overlap_merge_group_count', 0)
-            if snapshot.get("use_alarm_period_cache")
-            else merge_stats.get('eid_merge_group_count', 0)
-        )
-        primary_merge_label = "alarm_overlap" if snapshot.get("use_alarm_period_cache") else "eid"
-        print(
-            "   ↳ 批内合并统计: "
-            f"{primary_merge_label}={primary_merge_count}, "
-            f"shared_site={merge_stats.get('shared_site_merge_group_count', 0)}, "
-            f"hop={merge_stats.get('hop_merge_group_count', 0)}, "
-            f"distance={merge_stats.get('distance_merge_group_count', 0)}"
-        )
-    if mature_triggers:
-        mature_preview = [
-            {
-                "node": item.get("node", ""),
-                "rule": item.get("rule", ""),
-                "trigger_time": datetime.fromtimestamp(item["trigger_ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                if item.get("trigger_ts") is not None else "-",
-                "trigger_seq": item.get("trigger_seq", ""),
-            }
-            for item in mature_triggers
-        ]
-        print(f"   ↳ 本轮成熟 trigger: {json.dumps(mature_preview, ensure_ascii=False)}")
-        _print_debug_pending_eval_profiles(snapshot, debug_sites)
-
-    stage_mapping = (
-        ("原始候选组", raw_debug_matches),
-        ("当前批次合并后", batch_debug_matches),
-        ("pending 扩充后", expanded_debug_matches),
-        ("历史组合并后", finalized_debug_matches),
-    )
-    for stage_name, stage_matches in stage_mapping:
-        print(f"   ↳ {stage_name}: {len(stage_matches)} 个相关故障组")
-        for match in stage_matches:
-            _print_debug_match_details(match)
-
-    _print_debug_post_batch_state(engine, debug_sites)
-
-
-def _print_debug_event_removal(payload, debug_sites):
-    node = payload.get("node")
-    if node not in debug_sites:
-        return
-
-    removed_time = payload.get("ts")
-    removed_time_str = (
-        datetime.fromtimestamp(removed_time).strftime("%Y-%m-%d %H:%M:%S")
-        if removed_time is not None else "-"
-    )
-    if payload.get("reason") == "ttl":
-        current_ts = payload.get("current_ts")
-        current_time_str = (
-            datetime.fromtimestamp(current_ts).strftime("%Y-%m-%d %H:%M:%S")
-            if current_ts is not None else "-"
-        )
-        print(
-            f"🗑️ 事件移出缓存(TTL): site={node}, alarm={payload.get('alarm_type', '')}, "
-            f"time={removed_time_str}, eid={payload.get('event_id', '')}, current_time={current_time_str}"
-        )
-    elif payload.get("reason") == "clear":
-        print(
-            f"🗑️ 事件移出缓存(清除): site={node}, alarm={payload.get('alarm_type', '')}, "
-            f"time={removed_time_str}, eid={payload.get('event_id', '')}, "
-            f"cleared_event_id={payload.get('cleared_event_id', '')}"
-        )
+        if item_kind is not None:
+            _print_debug_item_state(engine, item, item_kind, matches=matches)
+        if matches:
+            on_debug_matches(matches, "同步检查")
+        _refresh_process_progress(process_progress)
 
 
 def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_matches, process_progress):
@@ -1280,9 +638,7 @@ def _run_live_mode(engine, valid_alarms, speedup, real_harvest_interval_sec, on_
     try:
         for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
             _process_alarm(engine, item, collect_matches=False)
-            if hasattr(process_progress, "_refresh_extra_text"):
-                process_progress._refresh_extra_text()
-            process_progress.update()
+            _refresh_process_progress(process_progress)
     finally:
         process_progress.close()
         engine.stop_periodic_harvest()
@@ -1296,9 +652,7 @@ def _run_offline_mode(engine, valid_alarms, on_matches, process_progress):
             matches = _process_alarm(engine, item, collect_matches=True)
             if matches:
                 on_matches(matches)
-            if hasattr(process_progress, "_refresh_extra_text"):
-                process_progress._refresh_extra_text()
-            process_progress.update()
+            _refresh_process_progress(process_progress)
     finally:
         process_progress.close()
 
@@ -1320,35 +674,21 @@ def _run_debug_mode(
         f"🔎 Debug 模式({mode}): 观察 {debug_target_text}，"
         "所有 trigger 仍按原始逻辑正常运行"
     )
-    debug_sites = {site_id for site_id, _alarm_name in debug_targets}
-    last_trigger_snapshots = {
-        site_id: _snapshot_debug_trigger_index(engine, site_id)
-        for site_id in debug_sites
-    }
+    debug_context = _build_debug_run_context(engine, debug_targets)
 
     def on_debug_snapshot(snapshot):
         _print_debug_collection_snapshot(snapshot, debug_targets, rules_config, engine)
         _print_debug_trigger_changes(
             engine,
-            debug_sites,
-            last_trigger_snapshots,
+            debug_context.debug_sites,
+            debug_context.last_trigger_snapshots,
             "🔁 收割后关注站点 trigger 变化",
             harvest_snapshot=snapshot,
         )
 
     engine.debug_observer = on_debug_snapshot
-    engine.debug_event_logger = lambda payload: _print_debug_event_removal(payload, debug_sites)
-
-    def on_debug_matches(matches, source="收割"):
-        debug_matches = [
-            match for match in matches
-            if _match_debug_trigger(match, debug_targets, rules_config)
-        ]
-        if debug_matches:
-            print(f"🔎 {source}命中 {len(debug_matches)} 个故障组")
-            for match in debug_matches:
-                _print_debug_match_details(match)
-        on_matches(matches)
+    engine.debug_event_logger = lambda payload: _print_debug_event_removal(payload, debug_context.debug_sites)
+    on_debug_matches = _build_debug_match_callback(on_matches, debug_targets, rules_config)
 
     if mode == 'live':
         now_ts_getter = _build_simulated_now_ts_getter(valid_alarms, speedup)
@@ -1358,63 +698,13 @@ def _run_debug_mode(
             now_ts_getter=now_ts_getter
         )
         try:
-            for item in _stream_alarms_by_ts(valid_alarms, speedup=speedup):
-                is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
-                is_debug_site_power_alarm = (
-                    item.get("site_id") in debug_sites
-                    and item.get("alarm_title") in POWER_ALARMS
-                    and not _is_clear_alarm(item.get("alarm", {}))
-                )
-                is_debug_site_clear = (
-                    item.get("site_id") in debug_sites
-                    and _is_clear_alarm(item.get("alarm", {}))
-                )
-                _process_alarm(
-                    engine,
-                    item,
-                    collect_matches=False,
-                    register_trigger=True
-                )
-                _print_debug_trigger_changes(
-                    engine,
-                    debug_sites,
-                    last_trigger_snapshots,
-                    "🔁 告警处理后关注站点 trigger 变化",
-                )
-                if is_debug_trigger:
-                    debug_site = item.get("site_id", "")
-                    debug_alarm = item.get("alarm_title", "")
-                    trigger_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                    print(
-                        f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
-                        f"time={trigger_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                    )
-                    print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-                    print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                    _print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
-                elif is_debug_site_power_alarm:
-                    debug_site = item.get("site_id", "")
-                    power_alarm = item.get("alarm_title", "")
-                    power_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                    print(
-                        f"⚡ 电告警进入缓存: site={debug_site}, alarm={power_alarm}, "
-                        f"time={power_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                    )
-                    print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-                elif is_debug_site_clear:
-                    debug_site = item.get("site_id", "")
-                    clear_alarm = item.get("alarm_title", "")
-                    clear_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                    print(
-                        f"🧹 清除告警输入: site={debug_site}, alarm={clear_alarm}, "
-                        f"time={clear_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                    )
-                    print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-                    print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                    _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
-                if hasattr(process_progress, "_refresh_extra_text"):
-                    process_progress._refresh_extra_text()
-                process_progress.update()
+            _run_debug_live_loop(
+                engine,
+                valid_alarms,
+                speedup,
+                process_progress,
+                debug_context,
+            )
         finally:
             process_progress.close()
             engine.stop_periodic_harvest()
@@ -1422,73 +712,19 @@ def _run_debug_mode(
         return
 
     try:
-        for item in valid_alarms:
-            is_debug_trigger = _is_debug_trigger_item(item, debug_targets)
-            is_debug_site_power_alarm = (
-                item.get("site_id") in debug_sites
-                and item.get("alarm_title") in POWER_ALARMS
-                and not _is_clear_alarm(item.get("alarm", {}))
-            )
-            is_debug_site_clear = (
-                item.get("site_id") in debug_sites
-                and _is_clear_alarm(item.get("alarm", {}))
-            )
-            matches = _process_alarm(
-                engine,
-                item,
-                collect_matches=True,
-                register_trigger=True
-            )
-            _print_debug_trigger_changes(
-                engine,
-                debug_sites,
-                last_trigger_snapshots,
-                "🔁 告警处理后关注站点 trigger 变化",
-            )
-            if is_debug_trigger:
-                debug_site = item.get("site_id", "")
-                debug_alarm = item.get("alarm_title", "")
-                trigger_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"🔎 Trigger 输入: site={debug_site}, alarm={debug_alarm}, "
-                    f"time={trigger_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                )
-                print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-                print(f"   ↳ 当前 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                _print_debug_pending_items(engine, debug_site, "   ↳ 当前 pending")
-                if not matches:
-                    print("   ↳ 当前触发点暂未产出故障组")
-            elif is_debug_site_power_alarm:
-                debug_site = item.get("site_id", "")
-                power_alarm = item.get("alarm_title", "")
-                power_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"⚡ 电告警进入缓存: site={debug_site}, alarm={power_alarm}, "
-                    f"time={power_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                )
-                print(f"   ↳ 当前站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-            elif is_debug_site_clear:
-                debug_site = item.get("site_id", "")
-                clear_alarm = item.get("alarm_title", "")
-                clear_time = datetime.fromtimestamp(item["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"🧹 清除告警输入: site={debug_site}, alarm={clear_alarm}, "
-                    f"time={clear_time}, eid={item['alarm'].get('告警编码ID', '')}"
-                )
-                print(f"   ↳ 清除后站点最近事件: {_format_debug_site_events(engine, debug_site)}")
-                print(f"   ↳ 清除后 trigger_index: {_format_debug_trigger_index(engine, debug_site)}")
-                _print_debug_pending_items(engine, debug_site, "   ↳ 清除后 pending")
-            if matches:
-                on_debug_matches(matches, "同步检查")
-            if hasattr(process_progress, "_refresh_extra_text"):
-                process_progress._refresh_extra_text()
-            process_progress.update()
+        _run_debug_offline_loop(
+            engine,
+            valid_alarms,
+            process_progress,
+            debug_context,
+            on_debug_matches,
+        )
     finally:
         process_progress.close()
         engine.debug_event_logger = None
 
 
-def main():
+def _build_arg_parser():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, help='output jsonl file')
@@ -1520,233 +756,32 @@ def main():
     parser.add_argument('--sorted-alarms-output', type=str, default='', help='从原始告警加载并排序后，额外写出排序告警缓存；后缀为 .zip 时写压缩包，供后续快速加载')
     parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
     parser.add_argument('--use-alarm-period-cache', action='store_true', help='可选：把 event_cache 切换为“设备告警时段”模式；默认关闭，保持旧版逐条活跃告警缓存逻辑')
-    args = parser.parse_args()
+    return parser
 
-    start_ts = None
-    end_ts = None
-    if args.start_time:
-        start_ts = _parse_datetime_text(args.start_time, "start_time").timestamp()
-    if args.end_time:
-        end_ts = _parse_datetime_text(args.end_time, "end_time").timestamp()
-    if start_ts is not None and end_ts is not None and start_ts > end_ts:
-        parser.error("start_time 不能晚于 end_time")
-    if args.batch_merge_density_knn < 0:
-        parser.error("batch-merge-density-knn 不能小于 0")
-    if args.batch_merge_density_scale < 0:
-        parser.error("batch-merge-density-scale 不能小于 0")
-    if args.batch_merge_density_min_meters < 0 or args.batch_merge_density_max_meters < 0:
-        parser.error("batch-merge-density-min-meters / max-meters 不能小于 0")
-    if (
-        args.batch_merge_density_max_meters > 0
-        and args.batch_merge_density_min_meters > 0
-        and args.batch_merge_density_max_meters < args.batch_merge_density_min_meters
-    ):
-        parser.error("batch-merge-density-max-meters 不能小于 batch-merge-density-min-meters")
-    if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:
-        parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
-    if args.site_chains and not os.path.exists(args.site_chains):
-        parser.error(f"site_chains 文件不存在: {args.site_chains}")
 
-    ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
-    if args.topo:
-        print(f"加载显式站点拓扑: {args.topo}")
-        topo_downstream_map = json.load(open(args.topo, 'r', encoding='utf-8'))
-        valid_sites = set(topo_downstream_map.keys())
-        for _, connected_sites in topo_downstream_map.items():
-            if isinstance(connected_sites, list):
-                valid_sites.update(connected_sites)
-            elif isinstance(connected_sites, dict):
-                valid_sites.update(connected_sites.keys())
-    else:
-        print(f"基于 ne_graph 原始连边构建站点传播拓扑: {args.ne_graph}")
-        topo_downstream_map, valid_sites = _build_site_topology_from_ne_graph(ne_graph_data)
-
-    site_chain_index = None
-    if args.site_chains:
-        print(f"加载预计算站点链路: {args.site_chains}")
-        site_chain_index, site_chain_valid_sites = _load_site_chain_index(args.site_chains)
-        valid_sites.update(site_chain_valid_sites)
-        print(f"预计算站点链路站点数: {len(site_chain_index)}")
-
-    site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
-    site_graph_data = json.load(open(args.site_graph, 'r', encoding='utf-8'))
-
-    print("加载有效站点集合...")
-    print(f"有效站点数: {len(valid_sites)}")
-    print(f"站点拓扑起点数: {len(topo_downstream_map)}")
-
-    print("构建 ne -> site 映射...")
-    ne_to_site = {
-        ne_id: str(ne_info.get("site_id", "")).strip()
-        for ne_id, ne_info in ne_graph_data.items()
-        if str(ne_info.get("site_id", "")).strip()
-    }
-    alarm_source_domain_map = {
-        ne_id: str(ne_info.get("domain", "")).strip()
-        for ne_id, ne_info in ne_graph_data.items()
-        if str(ne_info.get("domain", "")).strip()
-    }
-    print(f"NE 数量: {len(ne_to_site)}")
-    print("构建 site -> NE 输出索引...")
-    site_to_ne_ids = _build_site_to_ne_ids(ne_graph_data)
-    ne_link_info_cache = {}
-    print(f"site -> NE 索引站点数: {len(site_to_ne_ids)}")
-
-    valid_alarm_titles = CRITICAL_ALARMS
-    print(f"有效告警类型数: {len(valid_alarm_titles)}")
-    if args.start_time or args.end_time:
-        print(
-            "告警首次发生时间过滤: "
-            f"start_time={args.start_time or '-'}, "
-            f"end_time={args.end_time or '-'}"
-        )
-    if args.clear_delay_sec > 0:
-        print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
-    if args.batch_merge_site_hops > 0:
-        print(f"批内站点邻接合并: 开启，hop={args.batch_merge_site_hops}")
-    if args.batch_merge_density_knn > 0:
-        print(
-            "批内站点密度合并: 开启，"
-            f"k={args.batch_merge_density_knn}, "
-            f"scale={args.batch_merge_density_scale:g}, "
-            f"min_radius={args.batch_merge_density_min_meters:g}m, "
-            f"max_radius={args.batch_merge_density_max_meters:g}m"
-        )
-
-    all_rules_config = {
-        "transmission_rule": transmission_rule,
-        "link_rule": link_rule,
-        "power_rule": power_rule,
-        "data_rule": data_rule,
-        "data_link_adjacent_no_offline_rule": data_link_adjacent_no_offline_rule,
-        "data_link_adjacent_offline_rule": data_link_adjacent_offline_rule,
-        "data_link_adjacent_link_rule": data_link_adjacent_link_rule,
-        "data_no_offline_adjacent_optional_offline_rule": data_no_offline_adjacent_optional_offline_rule,
-        "data_offline_adjacent_offline_rule": data_offline_adjacent_offline_rule,
-    }
-    try:
-        selected_rule_names = _parse_selected_rule_names(args.rule, all_rules_config.keys())
-    except ValueError as exc:
-        parser.error(str(exc))
-    rules_config = (
-        {
-            rule_name: all_rules_config[rule_name]
-            for rule_name in selected_rule_names
-        }
-        if selected_rule_names else all_rules_config
+def _build_output_session(args, engine, static_context, alarm_metadata_index):
+    output_session = MatchOutputSession(
+        args=args,
+        engine=engine,
+        output_path=args.output,
+        ne_graph_data=static_context.ne_graph_data,
+        site_graph_data=static_context.site_graph_data,
+        alarm_metadata_index=alarm_metadata_index,
+        site_to_ne_ids=static_context.site_to_ne_ids,
+        ne_link_info_cache=static_context.ne_link_info_cache,
     )
-    print(
-        "启用规则: "
-        + ", ".join(rules_config.keys())
-    )
+    output_session.reset_output_file()
+    return output_session
 
-    density_site_merge_helper = None
-    if args.batch_merge_density_knn > 0:
-        density_site_merge_helper = AdaptiveDensitySiteMergeHelper(
-            args.site_graph,
-            density_knn=args.batch_merge_density_knn,
-            density_scale=args.batch_merge_density_scale,
-            min_radius_meters=args.batch_merge_density_min_meters,
-            max_radius_meters=args.batch_merge_density_max_meters,
-        )
 
-    batch_site_merge_helper = None
-    if args.batch_merge_site_hops > 0 or density_site_merge_helper is not None:
-        batch_site_merge_helper = BatchSiteMergeHelper(
-            topo_downstream_map,
-            site_neighbor_hops=args.batch_merge_site_hops,
-            density_helper=density_site_merge_helper,
-        )
-        if density_site_merge_helper is not None:
-            print("⏳ 正在准备站点批内合并辅助器...")
-            batch_site_merge_helper.warmup()
-            print("✅ 站点批内合并辅助器就绪")
-
-    print("⏳ 正在初始化时序图引擎与拓扑映射...")
-    print(f"聚合等待时间: {args.aggregation_wait_sec:g} 秒")
-    print(
-        "event_cache 模式: "
-        + ("设备告警时段(period)" if args.use_alarm_period_cache else "逐条活跃告警(raw, 默认)")
-    )
-    engine = TemporalGraphEngine(
-        topo_downstream_map,
-        rules_config,
-        site_domain_map,
-        alarm_source_domain_map=alarm_source_domain_map,
-        aggregation_wait_sec=args.aggregation_wait_sec,
-        site_merge_helper=batch_site_merge_helper,
-        site_chain_index=site_chain_index,
-        use_alarm_period_cache=args.use_alarm_period_cache,
-    )
-    print("✅ 引擎启动就绪，开始监听告警流...\n")
-
-    alarm_file_path = args.alarms
-    start_time = time.time()
-
-    sorted_alarm_cache_input = args.sorted_alarms_input.strip()
-    if sorted_alarm_cache_input:
-        if not os.path.exists(sorted_alarm_cache_input):
-            parser.error(f"排序告警缓存不存在: {sorted_alarm_cache_input}")
-        if not is_sorted_alarm_cache_file(sorted_alarm_cache_input):
-            parser.error(f"不是有效的排序告警缓存: {sorted_alarm_cache_input}")
-    elif is_sorted_alarm_cache_file(alarm_file_path):
-        sorted_alarm_cache_input = alarm_file_path
-
-    if sorted_alarm_cache_input:
-        print(f"⚡ 直接加载排序告警缓存: {sorted_alarm_cache_input}")
-        load_start_time = time.time()
-        (
-            processed_count,
-            valid_alarms,
-            normal_alarm_count,
-            clear_alarm_count,
-            sorted_alarm_cache_metadata,
-        ) = _load_sorted_alarm_cache(sorted_alarm_cache_input)
-        _warn_sorted_alarm_cache_option_mismatch(sorted_alarm_cache_metadata, args)
-        sort_elapsed = time.time() - load_start_time
-    else:
-        processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = _load_valid_alarms(
-            alarm_file_path,
-            valid_alarm_titles,
-            valid_sites,
-            ne_to_site,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            clear_delay_sec=args.clear_delay_sec,
-        )
-
-        print("⏳ 正在按时间排序有效告警...")
-        sort_start_time = time.time()
-        valid_alarms.sort(key=lambda item: item["ts"])
-        valid_alarms = _trim_trailing_clear_alarms(valid_alarms)
-        sort_elapsed = time.time() - sort_start_time
-        if args.sorted_alarms_output:
-            cached_normal_alarm_count, cached_clear_alarm_count = _count_alarm_event_types(valid_alarms)
-            cache_metadata = {
-                "source_alarms": os.path.abspath(alarm_file_path),
-                "topo": os.path.abspath(args.topo) if args.topo else "",
-                "ne_graph": os.path.abspath(args.ne_graph),
-                "start_time": args.start_time or "",
-                "end_time": args.end_time or "",
-                "clear_delay_sec": float(args.clear_delay_sec),
-                "processed_count": processed_count,
-                "normal_alarm_count": normal_alarm_count,
-                "clear_alarm_count": clear_alarm_count,
-                "cached_normal_alarm_count": cached_normal_alarm_count,
-                "cached_clear_alarm_count": cached_clear_alarm_count,
-                "valid_site_count": len(valid_sites),
-                "ne_to_site_count": len(ne_to_site),
-                "valid_alarm_title_count": len(valid_alarm_titles),
-            }
-            write_sorted_alarm_cache(args.sorted_alarms_output, valid_alarms, cache_metadata)
-            print(f"💾 排序告警缓存已写出: {args.sorted_alarms_output}")
-
-    alarm_metadata_index = _build_alarm_metadata_index(valid_alarms)
-    filtered_count = len(valid_alarms)
-    print(f"有效告警数: {filtered_count}，排序/加载耗时: {sort_elapsed:.4f} 秒")
-    print(f"正常告警数: {normal_alarm_count}，清除告警数: {clear_alarm_count}")
-
-    debug_targets = _parse_debug_targets(args)
+def _run_matching_pipeline(
+    args,
+    engine,
+    valid_alarms,
+    output_session,
+    debug_targets,
+    rules_config,
+):
     debug_enabled = bool(debug_targets)
     if debug_enabled:
         print("🔎 Debug 模式已开启:")
@@ -1755,66 +790,16 @@ def main():
 
     speedup = max(float(args.speedup), 1e-9)
     real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
+    process_progress = ProgressBar(len(valid_alarms), "处理有效告警")
+    process_progress._refresh_extra_text = output_session.refresh_progress_extra_text
+    output_session.process_progress = process_progress
+    output_session.refresh_progress_extra_text(force=True)
 
-    match_count = 0
-    process_progress = None
-    output_lock = threading.Lock()
-    with open(args.output, 'w', encoding='utf-8'):
-        pass
-
-    def on_matches(matches):
-        # 统一处理一批新产出的故障组：边输出报告，边按 jsonl 落盘。
-        nonlocal match_count
-        with output_lock:
-            with open(args.output, 'a', encoding='utf-8') as fw:
-                output_lines = []
-                for match in matches:
-                    if args.verbose_groups:
-                        generate_incident_report(match)
-                    enriched_match = _build_jsonl_match_output(
-                        match,
-                        ne_graph_data,
-                        site_graph_data,
-                        alarm_metadata_index,
-                        site_to_ne_ids=site_to_ne_ids,
-                        ne_link_info_cache=ne_link_info_cache,
-                        compact_output=args.compact_output,
-                        include_eid_list=args.use_alarm_period_cache,
-                    )
-                    output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
-                fw.writelines(output_lines)
-            match_count += len(matches)
-            if process_progress is not None:
-                process_progress.set_extra_text(_build_progress_extra_text())
-
-    def _build_progress_extra_text():
-        merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
-        primary_merge_count = (
-            merge_stats.get('alarm_overlap_merge_group_count', 0)
-            if args.use_alarm_period_cache
-            else merge_stats.get('eid_merge_group_count', 0)
-        )
-        primary_merge_label = "告警时段合并组数" if args.use_alarm_period_cache else "eid合并组数"
-        return (
-            f"已汇聚故障组数: {match_count} | "
-            f"{primary_merge_label}: {primary_merge_count} | "
-            f"hop合并组数: {merge_stats.get('hop_merge_group_count', 0)} | "
-            f"距离合并组数: {merge_stats.get('distance_merge_group_count', 0)}"
-        )
-
-    def _refresh_progress_extra_text(force=False):
-        if process_progress is None:
-            return
-        process_progress.set_extra_text(_build_progress_extra_text(), force=force)
-
-    process_progress = ProgressBar(filtered_count, "处理有效告警")
-    process_progress._refresh_extra_text = _refresh_progress_extra_text
-    _refresh_progress_extra_text(force=True)
     if debug_enabled:
         _run_debug_mode(
             engine,
             valid_alarms,
-            on_matches,
+            output_session.write_matches,
             process_progress,
             debug_targets,
             rules_config,
@@ -1828,13 +813,13 @@ def main():
             valid_alarms,
             speedup,
             real_harvest_interval_sec,
-            on_matches,
+            output_session.write_matches,
             process_progress
         )
     else:
-        _run_offline_mode(engine, valid_alarms, on_matches, process_progress)
+        _run_offline_mode(engine, valid_alarms, output_session.write_matches, process_progress)
 
-    process_progress = None
+    output_session.process_progress = None
 
     print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
     final_matches = engine.flush_pending()
@@ -1848,14 +833,13 @@ def main():
                 print(f"🔎 Flush 阶段额外产出 {len(debug_final_matches)} 个故障组")
                 for match in debug_final_matches:
                     _print_debug_match_details(match)
-            on_matches(final_matches)
-        else:
-            on_matches(final_matches)
+        output_session.write_matches(final_matches)
 
     if debug_enabled:
         engine.debug_observer = None
 
-    elapsed = time.time() - start_time
+
+def _print_final_summary(args, engine, processed_count, filtered_count, match_count, elapsed):
     final_merge_stats = engine.get_batch_merge_stats_snapshot().get("total", {})
     primary_merge_count = (
         final_merge_stats.get('alarm_overlap_merge_group_count', 0)
@@ -1872,25 +856,86 @@ def main():
         f"耗时 {elapsed:.4f} 秒。"
     )
 
-    if args.compute_ticket_recall:
-        ticket_recall_output = args.ticket_recall_output or f"{args.output}.ticket_recall.json"
-        print("⏳ 正在基于当前故障组输出计算工单站点召回率...")
-        try:
-            recall_result = compute_group_output_ticket_recall(
-                args.output,
-                args.ticket_sites,
-                ticket_field=args.ticket_field,
-                alarms_input=args.alarms,
-                ne_graph_file=args.ne_graph,
-                output_file=ticket_recall_output,
-            )
-            print(
-                f"✅ 工单站点召回率计算完成。工单数: {recall_result['ticket_count']}，"
-                f"平均召回率: {recall_result['average_recall']:.6f}，"
-                f"输出: {ticket_recall_output}"
-            )
-        except ValueError as exc:
-            print(f"⚠️ 工单站点召回率计算跳过: {exc}")
+
+def _prepare_runtime_execution(parser, args):
+    start_ts, end_ts = _validate_main_args(parser, args)
+    static_context = _load_static_context(args)
+    valid_alarm_titles = _default_valid_alarm_titles()
+    _print_run_configuration(args, static_context, valid_alarm_titles)
+    rules_config = _build_rules_config(args, parser)
+    batch_site_merge_helper = _build_batch_site_merge_helper(args, static_context.topo_downstream_map)
+    engine = _initialize_engine(args, static_context, rules_config, batch_site_merge_helper)
+    start_time = time.time()
+    alarm_load_result = _load_alarm_data(
+        args,
+        parser,
+        static_context,
+        valid_alarm_titles,
+        start_ts,
+        end_ts,
+    )
+    alarm_metadata_index = _build_alarm_metadata_index(alarm_load_result.valid_alarms)
+    _print_alarm_load_summary(alarm_load_result)
+    debug_targets = _parse_debug_targets(args)
+    output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
+    return RuntimeExecutionPlan(
+        static_context=static_context,
+        rules_config=rules_config,
+        engine=engine,
+        alarm_load_result=alarm_load_result,
+        alarm_metadata_index=alarm_metadata_index,
+        debug_targets=debug_targets,
+        output_session=output_session,
+        start_time=start_time,
+    )
+
+
+def _maybe_compute_ticket_recall(args):
+    if not args.compute_ticket_recall:
+        return
+
+    ticket_recall_output = args.ticket_recall_output or f"{args.output}.ticket_recall.json"
+    print("⏳ 正在基于当前故障组输出计算工单站点召回率...")
+    try:
+        recall_result = compute_group_output_ticket_recall(
+            args.output,
+            args.ticket_sites,
+            ticket_field=args.ticket_field,
+            alarms_input=args.alarms,
+            ne_graph_file=args.ne_graph,
+            output_file=ticket_recall_output,
+        )
+        print(
+            f"✅ 工单站点召回率计算完成。工单数: {recall_result['ticket_count']}，"
+            f"平均召回率: {recall_result['average_recall']:.6f}，"
+            f"输出: {ticket_recall_output}"
+        )
+    except ValueError as exc:
+        print(f"⚠️ 工单站点召回率计算跳过: {exc}")
+
+
+def main():
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    runtime_plan = _prepare_runtime_execution(parser, args)
+    _run_matching_pipeline(
+        args,
+        runtime_plan.engine,
+        runtime_plan.alarm_load_result.valid_alarms,
+        runtime_plan.output_session,
+        runtime_plan.debug_targets,
+        runtime_plan.rules_config,
+    )
+    elapsed = time.time() - runtime_plan.start_time
+    _print_final_summary(
+        args,
+        runtime_plan.engine,
+        runtime_plan.alarm_load_result.processed_count,
+        runtime_plan.alarm_load_result.filtered_count,
+        runtime_plan.output_session.match_count,
+        elapsed,
+    )
+    _maybe_compute_ticket_recall(args)
 
 
 if __name__ == "__main__":
