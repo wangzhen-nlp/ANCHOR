@@ -497,11 +497,19 @@ def main():
         return
 
     print(f"整合工单数: {result['ticket_count']}")
+    alarm_stream_ticket_count = result["alarm_stream_summary"].get("ticket_count", 0)
+    group_output_ticket_count = result["group_output_summary"].get("ticket_count", 0)
     alarm_stream_site_distribution = result["alarm_stream_summary"].get("ticket_site_count_distribution", {})
     group_output_site_distribution = result["group_output_summary"].get("ticket_site_count_distribution", {})
-    if alarm_stream_site_distribution == group_output_site_distribution:
+    if (
+        alarm_stream_ticket_count == group_output_ticket_count
+        and alarm_stream_site_distribution == group_output_site_distribution
+    ):
+        print(f"保留工单总数: {alarm_stream_ticket_count}")
         print(f"保留工单召回站点数分布: {alarm_stream_site_distribution}")
     else:
+        print(f"告警流保留工单总数: {alarm_stream_ticket_count}")
+        print(f"故障组输出保留工单总数: {group_output_ticket_count}")
         print(f"告警流保留工单召回站点数分布: {alarm_stream_site_distribution}")
         print(f"故障组输出保留工单召回站点数分布: {group_output_site_distribution}")
     print(
