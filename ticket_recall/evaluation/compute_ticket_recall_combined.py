@@ -146,6 +146,7 @@ def compute_ticket_recall_combined(
     min_site_num=0,
     upper_bound_associated_as_gold=False,
     upper_bound_site_diff_filter=None,
+    only_group_output_worse_cases=False,
 ):
     if combined_case_jsonl_output_file is None:
         combined_case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
@@ -233,6 +234,19 @@ def compute_ticket_recall_combined(
             _build_combined_case_record(ticket_id, alarm_stream_payload, group_output_payload)
         )
 
+    raw_combined_case_count = len(combined_case_records)
+    if only_group_output_worse_cases:
+        combined_case_records = [
+            record
+            for record in combined_case_records
+            if (
+                (record.get("group_output") or {}).get("present")
+                and (record.get("alarm_stream") or {}).get("present")
+                and float(((record.get("group_output") or {}).get("recall", 0.0) or 0.0))
+                < float(((record.get("alarm_stream") or {}).get("recall", 0.0) or 0.0))
+            )
+        ]
+
     combined_case_records.sort(
         key=lambda record: (
             float(((record.get("group_output") or {}).get("recall", 0.0) or 0.0)),
@@ -246,6 +260,8 @@ def compute_ticket_recall_combined(
         "method": "ticket_recall_combined",
         "combined_case_jsonl_output": combined_case_jsonl_output_file,
         "ticket_count": len(combined_case_records),
+        "raw_combined_case_count": raw_combined_case_count,
+        "only_group_output_worse_cases": only_group_output_worse_cases,
         "alarm_stream_summary": {
             "ticket_count": alarm_stream_result.get("ticket_count", 0),
             "final_sample_count": alarm_stream_result.get("final_sample_count", 0),
@@ -279,6 +295,7 @@ def compute_ticket_recall_combined(
             "min_site_num": min_site_num,
             "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
             "upper_bound_site_diff_filter": upper_bound_site_diff_filter,
+            "only_group_output_worse_cases": only_group_output_worse_cases,
         },
         "details": [
             {
@@ -420,6 +437,11 @@ def main():
         type=int,
         help="只评测 ticket_site_count - associated_site_count 等于该值的工单；不传则保持原 upper-bound 过滤口径",
     )
+    parser.add_argument(
+        "--only-group-output-worse-cases",
+        action="store_true",
+        help="combined cases 只保留故障组输出召回率低于告警流召回率的工单；不影响两个子评测汇总指标",
+    )
 
     args = parser.parse_args()
 
@@ -446,6 +468,7 @@ def main():
             min_site_num=args.min_site_num,
             upper_bound_associated_as_gold=args.upper_bound_associated_as_gold,
             upper_bound_site_diff_filter=args.upper_bound_site_diff,
+            only_group_output_worse_cases=args.only_group_output_worse_cases,
         )
     except ValueError as exc:
         print(f"❌ {exc}")
@@ -471,6 +494,12 @@ def main():
         f"平均准确率={result['group_output_summary']['average_precision']:.6f}, "
         f"平均F1={result['group_output_summary']['average_f1']:.6f}"
     )
+    if result.get("only_group_output_worse_cases"):
+        print(
+            "combined cases 过滤: "
+            f"仅保留故障组召回低于告警流的 cases，"
+            f"{result.get('ticket_count', 0)}/{result.get('raw_combined_case_count', 0)}"
+        )
     print(f"整合汇总 JSON: {args.output}")
     print(f"combined cases: {result['combined_case_jsonl_output']}")
 
