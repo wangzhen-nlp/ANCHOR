@@ -142,8 +142,10 @@ def compute_ticket_recall_combined(
     potential=False,
     only_one=False,
     ultimate_only=False,
+    use_site_list=False,
     min_site_num=0,
     upper_bound_associated_as_gold=False,
+    upper_bound_site_diff_filter=None,
 ):
     if combined_case_jsonl_output_file is None:
         combined_case_jsonl_output_file = derive_case_jsonl_output_path(output_file)
@@ -165,8 +167,10 @@ def compute_ticket_recall_combined(
         loose=loose,
         potential=potential,
         only_one=only_one,
+        use_site_list=use_site_list,
         min_site_num=min_site_num,
         upper_bound_associated_as_gold=upper_bound_associated_as_gold,
+        upper_bound_site_diff_filter=upper_bound_site_diff_filter,
     )
 
     print("步骤 2/3：计算故障组输出评测结果...")
@@ -187,8 +191,10 @@ def compute_ticket_recall_combined(
         potential=potential,
         only_one=only_one,
         ultimate_only=ultimate_only,
+        use_site_list=use_site_list,
         min_site_num=min_site_num,
         upper_bound_associated_as_gold=upper_bound_associated_as_gold,
+        upper_bound_site_diff_filter=upper_bound_site_diff_filter,
     )
 
     print("步骤 3/3：整合两个结果并生成 combined cases...")
@@ -269,8 +275,10 @@ def compute_ticket_recall_combined(
             "potential_mode": potential,
             "only_one_mode": only_one,
             "ultimate_only_mode": ultimate_only,
+            "use_site_list_mode": use_site_list,
             "min_site_num": min_site_num,
             "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+            "upper_bound_site_diff_filter": upper_bound_site_diff_filter,
         },
         "details": [
             {
@@ -387,6 +395,11 @@ def main():
         help="只保留覆盖该工单目标站点最多的单个 group / 故障组ID，用它的站点计算召回率",
     )
     parser.add_argument(
+        "--use-site-list",
+        action="store_true",
+        help="用 site_list 作为预测站点；默认只用实际有告警的站点",
+    )
+    parser.add_argument(
         "--ultimate-only",
         action="store_true",
         help="只用于故障组输出：只考虑不作为关联 group 出现的最终 group",
@@ -401,6 +414,11 @@ def main():
         "--upper-bound-associated-as-gold",
         action="store_true",
         help="改用 upper bound 的 associated_sites 作为 gold",
+    )
+    parser.add_argument(
+        "--upper-bound-site-diff",
+        type=int,
+        help="只评测 ticket_site_count - associated_site_count 等于该值的工单；不传则保持原 upper-bound 过滤口径",
     )
 
     args = parser.parse_args()
@@ -424,8 +442,10 @@ def main():
             potential=args.potential,
             only_one=args.only_one,
             ultimate_only=args.ultimate_only,
+            use_site_list=args.use_site_list,
             min_site_num=args.min_site_num,
             upper_bound_associated_as_gold=args.upper_bound_associated_as_gold,
+            upper_bound_site_diff_filter=args.upper_bound_site_diff,
         )
     except ValueError as exc:
         print(f"❌ {exc}")

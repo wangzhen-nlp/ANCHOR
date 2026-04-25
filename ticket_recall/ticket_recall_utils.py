@@ -181,6 +181,32 @@ def load_upper_bound_settings(filepath):
     }
 
 
+def upper_bound_site_diff(item):
+    if not isinstance(item, dict):
+        return 0
+    try:
+        ticket_site_count = int(item.get("ticket_site_count", 0) or 0)
+    except (TypeError, ValueError):
+        ticket_site_count = 0
+    try:
+        associated_site_count = int(item.get("associated_site_count", 0) or 0)
+    except (TypeError, ValueError):
+        associated_site_count = 0
+    return max(ticket_site_count - associated_site_count, 0)
+
+
+def upper_bound_matches_site_diff(item, expected_diff):
+    if not isinstance(item, dict):
+        return False
+    try:
+        ticket_site_count = int(item.get("ticket_site_count", 0) or 0)
+    except (TypeError, ValueError):
+        ticket_site_count = 0
+    if ticket_site_count <= 0:
+        return False
+    return upper_bound_site_diff(item) == expected_diff
+
+
 def build_site_alarm_map_for_sites(site_alarm_map, site_ids):
     result = {}
     for site_id in sorted(site_ids):
@@ -217,7 +243,7 @@ def build_ticket_site_count_distribution(details):
     }
 
 
-def select_best_group_by_target_sites(group_ids, group_to_sites, target_sites):
+def select_best_group_by_target_sites(group_ids, group_to_sites, target_sites, group_to_site_alarms=None):
     normalized_target_sites = {
         normalize_text(site_id) for site_id in target_sites if normalize_text(site_id)
     }
@@ -228,12 +254,17 @@ def select_best_group_by_target_sites(group_ids, group_to_sites, target_sites):
         return ""
 
     best_group_id = ""
-    best_count = -1
+    best_score = (-1, -1)
+    group_to_site_alarms = group_to_site_alarms or {}
     for group_id in normalized_group_ids:
         covered_count = len(set(group_to_sites.get(group_id, set())) & normalized_target_sites)
-        if covered_count > best_count:
+        alarm_recalled_count = len(
+            extract_nonempty_alarm_sites(group_to_site_alarms.get(group_id, {})) & normalized_target_sites
+        )
+        score = (covered_count, alarm_recalled_count)
+        if score > best_score:
             best_group_id = group_id
-            best_count = covered_count
+            best_score = score
     return best_group_id
 
 

@@ -45,6 +45,8 @@ from ticket_recall.ticket_recall_utils import (
     extract_alarm_record_id,
     select_best_group_by_target_sites,
     site_alarm_map_contains_domain,
+    upper_bound_matches_site_diff,
+    upper_bound_site_diff,
     write_jsonl_records,
 )
 
@@ -511,6 +513,8 @@ def _print_debug_summary(debug_summary):
             "- upper-bound-associated-as-gold: "
             f"{'开' if debug_summary['upper_bound_associated_as_gold_mode'] else '关'}"
         )
+    if debug_summary.get("upper_bound_site_diff_filter") is not None:
+        print(f"- upper-bound-site-diff: {debug_summary['upper_bound_site_diff_filter']}")
     if "ultimate_only_mode" in debug_summary:
         print(f"- ultimate-only: {'开' if debug_summary['ultimate_only_mode'] else '关'}")
     for label, key in (
@@ -626,8 +630,10 @@ def compute_group_output_ticket_recall(
     potential=False,
     only_one=False,
     ultimate_only=False,
+    use_site_list=False,
     min_site_num=0,
     upper_bound_associated_as_gold=False,
+    upper_bound_site_diff_filter=None,
     debug=False,
     debug_ticket_ids=None,
     debug_sample_limit=5,
@@ -638,6 +644,10 @@ def compute_group_output_ticket_recall(
     no_domain_alarm = _normalize_domain_arg(no_domain_alarm)
     no_domain_site = _normalize_domain_arg(no_domain_site)
     require_domain_per_site = _normalize_domain_arg(require_domain_per_site)
+    if upper_bound_site_diff_filter is not None:
+        upper_bound_site_diff_filter = int(upper_bound_site_diff_filter)
+        if upper_bound_site_diff_filter < 0:
+            raise ValueError("upper-bound-site-diff 必须 >= 0")
     upper_bound_index = load_upper_bound_index(upper_bound_file)
     upper_bound_settings = load_upper_bound_settings(upper_bound_file)
     debug_ticket_id_set = _normalize_debug_ticket_ids(debug_ticket_ids)
@@ -657,7 +667,20 @@ def compute_group_output_ticket_recall(
             for ticket_id, item in upper_bound_index.items()
             if int(item.get("associated_site_count", 0) or 0) > 0
         }
+        if upper_bound_site_diff_filter is not None:
+            eligible_ticket_ids = {
+                ticket_id
+                for ticket_id in eligible_ticket_ids
+                if upper_bound_matches_site_diff(
+                    upper_bound_index.get(ticket_id, {}),
+                    upper_bound_site_diff_filter,
+                )
+            }
         if not eligible_ticket_ids:
+            if upper_bound_site_diff_filter is not None:
+                raise ValueError(
+                    f"召回率上限结果里没有“已关联站点且站点差值为 {upper_bound_site_diff_filter}”的工单"
+                )
             raise ValueError("召回率上限结果里没有“已关联站点”的工单")
 
         ticket_sites = {
@@ -675,7 +698,15 @@ def compute_group_output_ticket_recall(
             for ticket_id, item in upper_bound_index.items()
             if item.get("fully_associable")
         }
+        if upper_bound_site_diff_filter is not None:
+            eligible_ticket_ids = {
+                ticket_id
+                for ticket_id, item in upper_bound_index.items()
+                if upper_bound_matches_site_diff(item, upper_bound_site_diff_filter)
+            }
         if not eligible_ticket_ids:
+            if upper_bound_site_diff_filter is not None:
+                raise ValueError(f"召回率上限结果里没有“站点差值为 {upper_bound_site_diff_filter}”的工单")
             raise ValueError("召回率上限结果里没有“可完整关联”的工单")
 
         if ticket_sites_file:
@@ -698,6 +729,7 @@ def compute_group_output_ticket_recall(
             "method": "group_output",
             "ticket_site_source": ticket_site_source,
             "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+            "upper_bound_site_diff_filter": upper_bound_site_diff_filter,
             "ultimate_only_mode": ultimate_only,
             "no_domain_site": no_domain_site,
             "require_domain_per_site": require_domain_per_site,
@@ -726,6 +758,7 @@ def compute_group_output_ticket_recall(
                 "present_in_upper_bound": debug_ticket_id in upper_bound_index,
                 "upper_bound_eligible": debug_ticket_id in eligible_ticket_ids,
                 "upper_bound_fully_associable": bool(upper_info.get("fully_associable")),
+                "upper_bound_site_diff": upper_bound_site_diff(upper_info),
                 "upper_bound_associated_sites": list(upper_info.get("associated_sites", [])),
                 "upper_bound_site_evidence_sites": sorted(upper_info.get("site_evidence", {}).keys()),
                 "source_ticket_sites": list(source_ticket_sites.get(debug_ticket_id, [])),
@@ -1038,6 +1071,7 @@ def compute_group_output_ticket_recall(
                 group_ids=fault_groups,
                 group_to_sites=group_to_sites,
                 target_sites=target_sites,
+                group_to_site_alarms=group_to_site_alarms,
             )
             effective_fault_groups = [selected_fault_group] if selected_fault_group else []
         else:
@@ -1047,7 +1081,8 @@ def compute_group_output_ticket_recall(
             debug_summary["ticket_with_effective_fault_group_count"] += 1
 
         merged_site_alarms = _merge_group_site_alarms(effective_fault_groups, group_to_site_alarms)
-        predicted_sites = extract_nonempty_alarm_sites(merged_site_alarms)
+        group_sites_from_index = _build_group_site_union(effective_fault_groups, group_to_sites)
+        predicted_sites = set(group_sites_from_index) if use_site_list else extract_nonempty_alarm_sites(merged_site_alarms)
         if debug_enabled:
             if predicted_sites:
                 debug_summary["ticket_with_predicted_sites_count"] += 1
@@ -1074,7 +1109,6 @@ def compute_group_output_ticket_recall(
         unrecalled_sites = target_sites - recalled_sites
         upper_info = upper_bound_index.get(ticket_id, {})
         upper_site_evidence = upper_info.get("site_evidence", {})
-        group_sites_from_index = _build_group_site_union(effective_fault_groups, group_to_sites)
         context_sites = sorted(set(group_sites_from_index) - set(target_sites))
         display_sites = sorted(set(target_sites) | set(group_sites_from_index))
         associated_site_alarms = build_site_alarm_map_for_sites(merged_site_alarms, recalled_sites)
@@ -1206,8 +1240,10 @@ def compute_group_output_ticket_recall(
         "potential_mode": potential,
         "only_one_mode": only_one,
         "ultimate_only_mode": ultimate_only,
+        "use_site_list_mode": use_site_list,
         "min_site_num": min_site_num,
         "upper_bound_associated_as_gold_mode": upper_bound_associated_as_gold,
+        "upper_bound_site_diff_filter": upper_bound_site_diff_filter,
         "details": details,
     }
     if debug_enabled:
@@ -1316,6 +1352,11 @@ def main():
         help="只保留覆盖该工单目标站点最多的单个 group，用它的站点计算召回率",
     )
     parser.add_argument(
+        "--use-site-list",
+        action="store_true",
+        help="用 group_info.site_list 作为预测站点；默认只用实际有告警的站点",
+    )
+    parser.add_argument(
         "--ultimate-only",
         action="store_true",
         help="只考虑不作为关联 group 出现的最终 group（即未出现在其它 group 的 related_group_uuids 中）",
@@ -1330,6 +1371,11 @@ def main():
         "--upper-bound-associated-as-gold",
         action="store_true",
         help="改用 upper bound 的 associated_sites 作为 gold；不开时保持原来的 fully_associable + 原工单站点口径",
+    )
+    parser.add_argument(
+        "--upper-bound-site-diff",
+        type=int,
+        help="只评测 ticket_site_count - associated_site_count 等于该值的工单；不传则保持原 upper-bound 过滤口径",
     )
     parser.add_argument(
         "--debug",
@@ -1387,8 +1433,10 @@ def main():
             potential=args.potential,
             only_one=args.only_one,
             ultimate_only=args.ultimate_only,
+            use_site_list=args.use_site_list,
             min_site_num=args.min_site_num,
             upper_bound_associated_as_gold=args.upper_bound_associated_as_gold,
+            upper_bound_site_diff_filter=args.upper_bound_site_diff,
             debug=args.debug,
             debug_ticket_ids=args.debug_ticket,
             debug_sample_limit=args.debug_sample_limit,
