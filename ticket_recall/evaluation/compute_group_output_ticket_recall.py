@@ -722,6 +722,11 @@ def compute_group_output_ticket_recall(
             if ticket_id in eligible_ticket_ids
         }
 
+    after_upper_bound_filter_count = len(ticket_sites)
+    after_no_domain_site_count = len(ticket_sites)
+    after_require_domain_per_site_count = len(ticket_sites)
+    after_min_site_num_count = len(ticket_sites)
+
     if debug_enabled:
         debug_summary = {
             "method": "group_output",
@@ -735,7 +740,7 @@ def compute_group_output_ticket_recall(
             "upper_bound_ticket_count": len(upper_bound_index),
             "upper_bound_eligible_ticket_count": len(eligible_ticket_ids),
             "ticket_site_source_count": len(source_ticket_sites),
-            "after_upper_bound_filter_count": len(ticket_sites),
+            "after_upper_bound_filter_count": after_upper_bound_filter_count,
             "example_ticket_ids": {},
         }
         removed_by_upper_bound = set(source_ticket_sites) - set(ticket_sites)
@@ -825,8 +830,9 @@ def compute_group_output_ticket_recall(
                 continue
             filtered_ticket_sites[ticket_id] = site_list
         ticket_sites = filtered_ticket_sites
+        after_no_domain_site_count = len(ticket_sites)
     if debug_enabled:
-        debug_summary["after_no_domain_site_count"] = len(ticket_sites)
+        debug_summary["after_no_domain_site_count"] = after_no_domain_site_count
     if debug_ticket_id_set:
         _snapshot_debug_sites("sites_after_no_domain_site", ticket_sites)
 
@@ -858,8 +864,9 @@ def compute_group_output_ticket_recall(
                         "filtered_by_require_domain_per_site"
                     )
         ticket_sites = filtered_ticket_sites
+        after_require_domain_per_site_count = len(ticket_sites)
     if debug_enabled:
-        debug_summary["after_require_domain_per_site_count"] = len(ticket_sites)
+        debug_summary["after_require_domain_per_site_count"] = after_require_domain_per_site_count
     if debug_ticket_id_set:
         _snapshot_debug_sites("sites_after_require_domain_per_site", ticket_sites)
         _snapshot_debug_sites("sites_before_min_site_num", ticket_sites)
@@ -880,13 +887,23 @@ def compute_group_output_ticket_recall(
                 continue
             filtered_ticket_sites[ticket_id] = site_list
         ticket_sites = filtered_ticket_sites
+        after_min_site_num_count = len(ticket_sites)
     if debug_enabled:
-        debug_summary["after_min_site_num_count"] = len(ticket_sites)
+        debug_summary["after_min_site_num_count"] = after_min_site_num_count
     if debug_ticket_id_set:
         _snapshot_debug_sites("final_ticket_sites", ticket_sites)
 
     if not ticket_sites:
-        raise ValueError("没有可用于计算的工单站点映射")
+        raise ValueError(
+            "没有可用于计算的工单站点映射；"
+            f"upper_bound工单数={len(upper_bound_index)}, "
+            f"eligible工单数={len(eligible_ticket_ids)}, "
+            f"{ticket_site_source}工单数={len(source_ticket_sites)}, "
+            f"upper_bound过滤后={after_upper_bound_filter_count}, "
+            f"no-domain-site后={after_no_domain_site_count}, "
+            f"require-domain后={after_require_domain_per_site_count}, "
+            f"min-site-num后={after_min_site_num_count}"
+        )
 
     referenced_group_ids = set()
     if ultimate_only:

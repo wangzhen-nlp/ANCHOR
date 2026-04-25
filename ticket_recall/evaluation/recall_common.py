@@ -78,6 +78,8 @@ def _load_ticket_sites(ticket_sites_file):
         normalized_ticket_id = _normalize_text(ticket_id)
         if not normalized_ticket_id:
             continue
+        if isinstance(sites, dict):
+            sites = sites.get("site_ids", [])
         if not isinstance(sites, list):
             continue
         normalized_sites = _normalize_site_list(sites)
