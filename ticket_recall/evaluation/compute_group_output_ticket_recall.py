@@ -236,9 +236,10 @@ def _build_group_site_union(group_ids, group_to_sites):
 def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, excluded_group_ids):
     excluded_groups = set(excluded_group_ids or ())
     matched_groups = set()
+    mapping_input_alarms = []
     evidence_alarm_hits = []
     if not isinstance(site_evidence, dict):
-        return [], []
+        return [], [], []
 
     for site_id in sorted(site_evidence):
         alarms = site_evidence.get(site_id, [])
@@ -255,6 +256,11 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
                 for group_id in alarm_to_groups.get(alarm_id, ())
                 if _normalize_text(group_id) and _normalize_text(group_id) not in excluded_groups
             })
+            mapping_input_record = dict(record)
+            mapping_input_record["site_id"] = _normalize_text(site_id)
+            mapping_input_record["alarm_id"] = alarm_id
+            mapping_input_record["matched_groups"] = raw_groups
+            mapping_input_alarms.append(mapping_input_record)
             if not raw_groups:
                 continue
             matched_groups.update(raw_groups)
@@ -265,7 +271,7 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
                 "matched_groups": raw_groups,
             })
 
-    return sorted(matched_groups), evidence_alarm_hits
+    return sorted(matched_groups), evidence_alarm_hits, mapping_input_alarms
 
 
 def _normalize_debug_alarm_ids(values):
@@ -638,9 +644,11 @@ def _print_debug_tickets(debug_ticket_details, count_field_name, count_label):
         print(f"- base_fault_groups: {item.get('base_fault_groups', [])}")
         print(f"- loose_fault_groups: {item.get('loose_fault_groups', [])}")
         print(f"- potential_fault_groups: {item.get('potential_fault_groups', [])}")
+        print(f"- alarm_to_group_mapping_input_alarms: {item.get('alarm_to_group_mapping_input_alarms', [])}")
         print(f"- potential_evidence_groups: {item.get('potential_evidence_groups', [])}")
         print(f"- potential_evidence_alarm_hits: {item.get('potential_evidence_alarm_hits', [])}")
         print(f"- fault_groups: {item.get('fault_groups', [])}")
+        print(f"- candidate_group_site_alarms: {item.get('candidate_group_site_alarms', {})}")
         print(f"- effective_fault_groups: {item.get('effective_fault_groups', [])}")
         print(f"- selected_fault_group: {item.get('selected_fault_group', '')}")
         print(f"- group_sites_from_index: {item.get('group_sites_from_index', [])}")
@@ -824,9 +832,11 @@ def compute_group_output_ticket_recall(
                 "base_fault_groups": [],
                 "loose_fault_groups": [],
                 "potential_fault_groups": [],
+                "alarm_to_group_mapping_input_alarms": [],
                 "potential_evidence_groups": [],
                 "potential_evidence_alarm_hits": [],
                 "fault_groups": [],
+                "candidate_group_site_alarms": {},
                 "effective_fault_groups": [],
                 "selected_fault_group": "",
                 "group_sites_from_index": [],
@@ -1036,12 +1046,18 @@ def compute_group_output_ticket_recall(
                 upper_site_evidence = upper_info.get("site_evidence", {})
                 potential_evidence_groups = []
                 potential_evidence_alarm_hits = []
+                alarm_to_group_mapping_input_alarms = []
                 if ticket_id in debug_ticket_details:
-                    potential_evidence_groups, potential_evidence_alarm_hits = _build_potential_evidence_debug_info(
+                    (
+                        potential_evidence_groups,
+                        potential_evidence_alarm_hits,
+                        alarm_to_group_mapping_input_alarms,
+                    ) = _build_potential_evidence_debug_info(
                         site_evidence=upper_site_evidence,
                         alarm_to_groups=alarm_to_groups,
                         excluded_group_ids=set(base_group_ids) | set(loose_groups),
                     )
+                    debug_ticket_details[ticket_id]["alarm_to_group_mapping_input_alarms"] = alarm_to_group_mapping_input_alarms
                     debug_ticket_details[ticket_id]["potential_evidence_groups"] = potential_evidence_groups
                     debug_ticket_details[ticket_id]["potential_evidence_alarm_hits"] = potential_evidence_alarm_hits
                 potential_groups = collect_groups_by_evidence(
@@ -1194,6 +1210,10 @@ def compute_group_output_ticket_recall(
                 "loose_fault_groups": loose_fault_groups,
                 "potential_fault_groups": potential_fault_groups,
                 "fault_groups": fault_groups,
+                "candidate_group_site_alarms": {
+                    group_id: group_to_site_alarms.get(group_id, {})
+                    for group_id in fault_groups
+                },
                 "effective_fault_groups": effective_fault_groups,
                 "selected_fault_group": selected_fault_group,
                 "group_sites_from_index": group_sites_from_index,
