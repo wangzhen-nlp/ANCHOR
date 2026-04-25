@@ -8,10 +8,12 @@
    若 symptom 中带有 eid_list，也一并纳入索引。
 2. 读取原始告警，按故障组ID分组，并提取每个原始故障组的 eid 集合；
 3. 以“输出故障组”和“原始故障组”为两类节点，若二者存在任意重合 eid，则连一条边；
-4. 对这个二分图求连通分量：
+   同时将输出故障组之间的 related_group_uuids 也作为连通边；
+4. 对这个图求连通分量：
    - 同一连通分量中的多个输出故障组会先彼此合并；
    - 连通分量中的原始故障组再整体并入这个合并结果；
    - 这样可以自然覆盖“一个原始组连接多个输出组”以及“通过多个原始组迭代串联多个输出组”的情况。
+   - 若分量内存在未被其它输出组引用的终极输出组，优先用它作为合并后顶层 uuid。
 5. 若原始故障组与任何输出故障组都没有重合，默认按输出格式构造一条新记录；
    如果启用 --retain-output，则丢弃这类不包含输出故障组的独立原始组。
 6. 最终输出保留：所有包含输出故障组的连通分量合并记录；
@@ -172,6 +174,27 @@ def _extract_eids_from_match_group(record):
             if normalized_eid:
                 eids.add(normalized_eid)
     return eids
+
+
+def _extract_match_group_uuid(record):
+    match_info = record.get("match_info", {}) or {}
+    if not isinstance(match_info, dict):
+        return ""
+    return _normalize_text(match_info.get("uuid", ""))
+
+
+def _extract_related_group_uuids(record):
+    match_info = record.get("match_info", {}) or {}
+    if not isinstance(match_info, dict):
+        return set()
+    related_group_uuids = match_info.get("related_group_uuids", []) or []
+    if not isinstance(related_group_uuids, list):
+        return set()
+    return {
+        normalized_uuid
+        for normalized_uuid in (_normalize_text(uuid_text) for uuid_text in related_group_uuids)
+        if normalized_uuid
+    }
 
 
 def _extract_eids_from_alarm_group(alarm_list):
@@ -483,8 +506,11 @@ def _merge_match_info(base_record, incoming_record):
         for uuid_text in (incoming_info.get("related_group_uuids", []) or [])
         if _normalize_text(uuid_text)
     )
+    related_group_uuids.discard(base_uuid)
     if related_group_uuids:
         base_info["related_group_uuids"] = sorted(related_group_uuids)
+    else:
+        base_info.pop("related_group_uuids", None)
 
     merged_rules = []
     seen_rules = set()
@@ -623,7 +649,42 @@ def _merge_alarm_list_into_match_group(record, alarm_group_id, alarm_list, ne_gr
     return record
 
 
-def _build_connected_components(match_group_eids, alarm_group_eids, eid_to_match_indices):
+def _build_match_related_adjacency(match_groups):
+    uuid_to_match_indices = defaultdict(set)
+    for match_idx, record in enumerate(match_groups):
+        group_uuid = _extract_match_group_uuid(record)
+        if group_uuid:
+            uuid_to_match_indices[group_uuid].add(match_idx)
+
+    related_adjacency = defaultdict(set)
+    referenced_group_uuids = set()
+    for match_idx, record in enumerate(match_groups):
+        for related_uuid in _extract_related_group_uuids(record):
+            referenced_group_uuids.add(related_uuid)
+            for related_match_idx in uuid_to_match_indices.get(related_uuid, ()):
+                if related_match_idx == match_idx:
+                    continue
+                related_adjacency[match_idx].add(related_match_idx)
+                related_adjacency[related_match_idx].add(match_idx)
+
+    return related_adjacency, referenced_group_uuids
+
+
+def _select_component_base_match_index(match_indices, match_groups, referenced_group_uuids):
+    for match_idx in match_indices:
+        group_uuid = _extract_match_group_uuid(match_groups[match_idx])
+        if group_uuid and group_uuid not in referenced_group_uuids:
+            return match_idx
+    return match_indices[0]
+
+
+def _build_connected_components(
+    match_group_eids,
+    alarm_group_eids,
+    eid_to_match_indices,
+    match_related_adjacency=None,
+):
+    match_related_adjacency = match_related_adjacency or {}
     eid_to_alarm_group_ids = defaultdict(set)
     for alarm_group_id, eids in alarm_group_eids.items():
         for eid in eids:
@@ -652,6 +713,11 @@ def _build_connected_components(match_group_eids, alarm_group_eids, eid_to_match
                             continue
                         visited_alarm_group_ids.add(alarm_group_id)
                         queue.append(("alarm", alarm_group_id))
+                for related_match_idx in match_related_adjacency.get(node_value, ()):
+                    if related_match_idx in visited_match_indices:
+                        continue
+                    visited_match_indices.add(related_match_idx)
+                    queue.append(("match", related_match_idx))
             else:
                 component_alarm_group_ids.add(node_value)
                 current_eids = alarm_group_eids.get(node_value, set())
@@ -712,11 +778,13 @@ def merge(
         for alarm_group_id, alarm_list in alarm_groups.items()
     }
 
-    print("构建输出组-原始组连通关系...")
+    print("构建输出组-原始组/关联输出组连通关系...")
+    match_related_adjacency, referenced_group_uuids = _build_match_related_adjacency(match_groups)
     components, standalone_alarm_group_ids = _build_connected_components(
         match_group_eids,
         alarm_group_eids,
         eid_to_match_indices,
+        match_related_adjacency=match_related_adjacency,
     )
 
     final_records = []
@@ -732,10 +800,16 @@ def merge(
         if not match_indices:
             continue
 
-        base_idx = match_indices[0]
+        base_idx = _select_component_base_match_index(
+            match_indices,
+            match_groups,
+            referenced_group_uuids,
+        )
         merged_record = copy.deepcopy(match_groups[base_idx])
 
-        for match_idx in match_indices[1:]:
+        for match_idx in match_indices:
+            if match_idx == base_idx:
+                continue
             _merge_match_group_records(merged_record, match_groups[match_idx])
 
         for alarm_group_id in component_alarm_group_ids:

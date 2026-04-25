@@ -251,14 +251,21 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
             alarm_id = extract_alarm_record_id(record)
             if not alarm_id:
                 continue
-            raw_groups = sorted({
+            indexed_groups = sorted({
                 _normalize_text(group_id)
                 for group_id in alarm_to_groups.get(alarm_id, ())
+                if _normalize_text(group_id)
+            })
+            raw_groups = sorted({
+                _normalize_text(group_id)
+                for group_id in indexed_groups
                 if _normalize_text(group_id) and _normalize_text(group_id) not in excluded_groups
             })
             mapping_input_record = dict(record)
             mapping_input_record["site_id"] = _normalize_text(site_id)
             mapping_input_record["alarm_id"] = alarm_id
+            mapping_input_record["indexed_groups"] = indexed_groups
+            mapping_input_record["excluded_groups"] = sorted(excluded_groups)
             mapping_input_record["matched_groups"] = raw_groups
             mapping_input_alarms.append(mapping_input_record)
             if not raw_groups:
