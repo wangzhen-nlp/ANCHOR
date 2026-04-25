@@ -593,9 +593,7 @@ def compute_ticket_site_recall(
         }
     else:
         eligible_ticket_ids = {
-            ticket_id
-            for ticket_id, item in upper_bound_index.items()
-            if item.get("fully_associable")
+            ticket_id for ticket_id in upper_bound_index
         }
         if upper_bound_site_diff_filter is not None:
             eligible_ticket_ids = {
@@ -606,7 +604,7 @@ def compute_ticket_site_recall(
         if not eligible_ticket_ids:
             if upper_bound_site_diff_filter is not None:
                 raise ValueError(f"召回率上限结果里没有“站点差值为 {upper_bound_site_diff_filter}”的工单")
-            raise ValueError("召回率上限结果里没有“可完整关联”的工单")
+            raise ValueError("召回率上限结果里没有工单")
 
         if ticket_sites_file:
             source_ticket_sites = _load_ticket_sites(ticket_sites_file)
@@ -1255,7 +1253,7 @@ def main():
     parser.add_argument(
         "--upper-bound-associated-as-gold",
         action="store_true",
-        help="改用 upper bound 的 associated_sites 作为 gold；不开时保持原来的 fully_associable + 原工单站点口径",
+        help="改用 upper bound 的 associated_sites 作为 gold；不开时使用原工单站点口径",
     )
     parser.add_argument(
         "--upper-bound-site-diff",
