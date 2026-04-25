@@ -395,6 +395,7 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
             "group_sites": [],
             "matched_allowed_sites": [],
             "symptom_nodes": [],
+            "symptom_alarms": [],
             "related_group_carriers": [],
             "matched_records": [],
         }
@@ -436,6 +437,24 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
             for symptom in group_record.get("symptoms", [])
             if isinstance(symptom, dict) and _normalize_text(symptom.get("node", ""))
         }
+        symptom_alarms = []
+        for symptom in group_record.get("symptoms", []):
+            if not isinstance(symptom, dict):
+                continue
+            site_id = _normalize_text(symptom.get("node", ""))
+            alarm_id = extract_alarm_record_id(symptom)
+            alarm_name = _normalize_text(symptom.get("alarm", "")) or _normalize_text(symptom.get("告警标题", ""))
+            if not site_id and not alarm_id and not alarm_name:
+                continue
+            symptom_alarms.append({
+                "site_id": site_id,
+                "alarm_id": alarm_id,
+                "alarm": alarm_name,
+                "ts": symptom.get("ts", ""),
+                "alarm_source": _normalize_text(symptom.get("alarm_source", "")) or _normalize_text(symptom.get("告警源", "")),
+                "matched_role": _normalize_text(symptom.get("matched_role", "")),
+                "ticket_id": _normalize_text(symptom.get("工单号", "")),
+            })
         for group_id in sorted(related_only_group_ids):
             result[group_id]["present_in_related_group_uuids"] = True
             carrier = effective_group_id or top_level_uuid or match_info_uuid
@@ -467,6 +486,33 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
                 for site_id in (result[group_id]["symptom_nodes"] + list(symptom_nodes))
                 if _normalize_text(site_id)
             })
+            existing_alarm_keys = {
+                (
+                    item.get("site_id", ""),
+                    item.get("alarm_id", ""),
+                    item.get("alarm", ""),
+                    item.get("ts", ""),
+                    item.get("alarm_source", ""),
+                    item.get("matched_role", ""),
+                    item.get("ticket_id", ""),
+                )
+                for item in result[group_id]["symptom_alarms"]
+                if isinstance(item, dict)
+            }
+            for symptom_alarm in symptom_alarms:
+                alarm_key = (
+                    symptom_alarm.get("site_id", ""),
+                    symptom_alarm.get("alarm_id", ""),
+                    symptom_alarm.get("alarm", ""),
+                    symptom_alarm.get("ts", ""),
+                    symptom_alarm.get("alarm_source", ""),
+                    symptom_alarm.get("matched_role", ""),
+                    symptom_alarm.get("ticket_id", ""),
+                )
+                if alarm_key in existing_alarm_keys:
+                    continue
+                existing_alarm_keys.add(alarm_key)
+                result[group_id]["symptom_alarms"].append(symptom_alarm)
             result[group_id]["matched_records"].append({
                 "matched_by": matched_by,
                 "top_level_uuid": top_level_uuid,
@@ -493,6 +539,7 @@ def _print_debug_group_site_lookup(debug_group_site_lookup):
         print(f"- group_sites: {item.get('group_sites', [])}")
         print(f"- matched_allowed_sites: {item.get('matched_allowed_sites', [])}")
         print(f"- symptom_nodes: {item.get('symptom_nodes', [])}")
+        print(f"- symptom_alarms: {item.get('symptom_alarms', [])}")
         print(f"- related_group_carriers: {item.get('related_group_carriers', [])}")
         print(f"- matched_records: {item.get('matched_records', [])}")
 
@@ -598,6 +645,7 @@ def _print_debug_tickets(debug_ticket_details, count_field_name, count_label):
         print(f"- selected_fault_group: {item.get('selected_fault_group', '')}")
         print(f"- group_sites_from_index: {item.get('group_sites_from_index', [])}")
         print(f"- predicted_sites_with_alarms: {item.get('predicted_sites', [])}")
+        print(f"- considered_site_alarms: {item.get('considered_site_alarms', {})}")
         print(f"- associated_sites: {item.get('associated_sites', [])}")
         print(f"- missing_sites: {item.get('missing_sites', [])}")
         print(f"- upper bound 有 offline evidence: {'是' if item.get('upper_bound_has_offline_evidence') else '否'}")
@@ -783,6 +831,7 @@ def compute_group_output_ticket_recall(
                 "selected_fault_group": "",
                 "group_sites_from_index": [],
                 "predicted_sites": [],
+                "considered_site_alarms": {},
                 "associated_sites": [],
                 "missing_sites": [],
                 "upper_bound_has_offline_evidence": False,
@@ -1149,6 +1198,7 @@ def compute_group_output_ticket_recall(
                 "selected_fault_group": selected_fault_group,
                 "group_sites_from_index": group_sites_from_index,
                 "predicted_sites": sorted(predicted_sites),
+                "considered_site_alarms": merged_site_alarms,
                 "associated_sites": sorted(recalled_sites),
                 "missing_sites": sorted(unrecalled_sites),
                 "upper_bound_has_offline_evidence": upper_bound_has_offline_evidence,
