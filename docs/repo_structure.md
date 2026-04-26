@@ -17,9 +17,11 @@
 
 - `match_rules.py`：按规则跑故障组匹配
 - `rule_config.py`：规则配置
-- `temporal_graph_engine.py`：时序图引擎核心
-- `temporal_graph_engine_utils.py` / `node_rule_helper.py` / `emitted_group_store.py`：配套能力
-- `reports.py`：报告生成
+- `alarm_events/`：告警事件读取、流式回放和已排序缓存
+- `matching/`：匹配运行时、debug、输出构建和报告生成
+- `temporal_engine/`：时序图引擎实现包，包含主引擎、遍历、输出、告警时段缓存、约束和工具函数
+- `tools/`：与主匹配流程解耦的故障组分析、过滤、提取、后处理和输入预处理脚本
+- `node_rule_helper.py` / `emitted_group_store.py`：配套能力
 
 ## `ticket_recall/`
 

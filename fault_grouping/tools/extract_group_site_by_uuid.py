@@ -4,8 +4,8 @@
 从 match_rules.py 输出的 JSONL 故障组文件中按 uuid 提取故障组。
 
 用法:
-    python fault_grouping/extract_group_site_by_uuid.py fault_groups.jsonl <uuid>
-    python fault_grouping/extract_group_site_by_uuid.py fault_groups.jsonl <uuid1>,<uuid2> -o selected_groups.jsonl
+    python fault_grouping/tools/extract_group_site_by_uuid.py fault_groups.jsonl <uuid>
+    python fault_grouping/tools/extract_group_site_by_uuid.py fault_groups.jsonl <uuid1>,<uuid2> -o selected_groups.jsonl
 """
 
 import argparse
@@ -13,10 +13,10 @@ import json
 import sys
 from pathlib import Path
 
-try:
-    from fault_grouping.analyze_group_site_distribution import extract_site_ids
-except ModuleNotFoundError:
-    from analyze_group_site_distribution import extract_site_ids
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from fault_grouping.tools.analyze_group_site_distribution import extract_site_ids
 
 
 def _as_dict(value):

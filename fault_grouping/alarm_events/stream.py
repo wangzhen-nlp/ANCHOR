@@ -1,6 +1,6 @@
 import time
 
-from fault_grouping.alarm_event_io import is_clear_alarm
+from fault_grouping.alarm_events.io import is_clear_alarm
 
 
 def stream_alarms_by_ts(valid_alarms, speedup=1.0):

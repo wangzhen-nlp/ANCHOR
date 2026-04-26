@@ -93,9 +93,9 @@ def load_upper_bound_index(filepath):
         raise ValueError("召回率上限结果 JSON 顶层必须是对象")
 
     try:
-        window_seconds = int(data.get("window_seconds", 600) or 600)
+        window_seconds = int(data.get("window_seconds", 900) or 900)
     except (TypeError, ValueError):
-        window_seconds = 600
+        window_seconds = 900
 
     ticket_index = {}
     for item in data.get("details", []):
@@ -169,9 +169,9 @@ def load_upper_bound_settings(filepath):
         raise ValueError("召回率上限结果 JSON 顶层必须是对象")
 
     try:
-        window_seconds = int(data.get("window_seconds", 600) or 600)
+        window_seconds = int(data.get("window_seconds", 900) or 900)
     except (TypeError, ValueError):
-        window_seconds = 600
+        window_seconds = 900
 
     return {
         "window_seconds": window_seconds,

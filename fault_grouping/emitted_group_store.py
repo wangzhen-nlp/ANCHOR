@@ -1,7 +1,7 @@
 import copy
 import collections
 
-from fault_grouping.temporal_graph_engine_utils import (
+from fault_grouping.temporal_engine.utils import (
     get_match_alarm_keys,
     get_match_symptom_overlap_keys,
     get_symptom_overlap_base_key,

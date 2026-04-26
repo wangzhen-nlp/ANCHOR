@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from alarm_tools.alarm_types import CRITICAL_ALARMS
 from alarm_tools.progress_utils import ProgressBar
-from fault_grouping.alarm_event_io import (
+from fault_grouping.alarm_events.io import (
     count_alarm_event_types,
     load_sorted_alarm_cache_with_stats,
     load_valid_alarms,
@@ -14,13 +14,13 @@ from fault_grouping.alarm_event_io import (
     trim_trailing_clear_alarms,
     warn_sorted_alarm_cache_option_mismatch,
 )
-from fault_grouping.alarm_event_stream import (
+from fault_grouping.alarm_events.stream import (
     build_simulated_now_ts_getter,
     process_alarm,
     refresh_process_progress,
     stream_alarms_by_ts,
 )
-from fault_grouping.matching_debug import (
+from fault_grouping.matching.debug import (
     match_debug_trigger,
     print_debug_match_details,
     run_debug_mode,
@@ -40,11 +40,11 @@ from fault_grouping.site_merge_helper import (
     AdaptiveDensitySiteMergeHelper,
     BatchSiteMergeHelper,
 )
-from fault_grouping.sorted_alarm_cache import (
+from fault_grouping.alarm_events.sorted_cache import (
     is_sorted_alarm_cache_file,
     write_sorted_alarm_cache,
 )
-from fault_grouping.temporal_graph_engine import TemporalGraphEngine
+from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.site_topology import (
     build_site_to_ne_ids,
     build_site_topology_from_ne_graph,

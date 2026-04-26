@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
-from fault_grouping.sorted_alarm_cache import load_sorted_alarm_cache
+from fault_grouping.alarm_events.sorted_cache import load_sorted_alarm_cache
 
 
 def parse_datetime_text(text, field_name="时间"):

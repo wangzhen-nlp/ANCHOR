@@ -4,7 +4,7 @@
 分析 match_rules.py 输出的故障组站点数分布。
 
 用法:
-    python fault_grouping/analyze_group_site_distribution.py \
+    python fault_grouping/tools/analyze_group_site_distribution.py \
         fault_groups.jsonl \
         --output group_site_dist.json
 """

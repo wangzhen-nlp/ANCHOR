@@ -22,7 +22,7 @@
 输出格式与 match_rules.py 保持一致，可直接在 fault_group_browser.html 中加载。
 
 用法：
-    python fault_grouping/merge_match_output_with_alarm_groups.py \
+    python fault_grouping/tools/merge_match_output_with_alarm_groups.py \
         --match-output match_groups.jsonl \
         --alarms alarms.jsonl \
         --ne-graph topology_resources/ne_graph.json \
@@ -40,9 +40,7 @@ from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
-    from _script_env import ensure_repo_root
-
-    ensure_repo_root(1)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from alarm_tools.progress_utils import ProgressBar

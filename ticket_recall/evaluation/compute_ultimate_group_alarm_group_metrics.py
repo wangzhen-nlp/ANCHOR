@@ -370,6 +370,27 @@ def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_g
     return case_details
 
 
+def _filter_metric_details_to_unrecalled(metric_result):
+    """仅过滤输出明细，不改变已经计算好的整体指标。"""
+    if not isinstance(metric_result, dict):
+        return metric_result
+    details = metric_result.get("details", [])
+    if not isinstance(details, list):
+        return metric_result
+
+    original_detail_count = len(details)
+    filtered_details = [
+        item
+        for item in details
+        if float(item.get("recall", 0.0) or 0.0) < 1.0
+    ]
+    metric_result["details"] = filtered_details
+    metric_result["details_filter"] = "recall_lt_1"
+    metric_result["details_total_count"] = original_detail_count
+    metric_result["details_output_count"] = len(filtered_details)
+    return metric_result
+
+
 def _build_loose_groups_by_time_window(
     gold_to_sites,
     gold_to_base_pred_groups,
@@ -524,8 +545,9 @@ def compute_ultimate_group_alarm_group_metrics(
     only_offline=False,
     only_one=False,
     loose=False,
-    window_seconds=600,
+    window_seconds=900,
     potential=False,
+    only_unrecalled_predictions=False,
     output_file=None,
     ultimate_case_jsonl_output_file=None,
     alarm_group_case_jsonl_output_file=None,
@@ -648,6 +670,10 @@ def compute_ultimate_group_alarm_group_metrics(
         potential_gold_to_pred_groups=alarm_group_to_potential_ultimate_groups,
     )
 
+    if only_unrecalled_predictions:
+        _filter_metric_details_to_unrecalled(ultimate_as_gold)
+        _filter_metric_details_to_unrecalled(alarm_group_as_gold)
+
     result = {
         "group_field": group_field,
         "min_site_num": min_site_num,
@@ -659,6 +685,7 @@ def compute_ultimate_group_alarm_group_metrics(
         "loose_mode": loose,
         "window_seconds": window_seconds,
         "potential_mode": potential,
+        "only_unrecalled_predictions_mode": only_unrecalled_predictions,
         "ultimate_group_count": len(ultimate_group_to_sites),
         "alarm_group_count": len(alarm_group_to_sites),
         "ultimate_group_as_gold": ultimate_as_gold,
@@ -769,13 +796,18 @@ def main():
     parser.add_argument(
         "--window-seconds",
         type=int,
-        default=600,
-        help="loose 模式使用的前后对称时间窗，单位秒，默认: 600",
+        default=900,
+        help="loose 模式使用的前后对称时间窗，单位秒，默认: 900",
     )
     parser.add_argument(
         "--potential",
         action="store_true",
         help="允许根据告警ID命中关系，把另一侧包含这些告警的额外 group 作为 potential 预测结果并入",
+    )
+    parser.add_argument(
+        "--only-unrecalled-predictions",
+        action="store_true",
+        help="输出 JSON 中两类 details 仅保留召回率不足 100%% 的预测；平均指标仍基于全部样本计算",
     )
     parser.add_argument(
         "--ultimate-case-jsonl-output",
@@ -808,6 +840,7 @@ def main():
         loose=args.loose,
         window_seconds=args.window_seconds,
         potential=args.potential,
+        only_unrecalled_predictions=args.only_unrecalled_predictions,
         output_file=args.output,
         ultimate_case_jsonl_output_file=args.ultimate_case_jsonl_output,
         alarm_group_case_jsonl_output_file=args.alarm_group_case_jsonl_output,

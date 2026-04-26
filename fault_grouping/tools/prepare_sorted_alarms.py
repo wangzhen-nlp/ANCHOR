@@ -2,14 +2,15 @@ import json
 import os
 import time
 from argparse import ArgumentParser
+from pathlib import Path
 
 if __package__ in (None, ""):
-    from _script_env import ensure_repo_root
+    import sys
 
-    ensure_repo_root(1)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from alarm_tools.alarm_types import CRITICAL_ALARMS
-from fault_grouping.alarm_event_io import (
+from fault_grouping.alarm_events.io import (
     is_clear_alarm,
     load_valid_alarms,
     parse_datetime_text,
@@ -18,7 +19,7 @@ from fault_grouping.alarm_event_io import (
 from fault_grouping.site_topology import (
     build_site_topology_from_ne_graph,
 )
-from fault_grouping.sorted_alarm_cache import write_sorted_alarm_cache
+from fault_grouping.alarm_events.sorted_cache import write_sorted_alarm_cache
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_GRAPH_BY_NE_JSON,

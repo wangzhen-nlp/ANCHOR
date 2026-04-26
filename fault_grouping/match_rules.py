@@ -16,12 +16,12 @@ from topology_resources import (
     resource_display,
 )
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
-from fault_grouping.matching_debug import parse_debug_targets
-from fault_grouping.group_output_builder import (
+from fault_grouping.matching.debug import parse_debug_targets
+from fault_grouping.matching.group_output_builder import (
     build_alarm_metadata_index,
 )
-from fault_grouping.group_output_session import MatchOutputSession
-from fault_grouping.matching_runtime import (
+from fault_grouping.matching.group_output_session import MatchOutputSession
+from fault_grouping.matching.runtime import (
     AlarmLoadResult,
     LoadedStaticContext,
     build_batch_site_merge_helper,
@@ -36,7 +36,7 @@ from fault_grouping.matching_runtime import (
     run_matching_pipeline,
     validate_main_args,
 )
-from fault_grouping.temporal_graph_engine import TemporalGraphEngine
+from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 
 
 @dataclass

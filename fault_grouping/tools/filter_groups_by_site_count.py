@@ -6,8 +6,8 @@
 默认行为：过滤掉站点数大于 n 的故障组，只保留 site_count <= n 的记录。
 
 用法:
-    python fault_grouping/filter_groups_by_site_count.py fault_groups.jsonl filtered.jsonl --max-site-count 20
-    python fault_grouping/filter_groups_by_site_count.py fault_groups.jsonl large_groups.jsonl --max-site-count 20 --keep-large
+    python fault_grouping/tools/filter_groups_by_site_count.py fault_groups.jsonl filtered.jsonl --max-site-count 20
+    python fault_grouping/tools/filter_groups_by_site_count.py fault_groups.jsonl large_groups.jsonl --max-site-count 20 --keep-large
 """
 
 import argparse
@@ -15,10 +15,10 @@ import json
 import sys
 from pathlib import Path
 
-try:
-    from fault_grouping.analyze_group_site_distribution import extract_site_ids
-except ModuleNotFoundError:
-    from analyze_group_site_distribution import extract_site_ids
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from fault_grouping.tools.analyze_group_site_distribution import extract_site_ids
 
 
 def iter_group_lines(jsonl_path):
