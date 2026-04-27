@@ -319,9 +319,9 @@ def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_g
             gold_group_to_site_alarms.get(item.get("gold_id", ""), {}),
             missing_sites,
         )
-        case_associated_sites = _nonempty_alarm_sites(associated_site_alarms)
-        case_missing_sites = _nonempty_alarm_sites(missing_site_alarms)
-        case_ticket_sites = sorted(set(case_associated_sites) | set(case_missing_sites))
+        case_associated_sites = matched_sites
+        case_missing_sites = missing_sites
+        case_ticket_sites = gold_sites
         case_details.append({
             "ticket_id": item.get("gold_id", ""),
             "ticket_site_count": len(case_ticket_sites),
