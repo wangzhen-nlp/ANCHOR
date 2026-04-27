@@ -249,6 +249,16 @@ class SiteRelationIndex:
             or site_a in self.bidirectional_direct.get(site_b, set())
         )
 
+    def direct_neighbors(self, site_id):
+        return (
+            set(self.downstream_direct.get(site_id, set()))
+            | set(self.upstream_direct.get(site_id, set()))
+            | set(self.bidirectional_direct.get(site_id, set()))
+        )
+
+    def non_downstream_neighbors(self, site_id):
+        return sorted(self.direct_neighbors(site_id) - set(self.downstream_direct.get(site_id, set())))
+
     def undirected_neighbors_in(self, site_id, site_set):
         return {
             other_site
@@ -384,29 +394,9 @@ def classify_chain_uplink(chain, component_sites, relation_index):
     return subtype, sorted(external_connected_chain_sites)
 
 
-def absorbed_router_unmanaged_sites_for_final(final_site, absorbed_by, router_device_sites):
-    matched_sites = []
-    for absorbed_site in sorted(absorbed_by):
-        if absorbed_site == final_site or absorbed_site not in router_device_sites:
-            continue
-
-        visited = {absorbed_site}
-        parent_site = absorbed_by.get(absorbed_site)
-        while parent_site:
-            if parent_site == final_site:
-                matched_sites.append(absorbed_site)
-                break
-            if parent_site in visited:
-                break
-            visited.add(parent_site)
-            parent_site = absorbed_by.get(parent_site)
-    return matched_sites
-
-
-def classify_component(component_sites, unmanaged_sites, relation_index, absorbed_by=None, router_device_sites=None):
+def classify_component(component_sites, unmanaged_sites, relation_index, router_device_sites=None):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
-    absorbed_by = absorbed_by or {}
     router_device_sites = set(router_device_sites or [])
     non_router_sites = component_sites - router_device_sites
 
@@ -422,49 +412,38 @@ def classify_component(component_sites, unmanaged_sites, relation_index, absorbe
             "non_router_sites": sorted(non_router_sites),
         }
 
-    if len(component_sites) == 1 and len(component_unmanaged_sites) == 1:
-        final_site = next(iter(component_sites))
-        absorbed_router_sites = absorbed_router_unmanaged_sites_for_final(
-            final_site,
-            absorbed_by,
-            router_device_sites,
-        )
-        if not absorbed_router_sites:
+    if len(component_unmanaged_sites) == 1:
+        candidate = next(iter(component_unmanaged_sites))
+        non_downstream_neighbors = relation_index.non_downstream_neighbors(candidate)
+        if len(non_downstream_neighbors) == 1:
+            pattern = "ip_chain"
+        elif len(non_downstream_neighbors) >= 2:
+            pattern = "multi_link"
+        else:
+            pattern = "unknown"
+
+        if pattern == "unknown":
             return {
                 "pattern": "unknown",
                 "sites": sorted(component_sites),
-                "unmanaged_sites": sorted(component_unmanaged_sites),
+                "unmanaged_sites": [candidate],
                 "managed_sites": [],
                 "final_site": "",
                 "final_managed_site": "",
                 "chains": [],
+                "non_downstream_connected_sites": non_downstream_neighbors,
             }
+
         return {
-            "pattern": "ip_chain",
+            "pattern": pattern,
             "sites": sorted(component_sites),
-            "unmanaged_sites": sorted(component_unmanaged_sites),
-            "managed_sites": [final_site],
-            "final_site": final_site,
-            "final_managed_site": final_site,
-            "absorbed_router_unmanaged_sites": absorbed_router_sites,
+            "unmanaged_sites": [candidate],
+            "managed_sites": [candidate],
+            "final_site": candidate if pattern == "ip_chain" else "",
+            "final_managed_site": candidate,
+            "non_downstream_connected_sites": non_downstream_neighbors,
             "chains": [],
         }
-
-    if len(component_sites) >= 3 and len(component_unmanaged_sites) == 1:
-        candidate = next(iter(component_unmanaged_sites))
-        if all(
-            other_site == candidate or relation_index.directly_connected(candidate, other_site)
-            for other_site in component_sites
-        ):
-            return {
-                "pattern": "multi_uplink",
-                "sites": sorted(component_sites),
-                "unmanaged_sites": [candidate],
-                "managed_sites": [candidate],
-                "final_site": "",
-                "final_managed_site": candidate,
-                "chains": [],
-            }
 
     unmanaged_components = connected_components(component_unmanaged_sites, relation_index)
     unmanaged_chains = []
@@ -523,7 +502,6 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
             component_sites,
             active_unmanaged_sites,
             relation_index,
-            absorbed_by=absorbed_by,
             router_device_sites=router_device_sites,
         )
         if component_record.get("pattern") != "unknown":
@@ -532,7 +510,7 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
 
     primary_pattern = "none"
     if component_records:
-        pattern_priority = {"ip_chain": 0, "multi_uplink": 1, "ip_ring": 2, "unknown": 3}
+        pattern_priority = {"ip_chain": 0, "multi_link": 1, "ip_ring": 2, "unknown": 3}
         primary_pattern = min(
             (item["pattern"] for item in component_records),
             key=lambda pattern: pattern_priority.get(pattern, 99),
