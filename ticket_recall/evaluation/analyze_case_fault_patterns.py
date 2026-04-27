@@ -260,6 +260,12 @@ class SiteRelationIndex:
     def non_downstream_neighbors(self, site_id):
         return sorted(self.direct_neighbors(site_id) - set(self.downstream_direct.get(site_id, set())))
 
+    def bidirectional_neighbors(self, site_id):
+        return sorted(self.bidirectional_direct.get(site_id, set()))
+
+    def direct_upstream_neighbors(self, site_id):
+        return sorted(self.upstream_direct.get(site_id, set()))
+
     def undirected_neighbors_in(self, site_id, site_set):
         return {
             other_site
@@ -395,6 +401,90 @@ def classify_chain_uplink(chain, component_sites, relation_index):
     return subtype, sorted(external_connected_chain_sites)
 
 
+def build_context_edges_for_anchors(anchors, related_sites_by_anchor, relation_type):
+    context_edges = []
+    seen = set()
+    for anchor_site in anchors:
+        for related_site in sorted(related_sites_by_anchor.get(anchor_site, set())):
+            if related_site == anchor_site:
+                continue
+            edge_key = (related_site, anchor_site, relation_type)
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            context_edges.append({
+                "supplemental_site": related_site,
+                "anchor_site": anchor_site,
+                "relation": relation_type,
+            })
+    return context_edges
+
+
+def classify_ip_ring_chain(chain, relation_index):
+    chain = list(chain)
+    chain_set = set(chain)
+    if len(chain) < 2:
+        return "ip_ring_others", [], []
+
+    endpoints = [chain[0], chain[-1]]
+    endpoint_set = set(endpoints)
+    endpoint_bidir = {
+        endpoint: set(relation_index.bidirectional_neighbors(endpoint))
+        for endpoint in endpoints
+    }
+
+    if all(len(relation_index.bidirectional_neighbors(site_id)) == 2 for site_id in chain):
+        context_edges = build_context_edges_for_anchors(
+            endpoints,
+            {
+                endpoint: endpoint_bidir[endpoint] - chain_set
+                for endpoint in endpoints
+            },
+            "bidirectional",
+        )
+        return "ip_ring_single_upstream", context_edges, []
+
+    internal_sites = [site_id for site_id in chain if site_id not in endpoint_set]
+    internal_bidir_ok = all(
+        len(relation_index.bidirectional_neighbors(site_id)) == 2
+        for site_id in internal_sites
+    )
+    endpoint_condition_failed = any(
+        len(relation_index.bidirectional_neighbors(endpoint)) != 2
+        for endpoint in endpoints
+    )
+    endpoint_upstream = {
+        endpoint: set(relation_index.direct_upstream_neighbors(endpoint))
+        for endpoint in endpoints
+    }
+    common_bidir_sites = sorted((endpoint_bidir[endpoints[0]] & endpoint_bidir[endpoints[1]]) - chain_set)
+    common_upstream_sites = sorted((endpoint_upstream[endpoints[0]] & endpoint_upstream[endpoints[1]]) - chain_set)
+
+    if internal_bidir_ok and endpoint_condition_failed and (common_bidir_sites or common_upstream_sites):
+        bidir_edges = build_context_edges_for_anchors(
+            endpoints,
+            {
+                endpoint: endpoint_bidir[endpoint] - chain_set
+                for endpoint in endpoints
+            },
+            "bidirectional",
+        )
+        upstream_edges = build_context_edges_for_anchors(
+            endpoints,
+            {
+                endpoint: endpoint_upstream[endpoint] - chain_set
+                for endpoint in endpoints
+            },
+            "upstream",
+        )
+        return "ip_ring_multi_upstream", bidir_edges + upstream_edges, [
+            {"relation": "common_bidirectional", "sites": common_bidir_sites},
+            {"relation": "common_upstream", "sites": common_upstream_sites},
+        ]
+
+    return "ip_ring_others", [], []
+
+
 def has_absorbed_site_for_final(final_site, absorbed_by):
     for absorbed_site in sorted(absorbed_by):
         if absorbed_site == final_site:
@@ -434,12 +524,12 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
         candidate = next(iter(component_unmanaged_sites))
         non_downstream_neighbors = relation_index.non_downstream_neighbors(candidate)
         if len(non_downstream_neighbors) == 1:
-            pattern = "ip_chain"
+            pattern = "ip_chain_single_link"
         elif len(non_downstream_neighbors) >= 2:
-            pattern = "multi_link"
+            pattern = "ip_chain_multi_link"
         else:
             pattern = "unknown"
-        if pattern == "ip_chain" and not has_absorbed_site_for_final(candidate, absorbed_by):
+        if pattern == "ip_chain_single_link" and not has_absorbed_site_for_final(candidate, absorbed_by):
             pattern = "unknown"
 
         if pattern == "unknown":
@@ -459,7 +549,7 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
             "sites": sorted(component_sites),
             "unmanaged_sites": [candidate],
             "managed_sites": [candidate],
-            "final_site": candidate if pattern == "ip_chain" else "",
+            "final_site": candidate if pattern == "ip_chain_single_link" else "",
             "final_managed_site": candidate,
             "non_downstream_connected_sites": non_downstream_neighbors,
             "chains": [],
@@ -485,14 +575,18 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
     unmanaged_chains.sort(key=lambda item: (-item["length"], item["chain"]))
 
     if len(unmanaged_chains) == 1 and chain_covered_sites == component_unmanaged_sites:
+        ring_chain = unmanaged_chains[0]["chain"]
+        ring_pattern, context_edges, ring_common_sites = classify_ip_ring_chain(ring_chain, relation_index)
         return {
-            "pattern": "ip_ring",
+            "pattern": ring_pattern,
             "sites": sorted(component_sites),
             "unmanaged_sites": sorted(component_unmanaged_sites),
-            "managed_sites": unmanaged_chains[0]["chain"],
+            "managed_sites": ring_chain,
             "final_site": "",
             "final_managed_site": "",
             "chains": unmanaged_chains,
+            "supplemental_context_edges": context_edges,
+            "ring_common_sites": ring_common_sites,
         }
 
     return {
@@ -531,7 +625,14 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
 
     primary_pattern = "none"
     if component_records:
-        pattern_priority = {"ip_chain": 0, "multi_link": 1, "ip_ring": 2, "unknown": 3}
+        pattern_priority = {
+            "ip_chain_single_link": 0,
+            "ip_chain_multi_link": 1,
+            "ip_ring_single_upstream": 2,
+            "ip_ring_multi_upstream": 3,
+            "ip_ring_others": 4,
+            "unknown": 99,
+        }
         primary_pattern = min(
             (item["pattern"] for item in component_records),
             key=lambda pattern: pattern_priority.get(pattern, 99),
@@ -599,7 +700,7 @@ def format_pattern_summary_line(pattern_info, index):
     pattern = pattern_info.get("pattern", "unknown")
     managed_sites = pattern_info.get("managed_sites", []) or []
 
-    if pattern == "ip_ring":
+    if pattern.startswith("ip_ring"):
         chains = pattern_info.get("chains", []) or []
         chain = chains[0].get("chain", []) if chains and isinstance(chains[0], dict) else []
         matched_text = "->".join(chain) if chain else "->".join(managed_sites)
@@ -678,8 +779,23 @@ def collect_supplemental_fault_pattern_sites(analysis, existing_sites, site_has_
     seen = set()
     for pattern_info in analysis.get("patterns", []) or []:
         pattern = pattern_info.get("pattern")
-        if pattern not in {"ip_chain", "multi_link"}:
+        if pattern not in {
+            "ip_chain_single_link",
+            "ip_chain_multi_link",
+            "ip_ring_single_upstream",
+            "ip_ring_multi_upstream",
+        }:
             continue
+        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
+            normalized_site_id = normalize_text(as_dict(edge_info).get("supplemental_site"))
+            if (
+                normalized_site_id
+                and normalized_site_id not in existing_sites
+                and normalized_site_id not in seen
+                and site_has_router_device.get(normalized_site_id, False)
+            ):
+                seen.add(normalized_site_id)
+                supplemental_sites.append(normalized_site_id)
         for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
             normalized_site_id = normalize_text(site_id)
             if (
@@ -704,8 +820,34 @@ def collect_supplemental_fault_pattern_edges(analysis, existing_sites, supplemen
     seen = set()
     for pattern_info in analysis.get("patterns", []) or []:
         pattern = pattern_info.get("pattern")
-        if pattern not in {"ip_chain", "multi_link"}:
+        if pattern not in {
+            "ip_chain_single_link",
+            "ip_chain_multi_link",
+            "ip_ring_single_upstream",
+            "ip_ring_multi_upstream",
+        }:
             continue
+        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
+            edge_info = as_dict(edge_info)
+            supplemental_site = normalize_text(edge_info.get("supplemental_site"))
+            anchor_site = normalize_text(edge_info.get("anchor_site"))
+            if (
+                not supplemental_site
+                or not anchor_site
+                or supplemental_site in existing_sites
+                or supplemental_site not in supplemental_site_set
+            ):
+                continue
+            edge_key = (supplemental_site, anchor_site)
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            supplemental_edges.append({
+                "supplemental_site": supplemental_site,
+                "anchor_site": anchor_site,
+                "pattern": pattern,
+                "relation": normalize_text(edge_info.get("relation")),
+            })
         unmanaged_sites = [
             normalize_text(site_id)
             for site_id in pattern_info.get("unmanaged_sites", []) or []

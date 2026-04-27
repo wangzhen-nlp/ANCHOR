@@ -2144,6 +2144,37 @@
             return DOMAIN_STYLE['DEFAULT'].color;
         }
 
+        function isSupplementalContextLink(link) {
+            return !!(link && link.supplemental_fault_pattern_context);
+        }
+
+        function getMapLinkDashArray(link) {
+            if (isSupplementalContextLink(link)) {
+                return '4, 5';
+            }
+            if (isDistanceLink(link)) {
+                return '10, 6';
+            }
+            return link && link.isNeighborExpanded ? '6, 6' : null;
+        }
+
+        function getMapLinkColor(link, sourceNode, targetNode, selected) {
+            if (selected) {
+                return '#cf222e';
+            }
+            if (isSupplementalContextLink(link)) {
+                return '#8c959f';
+            }
+            return getEdgeColorByNodes(sourceNode, targetNode);
+        }
+
+        function getMapLinkOpacity(link, selected) {
+            if (selected) {
+                return 1;
+            }
+            return isSupplementalContextLink(link) ? 0.65 : 0.8;
+        }
+
         // ==========================================
         // 坐标扰动功能（处理距离很近的节点）
         // ==========================================
@@ -3981,14 +4012,13 @@
             
             // 重置所有边的样式
             mapPolylines.forEach(function(polyline) {
-                const isDistance = isDistanceLink(polyline.linkData);
                 const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
                 const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                 polyline.setStyle({ 
-                    color: getEdgeColorByNodes(sourceNode, targetNode), 
+                    color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
                     weight: 2.5, 
-                    opacity: 0.8,
-                    dashArray: isDistance ? '10, 6' : null
+                    opacity: getMapLinkOpacity(polyline.linkData, false),
+                    dashArray: getMapLinkDashArray(polyline.linkData)
                 });
             });
         }
@@ -4225,8 +4255,8 @@
                 const sourceNode = currentNodes.find(function(n) { return n.id === sourceId; });
                 
                 const targetNode = currentNodes.find(function(n) { return n.id === targetId; });
-                const isSupplementalContextEdge = !!link.supplemental_fault_pattern_context;
-                const edgeColor = isSupplementalContextEdge ? '#8c959f' : getEdgeColorByNodes(sourceNode, targetNode);
+                const isSupplementalContextEdge = isSupplementalContextLink(link);
+                const edgeColor = getMapLinkColor(link, sourceNode, targetNode, false);
                 
                 const latlngs = [
                     [sourcePos[0], sourcePos[1]],
@@ -4240,8 +4270,8 @@
                 const polyline = L.polyline(latlngs, {
                     color: edgeColor,
                     weight: 2.5,
-                    opacity: isSupplementalContextEdge ? 0.65 : 0.8,
-                    dashArray: isSupplementalContextEdge ? '4, 5' : (isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null))
+                    opacity: getMapLinkOpacity(link, false),
+                    dashArray: getMapLinkDashArray(link)
                 }).addTo(map);
 
                 // 存储边数据到polyline以便点击时使用
@@ -4265,7 +4295,11 @@
 
                 // 鼠标悬停效果
                 polyline.on('mouseover', function(e) {
-                    this.setStyle({ weight: 5, opacity: 1 });
+                    this.setStyle({
+                        weight: 5,
+                        opacity: 1,
+                        dashArray: getMapLinkDashArray(this.linkData)
+                    });
                 });
                 
                 polyline.on('mouseout', function(e) {
@@ -4274,9 +4308,9 @@
                          (selectedEdge.source === this.targetId && selectedEdge.target === this.sourceId));
                     this.setStyle({ 
                         weight: isDistance ? 2.5 : 2.5, 
-                        opacity: isSelected ? 1 : 0.8,
-                        color: isSelected ? '#cf222e' : edgeColor,
-                        dashArray: isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null)
+                        opacity: getMapLinkOpacity(this.linkData, isSelected),
+                        color: getMapLinkColor(this.linkData, sourceNode, targetNode, isSelected),
+                        dashArray: getMapLinkDashArray(this.linkData)
                     });
                 });
 
@@ -4311,23 +4345,22 @@
             
             // 更新边样式...
             mapPolylines.forEach(function(polyline) {
+                const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
+                const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                 if (polyline.linkData === link) {
                     polyline.setStyle({ 
-                        color: '#cf222e', 
+                        color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, true),
                         weight: 4, 
                         opacity: 1,
-                        dashArray: isDistanceLink(link) ? '10, 6' : (link.isNeighborExpanded ? '6, 6' : null)
+                        dashArray: getMapLinkDashArray(polyline.linkData)
                     });
                     polyline.bringToFront();
                 } else {
-                    const isDistance = isDistanceLink(polyline.linkData);
-                    const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
-                    const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                     polyline.setStyle({ 
-                        color: getEdgeColorByNodes(sourceNode, targetNode), 
+                        color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
                         weight: 2.5, 
-                        opacity: 0.8,
-                        dashArray: isDistance ? '10, 6' : (polyline.linkData && polyline.linkData.isNeighborExpanded ? '6, 6' : null)
+                        opacity: getMapLinkOpacity(polyline.linkData, false),
+                        dashArray: getMapLinkDashArray(polyline.linkData)
                     });
                 }
             });
