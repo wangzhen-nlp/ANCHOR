@@ -667,6 +667,38 @@ def collect_supplemental_fault_pattern_sites(analysis, existing_sites):
     return supplemental_sites
 
 
+def collect_supplemental_fault_pattern_edges(analysis, existing_sites):
+    existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
+    supplemental_edges = []
+    seen = set()
+    for pattern_info in analysis.get("patterns", []) or []:
+        pattern = pattern_info.get("pattern")
+        if pattern not in {"ip_chain", "multi_link"}:
+            continue
+        unmanaged_sites = [
+            normalize_text(site_id)
+            for site_id in pattern_info.get("unmanaged_sites", []) or []
+            if normalize_text(site_id)
+        ]
+        if len(unmanaged_sites) != 1:
+            continue
+        anchor_site = unmanaged_sites[0]
+        for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
+            supplemental_site = normalize_text(site_id)
+            if not supplemental_site or supplemental_site in existing_sites:
+                continue
+            edge_key = (supplemental_site, anchor_site)
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            supplemental_edges.append({
+                "supplemental_site": supplemental_site,
+                "anchor_site": anchor_site,
+                "pattern": pattern,
+            })
+    return supplemental_edges
+
+
 def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_graph_data, site_to_ne_ids):
     if not ne_graph_data:
         return
@@ -683,6 +715,7 @@ def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_grap
 
     existing_ne_ids = set(ne_info.keys())
     supplemental_ne_ids = []
+    site_to_added_ne_ids = defaultdict(list)
     for site_id in supplemental_sites:
         for ne_id in site_to_ne_ids.get(site_id, ()):
             ne_graph_entry = as_dict(ne_graph_data.get(ne_id))
@@ -690,14 +723,24 @@ def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_grap
                 ne_info[ne_id] = build_context_ne_info(ne_id, ne_graph_entry, group_id)
             ne_info[ne_id]["supplemental_fault_pattern_context"] = True
             supplemental_ne_ids.append(ne_id)
+            site_to_added_ne_ids[site_id].append(ne_id)
 
-    all_case_ne_ids = set(ne_info.keys())
-    for source_ne in supplemental_ne_ids:
-        for target_ne in sorted(all_case_ne_ids - {source_ne}):
-            link_context = find_ne_link_context(source_ne, target_ne, ne_graph_data)
-            if link_context:
-                link_context["supplemental_fault_pattern_context"] = True
-                add_bidirectional_link(ne_info, source_ne, target_ne, link_context)
+    supplemental_edges = collect_supplemental_fault_pattern_edges(analysis, existing_sites)
+    for edge in supplemental_edges:
+        supplemental_site = edge["supplemental_site"]
+        anchor_site = edge["anchor_site"]
+        source_ne_ids = site_to_added_ne_ids.get(supplemental_site, [])
+        target_ne_ids = [
+            ne_id
+            for ne_id in site_to_ne_ids.get(anchor_site, ())
+            if ne_id in ne_info
+        ]
+        for source_ne in source_ne_ids:
+            for target_ne in target_ne_ids:
+                link_context = find_ne_link_context(source_ne, target_ne, ne_graph_data)
+                if link_context:
+                    link_context["supplemental_fault_pattern_context"] = True
+                    add_bidirectional_link(ne_info, source_ne, target_ne, link_context)
 
     group_info = record.setdefault("group_info", {})
     if isinstance(group_info, dict):
@@ -709,6 +752,7 @@ def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_grap
 
     record["fault_pattern_supplemental_sites"] = supplemental_sites
     record["fault_pattern_supplemental_ne_ids"] = sorted(set(supplemental_ne_ids))
+    record["fault_pattern_supplemental_edges"] = supplemental_edges
 
 
 def append_note(original_note, pattern_note):
