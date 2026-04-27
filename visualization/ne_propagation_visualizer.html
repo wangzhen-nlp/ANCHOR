@@ -2271,11 +2271,70 @@
             };
         }
 
+        function getNodeSiteKey(node) {
+            return String((node && (node.site_id || node.site_name)) || '').trim();
+        }
+
+        function getNodeCoordKey(node) {
+            if (!hasValidCoords(node)) return '';
+            return parseFloat(node.latitude).toFixed(6) + ',' + parseFloat(node.longitude).toFixed(6);
+        }
+
+        function buildSiteCanonicalCoordMap(nodes) {
+            const siteCoordStats = new Map();
+            (nodes || []).forEach(function(node) {
+                if (!hasValidCoords(node)) return;
+                const siteKey = getNodeSiteKey(node);
+                if (!siteKey) return;
+                const coordKey = getNodeCoordKey(node);
+                if (!coordKey) return;
+                if (!siteCoordStats.has(siteKey)) {
+                    siteCoordStats.set(siteKey, new Map());
+                }
+                const coordStats = siteCoordStats.get(siteKey);
+                if (!coordStats.has(coordKey)) {
+                    coordStats.set(coordKey, {
+                        key: coordKey,
+                        latitude: parseFloat(node.latitude),
+                        longitude: parseFloat(node.longitude),
+                        count: 0
+                    });
+                }
+                coordStats.get(coordKey).count += 1;
+            });
+
+            const siteCoordMap = new Map();
+            siteCoordStats.forEach(function(coordStats, siteKey) {
+                const sortedCoords = Array.from(coordStats.values()).sort(function(a, b) {
+                    if (b.count !== a.count) return b.count - a.count;
+                    return a.key.localeCompare(b.key);
+                });
+                if (sortedCoords.length > 0) {
+                    siteCoordMap.set(siteKey, sortedCoords[0]);
+                }
+            });
+            return siteCoordMap;
+        }
+
+        function nodeMatchesSiteCoordinate(node, siteCoordMap) {
+            const siteKey = getNodeSiteKey(node);
+            if (!siteKey || !siteCoordMap || !siteCoordMap.has(siteKey)) return true;
+            const canonicalCoord = siteCoordMap.get(siteKey);
+            return getNodeCoordKey(node) === canonicalCoord.key;
+        }
+
+        function getMapRenderableNodes() {
+            const siteCoordMap = buildSiteCanonicalCoordMap(currentNodes);
+            return currentNodes.filter(function(node) {
+                return hasValidCoords(node) && nodeMatchesSiteCoordinate(node, siteCoordMap);
+            });
+        }
+
         // 为当前节点应用坐标扰动
-        function getJitteredCoords() {
+        function getJitteredCoords(nodes) {
             const rawCoords = {};
             const domainDict = {};
-            currentNodes.forEach(function(node) {
+            (nodes || currentNodes).forEach(function(node) {
                 if (hasValidCoords(node)) {
                     rawCoords[node.id] = [parseFloat(node.latitude), parseFloat(node.longitude)];
                     const domain = node.domain || '';
@@ -2842,7 +2901,7 @@
                 siteOrderData = data;
                 statusEl.textContent = 'site_order：已自动加载 ../topology_resources/site_order.json，站点数 ' + Object.keys(siteOrderData).length;
                 if (map && currentNodes.length > 0) {
-                    renderSiteOverlays();
+                    renderMap({ preserveViewport: true });
                 }
             } catch (error) {
                 siteOrderData = null;
@@ -3280,13 +3339,14 @@
         function focusOnNodes(nodeIds) {
             if (!map || nodeIds.length === 0) return;
             
-            const nodesToFocus = currentNodes.filter(function(n) { 
-                return nodeIds.indexOf(n.id) !== -1 && hasValidCoords(n); 
+            const renderableNodes = getMapRenderableNodes();
+            const nodesToFocus = renderableNodes.filter(function(n) {
+                return nodeIds.indexOf(n.id) !== -1;
             });
             
             if (nodesToFocus.length === 0) return;
             
-            const jitterResult = getJitteredCoords();
+            const jitterResult = getJitteredCoords(renderableNodes);
             const jitteredCoords = jitterResult.coords;
             
             const latLngs = nodesToFocus.map(function(n) {
@@ -3439,10 +3499,10 @@
                    !isNaN(parseFloat(node.longitude));
         }
 
-        function getCurrentSiteLocations() {
+        function getCurrentSiteLocations(nodes, renderCoords) {
             const siteMap = new Map();
 
-            currentNodes.forEach(function(node) {
+            (nodes || currentNodes).forEach(function(node) {
                 if (!hasValidCoords(node)) return;
 
                 const siteId = node.site_id || '';
@@ -3450,8 +3510,9 @@
                 const siteKey = siteId || siteName;
                 if (!siteKey) return;
 
-                const lat = parseFloat(node.latitude);
-                const lng = parseFloat(node.longitude);
+                const renderedPos = renderCoords && renderCoords[node.id];
+                const lat = renderedPos ? parseFloat(renderedPos[0]) : parseFloat(node.latitude);
+                const lng = renderedPos ? parseFloat(renderedPos[1]) : parseFloat(node.longitude);
                 const existing = siteMap.get(siteKey);
 
                 if (existing) {
@@ -3652,13 +3713,13 @@
             return { strokeWidth: 2, strokeColor: '#ffffff' };
         }
 
-        function renderSiteOverlays() {
+        function renderSiteOverlays(nodes, renderCoords) {
             mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
             mapSiteOverlays = [];
 
             if (!map) return;
 
-            const sites = getCurrentSiteLocations();
+            const sites = getCurrentSiteLocations(nodes, renderCoords);
             sites.forEach(function(site) {
                 const latlng = [site.latitude, site.longitude];
                 const radius = Math.min(36, 18 + Math.max(0, site.deviceCount - 1) * 2);
@@ -3761,7 +3822,7 @@
             mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
             mapSiteOverlays = [];
 
-            const geoNodes = currentNodes.filter(function(n) { return hasValidCoords(n); });
+            const geoNodes = getMapRenderableNodes();
             
             if (geoNodes.length === 0) {
                 console.warn('没有带有有效经纬度的节点');
@@ -3769,10 +3830,10 @@
             }
 
             // 获取扰动后的坐标（距离相近的节点会被错开）
-            const jitterResult = getJitteredCoords();
+            const jitterResult = getJitteredCoords(geoNodes);
             const jitteredCoords = jitterResult.coords;
 
-            renderSiteOverlays();
+            renderSiteOverlays(geoNodes, jitteredCoords);
             
             // 显示/隐藏扰动指示器，并显示错开的节点数量
             const jitterIndicator = document.getElementById('jitterIndicator');
@@ -4185,7 +4246,9 @@
 
             if (multiSelectLinks.length === 0) return;
 
-            const jitterResult = getJitteredCoords();
+            const renderableNodes = getMapRenderableNodes();
+            const renderableNodeIds = new Set(renderableNodes.map(function(node) { return node.id; }));
+            const jitterResult = getJitteredCoords(renderableNodes);
             const jitteredCoords = jitterResult.coords;
 
             multiSelectLinks.forEach(function(link) {
@@ -4193,7 +4256,7 @@
                 const targetNode = allNodes.find(function(n) { return n.id === link.target; });
 
                 if (sourceNode && targetNode &&
-                    hasValidCoords(sourceNode) && hasValidCoords(targetNode)) {
+                    renderableNodeIds.has(sourceNode.id) && renderableNodeIds.has(targetNode.id)) {
                     
                     const sourcePos = jitteredCoords[link.source];
                     const targetPos = jitteredCoords[link.target];
@@ -5590,7 +5653,7 @@
                     siteOrderData = data;
                     document.getElementById('siteOrderStatus').textContent = 'site_order：已加载 ' + file.name + '，站点数 ' + Object.keys(siteOrderData).length;
                     if (map && currentNodes.length > 0) {
-                        renderSiteOverlays();
+                        renderMap({ preserveViewport: true });
                     }
                 } catch (error) {
                     siteOrderData = null;
