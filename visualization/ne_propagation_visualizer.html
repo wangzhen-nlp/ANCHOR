@@ -981,6 +981,23 @@
             color: #9a3412;
         }
 
+        .site-label-map.fault-pattern-site {
+            color: #cf222e;
+            font-weight: 800;
+            background: rgba(255, 245, 245, 0.96);
+            border-color: rgba(207, 34, 46, 0.55);
+            box-shadow: 0 2px 12px rgba(207, 34, 46, 0.22);
+        }
+
+        .node-item.fault-pattern-site {
+            border-right: 3px solid #cf222e;
+        }
+
+        .node-item .site-name .fault-pattern-site-id {
+            color: #cf222e;
+            font-weight: 800;
+        }
+
         .leaflet-popup-content-wrapper {
             background: #ffffff;
             color: #24292f;
@@ -2009,6 +2026,10 @@
                             <span>上下文/其它告警设备</span>
                         </div>
                         <div class="legend-item">
+                            <span style="color: #cf222e; font-weight: 800; font-size: 12px;">SITE</span>
+                            <span>故障模式匹配站点</span>
+                        </div>
+                        <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #ffd700; border-radius: 50%; animation: pulse 1s infinite;"></div>
                             <span>高亮站点</span>
                         </div>
@@ -2271,8 +2292,49 @@
             missing_site: new Set(),
             context_site: new Set()
         };
+        let faultPatternManagedSites = new Set();
         let siteNeighborModeEnabled = false;
         let siteNeighborHopCount = 1;
+
+        function normalizeSiteId(value) {
+            return String(value || '').trim();
+        }
+
+        function addSiteValuesToSet(targetSet, values) {
+            if (!Array.isArray(values)) return;
+            values.forEach(function(value) {
+                const siteId = normalizeSiteId(value);
+                if (siteId) {
+                    targetSet.add(siteId);
+                }
+            });
+        }
+
+        function updateFaultPatternManagedSites(data) {
+            const nextSites = new Set();
+            if (data && typeof data === 'object') {
+                addSiteValuesToSet(nextSites, data.fault_pattern_managed_sites);
+
+                const analysis = data.fault_pattern_analysis && typeof data.fault_pattern_analysis === 'object'
+                    ? data.fault_pattern_analysis
+                    : {};
+                addSiteValuesToSet(nextSites, analysis.managed_sites);
+
+                const patterns = Array.isArray(data.fault_patterns)
+                    ? data.fault_patterns
+                    : (Array.isArray(analysis.patterns) ? analysis.patterns : []);
+                patterns.forEach(function(patternInfo) {
+                    if (patternInfo && typeof patternInfo === 'object') {
+                        addSiteValuesToSet(nextSites, patternInfo.managed_sites);
+                    }
+                });
+            }
+            faultPatternManagedSites = nextSites;
+        }
+
+        function isFaultPatternManagedSite(siteId) {
+            return faultPatternManagedSites.has(normalizeSiteId(siteId));
+        }
 
         function updateRoleSiteSets(data) {
             const rootRoleMapping = (data && data.role_mapping && typeof data.role_mapping === 'object') ? data.role_mapping : {};
@@ -3356,6 +3418,7 @@
                     existing.count += 1;
                     existing.hasExpandedNode = existing.hasExpandedNode || !!node.isNeighborExpanded;
                     existing.hasBaseNode = existing.hasBaseNode || !node.isNeighborExpanded;
+                    existing.isFaultPatternSite = existing.isFaultPatternSite || isFaultPatternManagedSite(siteId);
                 } else {
                     siteMap.set(siteKey, {
                         siteId: siteId,
@@ -3364,7 +3427,8 @@
                         lngSum: lng,
                         count: 1,
                         hasExpandedNode: !!node.isNeighborExpanded,
-                        hasBaseNode: !node.isNeighborExpanded
+                        hasBaseNode: !node.isNeighborExpanded,
+                        isFaultPatternSite: isFaultPatternManagedSite(siteId)
                     });
                 }
             });
@@ -3379,7 +3443,8 @@
                     deviceCount: site.count,
                     isExpandedSite: !!site.hasExpandedNode && !site.hasBaseNode,
                     hasExpandedNode: !!site.hasExpandedNode,
-                    hasBaseNode: !!site.hasBaseNode
+                    hasBaseNode: !!site.hasBaseNode,
+                    isFaultPatternSite: !!site.isFaultPatternSite
                 };
             });
         }
@@ -3553,9 +3618,10 @@
                 const latlng = [site.latitude, site.longitude];
                 const radius = Math.min(36, 18 + Math.max(0, site.deviceCount - 1) * 2);
                 const isExpandedSite = !!site.isExpandedSite;
-                const overlayColor = isExpandedSite ? '#f59e0b' : '#0969da';
+                const isFaultPatternSite = !!site.isFaultPatternSite;
+                const overlayColor = isFaultPatternSite ? '#cf222e' : (isExpandedSite ? '#f59e0b' : '#0969da');
                 const fillOpacity = isExpandedSite ? 0.12 : 0.07;
-                const haloOpacity = isExpandedSite ? 0.4 : 0.28;
+                const haloOpacity = isFaultPatternSite ? 0.5 : (isExpandedSite ? 0.4 : 0.28);
 
                 const halo = L.circleMarker(latlng, {
                     pane: 'siteOverlayPane',
@@ -3585,7 +3651,7 @@
                     zIndexOffset: -1000,
                     icon: L.divIcon({
                         className: 'site-label-container',
-                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site' : '') + '">' + (site.label || site.siteId || site.siteName || '未知站点') + '</div>',
+                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site ' : '') + (isFaultPatternSite ? 'fault-pattern-site' : '') + '">' + escapeHtml(site.label || site.siteId || site.siteName || '未知站点') + '</div>',
                         iconSize: null,
                         iconAnchor: [-8, 14]
                     })
@@ -4703,6 +4769,7 @@
         function loadOriginalFormat(data) {
             graphData = data;
             updateRoleSiteSets(data);
+            updateFaultPatternManagedSites(data);
             allNodes = [];
             const hiddenSiteIds = getVisualizationExcludedSiteIds(data);
             const hiddenNeIds = new Set();
@@ -4804,6 +4871,7 @@
         function loadVizFormat(data) {
             graphData = data;
             updateRoleSiteSets(data);
+            updateFaultPatternManagedSites(data);
             allNodes = (data.nodes || []).map(function(n) {
                 const domain = n.domain || '';
                 const style = getDomainStyle(domain);
@@ -5110,11 +5178,15 @@
                 const isHighlighted = highlightedNodes.has(n.id);
                 const hasAlarmClass = getNodeAlarmRoleClass(n);
                 const isSelected = (n.id === highlightId) || (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id));
-                return '<div class="node-item ' + (isSelected ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
+                const isFaultPatternSite = isFaultPatternManagedSite(n.site_id);
+                const siteIdHtml = isFaultPatternSite
+                    ? '<span class="fault-pattern-site-id">' + escapeHtml(n.site_id || '-') + '</span>'
+                    : escapeHtml(n.site_id || '-');
+                return '<div class="node-item ' + (isSelected ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + ' ' + (isFaultPatternSite ? 'fault-pattern-site' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
-                        '<div class="ne-id">' + getRawNodeId(n) + '</div>' +
-                        '<div class="site-name">' + (n.site_id || '-') + ' | ' + style.label + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
+                        '<div class="ne-id">' + escapeHtml(getRawNodeId(n)) + '</div>' +
+                        '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
                     '</div>' +
                     '</div>';

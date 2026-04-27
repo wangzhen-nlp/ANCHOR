@@ -21,6 +21,7 @@ from fault_grouping.site_topology import (
 from topology_resources import NE_GRAPH_JSON, SITE_CHAINS_JSON, resource_display
 
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
+ROUTER_DEVICE_DOMAINS = {"DATA"}
 
 
 def normalize_text(value):
@@ -104,12 +105,57 @@ def extract_alarm_name(record):
     )
 
 
+def extract_domain(record):
+    if not isinstance(record, dict):
+        return ""
+    return (
+        normalize_text(record.get("domain"))
+        or normalize_text(record.get("Domain"))
+        or normalize_text(record.get("DOMAIN"))
+        or normalize_text(record.get("alarm_source_domain"))
+        or normalize_text(record.get("告警源专业"))
+    ).upper()
+
+
 def extract_record_site(record, ne_to_site):
     site_id = normalize_text(record.get("node")) or normalize_text(record.get("site_id")) or normalize_text(record.get("站点ID"))
     if site_id:
         return site_id
     alarm_source = normalize_text(record.get("alarm_source")) or normalize_text(record.get("告警源"))
     return normalize_text(ne_to_site.get(alarm_source, ""))
+
+
+def build_site_has_router_device_map(ne_graph_data):
+    site_has_router_device = defaultdict(bool)
+    for ne_info in ne_graph_data.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = normalize_text(ne_info.get("site_id"))
+        if not site_id:
+            continue
+        if extract_domain(ne_info) in ROUTER_DEVICE_DOMAINS:
+            site_has_router_device[site_id] = True
+    return dict(site_has_router_device)
+
+
+def extract_case_router_device_sites(record, site_has_router_device):
+    router_sites = {
+        site_id
+        for site_id in extract_case_sites(record)
+        if site_has_router_device.get(site_id, False)
+    }
+
+    for ne_meta in as_dict(record.get("ne_info")).values():
+        if not isinstance(ne_meta, dict):
+            continue
+        site_id = normalize_text(ne_meta.get("site_id"))
+        if site_id and extract_domain(ne_meta) in ROUTER_DEVICE_DOMAINS:
+            router_sites.add(site_id)
+        for alarm in ne_meta.get("alarm", []) or []:
+            if site_id and isinstance(alarm, dict) and extract_domain(alarm) in ROUTER_DEVICE_DOMAINS:
+                router_sites.add(site_id)
+
+    return router_sites
 
 
 def extract_offline_sites(record, ne_to_site):
@@ -327,12 +373,48 @@ def classify_chain_uplink(chain, component_sites, relation_index):
     return subtype, sorted(external_connected_chain_sites)
 
 
-def classify_component(component_sites, unmanaged_sites, relation_index):
+def absorbed_router_unmanaged_sites_for_final(final_site, absorbed_by, router_device_sites):
+    matched_sites = []
+    for absorbed_site in sorted(absorbed_by):
+        if absorbed_site == final_site or absorbed_site not in router_device_sites:
+            continue
+
+        visited = {absorbed_site}
+        parent_site = absorbed_by.get(absorbed_site)
+        while parent_site:
+            if parent_site == final_site:
+                matched_sites.append(absorbed_site)
+                break
+            if parent_site in visited:
+                break
+            visited.add(parent_site)
+            parent_site = absorbed_by.get(parent_site)
+    return matched_sites
+
+
+def classify_component(component_sites, unmanaged_sites, relation_index, absorbed_by=None, router_device_sites=None):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
+    absorbed_by = absorbed_by or {}
+    router_device_sites = set(router_device_sites or [])
 
-    if len(component_sites) == 1:
+    if len(component_sites) == 1 and len(component_unmanaged_sites) == 1:
         final_site = next(iter(component_sites))
+        absorbed_router_sites = absorbed_router_unmanaged_sites_for_final(
+            final_site,
+            absorbed_by,
+            router_device_sites,
+        )
+        if not absorbed_router_sites:
+            return {
+                "pattern": "unknown",
+                "sites": sorted(component_sites),
+                "unmanaged_sites": sorted(component_unmanaged_sites),
+                "managed_sites": [],
+                "final_site": "",
+                "final_managed_site": "",
+                "chains": [],
+            }
         return {
             "pattern": "ip_chain",
             "sites": sorted(component_sites),
@@ -340,10 +422,11 @@ def classify_component(component_sites, unmanaged_sites, relation_index):
             "managed_sites": [final_site],
             "final_site": final_site,
             "final_managed_site": final_site,
+            "absorbed_router_unmanaged_sites": absorbed_router_sites,
             "chains": [],
         }
 
-    if len(component_unmanaged_sites) == 1:
+    if len(component_sites) >= 3 and len(component_unmanaged_sites) == 1:
         candidate = next(iter(component_unmanaged_sites))
         if all(
             other_site == candidate or relation_index.directly_connected(candidate, other_site)
@@ -400,9 +483,10 @@ def classify_component(component_sites, unmanaged_sites, relation_index):
     }
 
 
-def analyze_case_record(record, relation_index, ne_to_site):
+def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
     site_ids = extract_case_sites(record)
     offline_sites = extract_offline_sites(record, ne_to_site) & set(site_ids)
+    router_device_sites = extract_case_router_device_sites(record, site_has_router_device)
     active_sites, active_unmanaged_sites, absorbed_by, absorb_steps = absorb_unmanaged_downstream_sites(
         site_ids,
         offline_sites,
@@ -411,7 +495,13 @@ def analyze_case_record(record, relation_index, ne_to_site):
 
     component_records = []
     for component_sites in connected_components(active_sites, relation_index):
-        component_record = classify_component(component_sites, active_unmanaged_sites, relation_index)
+        component_record = classify_component(
+            component_sites,
+            active_unmanaged_sites,
+            relation_index,
+            absorbed_by=absorbed_by,
+            router_device_sites=router_device_sites,
+        )
         if component_record.get("pattern") != "unknown":
             component_records.append(component_record)
     component_records.sort(key=lambda item: (item["pattern"], item["sites"]))
@@ -443,6 +533,7 @@ def analyze_case_record(record, relation_index, ne_to_site):
         "site_count": len(site_ids),
         "sites": site_ids,
         "offline_sites": sorted(offline_sites),
+        "router_device_sites": sorted(router_device_sites & set(site_ids)),
         "active_sites_after_absorption": sorted(active_sites),
         "active_unmanaged_sites": matched_unmanaged_sites,
         "managed_sites": managed_sites,
@@ -561,6 +652,7 @@ def main():
         for ne_id, ne_info in ne_graph_data.items()
         if isinstance(ne_info, dict) and normalize_text(ne_info.get("site_id"))
     }
+    site_has_router_device = build_site_has_router_device_map(ne_graph_data)
     site_chains_path = args.site_chains if args.site_chains and Path(args.site_chains).exists() else ""
     relation_index = SiteRelationIndex(ne_graph_data=ne_graph_data, site_chains_path=site_chains_path)
 
@@ -570,7 +662,7 @@ def main():
     with open(args.output, "w", encoding="utf-8") as output_file:
         try:
             for line_num, record in iter_jsonl_records(args.cases):
-                result = analyze_case_record(record, relation_index, ne_to_site)
+                result = analyze_case_record(record, relation_index, ne_to_site, site_has_router_device)
                 result["line_num"] = line_num
                 results.append(result)
                 output_record = result if args.analysis_only else build_augmented_case_record(record, result)
