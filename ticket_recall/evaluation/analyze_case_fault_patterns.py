@@ -13,6 +13,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from alarm_tools.alarm_types import OFFLINE_ALARMS
+from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.site_topology import (
     build_site_topology_from_ne_graph,
     load_site_chain_index,
@@ -57,6 +58,11 @@ def iter_jsonl_records(path):
                 continue
             if isinstance(record, dict):
                 yield line_num, record
+
+
+def count_jsonl_lines(path):
+    with open(path, "r", encoding="utf-8") as file_obj:
+        return sum(1 for line in file_obj if line.strip())
 
 
 def extract_record_uuid(record):
@@ -355,11 +361,15 @@ def classify_component(component_sites, unmanaged_sites, relation_index):
 
     unmanaged_components = connected_components(component_unmanaged_sites, relation_index)
     unmanaged_chains = []
+    chain_covered_sites = set()
     for unmanaged_component in unmanaged_components:
         chain = longest_path_in_component(unmanaged_component, relation_index)
         if len(chain) < 2:
             continue
+        if set(chain) != set(unmanaged_component):
+            continue
         subtype, external_sites = classify_chain_uplink(chain, component_sites, relation_index)
+        chain_covered_sites.update(chain)
         unmanaged_chains.append({
             "chain": chain,
             "length": len(chain),
@@ -368,7 +378,7 @@ def classify_component(component_sites, unmanaged_sites, relation_index):
         })
     unmanaged_chains.sort(key=lambda item: (-item["length"], item["chain"]))
 
-    if len(unmanaged_chains) == 1:
+    if len(unmanaged_chains) == 1 and chain_covered_sites == component_unmanaged_sites:
         return {
             "pattern": "ip_ring",
             "sites": sorted(component_sites),
@@ -401,7 +411,9 @@ def analyze_case_record(record, relation_index, ne_to_site):
 
     component_records = []
     for component_sites in connected_components(active_sites, relation_index):
-        component_records.append(classify_component(component_sites, active_unmanaged_sites, relation_index))
+        component_record = classify_component(component_sites, active_unmanaged_sites, relation_index)
+        if component_record.get("pattern") != "unknown":
+            component_records.append(component_record)
     component_records.sort(key=lambda item: (item["pattern"], item["sites"]))
 
     primary_pattern = "none"
@@ -416,6 +428,11 @@ def analyze_case_record(record, relation_index, ne_to_site):
         for component in component_records
         for site_id in component.get("managed_sites", [])
     })
+    matched_unmanaged_sites = sorted({
+        site_id
+        for component in component_records
+        for site_id in component.get("unmanaged_sites", [])
+    })
 
     return {
         "uuid": extract_record_uuid(record),
@@ -427,7 +444,7 @@ def analyze_case_record(record, relation_index, ne_to_site):
         "sites": site_ids,
         "offline_sites": sorted(offline_sites),
         "active_sites_after_absorption": sorted(active_sites),
-        "active_unmanaged_sites": sorted(active_unmanaged_sites),
+        "active_unmanaged_sites": matched_unmanaged_sites,
         "managed_sites": managed_sites,
         "absorbed_by": absorbed_by,
         "absorb_steps": absorb_steps,
@@ -454,49 +471,34 @@ def summarize_patterns(results):
     for result in results:
         patterns = result.get("patterns", [])
         if not isinstance(patterns, list) or not patterns:
-            counts[result.get("pattern", "unknown")] += 1
             continue
         for pattern_info in patterns:
-            if isinstance(pattern_info, dict):
-                counts[pattern_info.get("pattern", "unknown")] += 1
+            if not isinstance(pattern_info, dict):
+                continue
+            pattern = pattern_info.get("pattern", "")
+            if pattern and pattern != "unknown":
+                counts[pattern] += 1
     return {pattern: counts[pattern] for pattern in sorted(counts)}
 
 
 def format_pattern_summary_line(pattern_info, index):
     pattern = pattern_info.get("pattern", "unknown")
     managed_sites = pattern_info.get("managed_sites", []) or []
-    unmanaged_sites = pattern_info.get("unmanaged_sites", []) or []
-    final_site = normalize_text(pattern_info.get("final_site", ""))
-    final_managed_site = normalize_text(pattern_info.get("final_managed_site", ""))
 
-    parts = [
-        f"模式{index}: {pattern}",
-        f"站点: {','.join(pattern_info.get('sites', []) or []) or '无'}",
-        f"剩余脱管标识站点: {','.join(unmanaged_sites) or '无'}",
-        f"匹配托管站点: {','.join(managed_sites) or '无'}",
-    ]
-    if final_site:
-        parts.append(f"最终站点: {final_site}")
-    if final_managed_site:
-        parts.append(f"最终托管站点: {final_managed_site}")
+    if pattern == "ip_ring":
+        chains = pattern_info.get("chains", []) or []
+        chain = chains[0].get("chain", []) if chains and isinstance(chains[0], dict) else []
+        matched_text = "->".join(chain) if chain else "->".join(managed_sites)
+    else:
+        matched_text = "->".join(managed_sites)
 
-    chain_summaries = []
-    for chain_info in pattern_info.get("chains", []) or []:
-        chain = chain_info.get("chain", []) or []
-        if chain:
-            chain_summaries.append(
-                f"{'->'.join(chain)}({chain_info.get('uplink_type', 'unknown')})"
-            )
-    if chain_summaries:
-        parts.append(f"托管链: {'; '.join(chain_summaries)}")
-
-    return "；".join(parts)
+    return f"模式{index}：{pattern}（{matched_text or '无'}）"
 
 
 def build_pattern_note(analysis):
     patterns = analysis.get("patterns", []) or []
     if not patterns:
-        return "故障模式挖掘：无匹配模式"
+        return ""
 
     lines = ["故障模式挖掘："]
     lines.extend(
@@ -508,11 +510,14 @@ def build_pattern_note(analysis):
 
 def append_note(original_note, pattern_note):
     original_note = normalize_text(original_note)
+    pattern_note = normalize_text(pattern_note)
+    if not pattern_note:
+        return original_note
     if not original_note:
         return pattern_note
     if pattern_note in original_note:
         return original_note
-    return f"{original_note}\n{pattern_note}"
+    return f"{original_note.rstrip()}\n\n{pattern_note}"
 
 
 def build_augmented_case_record(record, analysis):
@@ -559,14 +564,20 @@ def main():
     site_chains_path = args.site_chains if args.site_chains and Path(args.site_chains).exists() else ""
     relation_index = SiteRelationIndex(ne_graph_data=ne_graph_data, site_chains_path=site_chains_path)
 
+    total_cases = count_jsonl_lines(args.cases)
+    progress = ProgressBar(total_cases, "分析 case 故障模式", min_interval=0.05)
     results = []
     with open(args.output, "w", encoding="utf-8") as output_file:
-        for line_num, record in iter_jsonl_records(args.cases):
-            result = analyze_case_record(record, relation_index, ne_to_site)
-            result["line_num"] = line_num
-            results.append(result)
-            output_record = result if args.analysis_only else build_augmented_case_record(record, result)
-            output_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+        try:
+            for line_num, record in iter_jsonl_records(args.cases):
+                result = analyze_case_record(record, relation_index, ne_to_site)
+                result["line_num"] = line_num
+                results.append(result)
+                output_record = result if args.analysis_only else build_augmented_case_record(record, result)
+                output_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+                progress.update()
+        finally:
+            progress.close()
 
     summary = {
         "case_count": len(results),
