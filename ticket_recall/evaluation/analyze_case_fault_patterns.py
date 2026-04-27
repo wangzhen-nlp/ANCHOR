@@ -420,6 +420,14 @@ def build_context_edges_for_anchors(anchors, related_sites_by_anchor, relation_t
     return context_edges
 
 
+def bidirectional_or_upstream_neighbors(site_id, relation_index):
+    return set(relation_index.bidirectional_neighbors(site_id)) | set(relation_index.direct_upstream_neighbors(site_id))
+
+
+def has_two_bidirectional_or_upstream_neighbors(site_id, relation_index):
+    return len(bidirectional_or_upstream_neighbors(site_id, relation_index)) == 2
+
+
 def classify_ip_ring_chain(chain, relation_index):
     chain = list(chain)
     chain_set = set(chain)
@@ -433,7 +441,7 @@ def classify_ip_ring_chain(chain, relation_index):
         for endpoint in endpoints
     }
 
-    if all(len(relation_index.bidirectional_neighbors(site_id)) == 2 for site_id in chain):
+    if all(has_two_bidirectional_or_upstream_neighbors(site_id, relation_index) for site_id in chain):
         context_edges = build_context_edges_for_anchors(
             endpoints,
             {
@@ -445,12 +453,12 @@ def classify_ip_ring_chain(chain, relation_index):
         return "ip_ring_single_upstream", context_edges, []
 
     internal_sites = [site_id for site_id in chain if site_id not in endpoint_set]
-    internal_bidir_ok = all(
-        len(relation_index.bidirectional_neighbors(site_id)) == 2
+    internal_ring_degree_ok = all(
+        has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
         for site_id in internal_sites
     )
     endpoint_condition_failed = any(
-        len(relation_index.bidirectional_neighbors(endpoint)) != 2
+        not has_two_bidirectional_or_upstream_neighbors(endpoint, relation_index)
         for endpoint in endpoints
     )
     endpoint_upstream = {
@@ -460,7 +468,7 @@ def classify_ip_ring_chain(chain, relation_index):
     common_bidir_sites = sorted((endpoint_bidir[endpoints[0]] & endpoint_bidir[endpoints[1]]) - chain_set)
     common_upstream_sites = sorted((endpoint_upstream[endpoints[0]] & endpoint_upstream[endpoints[1]]) - chain_set)
 
-    if internal_bidir_ok and endpoint_condition_failed and (common_bidir_sites or common_upstream_sites):
+    if internal_ring_degree_ok and endpoint_condition_failed and (common_bidir_sites or common_upstream_sites):
         bidir_edges = build_context_edges_for_anchors(
             endpoints,
             {
