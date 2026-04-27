@@ -395,10 +395,27 @@ def classify_chain_uplink(chain, component_sites, relation_index):
     return subtype, sorted(external_connected_chain_sites)
 
 
-def classify_component(component_sites, unmanaged_sites, relation_index, router_device_sites=None):
+def has_absorbed_site_for_final(final_site, absorbed_by):
+    for absorbed_site in sorted(absorbed_by):
+        if absorbed_site == final_site:
+            continue
+        visited = {absorbed_site}
+        parent_site = absorbed_by.get(absorbed_site)
+        while parent_site:
+            if parent_site == final_site:
+                return True
+            if parent_site in visited:
+                break
+            visited.add(parent_site)
+            parent_site = absorbed_by.get(parent_site)
+    return False
+
+
+def classify_component(component_sites, unmanaged_sites, relation_index, router_device_sites=None, absorbed_by=None):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
     router_device_sites = set(router_device_sites or [])
+    absorbed_by = absorbed_by or {}
     non_router_sites = component_sites - router_device_sites
 
     if non_router_sites:
@@ -421,6 +438,8 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
         elif len(non_downstream_neighbors) >= 2:
             pattern = "multi_link"
         else:
+            pattern = "unknown"
+        if pattern == "ip_chain" and not has_absorbed_site_for_final(candidate, absorbed_by):
             pattern = "unknown"
 
         if pattern == "unknown":
@@ -504,6 +523,7 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
             active_unmanaged_sites,
             relation_index,
             router_device_sites=router_device_sites,
+            absorbed_by=absorbed_by,
         )
         if component_record.get("pattern") != "unknown":
             component_records.append(component_record)
@@ -651,8 +671,9 @@ def find_ne_link_context(source_ne, target_ne, ne_graph_data):
     return {}
 
 
-def collect_supplemental_fault_pattern_sites(analysis, existing_sites):
+def collect_supplemental_fault_pattern_sites(analysis, existing_sites, site_has_router_device=None):
     existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
+    site_has_router_device = site_has_router_device or {}
     supplemental_sites = []
     seen = set()
     for pattern_info in analysis.get("patterns", []) or []:
@@ -661,14 +682,24 @@ def collect_supplemental_fault_pattern_sites(analysis, existing_sites):
             continue
         for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
             normalized_site_id = normalize_text(site_id)
-            if normalized_site_id and normalized_site_id not in existing_sites and normalized_site_id not in seen:
+            if (
+                normalized_site_id
+                and normalized_site_id not in existing_sites
+                and normalized_site_id not in seen
+                and site_has_router_device.get(normalized_site_id, False)
+            ):
                 seen.add(normalized_site_id)
                 supplemental_sites.append(normalized_site_id)
     return supplemental_sites
 
 
-def collect_supplemental_fault_pattern_edges(analysis, existing_sites):
+def collect_supplemental_fault_pattern_edges(analysis, existing_sites, supplemental_sites=None):
     existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
+    supplemental_site_set = {
+        normalize_text(site_id)
+        for site_id in (supplemental_sites or [])
+        if normalize_text(site_id)
+    }
     supplemental_edges = []
     seen = set()
     for pattern_info in analysis.get("patterns", []) or []:
@@ -685,7 +716,11 @@ def collect_supplemental_fault_pattern_edges(analysis, existing_sites):
         anchor_site = unmanaged_sites[0]
         for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
             supplemental_site = normalize_text(site_id)
-            if not supplemental_site or supplemental_site in existing_sites:
+            if (
+                not supplemental_site
+                or supplemental_site in existing_sites
+                or supplemental_site not in supplemental_site_set
+            ):
                 continue
             edge_key = (supplemental_site, anchor_site)
             if edge_key in seen:
@@ -699,7 +734,13 @@ def collect_supplemental_fault_pattern_edges(analysis, existing_sites):
     return supplemental_edges
 
 
-def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_graph_data, site_to_ne_ids):
+def augment_case_with_supplemental_fault_pattern_sites(
+    record,
+    analysis,
+    ne_graph_data,
+    site_to_ne_ids,
+    site_has_router_device=None,
+):
     if not ne_graph_data:
         return
 
@@ -709,7 +750,11 @@ def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_grap
 
     group_id = extract_record_uuid(record) or normalize_text(record.get("uuid")) or "fault_pattern_context"
     existing_sites = extract_case_sites(record)
-    supplemental_sites = collect_supplemental_fault_pattern_sites(analysis, existing_sites)
+    supplemental_sites = collect_supplemental_fault_pattern_sites(
+        analysis,
+        existing_sites,
+        site_has_router_device=site_has_router_device,
+    )
     if not supplemental_sites:
         return
 
@@ -725,7 +770,11 @@ def augment_case_with_supplemental_fault_pattern_sites(record, analysis, ne_grap
             supplemental_ne_ids.append(ne_id)
             site_to_added_ne_ids[site_id].append(ne_id)
 
-    supplemental_edges = collect_supplemental_fault_pattern_edges(analysis, existing_sites)
+    supplemental_edges = collect_supplemental_fault_pattern_edges(
+        analysis,
+        existing_sites,
+        supplemental_sites=supplemental_sites,
+    )
     for edge in supplemental_edges:
         supplemental_site = edge["supplemental_site"]
         anchor_site = edge["anchor_site"]
@@ -767,7 +816,13 @@ def append_note(original_note, pattern_note):
     return f"{original_note.rstrip()}\n\n{pattern_note}"
 
 
-def build_augmented_case_record(record, analysis, ne_graph_data=None, site_to_ne_ids=None):
+def build_augmented_case_record(
+    record,
+    analysis,
+    ne_graph_data=None,
+    site_to_ne_ids=None,
+    site_has_router_device=None,
+):
     augmented = copy.deepcopy(record)
     pattern_note = build_pattern_note(analysis)
 
@@ -786,6 +841,7 @@ def build_augmented_case_record(record, analysis, ne_graph_data=None, site_to_ne
         analysis,
         ne_graph_data or {},
         site_to_ne_ids or {},
+        site_has_router_device=site_has_router_device or {},
     )
     return augmented
 
@@ -833,6 +889,7 @@ def main():
                     result,
                     ne_graph_data=ne_graph_data,
                     site_to_ne_ids=site_to_ne_ids,
+                    site_has_router_device=site_has_router_device,
                 )
                 output_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
                 progress.update()
