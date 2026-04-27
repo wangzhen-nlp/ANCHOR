@@ -637,6 +637,13 @@
             box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
         }
 
+        .node-item.supplemental-context {
+            border-color: #8c959f;
+            border-left-color: #8c959f;
+            background: #f6f8fa;
+            box-shadow: inset 0 0 0 1px rgba(140, 149, 159, 0.2);
+        }
+
         .node-item.neighbor-expanded {
             background: linear-gradient(135deg, #fff7ed 0%, #ffffff 100%);
             border-color: #fdba74;
@@ -2028,6 +2035,10 @@
                         <div class="legend-item">
                             <span style="color: #cf222e; font-weight: 800; font-size: 12px;">SITE</span>
                             <span>故障模式匹配站点</span>
+                        </div>
+                        <div class="legend-item">
+                            <div style="width: 16px; height: 16px; border: 3px solid #8c959f; border-radius: 50%;"></div>
+                            <span>补全上下文设备/边</span>
                         </div>
                         <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #ffd700; border-radius: 50%; animation: pulse 1s infinite;"></div>
@@ -3599,6 +3610,9 @@
             if (isSelected) {
                 return { strokeWidth: 4, strokeColor: '#cf222e' };
             }
+            if (node && node.supplemental_fault_pattern_context) {
+                return { strokeWidth: 3.5, strokeColor: '#8c959f' };
+            }
             const alarmRole = getNodeAlarmRole(node);
             if (alarmRole) {
                 const roleStyle = NODE_ROLE_BORDER_STYLE[alarmRole] || NODE_ROLE_BORDER_STYLE.alarm_other;
@@ -4211,7 +4225,8 @@
                 const sourceNode = currentNodes.find(function(n) { return n.id === sourceId; });
                 
                 const targetNode = currentNodes.find(function(n) { return n.id === targetId; });
-                const edgeColor = getEdgeColorByNodes(sourceNode, targetNode);
+                const isSupplementalContextEdge = !!link.supplemental_fault_pattern_context;
+                const edgeColor = isSupplementalContextEdge ? '#8c959f' : getEdgeColorByNodes(sourceNode, targetNode);
                 
                 const latlngs = [
                     [sourcePos[0], sourcePos[1]],
@@ -4225,8 +4240,8 @@
                 const polyline = L.polyline(latlngs, {
                     color: edgeColor,
                     weight: 2.5,
-                    opacity: 0.8,
-                    dashArray: isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null)
+                    opacity: isSupplementalContextEdge ? 0.65 : 0.8,
+                    dashArray: isSupplementalContextEdge ? '4, 5' : (isDistance ? '10, 6' : (isNeighborExpandedEdge ? '6, 6' : null))
                 }).addTo(map);
 
                 // 存储边数据到polyline以便点击时使用
@@ -4235,6 +4250,7 @@
                 polyline.targetId = targetId;
                 polyline.isDistance = isDistance;
                 polyline.isNeighborExpandedEdge = isNeighborExpandedEdge;
+                polyline.isSupplementalContextEdge = isSupplementalContextEdge;
 
                 polyline.bindTooltip(sourceId + ' → ' + targetId + (isDistance ? ' (Distance)' : ''), {
                     permanent: false,
@@ -4803,6 +4819,7 @@
                     alarm_types: alarmTypes,
                     name: neInfo.name || neId,
                     alarm: nodeAlarms,
+                    supplemental_fault_pattern_context: !!neInfo.supplemental_fault_pattern_context,
                     latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
                     longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined))
                 });
@@ -4831,7 +4848,8 @@
                                     time_window: linkInfo.time_window || '',
                                     distance: linkInfo.distance || 0,
                                     left_alarm: linkInfo.left_alarm || null,
-                                    right_alarm: linkInfo.right_alarm || null
+                                    right_alarm: linkInfo.right_alarm || null,
+                                    supplemental_fault_pattern_context: !!linkInfo.supplemental_fault_pattern_context
                                 });
                                 edgeDetails[key] = linkInfo;
                             }
@@ -5179,14 +5197,15 @@
                 const hasAlarmClass = getNodeAlarmRoleClass(n);
                 const isSelected = (n.id === highlightId) || (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id));
                 const isFaultPatternSite = isFaultPatternManagedSite(n.site_id);
+                const isSupplementalContext = !!n.supplemental_fault_pattern_context;
                 const siteIdHtml = isFaultPatternSite
                     ? '<span class="fault-pattern-site-id">' + escapeHtml(n.site_id || '-') + '</span>'
                     : escapeHtml(n.site_id || '-');
-                return '<div class="node-item ' + (isSelected ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + ' ' + (isFaultPatternSite ? 'fault-pattern-site' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
+                return '<div class="node-item ' + (isSelected ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + ' ' + (isFaultPatternSite ? 'fault-pattern-site' : '') + ' ' + (isSupplementalContext ? 'supplemental-context' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
                         '<div class="ne-id">' + escapeHtml(getRawNodeId(n)) + '</div>' +
-                        '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
+                        '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (isSupplementalContext ? ' | 补全上下文' : '') + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
                     '</div>' +
                     '</div>';
