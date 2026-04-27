@@ -305,6 +305,17 @@ def connected_components(nodes, relation_index):
     return components
 
 
+def projected_active_components_by_original_graph(original_sites, active_sites, relation_index):
+    """按原始站点图划分连通分量，再投影出吸收后仍保留的站点。"""
+    active_site_set = set(active_sites)
+    projected_components = []
+    for original_component in connected_components(original_sites, relation_index):
+        component_active_sites = set(original_component) & active_site_set
+        if component_active_sites:
+            projected_components.append(component_active_sites)
+    return projected_components
+
+
 def longest_path_in_component(component, relation_index):
     component = set(component)
     if len(component) <= 1:
@@ -397,6 +408,19 @@ def classify_component(component_sites, unmanaged_sites, relation_index, absorbe
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
     absorbed_by = absorbed_by or {}
     router_device_sites = set(router_device_sites or [])
+    non_router_sites = component_sites - router_device_sites
+
+    if non_router_sites:
+        return {
+            "pattern": "unknown",
+            "sites": sorted(component_sites),
+            "unmanaged_sites": sorted(component_unmanaged_sites),
+            "managed_sites": [],
+            "final_site": "",
+            "final_managed_site": "",
+            "chains": [],
+            "non_router_sites": sorted(non_router_sites),
+        }
 
     if len(component_sites) == 1 and len(component_unmanaged_sites) == 1:
         final_site = next(iter(component_sites))
@@ -494,7 +518,7 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
     )
 
     component_records = []
-    for component_sites in connected_components(active_sites, relation_index):
+    for component_sites in projected_active_components_by_original_graph(site_ids, active_sites, relation_index):
         component_record = classify_component(
             component_sites,
             active_unmanaged_sites,
