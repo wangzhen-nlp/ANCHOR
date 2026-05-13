@@ -23,6 +23,36 @@ from site_relation_learning.core import (
 )
 
 
+def _domain_pair_key(row):
+    left_domain = str(row.get("site_a_domain") or "MISSING")
+    right_domain = str(row.get("site_b_domain") or "MISSING")
+    return f"{left_domain}__{right_domain}"
+
+
+def _evaluate_pair_rows_by_domain_pair(pair_rows):
+    buckets = {}
+    for row in pair_rows:
+        buckets.setdefault(_domain_pair_key(row), []).append(row)
+    return {
+        key: evaluate_pair_level_prediction_rows(rows)
+        for key, rows in sorted(buckets.items())
+    }
+
+
+def _print_domain_pair_metrics(metrics_by_domain_pair):
+    if not metrics_by_domain_pair:
+        return
+    print("pair-level 按 dominant domain pair 分桶指标:")
+    for key, metrics in sorted(
+        metrics_by_domain_pair.items(),
+        key=lambda item: (-item[1].get("pair_count", 0), item[0]),
+    ):
+        print(
+            f"  {key}: pair_count={metrics['pair_count']}, "
+            f"accuracy={metrics['accuracy']:.4f}, macro_f1={metrics['macro_f1']:.4f}"
+        )
+
+
 def _derive_output_base(model_file, test_file):
     model_path = Path(model_file)
     return model_path.parent / f"{model_path.stem}.{Path(test_file).stem}"
@@ -64,6 +94,7 @@ def main():
     prediction_rows = build_prediction_rows(dense, probabilities)
     pair_prediction_rows = build_pair_level_prediction_rows(dense, probabilities)
     pair_metrics = evaluate_pair_level_prediction_rows(pair_prediction_rows)
+    pair_metrics_by_domain_pair = _evaluate_pair_rows_by_domain_pair(pair_prediction_rows)
 
     output_base = _derive_output_base(args.model, args.test)
     output_file = args.output or str(output_base) + ".eval.json"
@@ -76,6 +107,7 @@ def main():
             "test": args.test,
             "metrics": metrics,
             "pair_level_metrics": pair_metrics,
+            "pair_level_metrics_by_dominant_domain_pair": pair_metrics_by_domain_pair,
         },
     )
     write_jsonl(predictions_output, prediction_rows)
@@ -86,6 +118,7 @@ def main():
         f"pair-level test: accuracy={pair_metrics['accuracy']:.4f}, "
         f"macro_f1={pair_metrics['macro_f1']:.4f}, pair_count={pair_metrics['pair_count']}"
     )
+    _print_domain_pair_metrics(pair_metrics_by_domain_pair)
     print(f"评估结果已输出到: {output_file}")
     print(f"逐样本预测已输出到: {predictions_output}")
     print(f"pair-level预测已输出到: {pair_predictions_output}")
