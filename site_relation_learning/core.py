@@ -1272,7 +1272,7 @@ def evaluate_pair_level_prediction_rows(rows):
     }
 
 
-def generate_candidate_relation_samples(context, max_candidate_count=50000, seed=42):
+def generate_candidate_relation_samples(context, max_candidate_count=50000, seed=42, exclude_labeled=True):
     rng = random.Random(seed)
     candidates = []
     seen = set()
@@ -1294,6 +1294,8 @@ def generate_candidate_relation_samples(context, max_candidate_count=50000, seed
         candidate_targets.update(nearest)
         for right_site_id in candidate_targets:
             if right_site_id == left_site_id or (left_site_id, right_site_id) in seen:
+                continue
+            if exclude_labeled and _has_any_labeled_relation(context, left_site_id, right_site_id):
                 continue
             seen.add((left_site_id, right_site_id))
             candidates.append((left_site_id, right_site_id))
