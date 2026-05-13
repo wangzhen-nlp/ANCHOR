@@ -1274,7 +1274,7 @@ def evaluate_pair_level_prediction_rows(rows):
 
 def generate_candidate_relation_samples(context, max_candidate_count=50000, seed=42, exclude_labeled=True):
     rng = random.Random(seed)
-    candidates = []
+    pair_candidates = set()
     seen = set()
     sites = context.site_ids
     for left_site_id in sites:
@@ -1298,13 +1298,19 @@ def generate_candidate_relation_samples(context, max_candidate_count=50000, seed
             if exclude_labeled and _has_any_labeled_relation(context, left_site_id, right_site_id):
                 continue
             seen.add((left_site_id, right_site_id))
-            candidates.append((left_site_id, right_site_id))
-            if (right_site_id, left_site_id) not in seen:
-                seen.add((right_site_id, left_site_id))
-                candidates.append((right_site_id, left_site_id))
+            seen.add((right_site_id, left_site_id))
+            pair_candidates.add(tuple(sorted((left_site_id, right_site_id))))
 
-    if max_candidate_count > 0 and len(candidates) > max_candidate_count:
-        candidates = rng.sample(candidates, max_candidate_count)
+    pair_candidates = sorted(pair_candidates)
+    if max_candidate_count > 0:
+        max_pair_count = max(1, max_candidate_count // 2)
+        if len(pair_candidates) > max_pair_count:
+            pair_candidates = sorted(rng.sample(pair_candidates, max_pair_count))
+
+    candidates = []
+    for left_site_id, right_site_id in pair_candidates:
+        candidates.append((left_site_id, right_site_id))
+        candidates.append((right_site_id, left_site_id))
     return [
         build_relation_sample(context, left_site_id, right_site_id, "none", {"candidate"}, "candidate")
         for left_site_id, right_site_id in sorted(candidates)
