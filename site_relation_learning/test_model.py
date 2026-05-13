@@ -29,6 +29,13 @@ def _domain_pair_key(row):
     return f"{left_domain}__{right_domain}"
 
 
+def _relation_key(row):
+    relation = row.get("gold_relation", "none")
+    if relation not in RELATION_CLASSES:
+        relation = "none"
+    return relation
+
+
 def _evaluate_pair_rows_by_domain_pair(pair_rows):
     buckets = {}
     for row in pair_rows:
@@ -36,6 +43,16 @@ def _evaluate_pair_rows_by_domain_pair(pair_rows):
     return {
         key: evaluate_pair_level_prediction_rows(rows)
         for key, rows in sorted(buckets.items())
+    }
+
+
+def _evaluate_pair_rows_by_relation(pair_rows):
+    buckets = {label: [] for label in RELATION_CLASSES}
+    for row in pair_rows:
+        buckets[_relation_key(row)].append(row)
+    return {
+        label: evaluate_pair_level_prediction_rows(rows)
+        for label, rows in buckets.items()
     }
 
 
@@ -50,6 +67,26 @@ def _print_domain_pair_metrics(metrics_by_domain_pair):
         print(
             f"  {key}: pair_count={metrics['pair_count']}, "
             f"accuracy={metrics['accuracy']:.4f}, macro_f1={metrics['macro_f1']:.4f}"
+        )
+
+
+def _print_relation_metrics(metrics_by_relation):
+    if not metrics_by_relation:
+        return
+    print("pair-level 按 gold relation（边类型）分桶指标:")
+    for label in RELATION_CLASSES:
+        metrics = metrics_by_relation.get(label)
+        if not metrics or metrics.get("pair_count", 0) == 0:
+            print(f"  {label}: pair_count=0 (无样本)")
+            continue
+        per_class = metrics.get("per_class", {}).get(label, {})
+        precision = per_class.get("precision", 0.0)
+        recall = per_class.get("recall", 0.0)
+        f1 = per_class.get("f1", 0.0)
+        print(
+            f"  {label}: pair_count={metrics['pair_count']}, "
+            f"accuracy={metrics['accuracy']:.4f}, macro_f1={metrics['macro_f1']:.4f}, "
+            f"precision={precision:.4f}, recall={recall:.4f}, f1={f1:.4f}"
         )
 
 
@@ -95,6 +132,7 @@ def main():
     pair_prediction_rows = build_pair_level_prediction_rows(dense, probabilities)
     pair_metrics = evaluate_pair_level_prediction_rows(pair_prediction_rows)
     pair_metrics_by_domain_pair = _evaluate_pair_rows_by_domain_pair(pair_prediction_rows)
+    pair_metrics_by_relation = _evaluate_pair_rows_by_relation(pair_prediction_rows)
 
     output_base = _derive_output_base(args.model, args.test)
     output_file = args.output or str(output_base) + ".eval.json"
@@ -108,6 +146,7 @@ def main():
             "metrics": metrics,
             "pair_level_metrics": pair_metrics,
             "pair_level_metrics_by_dominant_domain_pair": pair_metrics_by_domain_pair,
+            "pair_level_metrics_by_gold_relation": pair_metrics_by_relation,
         },
     )
     write_jsonl(predictions_output, prediction_rows)
@@ -118,6 +157,7 @@ def main():
         f"pair-level test: accuracy={pair_metrics['accuracy']:.4f}, "
         f"macro_f1={pair_metrics['macro_f1']:.4f}, pair_count={pair_metrics['pair_count']}"
     )
+    _print_relation_metrics(pair_metrics_by_relation)
     _print_domain_pair_metrics(pair_metrics_by_domain_pair)
     print(f"评估结果已输出到: {output_file}")
     print(f"逐样本预测已输出到: {predictions_output}")
