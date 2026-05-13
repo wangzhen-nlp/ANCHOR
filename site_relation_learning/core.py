@@ -1772,9 +1772,9 @@ def _candidate_targets_for_site(
     left_site_id,
     sites,
     rng=None,
-    same_region_limit=-1,
-    same_domain_limit=-1,
-    topology_neighbor_limit=-1,
+    same_region_limit=10,
+    same_domain_limit=10,
+    topology_neighbor_limit=10,
     nearest_limit=10,
 ):
     candidate_targets = set()
@@ -1819,9 +1819,9 @@ def _iter_candidate_pair_keys(
     max_pair_count=0,
     seed=42,
     randomize=False,
-    same_region_limit=-1,
-    same_domain_limit=-1,
-    topology_neighbor_limit=-1,
+    same_region_limit=10,
+    same_domain_limit=10,
+    topology_neighbor_limit=10,
     nearest_limit=10,
 ):
     rng = random.Random(seed)
@@ -1872,9 +1872,9 @@ def iter_candidate_relation_sample_chunks(
     seed=42,
     exclude_labeled=True,
     max_samples_per_chunk=20000,
-    same_region_limit=-1,
-    same_domain_limit=-1,
-    topology_neighbor_limit=-1,
+    same_region_limit=10,
+    same_domain_limit=10,
+    topology_neighbor_limit=10,
     nearest_limit=10,
     show_progress=False,
     progress_label="扫描候选源站点",
