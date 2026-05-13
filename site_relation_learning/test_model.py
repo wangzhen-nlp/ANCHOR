@@ -17,23 +17,69 @@ from site_relation_learning.core import (
     evaluate_pair_level_prediction_rows,
     load_dataset_samples,
     load_json,
+    safe_ratio,
     vectorize_samples,
     write_json,
     write_jsonl,
 )
 
 
+# 合并 downstream / upstream 为一个"有向边"类别，因为 pair-level 已按
+# canonical_pair 字典序去重，方向只取决于站点 ID 排序，分开统计意义不大。
+MERGED_RELATION_CLASSES = ("downstream/upstream", "bidirection", "none")
+
+
+def _merge_relation(label):
+    if label in ("downstream", "upstream"):
+        return "downstream/upstream"
+    if label in MERGED_RELATION_CLASSES:
+        return label
+    return "none"
+
+
+def _evaluate_pair_rows_merged(rows):
+    """与 evaluate_pair_level_prediction_rows 同形态，但用合并后的 3 类。"""
+    classes = MERGED_RELATION_CLASSES
+    class_count = len(classes)
+    confusion = [[0 for _ in classes] for _ in classes]
+    for row in rows:
+        gold = _merge_relation(row.get("gold_relation", "none"))
+        pred = _merge_relation(row.get("predicted_relation", "none"))
+        confusion[classes.index(gold)][classes.index(pred)] += 1
+
+    total = sum(sum(r) for r in confusion)
+    correct = sum(confusion[idx][idx] for idx in range(class_count))
+    per_class = {}
+    macro_f1 = 0.0
+    for idx, label in enumerate(classes):
+        tp = confusion[idx][idx]
+        fp = sum(confusion[row][idx] for row in range(class_count) if row != idx)
+        fn = sum(confusion[idx][col] for col in range(class_count) if col != idx)
+        precision = safe_ratio(tp, tp + fp)
+        recall = safe_ratio(tp, tp + fn)
+        f1 = safe_ratio(2 * precision * recall, precision + recall)
+        macro_f1 += f1
+        per_class[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": sum(confusion[idx]),
+        }
+    macro_f1 /= class_count
+    return {
+        "accuracy": safe_ratio(correct, total),
+        "macro_f1": macro_f1,
+        "confusion_matrix": confusion,
+        "classes": list(classes),
+        "per_class": per_class,
+        "pair_count": total,
+    }
+
+
 def _domain_pair_key(row):
     left_domain = str(row.get("site_a_domain") or "MISSING")
     right_domain = str(row.get("site_b_domain") or "MISSING")
     return f"{left_domain}__{right_domain}"
-
-
-def _relation_key(row):
-    relation = row.get("gold_relation", "none")
-    if relation not in RELATION_CLASSES:
-        relation = "none"
-    return relation
 
 
 def _evaluate_pair_rows_by_domain_pair(pair_rows):
@@ -47,11 +93,11 @@ def _evaluate_pair_rows_by_domain_pair(pair_rows):
 
 
 def _evaluate_pair_rows_by_relation(pair_rows):
-    buckets = {label: [] for label in RELATION_CLASSES}
+    buckets = {label: [] for label in MERGED_RELATION_CLASSES}
     for row in pair_rows:
-        buckets[_relation_key(row)].append(row)
+        buckets[_merge_relation(row.get("gold_relation", "none"))].append(row)
     return {
-        label: evaluate_pair_level_prediction_rows(rows)
+        label: _evaluate_pair_rows_merged(rows)
         for label, rows in buckets.items()
     }
 
@@ -73,8 +119,8 @@ def _print_domain_pair_metrics(metrics_by_domain_pair):
 def _print_relation_metrics(metrics_by_relation):
     if not metrics_by_relation:
         return
-    print("pair-level 按 gold relation（边类型）分桶指标:")
-    for label in RELATION_CLASSES:
+    print("pair-level 按 gold relation（合并 downstream/upstream 后）分桶指标:")
+    for label in MERGED_RELATION_CLASSES:
         metrics = metrics_by_relation.get(label)
         if not metrics or metrics.get("pair_count", 0) == 0:
             print(f"  {label}: pair_count=0 (无样本)")
