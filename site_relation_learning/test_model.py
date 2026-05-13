@@ -51,6 +51,7 @@ def _evaluate_pair_rows_merged(rows):
     correct = sum(confusion[idx][idx] for idx in range(class_count))
     per_class = {}
     macro_f1 = 0.0
+    macro_class_count = 0
     for idx, label in enumerate(classes):
         tp = confusion[idx][idx]
         fp = sum(confusion[row][idx] for row in range(class_count) if row != idx)
@@ -58,14 +59,17 @@ def _evaluate_pair_rows_merged(rows):
         precision = safe_ratio(tp, tp + fp)
         recall = safe_ratio(tp, tp + fn)
         f1 = safe_ratio(2 * precision * recall, precision + recall)
-        macro_f1 += f1
+        support = sum(confusion[idx])
+        if support > 0:
+            macro_f1 += f1
+            macro_class_count += 1
         per_class[label] = {
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "support": sum(confusion[idx]),
+            "support": support,
         }
-    macro_f1 /= class_count
+    macro_f1 = safe_ratio(macro_f1, macro_class_count)
     return {
         "accuracy": safe_ratio(correct, total),
         "macro_f1": macro_f1,

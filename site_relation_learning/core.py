@@ -1096,6 +1096,7 @@ def _compute_metrics_from_confusion(confusion):
     correct = int(np.trace(confusion))
     per_class = {}
     macro_f1 = 0.0
+    macro_class_count = 0
     class_count = len(RELATION_CLASSES)
     for idx, label in enumerate(RELATION_CLASSES):
         tp = int(confusion[idx, idx])
@@ -1104,14 +1105,17 @@ def _compute_metrics_from_confusion(confusion):
         precision = safe_ratio(tp, tp + fp)
         recall = safe_ratio(tp, tp + fn)
         f1 = safe_ratio(2 * precision * recall, precision + recall)
-        macro_f1 += f1
+        support = int(confusion[idx, :].sum())
+        if support > 0:
+            macro_f1 += f1
+            macro_class_count += 1
         per_class[label] = {
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "support": int(confusion[idx, :].sum()),
+            "support": support,
         }
-    macro_f1 /= class_count
+    macro_f1 = safe_ratio(macro_f1, macro_class_count)
     return {
         "accuracy": safe_ratio(correct, total),
         "macro_f1": macro_f1,
@@ -1723,6 +1727,7 @@ def evaluate_pair_level_prediction_rows(rows):
     correct = sum(confusion[index][index] for index in range(len(RELATION_CLASSES)))
     per_class = {}
     macro_f1 = 0.0
+    macro_class_count = 0
     for index, label in enumerate(RELATION_CLASSES):
         tp = confusion[index][index]
         fp = sum(confusion[row][index] for row in range(len(RELATION_CLASSES)) if row != index)
@@ -1730,14 +1735,17 @@ def evaluate_pair_level_prediction_rows(rows):
         precision = safe_ratio(tp, tp + fp)
         recall = safe_ratio(tp, tp + fn)
         f1 = safe_ratio(2 * precision * recall, precision + recall)
-        macro_f1 += f1
+        support = sum(confusion[index])
+        if support > 0:
+            macro_f1 += f1
+            macro_class_count += 1
         per_class[label] = {
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "support": sum(confusion[index]),
+            "support": support,
         }
-    macro_f1 /= len(RELATION_CLASSES)
+    macro_f1 = safe_ratio(macro_f1, macro_class_count)
     return {
         "accuracy": safe_ratio(correct, total),
         "macro_f1": macro_f1,
