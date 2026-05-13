@@ -85,7 +85,7 @@ def _predict_missing_error_rows_streaming(
     biases,
     threshold,
     max_candidate_count,
-    chunk_size,
+    max_samples_per_chunk,
     seed,
     top_k=0,
     output_file=None,
@@ -100,7 +100,7 @@ def _predict_missing_error_rows_streaming(
         context,
         max_candidate_count=max_candidate_count,
         seed=seed,
-        chunk_size=chunk_size,
+        max_samples_per_chunk=max_samples_per_chunk,
         show_progress=not no_progress,
         progress_label="扫描潜在缺边候选源站点",
     )
@@ -222,7 +222,12 @@ def main():
     parser.add_argument("--wrong-min-score", type=float, default=-1.0, help="错方向阈值；<0 使用 --min-score")
     parser.add_argument("--extra-min-score", type=float, default=-1.0, help="多边阈值；<0 使用 --min-score")
     parser.add_argument("--max-candidate-count", type=int, default=0, help="missing 候选池上限，0 表示不限制，默认: 0")
-    parser.add_argument("--candidate-chunk-size", type=int, default=500, help="missing 候选每批扫描的源站点数，默认: 500")
+    parser.add_argument(
+        "--candidate-max-samples-per-chunk",
+        type=int,
+        default=20000,
+        help="missing 候选每批最多 ordered samples 数，防止单批源站点候选过大，默认: 20000",
+    )
     parser.add_argument("--top-k", type=int, default=0, help="最多输出前 K 条；0 表示不限制")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
@@ -274,7 +279,7 @@ def main():
             biases,
             threshold=missing_threshold,
             max_candidate_count=args.max_candidate_count,
-            chunk_size=args.candidate_chunk_size,
+            max_samples_per_chunk=args.candidate_max_samples_per_chunk,
             seed=args.seed,
             top_k=args.top_k,
             output_file=output_file,
@@ -296,7 +301,7 @@ def main():
             "known_pair_count": len(known_rows),
             "missing_candidate_ordered_sample_count": missing_sample_count,
             "missing_candidate_pair_count": missing_pair_count,
-            "candidate_source_site_chunk_size": args.candidate_chunk_size,
+            "candidate_max_ordered_samples_per_chunk": args.candidate_max_samples_per_chunk,
             "retained_error_count": output_state["retained_error_count"],
             "error_type_counts": counts,
             "predicted_relation_counts": relation_counts,

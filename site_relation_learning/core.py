@@ -1347,11 +1347,11 @@ def iter_candidate_relation_sample_chunks(
     max_candidate_count=50000,
     seed=42,
     exclude_labeled=True,
-    chunk_size=1000,
+    max_samples_per_chunk=20000,
     show_progress=False,
     progress_label="扫描候选源站点",
 ):
-    source_chunk_size = max(1, int(chunk_size or 1000))
+    max_samples_per_chunk = max(2, int(max_samples_per_chunk or 20000))
     rng = random.Random(seed)
     sites = list(context.site_ids)
     randomize = max_candidate_count > 0
@@ -1360,12 +1360,10 @@ def iter_candidate_relation_sample_chunks(
     max_pair_count = max(1, max_candidate_count // 2) if max_candidate_count > 0 else 0
     emitted_pairs = set() if max_pair_count > 0 else None
     emitted_count = 0
-    source_count_in_chunk = 0
     chunk = []
     progress = _create_progress_bar(len(sites), progress_label, show_progress)
     try:
         for index, left_site_id in enumerate(sites, 1):
-            source_count_in_chunk += 1
             reached_limit = False
             for right_site_id in _candidate_targets_for_site(
                 context,
@@ -1395,13 +1393,15 @@ def iter_candidate_relation_sample_chunks(
                 if max_pair_count > 0 and emitted_count >= max_pair_count:
                     reached_limit = True
                     break
+                if len(chunk) >= max_samples_per_chunk:
+                    yield chunk
+                    chunk = []
 
             if progress is not None:
                 progress.set(index)
-            if chunk and (source_count_in_chunk >= source_chunk_size or reached_limit):
+            if chunk and reached_limit:
                 yield chunk
                 chunk = []
-                source_count_in_chunk = 0
             if reached_limit:
                 return
     finally:
@@ -1417,7 +1417,7 @@ def generate_candidate_relation_samples(context, max_candidate_count=50000, seed
         max_candidate_count=max_candidate_count,
         seed=seed,
         exclude_labeled=exclude_labeled,
-        chunk_size=len(context.site_ids),
+        max_samples_per_chunk=max_candidate_count if max_candidate_count > 0 else 20000,
         show_progress=False,
     ):
         samples.extend(chunk)
