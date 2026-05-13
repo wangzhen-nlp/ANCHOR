@@ -221,7 +221,7 @@ def main():
     parser.add_argument("--missing-min-score", type=float, default=-1.0, help="缺边阈值；<0 使用 --min-score")
     parser.add_argument("--wrong-min-score", type=float, default=-1.0, help="错方向阈值；<0 使用 --min-score")
     parser.add_argument("--extra-min-score", type=float, default=-1.0, help="多边阈值；<0 使用 --min-score")
-    parser.add_argument("--max-candidate-count", type=int, default=50000, help="missing 候选池上限，默认: 50000")
+    parser.add_argument("--max-candidate-count", type=int, default=0, help="missing 候选池上限，0 表示不限制，默认: 0")
     parser.add_argument("--candidate-chunk-size", type=int, default=500, help="missing 候选每批扫描的源站点数，默认: 500")
     parser.add_argument("--top-k", type=int, default=0, help="最多输出前 K 条；0 表示不限制")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
