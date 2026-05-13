@@ -78,6 +78,7 @@ def main():
     )
     parser.add_argument("--nearest-negatives", type=int, default=1, help="近距离 hard none 采样数，默认: 1")
     parser.add_argument("--random-negative-ratio", type=float, default=1.0, help="随机 none 补充比例，默认: 1.0")
+    parser.add_argument("--none-max-rounds", type=int, default=3, help="hard none 候选最多扫描轮数，默认: 3")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
     args = parser.parse_args()
 
@@ -92,6 +93,7 @@ def main():
         same_domain_negatives=args.same_domain_negatives,
         nearest_negatives=args.nearest_negatives,
         random_negative_ratio=args.random_negative_ratio,
+        none_max_rounds=args.none_max_rounds,
         show_progress=not args.no_progress,
     )
 
@@ -113,6 +115,7 @@ def main():
                 "same_domain_negatives": args.same_domain_negatives,
                 "nearest_negatives": args.nearest_negatives,
                 "random_negative_ratio": args.random_negative_ratio,
+                "none_max_rounds": args.none_max_rounds,
             },
         }
     )

@@ -778,11 +778,12 @@ def _generate_none_relation_pool(
     nearest_negatives=1,
     random_negative_ratio=1.0,
     target_none_count=None,
+    max_rounds=3,
     show_progress=False,
 ):
     none_reason_map = defaultdict(set)
     ordered_pairs = list(positive_ordered_pairs)
-    max_rounds = 3 if target_none_count is not None else 1
+    max_rounds = max(1, int(max_rounds)) if target_none_count is not None else 1
     progress = _create_progress_bar(max_rounds * max(1, len(ordered_pairs)), "构造 none 关系候选", show_progress)
     progress_index = 0
     try:
@@ -841,6 +842,7 @@ def generate_relation_learning_samples(
     same_domain_negatives=1,
     nearest_negatives=1,
     random_negative_ratio=1.0,
+    none_max_rounds=3,
     show_progress=False,
 ):
     rng = random.Random(seed)
@@ -855,6 +857,7 @@ def generate_relation_learning_samples(
         nearest_negatives=nearest_negatives,
         random_negative_ratio=random_negative_ratio,
         target_none_count=target_none_count,
+        max_rounds=none_max_rounds,
         show_progress=show_progress,
     )
     none_items = list(none_reason_map.items())
