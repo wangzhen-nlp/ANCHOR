@@ -647,6 +647,10 @@ def _try_add_none_pair(context, none_reason_map, left_site_id, right_site_id, re
     return True
 
 
+def _none_pool_reached_target(none_reason_map, target_none_count):
+    return target_none_count is not None and target_none_count >= 0 and len(none_reason_map) >= target_none_count
+
+
 def _deterministic_sample(seq, k, rng):
     seq = list(seq)
     if k <= 0 or not seq:
@@ -672,6 +676,58 @@ def _nearest_sites_by_distance(context, site_id, candidates, limit):
     return [site_id for _, site_id in scored[:limit]]
 
 
+def _sample_candidates_for_nearest(candidates, rng, max_size=500):
+    candidates = list(candidates)
+    if len(candidates) <= max_size:
+        return candidates
+    return rng.sample(candidates, max_size)
+
+
+def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, same_region_negatives, same_domain_negatives, nearest_negatives):
+    left_info = context.site_infos[left_site_id]
+    right_info = context.site_infos[right_site_id]
+
+    if same_region_negatives > 0 and right_info.region_id != "MISSING":
+        candidates = [
+            site_id for site_id in context.region_to_sites.get(right_info.region_id, [])
+            if site_id != right_site_id
+        ]
+        for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
+            yield left_site_id, candidate_id, "same_target_region"
+
+    if same_region_negatives > 0 and left_info.region_id != "MISSING":
+        candidates = [
+            site_id for site_id in context.region_to_sites.get(left_info.region_id, [])
+            if site_id != left_site_id
+        ]
+        for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
+            yield candidate_id, right_site_id, "same_source_region"
+
+    if same_domain_negatives > 0 and right_info.dominant_domain != "MISSING":
+        candidates = [
+            site_id for site_id in context.dominant_domain_to_sites.get(right_info.dominant_domain, [])
+            if site_id != right_site_id
+        ]
+        for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
+            yield left_site_id, candidate_id, "same_target_domain"
+
+    if same_domain_negatives > 0 and left_info.dominant_domain != "MISSING":
+        candidates = [
+            site_id for site_id in context.dominant_domain_to_sites.get(left_info.dominant_domain, [])
+            if site_id != left_site_id
+        ]
+        for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
+            yield candidate_id, right_site_id, "same_source_domain"
+
+    if nearest_negatives > 0:
+        candidates = _sample_candidates_for_nearest(
+            (site_id for site_id in context.site_ids if site_id != left_site_id),
+            rng,
+        )
+        for candidate_id in _nearest_sites_by_distance(context, left_site_id, candidates, nearest_negatives):
+            yield left_site_id, candidate_id, "nearest_to_source"
+
+
 def _generate_none_relation_pool(
     context,
     positive_ordered_pairs,
@@ -680,59 +736,52 @@ def _generate_none_relation_pool(
     same_domain_negatives=1,
     nearest_negatives=1,
     random_negative_ratio=1.0,
+    target_none_count=None,
     show_progress=False,
 ):
     none_reason_map = defaultdict(set)
-    progress = _create_progress_bar(len(positive_ordered_pairs), "构造 none 关系候选", show_progress)
+    ordered_pairs = list(positive_ordered_pairs)
+    max_rounds = 3 if target_none_count is not None else 1
+    progress = _create_progress_bar(max_rounds * max(1, len(ordered_pairs)), "构造 none 关系候选", show_progress)
+    progress_index = 0
     try:
-        for index, (left_site_id, right_site_id) in enumerate(positive_ordered_pairs, start=1):
-            left_info = context.site_infos[left_site_id]
-            right_info = context.site_infos[right_site_id]
-
-            if same_region_negatives > 0 and right_info.region_id != "MISSING":
-                candidates = [
-                    site_id for site_id in context.region_to_sites.get(right_info.region_id, [])
-                    if site_id != right_site_id
-                ]
-                for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-                    _try_add_none_pair(context, none_reason_map, left_site_id, candidate_id, "same_target_region")
-
-            if same_region_negatives > 0 and left_info.region_id != "MISSING":
-                candidates = [
-                    site_id for site_id in context.region_to_sites.get(left_info.region_id, [])
-                    if site_id != left_site_id
-                ]
-                for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-                    _try_add_none_pair(context, none_reason_map, candidate_id, right_site_id, "same_source_region")
-
-            if same_domain_negatives > 0 and right_info.dominant_domain != "MISSING":
-                candidates = [
-                    site_id for site_id in context.dominant_domain_to_sites.get(right_info.dominant_domain, [])
-                    if site_id != right_site_id
-                ]
-                for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-                    _try_add_none_pair(context, none_reason_map, left_site_id, candidate_id, "same_target_domain")
-
-            if same_domain_negatives > 0 and left_info.dominant_domain != "MISSING":
-                candidates = [
-                    site_id for site_id in context.dominant_domain_to_sites.get(left_info.dominant_domain, [])
-                    if site_id != left_site_id
-                ]
-                for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-                    _try_add_none_pair(context, none_reason_map, candidate_id, right_site_id, "same_source_domain")
-
-            if nearest_negatives > 0:
-                candidates = [site_id for site_id in context.site_ids if site_id != left_site_id]
-                for candidate_id in _nearest_sites_by_distance(context, left_site_id, candidates, nearest_negatives):
-                    _try_add_none_pair(context, none_reason_map, left_site_id, candidate_id, "nearest_to_source")
-
-            if progress is not None:
-                progress.set(index)
-                progress.set_extra_text(f"none候选={len(none_reason_map)}")
+        for round_index in range(max_rounds):
+            shuffled_pairs = list(ordered_pairs)
+            rng.shuffle(shuffled_pairs)
+            added_this_round = 0
+            for left_site_id, right_site_id in shuffled_pairs:
+                if _none_pool_reached_target(none_reason_map, target_none_count):
+                    break
+                before_count = len(none_reason_map)
+                for cand_left, cand_right, reason in _iter_none_candidate_attempts(
+                    context,
+                    left_site_id,
+                    right_site_id,
+                    rng,
+                    same_region_negatives,
+                    same_domain_negatives,
+                    nearest_negatives,
+                ):
+                    if _try_add_none_pair(context, none_reason_map, cand_left, cand_right, reason):
+                        added_this_round += 1
+                        break
+                if len(none_reason_map) == before_count:
+                    continue
+                if progress is not None:
+                    progress_index += 1
+                    progress.set(min(progress_index, max_rounds * max(1, len(ordered_pairs))))
+                    progress.set_extra_text(
+                        f"round={round_index + 1}, none候选={len(none_reason_map)}"
+                    )
+            if _none_pool_reached_target(none_reason_map, target_none_count) or added_this_round == 0:
+                break
     finally:
         _close_progress_bar(progress)
 
-    target_random_count = int(math.ceil(len(positive_ordered_pairs) * max(0.0, random_negative_ratio)))
+    if target_none_count is None:
+        target_random_count = int(math.ceil(len(positive_ordered_pairs) * max(0.0, random_negative_ratio)))
+    else:
+        target_random_count = max(0, target_none_count)
     attempts = 0
     max_attempts = max(2000, target_random_count * 50)
     while len(none_reason_map) < target_random_count and attempts < max_attempts and context.site_ids:
@@ -755,6 +804,7 @@ def generate_relation_learning_samples(
 ):
     rng = random.Random(seed)
     positive_pairs = sorted(context.label_relation_map)
+    target_none_count = int(math.ceil(len(positive_pairs) * max(0.0, none_per_positive)))
     none_reason_map = _generate_none_relation_pool(
         context,
         positive_pairs,
@@ -763,9 +813,9 @@ def generate_relation_learning_samples(
         same_domain_negatives=same_domain_negatives,
         nearest_negatives=nearest_negatives,
         random_negative_ratio=random_negative_ratio,
+        target_none_count=target_none_count,
         show_progress=show_progress,
     )
-    target_none_count = int(math.ceil(len(positive_pairs) * max(0.0, none_per_positive)))
     none_items = list(none_reason_map.items())
     if len(none_items) > target_none_count:
         none_items = rng.sample(none_items, target_none_count)
