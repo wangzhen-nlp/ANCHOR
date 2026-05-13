@@ -492,6 +492,63 @@
             line-height: 1.5;
         }
 
+        .device-filter-panel {
+            position: absolute;
+            left: 12px;
+            top: 58px;
+            z-index: 500;
+            background: rgba(255, 255, 255, 0.96);
+            border: 1px solid #d0d7de;
+            border-radius: 8px;
+            padding: 10px 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+            backdrop-filter: blur(4px);
+            min-width: 210px;
+        }
+
+        .device-filter-panel h4 {
+            font-size: 12px;
+            color: #0969da;
+            margin-bottom: 8px;
+            font-weight: 700;
+        }
+
+        .device-filter-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 10px;
+        }
+
+        .device-filter-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #24292f;
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        .device-filter-item input {
+            margin: 0;
+        }
+
+        .device-filter-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            border: 1px solid rgba(0,0,0,0.12);
+        }
+
+        .device-filter-status {
+            margin-top: 7px;
+            font-size: 10px;
+            color: #57606a;
+            line-height: 1.4;
+        }
+
         .alarm-meta-panel {
             background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
             padding: 12px;
@@ -1972,6 +2029,38 @@
                     <button onclick="toggleMultiSelect()" id="mapMultiSelectBtn" class="danger">🎯 多选模式</button>
                 </div>
 
+                <div class="device-filter-panel" id="deviceTypeFilterPanel">
+                    <h4>设备类型筛选</h4>
+                    <div class="device-filter-grid">
+                        <label class="device-filter-item">
+                            <input type="checkbox" data-device-filter="DATA" checked onchange="updateDeviceTypeFilter(this)">
+                            <span class="device-filter-dot" style="background:#00BFFF;"></span>
+                            <span>Data</span>
+                        </label>
+                        <label class="device-filter-item">
+                            <input type="checkbox" data-device-filter="TRANSMISSION" checked onchange="updateDeviceTypeFilter(this)">
+                            <span class="device-filter-dot" style="background:#FF8C00;"></span>
+                            <span>Transmission</span>
+                        </label>
+                        <label class="device-filter-item">
+                            <input type="checkbox" data-device-filter="RAN" checked onchange="updateDeviceTypeFilter(this)">
+                            <span class="device-filter-dot" style="background:#32CD32;"></span>
+                            <span>Ran</span>
+                        </label>
+                        <label class="device-filter-item">
+                            <input type="checkbox" data-device-filter="MICROWAVE" checked onchange="updateDeviceTypeFilter(this)">
+                            <span class="device-filter-dot" style="background:#9370DB;"></span>
+                            <span>Microwave</span>
+                        </label>
+                        <label class="device-filter-item">
+                            <input type="checkbox" data-device-filter="OTHER" checked onchange="updateDeviceTypeFilter(this)">
+                            <span class="device-filter-dot" style="background:#808080;"></span>
+                            <span>Other</span>
+                        </label>
+                    </div>
+                    <div class="device-filter-status" id="deviceTypeFilterStatus">显示全部设备</div>
+                </div>
+
                 <!-- 右侧控制按钮 -->
                 <div class="controls">
                     <button class="control-btn" onclick="zoomIn()" title="放大">+</button>
@@ -2128,6 +2217,128 @@
         // 根据 domain 字符串获取样式
         function getDomainStyle(domainStr) {
             return DOMAIN_STYLE[getDomainKey(domainStr)] || DOMAIN_STYLE['DEFAULT'];
+        }
+
+        const DEVICE_TYPE_FILTERS = {
+            DATA: { label: 'Data', domainKeys: ['IP'] },
+            TRANSMISSION: { label: 'Transmission', domainKeys: ['Transmission'] },
+            RAN: { label: 'Ran', domainKeys: ['RAN'] },
+            MICROWAVE: { label: 'Microwave', domainKeys: ['MICROWAVE'] },
+            OTHER: { label: 'Other', domainKeys: ['DEFAULT'] }
+        };
+
+        const deviceTypeFilterState = {
+            DATA: true,
+            TRANSMISSION: true,
+            RAN: true,
+            MICROWAVE: true,
+            OTHER: true
+        };
+
+        function getDeviceTypeKey(domainStr) {
+            const domainKey = getDomainKey(domainStr);
+            if (domainKey === 'IP') return 'DATA';
+            if (domainKey === 'Transmission') return 'TRANSMISSION';
+            if (domainKey === 'RAN') return 'RAN';
+            if (domainKey === 'MICROWAVE') return 'MICROWAVE';
+            return 'OTHER';
+        }
+
+        function isNodeVisibleByDeviceFilter(node) {
+            if (!node) return false;
+            const typeKey = getDeviceTypeKey(node.domain || '');
+            return deviceTypeFilterState[typeKey] !== false;
+        }
+
+        function getCurrentNodeById(nodeId) {
+            return currentNodes.find(function(node) { return node.id === nodeId; });
+        }
+
+        function isLinkVisibleByDeviceFilter(link) {
+            const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+            const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+            return isNodeVisibleByDeviceFilter(getCurrentNodeById(sourceId)) &&
+                   isNodeVisibleByDeviceFilter(getCurrentNodeById(targetId));
+        }
+
+        function setLeafletLayerVisible(layer, visible) {
+            if (!layer || !map) return;
+            if (visible) {
+                if (!map.hasLayer(layer)) {
+                    layer.addTo(map);
+                }
+            } else if (map.hasLayer(layer)) {
+                layer.removeFrom(map);
+            }
+        }
+
+        function updateDeviceTypeFilter(input) {
+            const key = input && input.getAttribute('data-device-filter');
+            if (!key || !Object.prototype.hasOwnProperty.call(deviceTypeFilterState, key)) return;
+            deviceTypeFilterState[key] = !!input.checked;
+            applyDeviceTypeFilterToMap();
+        }
+
+        function applyDeviceTypeFilterToMap() {
+            if (!map) return;
+            let visibleNodeCount = 0;
+            const visibleSiteKeys = new Set();
+
+            Object.keys(mapMarkers).forEach(function(nodeId) {
+                const node = getCurrentNodeById(nodeId);
+                const visible = isNodeVisibleByDeviceFilter(node);
+                if (visible) {
+                    visibleNodeCount += 1;
+                    const siteKey = getNodeSiteKey(node);
+                    if (siteKey) visibleSiteKeys.add(siteKey);
+                }
+                setLeafletLayerVisible(mapMarkers[nodeId], visible);
+            });
+
+            mapPolylines.forEach(function(polyline) {
+                const visible = showMapConnections && isLinkVisibleByDeviceFilter(polyline.linkData || {});
+                setLeafletLayerVisible(polyline, visible);
+            });
+
+            mapDistanceLines.forEach(function(layer) {
+                const sourceNode = getCurrentNodeById(layer.sourceId);
+                const targetNode = getCurrentNodeById(layer.targetId);
+                const visible = !layer.sourceId || !layer.targetId ||
+                    (isNodeVisibleByDeviceFilter(sourceNode) && isNodeVisibleByDeviceFilter(targetNode));
+                setLeafletLayerVisible(layer, visible);
+            });
+
+            mapSiteOverlays.forEach(function(layer) {
+                const visible = !layer.siteKey || visibleSiteKeys.has(layer.siteKey);
+                setLeafletLayerVisible(layer, visible);
+            });
+
+            if (selectedNode && !isNodeVisibleByDeviceFilter(getCurrentNodeById(selectedNode))) {
+                selectedNode = null;
+                if (map) map.closePopup();
+                document.getElementById('detailPanel').classList.remove('show');
+                renderNodeList();
+            }
+
+            if (selectedEdge && !isLinkVisibleByDeviceFilter(selectedEdge.data || {})) {
+                selectedEdge = null;
+                document.getElementById('detailPanel').classList.remove('show');
+            }
+
+            updateDeviceTypeFilterStatus(visibleNodeCount);
+        }
+
+        function updateDeviceTypeFilterStatus(visibleNodeCount) {
+            const statusEl = document.getElementById('deviceTypeFilterStatus');
+            if (!statusEl) return;
+            const hiddenLabels = Object.keys(deviceTypeFilterState)
+                .filter(function(key) { return !deviceTypeFilterState[key]; })
+                .map(function(key) { return DEVICE_TYPE_FILTERS[key].label; });
+            if (hiddenLabels.length === 0) {
+                statusEl.textContent = '显示全部设备';
+            } else {
+                statusEl.textContent = '当前显示 ' + visibleNodeCount + ' 个设备；已隐藏: ' + hiddenLabels.join(', ');
+            }
         }
 
         function getEdgeColorByNodes(sourceNode, targetNode) {
@@ -3740,6 +3951,7 @@
                     fillOpacity: fillOpacity,
                     interactive: false
                 }).addTo(map);
+                halo.siteKey = site.siteId || site.siteName || site.label;
 
                 const core = L.circleMarker(latlng, {
                     pane: 'siteOverlayPane',
@@ -3749,6 +3961,7 @@
                     fillOpacity: isExpandedSite ? 0.32 : 0.22,
                     interactive: false
                 }).addTo(map);
+                core.siteKey = site.siteId || site.siteName || site.label;
 
                 const label = L.marker(latlng, {
                     pane: 'siteLabelPane',
@@ -3762,6 +3975,7 @@
                         iconAnchor: [-8, 14]
                     })
                 }).addTo(map);
+                label.siteKey = site.siteId || site.siteName || site.label;
 
                 mapSiteOverlays.push(halo);
                 mapSiteOverlays.push(core);
@@ -3994,6 +4208,7 @@
                 const group = new L.featureGroup(Object.values(mapMarkers));
                 map.fitBounds(group.getBounds().pad(0.1));
             }
+            applyDeviceTypeFilterToMap();
         }
 
         // 新增：仅更新地图上的选中状态，不重新渲染整个地图（需求2的核心实现）
@@ -4274,6 +4489,8 @@
                         opacity: 0.9,
                         smoothFactor: 1
                     }).addTo(map);
+                    polyline.sourceId = link.source;
+                    polyline.targetId = link.target;
 
                     const midLat = (sourcePos[0] + targetPos[0]) / 2;
                     const midLng = (sourcePos[1] + targetPos[1]) / 2;
@@ -4290,6 +4507,8 @@
                         interactive: false,
                         zIndexOffset: 1000
                     }).addTo(map);
+                    labelMarker.sourceId = link.source;
+                    labelMarker.targetId = link.target;
 
                     polyline.bindTooltip('<div style="font-weight: bold; color: #cf222e;">' + link.source + ' ↔ ' + link.target + '</div>' +
                         '<div>地理距离: ' + link.distance.toFixed(2) + ' km</div>', {
@@ -4518,8 +4737,11 @@
         }
 
         function fitMapBounds() {
-            if (Object.keys(mapMarkers).length > 0) {
-                const group = new L.featureGroup(Object.values(mapMarkers));
+            const visibleMarkers = Object.keys(mapMarkers)
+                .filter(function(nodeId) { return isNodeVisibleByDeviceFilter(getCurrentNodeById(nodeId)); })
+                .map(function(nodeId) { return mapMarkers[nodeId]; });
+            if (visibleMarkers.length > 0) {
+                const group = new L.featureGroup(visibleMarkers);
                 map.fitBounds(group.getBounds().pad(0.1));
             }
         }
