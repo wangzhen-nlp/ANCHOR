@@ -1756,21 +1756,52 @@ def evaluate_pair_level_prediction_rows(rows):
     }
 
 
-def _candidate_targets_for_site(context, left_site_id, sites, rng=None):
+def _limit_candidates(candidates, limit, rng=None):
+    candidates = list(candidates)
+    if limit is None or limit < 0 or len(candidates) <= limit:
+        return candidates
+    if limit <= 0:
+        return []
+    if rng is not None:
+        return rng.sample(candidates, limit)
+    return sorted(candidates)[:limit]
+
+
+def _candidate_targets_for_site(
+    context,
+    left_site_id,
+    sites,
+    rng=None,
+    same_region_limit=-1,
+    same_domain_limit=-1,
+    topology_neighbor_limit=-1,
+    nearest_limit=10,
+):
     candidate_targets = set()
     info = context.site_infos[left_site_id]
     if info.region_id != "MISSING":
-        candidate_targets.update(context.region_to_sites.get(info.region_id, []))
+        candidates = [
+            site_id for site_id in context.region_to_sites.get(info.region_id, [])
+            if site_id != left_site_id
+        ]
+        candidate_targets.update(_limit_candidates(candidates, same_region_limit, rng))
     if info.dominant_domain != "MISSING":
-        candidate_targets.update(context.dominant_domain_to_sites.get(info.dominant_domain, []))
-    candidate_targets.update(context.undirected_map.get(left_site_id, set()))
-    nearest = _nearest_sites_by_distance(
-        context,
-        left_site_id,
-        [site_id for site_id in sites if site_id != left_site_id],
-        10,
+        candidates = [
+            site_id for site_id in context.dominant_domain_to_sites.get(info.dominant_domain, [])
+            if site_id != left_site_id
+        ]
+        candidate_targets.update(_limit_candidates(candidates, same_domain_limit, rng))
+    candidate_targets.update(
+        _limit_candidates(context.undirected_map.get(left_site_id, set()), topology_neighbor_limit, rng)
     )
-    candidate_targets.update(nearest)
+    if nearest_limit is None or nearest_limit != 0:
+        nearest = _nearest_sites_by_distance(
+            context,
+            left_site_id,
+            [site_id for site_id in sites if site_id != left_site_id],
+            10 if nearest_limit is None or nearest_limit < 0 else nearest_limit,
+        )
+        candidate_targets.update(nearest)
     candidate_targets.discard(left_site_id)
     candidate_targets = list(candidate_targets)
     if rng is not None:
@@ -1788,6 +1819,10 @@ def _iter_candidate_pair_keys(
     max_pair_count=0,
     seed=42,
     randomize=False,
+    same_region_limit=-1,
+    same_domain_limit=-1,
+    topology_neighbor_limit=-1,
+    nearest_limit=10,
 ):
     rng = random.Random(seed)
     sites = list(context.site_ids)
@@ -1803,6 +1838,10 @@ def _iter_candidate_pair_keys(
                 left_site_id,
                 sites,
                 rng=rng if randomize else None,
+                same_region_limit=same_region_limit,
+                same_domain_limit=same_domain_limit,
+                topology_neighbor_limit=topology_neighbor_limit,
+                nearest_limit=nearest_limit,
             ):
                 if right_site_id == left_site_id:
                     continue
@@ -1833,6 +1872,10 @@ def iter_candidate_relation_sample_chunks(
     seed=42,
     exclude_labeled=True,
     max_samples_per_chunk=20000,
+    same_region_limit=-1,
+    same_domain_limit=-1,
+    topology_neighbor_limit=-1,
+    nearest_limit=10,
     show_progress=False,
     progress_label="扫描候选源站点",
 ):
@@ -1855,6 +1898,10 @@ def iter_candidate_relation_sample_chunks(
                 left_site_id,
                 sites,
                 rng=rng if randomize else None,
+                same_region_limit=same_region_limit,
+                same_domain_limit=same_domain_limit,
+                topology_neighbor_limit=topology_neighbor_limit,
+                nearest_limit=nearest_limit,
             ):
                 if right_site_id == left_site_id:
                     continue

@@ -89,6 +89,10 @@ def main():
         default=20000,
         help="候选每批最多 ordered samples 数，默认: 20000",
     )
+    parser.add_argument("--candidate-same-region-limit", type=int, default=-1, help="每个站点最多加入同 region 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-same-domain-limit", type=int, default=-1, help="每个站点最多加入同 dominant domain 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-topology-neighbor-limit", type=int, default=-1, help="每个站点最多加入已知拓扑邻居候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-nearest-limit", type=int, default=10, help="每个站点最多加入近距离候选数；0 关闭，默认: 10")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
     args = parser.parse_args()
@@ -111,6 +115,10 @@ def main():
             max_candidate_count=args.max_candidate_count,
             seed=args.seed,
             max_samples_per_chunk=args.candidate_max_samples_per_chunk,
+            same_region_limit=args.candidate_same_region_limit,
+            same_domain_limit=args.candidate_same_domain_limit,
+            topology_neighbor_limit=args.candidate_topology_neighbor_limit,
+            nearest_limit=args.candidate_nearest_limit,
             show_progress=not args.no_progress,
             progress_label="扫描候选站点对",
         )
@@ -170,6 +178,12 @@ def main():
             "min_score": args.min_score,
             "include_none": args.include_none,
             "candidate_max_ordered_samples_per_chunk": args.candidate_max_samples_per_chunk,
+            "candidate_limits": {
+                "same_region": args.candidate_same_region_limit,
+                "same_domain": args.candidate_same_domain_limit,
+                "topology_neighbor": args.candidate_topology_neighbor_limit,
+                "nearest": args.candidate_nearest_limit,
+            },
             "global_sort": not stream_output,
             "output": output,
         },

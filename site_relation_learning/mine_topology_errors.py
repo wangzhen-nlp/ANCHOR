@@ -87,6 +87,10 @@ def _predict_missing_error_rows_streaming(
     max_candidate_count,
     max_samples_per_chunk,
     seed,
+    same_region_limit=-1,
+    same_domain_limit=-1,
+    topology_neighbor_limit=-1,
+    nearest_limit=10,
     output_file=None,
     output_state=None,
     no_progress=False,
@@ -100,6 +104,10 @@ def _predict_missing_error_rows_streaming(
         max_candidate_count=max_candidate_count,
         seed=seed,
         max_samples_per_chunk=max_samples_per_chunk,
+        same_region_limit=same_region_limit,
+        same_domain_limit=same_domain_limit,
+        topology_neighbor_limit=topology_neighbor_limit,
+        nearest_limit=nearest_limit,
         show_progress=not no_progress,
         progress_label="扫描潜在缺边候选源站点",
     )
@@ -225,6 +233,10 @@ def main():
         default=20000,
         help="missing 候选每批最多 ordered samples 数，防止单批源站点候选过大，默认: 20000",
     )
+    parser.add_argument("--candidate-same-region-limit", type=int, default=-1, help="每个站点最多加入同 region 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-same-domain-limit", type=int, default=-1, help="每个站点最多加入同 dominant domain 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-topology-neighbor-limit", type=int, default=-1, help="每个站点最多加入已知拓扑邻居候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-nearest-limit", type=int, default=10, help="每个站点最多加入近距离候选数；0 关闭，默认: 10")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
     args = parser.parse_args()
@@ -277,6 +289,10 @@ def main():
             max_candidate_count=args.max_candidate_count,
             max_samples_per_chunk=args.candidate_max_samples_per_chunk,
             seed=args.seed,
+            same_region_limit=args.candidate_same_region_limit,
+            same_domain_limit=args.candidate_same_domain_limit,
+            topology_neighbor_limit=args.candidate_topology_neighbor_limit,
+            nearest_limit=args.candidate_nearest_limit,
             output_file=output_file,
             output_state=output_state,
             no_progress=args.no_progress,
@@ -297,6 +313,12 @@ def main():
             "missing_candidate_ordered_sample_count": missing_sample_count,
             "missing_candidate_pair_count": missing_pair_count,
             "candidate_max_ordered_samples_per_chunk": args.candidate_max_samples_per_chunk,
+            "candidate_limits": {
+                "same_region": args.candidate_same_region_limit,
+                "same_domain": args.candidate_same_domain_limit,
+                "topology_neighbor": args.candidate_topology_neighbor_limit,
+                "nearest": args.candidate_nearest_limit,
+            },
             "retained_error_count": output_state["retained_error_count"],
             "error_type_counts": counts,
             "predicted_relation_counts": relation_counts,

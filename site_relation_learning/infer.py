@@ -55,6 +55,10 @@ def _predict_rank_rows_streaming(args, model_payload, feature_names, weights, bi
             max_candidate_count=args.max_candidate_count,
             seed=args.seed,
             max_samples_per_chunk=args.candidate_max_samples_per_chunk,
+            same_region_limit=args.candidate_same_region_limit,
+            same_domain_limit=args.candidate_same_domain_limit,
+            topology_neighbor_limit=args.candidate_topology_neighbor_limit,
+            nearest_limit=args.candidate_nearest_limit,
             show_progress=not args.no_progress,
             progress_label="扫描候选站点对",
         )
@@ -115,6 +119,12 @@ def _predict_rank_rows_streaming(args, model_payload, feature_names, weights, bi
             "min_score": args.min_score,
             "include_none": args.include_none,
             "candidate_max_ordered_samples_per_chunk": args.candidate_max_samples_per_chunk,
+            "candidate_limits": {
+                "same_region": args.candidate_same_region_limit,
+                "same_domain": args.candidate_same_domain_limit,
+                "topology_neighbor": args.candidate_topology_neighbor_limit,
+                "nearest": args.candidate_nearest_limit,
+            },
             "global_sort": not stream_output,
             "output": output,
         },
@@ -147,6 +157,10 @@ def _predict_missing_error_rows_streaming(
         max_candidate_count=args.max_candidate_count,
         seed=args.seed,
         max_samples_per_chunk=args.candidate_max_samples_per_chunk,
+        same_region_limit=args.candidate_same_region_limit,
+        same_domain_limit=args.candidate_same_domain_limit,
+        topology_neighbor_limit=args.candidate_topology_neighbor_limit,
+        nearest_limit=args.candidate_nearest_limit,
         show_progress=not args.no_progress,
         progress_label="扫描潜在缺边候选源站点",
     )
@@ -244,6 +258,12 @@ def _predict_topology_error_rows(args, model_payload, feature_names, weights, bi
             "missing_candidate_ordered_sample_count": missing_sample_count,
             "missing_candidate_pair_count": missing_pair_count,
             "candidate_max_ordered_samples_per_chunk": args.candidate_max_samples_per_chunk,
+            "candidate_limits": {
+                "same_region": args.candidate_same_region_limit,
+                "same_domain": args.candidate_same_domain_limit,
+                "topology_neighbor": args.candidate_topology_neighbor_limit,
+                "nearest": args.candidate_nearest_limit,
+            },
             "retained_error_count": output_state["retained_error_count"],
             "error_type_counts": counts,
             "predicted_relation_counts": relation_counts,
@@ -301,13 +321,17 @@ def main():
     parser.add_argument("-o", "--output", default="", help="输出 JSONL")
     parser.add_argument("--summary-output", default="", help="摘要输出 JSON")
     parser.add_argument("--min-score", type=float, default=None, help="最低预测概率；rank 默认 0，topology-errors 默认 0.95")
-    parser.add_argument("--max-candidate-count", type=int, default=None, help="候选池上限；0 表示不限制；rank 默认 50000，topology-errors 默认 0")
+    parser.add_argument("--max-candidate-count", type=int, default=None, help="候选池上限；0 表示不限制；默认: 0")
     parser.add_argument(
         "--candidate-max-samples-per-chunk",
         type=int,
         default=20000,
         help="候选每批最多 ordered samples 数，默认: 20000",
     )
+    parser.add_argument("--candidate-same-region-limit", type=int, default=-1, help="每个站点最多加入同 region 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-same-domain-limit", type=int, default=-1, help="每个站点最多加入同 dominant domain 候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-topology-neighbor-limit", type=int, default=-1, help="每个站点最多加入已知拓扑邻居候选数；-1 不限制，0 关闭，默认: -1")
+    parser.add_argument("--candidate-nearest-limit", type=int, default=10, help="每个站点最多加入近距离候选数；0 关闭，默认: 10")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
 
@@ -324,7 +348,7 @@ def main():
     if args.min_score is None:
         args.min_score = 0.95 if args.mode == "topology-errors" else 0.0
     if args.max_candidate_count is None:
-        args.max_candidate_count = 0 if args.mode == "topology-errors" else 50000
+        args.max_candidate_count = 0
 
     output = _derive_output_path(args)
     summary_output = _derive_summary_output_path(args, output)
