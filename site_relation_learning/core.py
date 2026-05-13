@@ -1272,66 +1272,74 @@ def evaluate_pair_level_prediction_rows(rows):
     }
 
 
-def _iter_candidate_pair_keys(context, exclude_labeled=True, show_progress=False, progress_label="扫描候选站点"):
-    sites = context.site_ids
+def _candidate_targets_for_site(context, left_site_id, sites, rng=None):
+    candidate_targets = set()
+    info = context.site_infos[left_site_id]
+    if info.region_id != "MISSING":
+        candidate_targets.update(context.region_to_sites.get(info.region_id, []))
+    if info.dominant_domain != "MISSING":
+        candidate_targets.update(context.dominant_domain_to_sites.get(info.dominant_domain, []))
+    candidate_targets.update(context.undirected_map.get(left_site_id, set()))
+    nearest = _nearest_sites_by_distance(
+        context,
+        left_site_id,
+        [site_id for site_id in sites if site_id != left_site_id],
+        10,
+    )
+    candidate_targets.update(nearest)
+    candidate_targets = list(candidate_targets)
+    if rng is not None:
+        rng.shuffle(candidate_targets)
+    else:
+        candidate_targets.sort()
+    return candidate_targets
+
+
+def _iter_candidate_pair_keys(
+    context,
+    exclude_labeled=True,
+    show_progress=False,
+    progress_label="扫描候选源站点",
+    max_pair_count=0,
+    seed=42,
+    randomize=False,
+):
+    rng = random.Random(seed)
+    sites = list(context.site_ids)
+    if randomize:
+        rng.shuffle(sites)
+    emitted_pairs = set() if max_pair_count > 0 else None
+    emitted_count = 0
     progress = _create_progress_bar(len(sites), progress_label, show_progress)
     try:
         for index, left_site_id in enumerate(sites, 1):
-            candidate_targets = set()
-            info = context.site_infos[left_site_id]
-            if info.region_id != "MISSING":
-                candidate_targets.update(context.region_to_sites.get(info.region_id, []))
-            if info.dominant_domain != "MISSING":
-                candidate_targets.update(context.dominant_domain_to_sites.get(info.dominant_domain, []))
-            candidate_targets.update(context.undirected_map.get(left_site_id, set()))
-            nearest = _nearest_sites_by_distance(
+            for right_site_id in _candidate_targets_for_site(
                 context,
                 left_site_id,
-                [site_id for site_id in sites if site_id != left_site_id],
-                10,
-            )
-            candidate_targets.update(nearest)
-
-            for right_site_id in candidate_targets:
+                sites,
+                rng=rng if randomize else None,
+            ):
                 if right_site_id == left_site_id:
                     continue
                 pair_key = tuple(sorted((left_site_id, right_site_id)))
-                if pair_key[0] != left_site_id:
+                if emitted_pairs is None and pair_key[0] != left_site_id:
+                    continue
+                if emitted_pairs is not None and pair_key in emitted_pairs:
                     continue
                 if exclude_labeled and _has_any_labeled_relation(context, left_site_id, right_site_id):
                     continue
+                if emitted_pairs is not None:
+                    emitted_pairs.add(pair_key)
+                emitted_count += 1
                 yield pair_key
+                if max_pair_count > 0 and emitted_count >= max_pair_count:
+                    if progress is not None:
+                        progress.set(index)
+                    return
             if progress is not None:
                 progress.set(index)
     finally:
         _close_progress_bar(progress)
-
-
-def _reservoir_sample_candidate_pairs(
-    context,
-    max_pair_count,
-    seed=42,
-    exclude_labeled=True,
-    show_progress=False,
-    progress_label="扫描候选站点",
-):
-    rng = random.Random(seed)
-    reservoir = []
-    seen_pair_count = 0
-    for pair_key in _iter_candidate_pair_keys(
-        context,
-        exclude_labeled=exclude_labeled,
-        show_progress=show_progress,
-        progress_label=progress_label,
-    ):
-        seen_pair_count += 1
-        if len(reservoir) < max_pair_count:
-            reservoir.append(pair_key)
-            continue
-        replace_index = rng.randrange(seen_pair_count)
-        if replace_index < max_pair_count:
-            reservoir[replace_index] = pair_key
-    return sorted(reservoir), seen_pair_count
 
 
 def iter_candidate_relation_sample_chunks(
@@ -1339,40 +1347,65 @@ def iter_candidate_relation_sample_chunks(
     max_candidate_count=50000,
     seed=42,
     exclude_labeled=True,
-    chunk_size=2000,
+    chunk_size=1000,
     show_progress=False,
-    progress_label="扫描候选站点",
+    progress_label="扫描候选源站点",
 ):
-    chunk_size = max(2, int(chunk_size or 2000))
-    if max_candidate_count > 0:
-        max_pair_count = max(1, max_candidate_count // 2)
-        pair_iterable, _seen_pair_count = _reservoir_sample_candidate_pairs(
-            context,
-            max_pair_count,
-            seed=seed,
-            exclude_labeled=exclude_labeled,
-            show_progress=show_progress,
-            progress_label=progress_label,
-        )
-    else:
-        pair_iterable = _iter_candidate_pair_keys(
-            context,
-            exclude_labeled=exclude_labeled,
-            show_progress=show_progress,
-            progress_label=progress_label,
-        )
-
+    source_chunk_size = max(1, int(chunk_size or 1000))
+    rng = random.Random(seed)
+    sites = list(context.site_ids)
+    randomize = max_candidate_count > 0
+    if randomize:
+        rng.shuffle(sites)
+    max_pair_count = max(1, max_candidate_count // 2) if max_candidate_count > 0 else 0
+    emitted_pairs = set() if max_pair_count > 0 else None
+    emitted_count = 0
+    source_count_in_chunk = 0
     chunk = []
-    for left_site_id, right_site_id in pair_iterable:
-        chunk.append(
-            build_relation_sample(context, left_site_id, right_site_id, "none", {"candidate"}, "candidate")
-        )
-        chunk.append(
-            build_relation_sample(context, right_site_id, left_site_id, "none", {"candidate"}, "candidate")
-        )
-        if len(chunk) >= chunk_size:
-            yield chunk
-            chunk = []
+    progress = _create_progress_bar(len(sites), progress_label, show_progress)
+    try:
+        for index, left_site_id in enumerate(sites, 1):
+            source_count_in_chunk += 1
+            reached_limit = False
+            for right_site_id in _candidate_targets_for_site(
+                context,
+                left_site_id,
+                sites,
+                rng=rng if randomize else None,
+            ):
+                if right_site_id == left_site_id:
+                    continue
+                pair_key = tuple(sorted((left_site_id, right_site_id)))
+                if emitted_pairs is None and pair_key[0] != left_site_id:
+                    continue
+                if emitted_pairs is not None and pair_key in emitted_pairs:
+                    continue
+                if exclude_labeled and _has_any_labeled_relation(context, left_site_id, right_site_id):
+                    continue
+
+                if emitted_pairs is not None:
+                    emitted_pairs.add(pair_key)
+                emitted_count += 1
+                chunk.append(
+                    build_relation_sample(context, pair_key[0], pair_key[1], "none", {"candidate"}, "candidate")
+                )
+                chunk.append(
+                    build_relation_sample(context, pair_key[1], pair_key[0], "none", {"candidate"}, "candidate")
+                )
+                if max_pair_count > 0 and emitted_count >= max_pair_count:
+                    reached_limit = True
+                    break
+
+            if progress is not None:
+                progress.set(index)
+            if chunk and (source_count_in_chunk >= source_chunk_size or reached_limit):
+                yield chunk
+                chunk = []
+                source_count_in_chunk = 0
+            if reached_limit:
+                return
+    finally:
+        _close_progress_bar(progress)
     if chunk:
         yield chunk
 
@@ -1384,7 +1417,7 @@ def generate_candidate_relation_samples(context, max_candidate_count=50000, seed
         max_candidate_count=max_candidate_count,
         seed=seed,
         exclude_labeled=exclude_labeled,
-        chunk_size=max_candidate_count if max_candidate_count > 0 else 2000,
+        chunk_size=len(context.site_ids),
         show_progress=False,
     ):
         samples.extend(chunk)

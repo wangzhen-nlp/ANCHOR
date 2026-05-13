@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import json
 from argparse import ArgumentParser
 
 if __package__ in (None, ""):
@@ -17,7 +18,6 @@ from site_relation_learning.core import (
     iter_candidate_relation_sample_chunks,
     vectorize_samples,
     write_json,
-    write_jsonl,
 )
 from site_relation_learning.test_model import _load_model
 
@@ -88,9 +88,10 @@ def _predict_missing_error_rows_streaming(
     chunk_size,
     seed,
     top_k=0,
+    output_file=None,
+    output_state=None,
     no_progress=False,
 ):
-    error_rows = []
     sample_count = 0
     pair_count = 0
     chunk_count = 0
@@ -101,7 +102,7 @@ def _predict_missing_error_rows_streaming(
         seed=seed,
         chunk_size=chunk_size,
         show_progress=not no_progress,
-        progress_label="扫描潜在缺边候选站点",
+        progress_label="扫描潜在缺边候选源站点",
     )
     for samples in chunks:
         chunk_count += 1
@@ -116,22 +117,25 @@ def _predict_missing_error_rows_streaming(
             label="缺边候选样本",
         )
         pair_count += len(rows)
+        chunk_error_rows = []
         for row in rows:
             error_type = _classify_missing_relation_error(row, threshold)
             if error_type:
-                _append_ranked_error_row(error_rows, _format_error_row(row, error_type), top_k=top_k)
+                chunk_error_rows.append(_format_error_row(row, error_type))
+        if output_file is not None and output_state is not None and chunk_error_rows:
+            _write_error_rows(output_file, chunk_error_rows, output_state, top_k=top_k)
         if not no_progress and (chunk_count == 1 or chunk_count % 10 == 0):
             print(
                 f"已处理缺边候选: chunks={chunk_count}, ordered_samples={sample_count}, "
-                f"pairs={pair_count}, retained={len(error_rows)}"
+                f"pairs={pair_count}, retained={output_state['retained_error_count'] if output_state else 0}"
             )
 
     if not no_progress:
         print(
             f"缺边候选处理完成: chunks={chunk_count}, ordered_samples={sample_count}, "
-            f"pairs={pair_count}, retained={len(error_rows)}"
+            f"pairs={pair_count}, retained={output_state['retained_error_count'] if output_state else 0}"
         )
-    return error_rows, sample_count, pair_count
+    return sample_count, pair_count
 
 
 def _classify_known_relation_error(row, min_score):
@@ -168,11 +172,31 @@ def _error_sort_key(row):
     return (-float(row.get("score", 0.0) or 0.0), row["error_type"], row["sample_id"])
 
 
-def _append_ranked_error_row(rows, row, top_k=0):
-    rows.append(row)
-    if top_k > 0 and len(rows) > max(top_k * 2, top_k + 1000):
-        rows.sort(key=_error_sort_key)
-        del rows[top_k:]
+def _new_output_state():
+    return {
+        "retained_error_count": 0,
+        "error_type_counts": {error_type: 0 for error_type in ("missing", "wrong_direction", "extra")},
+        "predicted_relation_counts": {label: 0 for label in RELATION_CLASSES},
+    }
+
+
+def _write_error_rows(output_file, rows, state, top_k=0):
+    rows = sorted(rows, key=_error_sort_key)
+    written = 0
+    for row in rows:
+        if top_k > 0 and state["retained_error_count"] >= top_k:
+            break
+        output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        state["retained_error_count"] += 1
+        state["error_type_counts"][row["error_type"]] = state["error_type_counts"].get(row["error_type"], 0) + 1
+        predicted_relation = row.get("predicted_relation", "none")
+        if predicted_relation not in state["predicted_relation_counts"]:
+            state["predicted_relation_counts"][predicted_relation] = 0
+        state["predicted_relation_counts"][predicted_relation] += 1
+        written += 1
+    if written:
+        output_file.flush()
+    return written
 
 
 def main():
@@ -198,7 +222,7 @@ def main():
     parser.add_argument("--wrong-min-score", type=float, default=-1.0, help="错方向阈值；<0 使用 --min-score")
     parser.add_argument("--extra-min-score", type=float, default=-1.0, help="多边阈值；<0 使用 --min-score")
     parser.add_argument("--max-candidate-count", type=int, default=50000, help="missing 候选池上限，默认: 50000")
-    parser.add_argument("--candidate-chunk-size", type=int, default=2000, help="missing 候选流式预测 chunk 大小，默认: 2000")
+    parser.add_argument("--candidate-chunk-size", type=int, default=500, help="missing 候选每批扫描的源站点数，默认: 500")
     parser.add_argument("--top-k", type=int, default=0, help="最多输出前 K 条；0 表示不限制")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
@@ -226,44 +250,42 @@ def main():
         label="已知关系样本",
     )
 
-    print("构造并流式预测潜在缺边候选...")
-    missing_error_rows, missing_sample_count, missing_pair_count = _predict_missing_error_rows_streaming(
-        context,
-        model_payload,
-        feature_names,
-        weights,
-        biases,
-        threshold=missing_threshold,
-        max_candidate_count=args.max_candidate_count,
-        chunk_size=args.candidate_chunk_size,
-        seed=args.seed,
-        top_k=args.top_k,
-        no_progress=args.no_progress,
-    )
-
-    error_rows = []
+    output_state = _new_output_state()
+    known_error_rows = []
     for row in known_rows:
         error_type = _classify_known_relation_error(
             row,
             extra_threshold if row.get("predicted_relation") == "none" else wrong_threshold,
         )
         if error_type:
-            _append_ranked_error_row(error_rows, _format_error_row(row, error_type), top_k=args.top_k)
+            known_error_rows.append(_format_error_row(row, error_type))
 
-    error_rows.extend(missing_error_rows)
+    print(f"写出已知关系错例: {args.output}")
+    with open(args.output, "w", encoding="utf-8") as output_file:
+        _write_error_rows(output_file, known_error_rows, output_state, top_k=args.top_k)
+        print(f"已知关系错例已写出: {output_state['retained_error_count']}")
 
-    error_rows.sort(key=_error_sort_key)
-    if args.top_k > 0:
-        error_rows = error_rows[: args.top_k]
+        print("构造并流式预测潜在缺边候选...")
+        missing_sample_count, missing_pair_count = _predict_missing_error_rows_streaming(
+            context,
+            model_payload,
+            feature_names,
+            weights,
+            biases,
+            threshold=missing_threshold,
+            max_candidate_count=args.max_candidate_count,
+            chunk_size=args.candidate_chunk_size,
+            seed=args.seed,
+            top_k=args.top_k,
+            output_file=output_file,
+            output_state=output_state,
+            no_progress=args.no_progress,
+        )
 
     summary_output = args.summary_output or _derive_summary_path(args.output)
-    counts = {error_type: 0 for error_type in ("missing", "wrong_direction", "extra")}
-    relation_counts = {label: 0 for label in RELATION_CLASSES}
-    for row in error_rows:
-        counts[row["error_type"]] = counts.get(row["error_type"], 0) + 1
-        relation_counts[row.get("predicted_relation", "none")] += 1
+    counts = output_state["error_type_counts"]
+    relation_counts = output_state["predicted_relation_counts"]
 
-    write_jsonl(args.output, error_rows)
     write_json(
         summary_output,
         {
@@ -274,7 +296,8 @@ def main():
             "known_pair_count": len(known_rows),
             "missing_candidate_ordered_sample_count": missing_sample_count,
             "missing_candidate_pair_count": missing_pair_count,
-            "retained_error_count": len(error_rows),
+            "candidate_source_site_chunk_size": args.candidate_chunk_size,
+            "retained_error_count": output_state["retained_error_count"],
             "error_type_counts": counts,
             "predicted_relation_counts": relation_counts,
             "thresholds": {
@@ -289,7 +312,7 @@ def main():
     print(f"已知关系 pair 数: {len(known_rows)}")
     print(f"缺边候选有序样本数: {missing_sample_count}")
     print(f"缺边候选 pair 数: {missing_pair_count}")
-    print(f"错例候选数: {len(error_rows)}")
+    print(f"错例候选数: {output_state['retained_error_count']}")
     print(f"错例类型分布: {counts}")
     print(f"输出: {args.output}")
     print(f"摘要: {summary_output}")
