@@ -712,50 +712,61 @@ def _sample_candidates_for_nearest(candidates, rng, max_size=500):
 def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, same_region_negatives, same_domain_negatives, nearest_negatives):
     left_info = context.site_infos[left_site_id]
     right_info = context.site_infos[right_site_id]
-    attempts = []
+    attempt_types = [
+        "same_target_region",
+        "same_source_region",
+        "same_target_domain",
+        "same_source_domain",
+        "nearest_to_source",
+    ]
+    rng.shuffle(attempt_types)
 
-    if same_region_negatives > 0 and right_info.region_id != "MISSING":
-        candidates = [
-            site_id for site_id in context.region_to_sites.get(right_info.region_id, [])
-            if site_id != right_site_id
-        ]
-        for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-            attempts.append((left_site_id, candidate_id, "same_target_region"))
-
-    if same_region_negatives > 0 and left_info.region_id != "MISSING":
-        candidates = [
-            site_id for site_id in context.region_to_sites.get(left_info.region_id, [])
-            if site_id != left_site_id
-        ]
-        for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-            attempts.append((candidate_id, right_site_id, "same_source_region"))
-
-    if same_domain_negatives > 0 and right_info.dominant_domain != "MISSING":
-        candidates = [
-            site_id for site_id in context.dominant_domain_to_sites.get(right_info.dominant_domain, [])
-            if site_id != right_site_id
-        ]
-        for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-            attempts.append((left_site_id, candidate_id, "same_target_domain"))
-
-    if same_domain_negatives > 0 and left_info.dominant_domain != "MISSING":
-        candidates = [
-            site_id for site_id in context.dominant_domain_to_sites.get(left_info.dominant_domain, [])
-            if site_id != left_site_id
-        ]
-        for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-            attempts.append((candidate_id, right_site_id, "same_source_domain"))
-
-    if nearest_negatives > 0:
-        candidates = _sample_candidates_for_nearest(
-            (site_id for site_id in context.site_ids if site_id != left_site_id),
-            rng,
-        )
-        for candidate_id in _nearest_sites_by_distance(context, left_site_id, candidates, nearest_negatives):
-            attempts.append((left_site_id, candidate_id, "nearest_to_source"))
-
-    rng.shuffle(attempts)
-    yield from attempts
+    for attempt_type in attempt_types:
+        if attempt_type == "same_target_region":
+            if same_region_negatives <= 0 or right_info.region_id == "MISSING":
+                continue
+            candidates = [
+                site_id for site_id in context.region_to_sites.get(right_info.region_id, [])
+                if site_id != right_site_id
+            ]
+            for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
+                yield left_site_id, candidate_id, "same_target_region"
+        elif attempt_type == "same_source_region":
+            if same_region_negatives <= 0 or left_info.region_id == "MISSING":
+                continue
+            candidates = [
+                site_id for site_id in context.region_to_sites.get(left_info.region_id, [])
+                if site_id != left_site_id
+            ]
+            for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
+                yield candidate_id, right_site_id, "same_source_region"
+        elif attempt_type == "same_target_domain":
+            if same_domain_negatives <= 0 or right_info.dominant_domain == "MISSING":
+                continue
+            candidates = [
+                site_id for site_id in context.dominant_domain_to_sites.get(right_info.dominant_domain, [])
+                if site_id != right_site_id
+            ]
+            for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
+                yield left_site_id, candidate_id, "same_target_domain"
+        elif attempt_type == "same_source_domain":
+            if same_domain_negatives <= 0 or left_info.dominant_domain == "MISSING":
+                continue
+            candidates = [
+                site_id for site_id in context.dominant_domain_to_sites.get(left_info.dominant_domain, [])
+                if site_id != left_site_id
+            ]
+            for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
+                yield candidate_id, right_site_id, "same_source_domain"
+        elif attempt_type == "nearest_to_source":
+            if nearest_negatives <= 0:
+                continue
+            candidates = _sample_candidates_for_nearest(
+                (site_id for site_id in context.site_ids if site_id != left_site_id),
+                rng,
+            )
+            for candidate_id in _nearest_sites_by_distance(context, left_site_id, candidates, nearest_negatives):
+                yield left_site_id, candidate_id, "nearest_to_source"
 
 
 def _generate_none_relation_pool(
