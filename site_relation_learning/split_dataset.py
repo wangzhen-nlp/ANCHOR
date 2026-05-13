@@ -9,13 +9,12 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
+from alarm_tools.progress_utils import ProgressBar
 from site_relation_learning.core import (
     RELATION_CLASSES,
     load_dataset_samples,
-    split_samples_by_group,
     summarize_samples,
     write_json,
-    write_jsonl,
 )
 
 
@@ -32,6 +31,46 @@ def _format_label_counts(summary):
     )
 
 
+def _split_samples_by_group_with_progress(samples, train_ratio=0.8, valid_ratio=0.1, seed=42):
+    from site_relation_learning.core import stable_hash_fraction
+
+    train_boundary = train_ratio
+    valid_boundary = train_ratio + valid_ratio
+    buckets = {"train": [], "valid": [], "test": []}
+    progress = ProgressBar(len(samples), "切分样本")
+    try:
+        for index, sample in enumerate(samples, start=1):
+            group_key = sample.get("unordered_site_pair_key") or sample.get("sample_id", "")
+            value = stable_hash_fraction(group_key, seed=seed)
+            if value < train_boundary:
+                buckets["train"].append(sample)
+            elif value < valid_boundary:
+                buckets["valid"].append(sample)
+            else:
+                buckets["test"].append(sample)
+            progress.set(index)
+            if index % 1000 == 0 or index == len(samples):
+                progress.set_extra_text(
+                    f"train={len(buckets['train'])}, valid={len(buckets['valid'])}, test={len(buckets['test'])}"
+                )
+    finally:
+        progress.close()
+    return buckets
+
+
+def _write_jsonl_with_progress(output_path, samples, label):
+    progress = ProgressBar(len(samples), label)
+    try:
+        with open(output_path, "w", encoding="utf-8") as file_obj:
+            for index, item in enumerate(samples, start=1):
+                import json
+
+                file_obj.write(json.dumps(item, ensure_ascii=False) + "\n")
+                progress.set(index)
+    finally:
+        progress.close()
+
+
 def main():
     parser = ArgumentParser(description="切分站点关系四分类数据集")
     parser.add_argument("dataset", help="build_relation_dataset.py 输出 JSONL")
@@ -44,8 +83,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     args = parser.parse_args()
 
+    print(f"加载数据集: {args.dataset}")
     samples = load_dataset_samples(args.dataset)
-    buckets = split_samples_by_group(
+    print(f"样本数: {len(samples)}")
+    buckets = _split_samples_by_group_with_progress(
         samples,
         train_ratio=args.train_ratio,
         valid_ratio=args.valid_ratio,
@@ -57,9 +98,9 @@ def main():
     test_output = args.test_output or _derive_output_path(args.dataset, "test")
     summary_output = args.summary_output or str(Path(args.dataset).with_suffix(".split.summary.json"))
 
-    write_jsonl(train_output, buckets["train"])
-    write_jsonl(valid_output, buckets["valid"])
-    write_jsonl(test_output, buckets["test"])
+    _write_jsonl_with_progress(train_output, buckets["train"], "写出 train")
+    _write_jsonl_with_progress(valid_output, buckets["valid"], "写出 valid")
+    _write_jsonl_with_progress(test_output, buckets["test"], "写出 test")
     write_json(
         summary_output,
         {

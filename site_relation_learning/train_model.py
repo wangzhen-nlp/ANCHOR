@@ -21,6 +21,15 @@ from site_relation_learning.core import (
 )
 
 
+def _format_label_counts(samples):
+    counts = {label: 0 for label in RELATION_CLASSES}
+    for sample in samples:
+        label = sample.get("label", "none")
+        if label in counts:
+            counts[label] += 1
+    return ", ".join(f"{label}={counts[label]}" for label in RELATION_CLASSES)
+
+
 def _derive_metrics_path(model_output):
     if model_output.endswith(".json"):
         return model_output[:-5] + ".metrics.json"
@@ -41,15 +50,48 @@ def main():
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
     args = parser.parse_args()
 
+    print(f"加载训练集: {args.train}")
     train_samples = load_dataset_samples(args.train)
     if not train_samples:
         raise ValueError("训练集为空")
-    valid_samples = load_dataset_samples(args.valid) if args.valid else []
-    feature_names = infer_feature_names(train_samples)
-    standardizer = fit_standardizer(train_samples, feature_names)
-    train_dense = vectorize_samples(train_samples, feature_names, standardizer, show_progress=not args.no_progress)
-    valid_dense = vectorize_samples(valid_samples, feature_names, standardizer, show_progress=not args.no_progress) if valid_samples else []
+    print(f"训练样本数: {len(train_samples)}")
+    print(f"训练类别分布: {_format_label_counts(train_samples)}")
 
+    valid_samples = []
+    if args.valid:
+        print(f"加载验证集: {args.valid}")
+        valid_samples = load_dataset_samples(args.valid)
+        print(f"验证样本数: {len(valid_samples)}")
+        print(f"验证类别分布: {_format_label_counts(valid_samples)}")
+
+    print("推断特征集合...")
+    feature_names = infer_feature_names(train_samples)
+    print(f"特征数: {len(feature_names)}")
+
+    standardizer = fit_standardizer(
+        train_samples,
+        feature_names,
+        show_progress=not args.no_progress,
+    )
+    train_dense = vectorize_samples(
+        train_samples,
+        feature_names,
+        standardizer,
+        show_progress=not args.no_progress,
+        progress_label="向量化训练样本",
+    )
+    valid_dense = (
+        vectorize_samples(
+            valid_samples,
+            feature_names,
+            standardizer,
+            show_progress=not args.no_progress,
+            progress_label="向量化验证样本",
+        )
+        if valid_samples else []
+    )
+
+    print("开始训练模型...")
     model_state = train_softmax_regression(
         train_dense,
         valid_dense_samples=valid_dense,
@@ -126,4 +168,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

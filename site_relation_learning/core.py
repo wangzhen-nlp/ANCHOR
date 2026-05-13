@@ -909,14 +909,33 @@ def infer_feature_names(samples):
     return sorted(feature_names)
 
 
-def fit_standardizer(samples, feature_names):
+def fit_standardizer(samples, feature_names, show_progress=False, progress_label="拟合标准化参数"):
     means = {}
     stds = {}
     count = max(1, len(samples))
+    feature_set = set(feature_names)
+    sums = {feature_name: 0.0 for feature_name in feature_names}
+    sumsq = {feature_name: 0.0 for feature_name in feature_names}
+    progress = _create_progress_bar(len(samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(samples, start=1):
+            features = sample.get("features", {})
+            for feature_name, raw_value in features.items():
+                if feature_name not in feature_set:
+                    continue
+                value = float(raw_value or 0.0)
+                sums[feature_name] += value
+                sumsq[feature_name] += value * value
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
+
     for feature_name in feature_names:
-        values = [sample["features"].get(feature_name, 0.0) for sample in samples]
-        mean = sum(values) / count
-        variance = sum((value - mean) ** 2 for value in values) / count
+        mean = sums[feature_name] / count
+        variance = (sumsq[feature_name] / count) - mean * mean
+        if variance < 0 and abs(variance) < 1e-12:
+            variance = 0.0
         means[feature_name] = mean
         stds[feature_name] = math.sqrt(variance) if variance > 1e-12 else 1.0
     return {"means": means, "stds": stds}
