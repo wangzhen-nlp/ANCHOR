@@ -8,6 +8,8 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
+import numpy as np
+
 from alarm_tools.progress_utils import ProgressBar
 
 
@@ -446,9 +448,8 @@ def load_label_relation_map(label_file):
     return _load_edge_prediction_relation_map(payload)
 
 
-def build_site_relation_context(label_file, site_graph_file, site_device_counts_file):
-    site_infos = load_site_infos(site_graph_file, site_device_counts_file)
-    relation_map = load_label_relation_map(label_file)
+def build_site_relation_context_from_relation_map(site_infos, relation_map):
+    relation_map = dict(relation_map)
     for left_site_id, right_site_id in relation_map:
         if left_site_id not in site_infos:
             site_infos[left_site_id] = SiteInfo(
@@ -493,6 +494,12 @@ def build_site_relation_context(label_file, site_graph_file, site_device_counts_
         region_to_sites={key: sorted(value) for key, value in region_to_sites.items()},
         dominant_domain_to_sites={key: sorted(value) for key, value in dominant_domain_to_sites.items()},
     )
+
+
+def build_site_relation_context(label_file, site_graph_file, site_device_counts_file):
+    site_infos = load_site_infos(site_graph_file, site_device_counts_file)
+    relation_map = load_label_relation_map(label_file)
+    return build_site_relation_context_from_relation_map(site_infos, relation_map)
 
 
 def _neighbors_excluding_pair(neighbor_map, site_id, excluded_site_id):
@@ -545,8 +552,9 @@ def extract_site_relation_features(context, left_site_id, right_site_id):
         "geo_distance_log1p": safe_log1p(geo_distance_km or 0.0),
         "left_device_total": float(left_total),
         "right_device_total": float(right_total),
-        "device_total_ratio_min_max": safe_ratio(min(left_total, right_total), max(left_total, right_total)),
-        "device_total_diff_abs": float(abs(left_total - right_total)),
+        "device_total_ratio_left_right": safe_ratio(left_total, right_total),
+        "device_total_ratio_right_left": safe_ratio(right_total, left_total),
+        "device_total_diff_left_minus_right": float(left_total - right_total),
         # Label-graph context below is leave-one-site-pair-out: the current
         # pair is removed before computing any degree/common-neighbor feature.
         "left_down_degree_excl_pair": float(len(left_down)),
@@ -629,6 +637,24 @@ def build_relation_sample(context, left_site_id, right_site_id, relation, reason
     }
 
 
+def rebuild_site_relation_sample_features(samples, context, show_progress=False, progress_label="重算站点关系特征"):
+    rebuilt = []
+    progress = _create_progress_bar(len(samples), progress_label, show_progress)
+    try:
+        for index, sample in enumerate(samples, start=1):
+            item = dict(sample)
+            left_site_id = str(item.get("u_site_id", "") or "")
+            right_site_id = str(item.get("v_site_id", "") or "")
+            if left_site_id in context.site_infos and right_site_id in context.site_infos:
+                item["features"] = extract_site_relation_features(context, left_site_id, right_site_id)
+            rebuilt.append(item)
+            if progress is not None:
+                progress.set(index)
+    finally:
+        _close_progress_bar(progress)
+    return rebuilt
+
+
 def _has_any_labeled_relation(context, left_site_id, right_site_id):
     return (
         (left_site_id, right_site_id) in context.label_relation_map
@@ -686,6 +712,7 @@ def _sample_candidates_for_nearest(candidates, rng, max_size=500):
 def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, same_region_negatives, same_domain_negatives, nearest_negatives):
     left_info = context.site_infos[left_site_id]
     right_info = context.site_infos[right_site_id]
+    attempts = []
 
     if same_region_negatives > 0 and right_info.region_id != "MISSING":
         candidates = [
@@ -693,7 +720,7 @@ def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, sam
             if site_id != right_site_id
         ]
         for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-            yield left_site_id, candidate_id, "same_target_region"
+            attempts.append((left_site_id, candidate_id, "same_target_region"))
 
     if same_region_negatives > 0 and left_info.region_id != "MISSING":
         candidates = [
@@ -701,7 +728,7 @@ def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, sam
             if site_id != left_site_id
         ]
         for candidate_id in _deterministic_sample(candidates, same_region_negatives, rng):
-            yield candidate_id, right_site_id, "same_source_region"
+            attempts.append((candidate_id, right_site_id, "same_source_region"))
 
     if same_domain_negatives > 0 and right_info.dominant_domain != "MISSING":
         candidates = [
@@ -709,7 +736,7 @@ def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, sam
             if site_id != right_site_id
         ]
         for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-            yield left_site_id, candidate_id, "same_target_domain"
+            attempts.append((left_site_id, candidate_id, "same_target_domain"))
 
     if same_domain_negatives > 0 and left_info.dominant_domain != "MISSING":
         candidates = [
@@ -717,7 +744,7 @@ def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, sam
             if site_id != left_site_id
         ]
         for candidate_id in _deterministic_sample(candidates, same_domain_negatives, rng):
-            yield candidate_id, right_site_id, "same_source_domain"
+            attempts.append((candidate_id, right_site_id, "same_source_domain"))
 
     if nearest_negatives > 0:
         candidates = _sample_candidates_for_nearest(
@@ -725,7 +752,10 @@ def _iter_none_candidate_attempts(context, left_site_id, right_site_id, rng, sam
             rng,
         )
         for candidate_id in _nearest_sites_by_distance(context, left_site_id, candidates, nearest_negatives):
-            yield left_site_id, candidate_id, "nearest_to_source"
+            attempts.append((left_site_id, candidate_id, "nearest_to_source"))
+
+    rng.shuffle(attempts)
+    yield from attempts
 
 
 def _generate_none_relation_pool(
@@ -964,41 +994,99 @@ def vectorize_samples(samples, feature_names, standardizer, show_progress=False,
     return dense_samples
 
 
+def _as_weight_matrix(weights):
+    """把 list-of-lists 或 ndarray 统一成 (class_count, feature_dim) ndarray。"""
+    return np.asarray(weights, dtype=np.float64)
+
+
+def _as_bias_vector(biases):
+    return np.asarray(biases, dtype=np.float64)
+
+
 def _softmax(scores):
-    max_score = max(scores) if scores else 0.0
-    exps = [math.exp(score - max_score) for score in scores]
-    total = sum(exps) or 1.0
-    return [value / total for value in exps]
+    """单样本 softmax；保留给少量旧调用者。优先使用 _softmax_batch。"""
+    if not scores:
+        return []
+    arr = np.asarray(scores, dtype=np.float64)
+    arr = arr - arr.max()
+    exps = np.exp(arr)
+    total = float(exps.sum()) or 1.0
+    return [float(value / total) for value in exps]
+
+
+def _softmax_batch(scores):
+    """对 (n, c) 矩阵做行级 softmax，返回 (n, c) ndarray。"""
+    scores = scores - scores.max(axis=1, keepdims=True)
+    exps = np.exp(scores)
+    return exps / np.maximum(exps.sum(axis=1, keepdims=True), 1e-300)
 
 
 def predict_probabilities(weights, biases, dense_vector):
-    scores = []
-    for class_index, class_weights in enumerate(weights):
-        score = biases[class_index]
-        for weight, feature_value in zip(class_weights, dense_vector):
-            score += weight * feature_value
-        scores.append(score)
-    return _softmax(scores)
+    """单样本预测；返回 list[float]，长度为 class_count。
+
+    旧接口保留以兼容外部调用者。性能敏感场景请用 predict_probabilities_batch。
+    """
+    x = np.asarray(dense_vector, dtype=np.float64)
+    return predict_probabilities_batch(weights, biases, x.reshape(1, -1))[0].tolist()
 
 
-def evaluate_dense_samples(dense_samples, weights, biases):
-    confusion = [[0 for _ in RELATION_CLASSES] for _ in RELATION_CLASSES]
-    probabilities = []
-    for item in dense_samples:
-        probs = predict_probabilities(weights, biases, item["x"])
-        pred = max(range(len(probs)), key=lambda idx: probs[idx])
-        gold = item["y"]
-        confusion[gold][pred] += 1
-        probabilities.append(probs)
+def predict_probabilities_batch(weights, biases, dense_matrix):
+    """批量预测；支持 softmax 权重矩阵、MLP 参数 dict 或 GBDT Booster。"""
+    X = np.asarray(dense_matrix, dtype=np.float64)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    if isinstance(weights, dict) and weights.get("model_type") == "mlp":
+        W1 = np.asarray(weights["hidden_weights"], dtype=np.float64)
+        b1 = np.asarray(weights["hidden_biases"], dtype=np.float64)
+        W2 = np.asarray(weights["output_weights"], dtype=np.float64)
+        b2 = np.asarray(weights["output_biases"], dtype=np.float64)
+        hidden = np.maximum(0.0, X @ W1.T + b1)
+        scores = hidden @ W2.T + b2
+        return _softmax_batch(scores)
+    if isinstance(weights, dict) and weights.get("model_type") == "gbdt":
+        booster = weights.get("booster")
+        if booster is None:
+            # 兜底：从 model_string 临时构建，但不再回写到 weights，避免污染调用方 dict。
+            # 高频调用路径下推荐在加载时（_load_model 或 train_*）就把 booster 放进 dict。
+            if "model_string" not in weights:
+                raise ValueError("GBDT 权重 dict 既无 booster 也无 model_string")
+            import lightgbm as lgb
 
-    total = sum(sum(row) for row in confusion)
-    correct = sum(confusion[idx][idx] for idx in range(len(RELATION_CLASSES)))
+            booster = lgb.Booster(model_str=weights["model_string"])
+        best_iteration = int(weights.get("best_iteration") or 0)
+        probs = np.asarray(
+            booster.predict(X, num_iteration=best_iteration if best_iteration > 0 else None),
+            dtype=np.float64,
+        )
+        if probs.ndim == 1:
+            probs = probs.reshape(-1, len(RELATION_CLASSES))
+        row_sums = probs.sum(axis=1, keepdims=True)
+        return probs / np.maximum(row_sums, 1e-300)
+    W = _as_weight_matrix(weights)
+    b = _as_bias_vector(biases)
+    scores = X @ W.T + b
+    return _softmax_batch(scores)
+
+
+def _stack_dense_samples(dense_samples):
+    """把 dense_samples（list of dict with x,y）拼成 (X, y) ndarray。"""
+    X = np.asarray([item["x"] for item in dense_samples], dtype=np.float64)
+    y = np.asarray([item["y"] for item in dense_samples], dtype=np.int64)
+    return X, y
+
+
+def _compute_metrics_from_confusion(confusion):
+    """从 (c, c) ndarray confusion 矩阵计算 accuracy / macro_f1 / per_class。"""
+    confusion_list = [[int(v) for v in row] for row in confusion]
+    total = int(confusion.sum())
+    correct = int(np.trace(confusion))
     per_class = {}
     macro_f1 = 0.0
+    class_count = len(RELATION_CLASSES)
     for idx, label in enumerate(RELATION_CLASSES):
-        tp = confusion[idx][idx]
-        fp = sum(confusion[row][idx] for row in range(len(RELATION_CLASSES)) if row != idx)
-        fn = sum(confusion[idx][col] for col in range(len(RELATION_CLASSES)) if col != idx)
+        tp = int(confusion[idx, idx])
+        fp = int(confusion[:, idx].sum() - tp)
+        fn = int(confusion[idx, :].sum() - tp)
         precision = safe_ratio(tp, tp + fp)
         recall = safe_ratio(tp, tp + fn)
         f1 = safe_ratio(2 * precision * recall, precision + recall)
@@ -1007,17 +1095,66 @@ def evaluate_dense_samples(dense_samples, weights, biases):
             "precision": precision,
             "recall": recall,
             "f1": f1,
-            "support": sum(confusion[idx]),
+            "support": int(confusion[idx, :].sum()),
         }
-    macro_f1 /= len(RELATION_CLASSES)
+    macro_f1 /= class_count
     return {
         "accuracy": safe_ratio(correct, total),
         "macro_f1": macro_f1,
-        "confusion_matrix": confusion,
+        "confusion_matrix": confusion_list,
         "classes": list(RELATION_CLASSES),
         "per_class": per_class,
         "sample_count": total,
-    }, probabilities
+    }
+
+
+def evaluate_dense_samples(dense_samples, weights, biases):
+    """批量评估；返回 (metrics_dict, probabilities_list_of_list)。"""
+    class_count = len(RELATION_CLASSES)
+    if not dense_samples:
+        empty_confusion = np.zeros((class_count, class_count), dtype=np.int64)
+        return _compute_metrics_from_confusion(empty_confusion), []
+
+    X, y = _stack_dense_samples(dense_samples)
+    probs = predict_probabilities_batch(weights, biases, X)
+    preds = probs.argmax(axis=1)
+
+    confusion = np.zeros((class_count, class_count), dtype=np.int64)
+    np.add.at(confusion, (y, preds), 1)
+    metrics = _compute_metrics_from_confusion(confusion)
+    # 转回 Python list 保持旧接口兼容
+    probabilities = probs.tolist()
+    return metrics, probabilities
+
+
+def _evaluate_dense_matrix(X, y, weights, biases):
+    """在已拼好的 (X, y) ndarray 上跑批量评估，避免反复构造矩阵。"""
+    class_count = len(RELATION_CLASSES)
+    if X.size == 0:
+        return _compute_metrics_from_confusion(np.zeros((class_count, class_count), dtype=np.int64))
+    probs = predict_probabilities_batch(weights, biases, X)
+    preds = probs.argmax(axis=1)
+    confusion = np.zeros((class_count, class_count), dtype=np.int64)
+    np.add.at(confusion, (y, preds), 1)
+    return _compute_metrics_from_confusion(confusion)
+
+
+def _compute_class_weight_vector(y_train, class_weight):
+    class_count = len(RELATION_CLASSES)
+    n_train = int(len(y_train))
+    label_counter = Counter(int(label) for label in y_train.tolist())
+    if class_weight == "balanced":
+        class_weights = {
+            idx: safe_ratio(n_train, class_count * label_counter.get(idx, 0))
+            for idx in range(class_count)
+        }
+    else:
+        class_weights = {idx: 1.0 for idx in range(class_count)}
+    class_weight_vec = np.asarray(
+        [class_weights[idx] for idx in range(class_count)],
+        dtype=np.float64,
+    )
+    return class_weights, class_weight_vec
 
 
 def train_softmax_regression(
@@ -1027,73 +1164,398 @@ def train_softmax_regression(
     learning_rate=0.03,
     l2=1e-4,
     class_weight="balanced",
+    early_stop_patience=5,
+    early_stop_min_delta=1e-8,
     seed=42,
     show_progress=False,
+    batch_size=512,
 ):
-    rng = random.Random(seed)
+    """Softmax 多分类 SGD 训练（mini-batch + numpy 向量化）。
+
+    与原 per-sample SGD 的差异：
+    - 批量梯度采用 mean over batch（标准 mini-batch SGD 语义），等效学习率与
+      pure SGD 保持一致；
+    - L2 在每个 mini-batch 应用一次（标准 weight decay 语义）。
+    """
     if not train_dense_samples:
         raise ValueError("训练集为空")
+
     feature_dim = len(train_dense_samples[0]["x"])
     class_count = len(RELATION_CLASSES)
-    weights = [[0.0 for _ in range(feature_dim)] for _ in range(class_count)]
-    biases = [0.0 for _ in range(class_count)]
-    label_counter = Counter(item["y"] for item in train_dense_samples)
-    if class_weight == "balanced":
-        class_weights = {
-            idx: safe_ratio(len(train_dense_samples), class_count * label_counter.get(idx, 0))
-            for idx in range(class_count)
-        }
+    batch_size = max(1, int(batch_size))
+
+    X_train, y_train = _stack_dense_samples(train_dense_samples)
+    n_train = X_train.shape[0]
+
+    class_weights, class_weight_vec = _compute_class_weight_vector(y_train, class_weight)
+    sample_weights = class_weight_vec[y_train]  # (n,)
+
+    if valid_dense_samples:
+        X_valid, y_valid = _stack_dense_samples(valid_dense_samples)
     else:
-        class_weights = {idx: 1.0 for idx in range(class_count)}
+        X_valid = y_valid = None
+
+    weights = np.zeros((class_count, feature_dim), dtype=np.float64)
+    biases = np.zeros(class_count, dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    eye = np.eye(class_count, dtype=np.float64)
 
     best_state = None
     best_score = -1.0
+    no_improve_epochs = 0
+    stopped_epoch = epochs
     history = []
     progress = _create_progress_bar(epochs, "训练 softmax 多分类模型", show_progress)
     try:
         for epoch in range(1, epochs + 1):
-            shuffled = list(train_dense_samples)
-            rng.shuffle(shuffled)
-            for item in shuffled:
-                probs = predict_probabilities(weights, biases, item["x"])
-                gold = item["y"]
-                sample_weight = class_weights.get(gold, 1.0)
-                for class_idx in range(class_count):
-                    target = 1.0 if class_idx == gold else 0.0
-                    error = (probs[class_idx] - target) * sample_weight
-                    biases[class_idx] -= learning_rate * error
-                    class_weights_vec = weights[class_idx]
-                    for feat_idx, feature_value in enumerate(item["x"]):
-                        grad = error * feature_value + l2 * class_weights_vec[feat_idx]
-                        class_weights_vec[feat_idx] -= learning_rate * grad
+            perm = rng.permutation(n_train)
+            X_shuf = X_train[perm]
+            y_shuf = y_train[perm]
+            w_shuf = sample_weights[perm]
 
-            train_metrics, _ = evaluate_dense_samples(train_dense_samples, weights, biases)
+            for start in range(0, n_train, batch_size):
+                end = start + batch_size
+                xb = X_shuf[start:end]            # (b, d)
+                yb = y_shuf[start:end]            # (b,)
+                wb = w_shuf[start:end]            # (b,)
+                b = xb.shape[0]
+                if b == 0:
+                    continue
+
+                scores = xb @ weights.T + biases  # (b, c)
+                probs = _softmax_batch(scores)    # (b, c)
+                one_hot = eye[yb]                 # (b, c)
+                # 标准 cross-entropy 梯度，按类权重加权
+                error = (probs - one_hot) * wb[:, None]  # (b, c)
+                # mean-gradient mini-batch
+                grad_b = error.mean(axis=0)
+                grad_w = error.T @ xb / b + l2 * weights
+                biases -= learning_rate * grad_b
+                weights -= learning_rate * grad_w
+
+            train_metrics = _evaluate_dense_matrix(X_train, y_train, weights, biases)
             valid_metrics = None
             score = train_metrics["macro_f1"]
-            if valid_dense_samples:
-                valid_metrics, _ = evaluate_dense_samples(valid_dense_samples, weights, biases)
+            if X_valid is not None:
+                valid_metrics = _evaluate_dense_matrix(X_valid, y_valid, weights, biases)
                 score = valid_metrics["macro_f1"]
             history.append({"epoch": epoch, "train": train_metrics, "valid": valid_metrics})
-            if score > best_score:
+            if score > best_score + early_stop_min_delta:
                 best_score = score
+                no_improve_epochs = 0
                 best_state = {
-                    "weights": [list(row) for row in weights],
-                    "biases": list(biases),
+                    "weights": [list(row) for row in weights.tolist()],
+                    "biases": list(biases.tolist()),
                     "best_epoch": epoch,
+                    "train_metrics": train_metrics,
+                    "valid_metrics": valid_metrics,
                 }
+            else:
+                no_improve_epochs += 1
             if progress is not None:
                 progress.set(epoch)
                 progress.set_extra_text(f"macro_f1={score:.4f}")
+            if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+                stopped_epoch = epoch
+                break
     finally:
         _close_progress_bar(progress)
 
+    if best_state is None:
+        # 极端情况下（epochs <= 0）保底返回当前权重
+        best_state = {
+            "weights": [list(row) for row in weights.tolist()],
+            "biases": list(biases.tolist()),
+            "best_epoch": 0,
+            "train_metrics": _evaluate_dense_matrix(X_train, y_train, weights, biases),
+            "valid_metrics": (
+                _evaluate_dense_matrix(X_valid, y_valid, weights, biases)
+                if X_valid is not None else None
+            ),
+        }
+
     best_state["history"] = history
     best_state["class_weights"] = class_weights
+    best_state["stopped_epoch"] = stopped_epoch
+    best_state["early_stop_patience"] = early_stop_patience
+    best_state["early_stop_min_delta"] = early_stop_min_delta
+    best_state["batch_size"] = batch_size
     return best_state
+
+
+def _mlp_param_dict(hidden_weights, hidden_biases, output_weights, output_biases):
+    return {
+        "model_type": "mlp",
+        "hidden_weights": [list(row) for row in hidden_weights.tolist()],
+        "hidden_biases": list(hidden_biases.tolist()),
+        "output_weights": [list(row) for row in output_weights.tolist()],
+        "output_biases": list(output_biases.tolist()),
+    }
+
+
+def train_mlp_classifier(
+    train_dense_samples,
+    valid_dense_samples=None,
+    epochs=50,
+    learning_rate=0.01,
+    l2=1e-4,
+    class_weight="balanced",
+    early_stop_patience=8,
+    early_stop_min_delta=1e-8,
+    seed=42,
+    show_progress=False,
+    batch_size=512,
+    hidden_dim=64,
+):
+    """单隐层 ReLU MLP，用于学习简单线性模型无法表达的特征交互。"""
+    if not train_dense_samples:
+        raise ValueError("训练集为空")
+
+    feature_dim = len(train_dense_samples[0]["x"])
+    class_count = len(RELATION_CLASSES)
+    batch_size = max(1, int(batch_size))
+    hidden_dim = max(1, int(hidden_dim))
+
+    X_train, y_train = _stack_dense_samples(train_dense_samples)
+    n_train = X_train.shape[0]
+    class_weights, class_weight_vec = _compute_class_weight_vector(y_train, class_weight)
+    sample_weights = class_weight_vec[y_train]
+
+    if valid_dense_samples:
+        X_valid, y_valid = _stack_dense_samples(valid_dense_samples)
+    else:
+        X_valid = y_valid = None
+
+    rng = np.random.default_rng(seed)
+    hidden_weights = rng.normal(0.0, math.sqrt(2.0 / max(1, feature_dim)), size=(hidden_dim, feature_dim))
+    hidden_biases = np.zeros(hidden_dim, dtype=np.float64)
+    output_weights = rng.normal(0.0, math.sqrt(2.0 / max(1, hidden_dim)), size=(class_count, hidden_dim))
+    output_biases = np.zeros(class_count, dtype=np.float64)
+    eye = np.eye(class_count, dtype=np.float64)
+
+    best_state = None
+    best_score = -1.0
+    no_improve_epochs = 0
+    stopped_epoch = epochs
+    history = []
+    progress = _create_progress_bar(epochs, "训练 MLP 多分类模型", show_progress)
+    try:
+        for epoch in range(1, epochs + 1):
+            perm = rng.permutation(n_train)
+            X_shuf = X_train[perm]
+            y_shuf = y_train[perm]
+            w_shuf = sample_weights[perm]
+
+            for start in range(0, n_train, batch_size):
+                end = start + batch_size
+                xb = X_shuf[start:end]
+                yb = y_shuf[start:end]
+                wb = w_shuf[start:end]
+                b = xb.shape[0]
+                if b == 0:
+                    continue
+
+                hidden_pre = xb @ hidden_weights.T + hidden_biases
+                hidden = np.maximum(0.0, hidden_pre)
+                scores = hidden @ output_weights.T + output_biases
+                probs = _softmax_batch(scores)
+                one_hot = eye[yb]
+                error = (probs - one_hot) * wb[:, None]
+
+                grad_output_biases = error.mean(axis=0)
+                grad_output_weights = error.T @ hidden / b + l2 * output_weights
+                hidden_error = error @ output_weights
+                hidden_error *= hidden_pre > 0.0
+                grad_hidden_biases = hidden_error.mean(axis=0)
+                grad_hidden_weights = hidden_error.T @ xb / b + l2 * hidden_weights
+
+                output_biases -= learning_rate * grad_output_biases
+                output_weights -= learning_rate * grad_output_weights
+                hidden_biases -= learning_rate * grad_hidden_biases
+                hidden_weights -= learning_rate * grad_hidden_weights
+
+            params = _mlp_param_dict(hidden_weights, hidden_biases, output_weights, output_biases)
+            train_metrics = _evaluate_dense_matrix(X_train, y_train, params, None)
+            valid_metrics = None
+            score = train_metrics["macro_f1"]
+            if X_valid is not None:
+                valid_metrics = _evaluate_dense_matrix(X_valid, y_valid, params, None)
+                score = valid_metrics["macro_f1"]
+            history.append({"epoch": epoch, "train": train_metrics, "valid": valid_metrics})
+            if score > best_score + early_stop_min_delta:
+                best_score = score
+                no_improve_epochs = 0
+                best_state = {
+                    **params,
+                    "best_epoch": epoch,
+                    "train_metrics": train_metrics,
+                    "valid_metrics": valid_metrics,
+                }
+            else:
+                no_improve_epochs += 1
+            if progress is not None:
+                progress.set(epoch)
+                progress.set_extra_text(f"macro_f1={score:.4f}")
+            if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
+                stopped_epoch = epoch
+                break
+    finally:
+        _close_progress_bar(progress)
+
+    if best_state is None:
+        params_fallback = _mlp_param_dict(hidden_weights, hidden_biases, output_weights, output_biases)
+        best_state = {
+            **params_fallback,
+            "best_epoch": 0,
+            "train_metrics": _evaluate_dense_matrix(X_train, y_train, params_fallback, None),
+            "valid_metrics": (
+                _evaluate_dense_matrix(X_valid, y_valid, params_fallback, None)
+                if X_valid is not None else None
+            ),
+        }
+
+    best_state["history"] = history
+    best_state["class_weights"] = class_weights
+    best_state["stopped_epoch"] = stopped_epoch
+    best_state["early_stop_patience"] = early_stop_patience
+    best_state["early_stop_min_delta"] = early_stop_min_delta
+    best_state["batch_size"] = batch_size
+    best_state["hidden_dim"] = hidden_dim
+    return best_state
+
+
+def train_gbdt_classifier(
+    train_dense_samples,
+    valid_dense_samples=None,
+    epochs=200,
+    learning_rate=0.05,
+    l2=1e-4,
+    class_weight="balanced",
+    early_stop_patience=20,
+    seed=42,
+    show_progress=False,
+    num_leaves=31,
+    min_data_in_leaf=20,
+):
+    """LightGBM GBDT 多分类模型，适合学习表格特征的非线性交互。"""
+    if not train_dense_samples:
+        raise ValueError("训练集为空")
+    try:
+        import lightgbm as lgb
+    except ImportError as exc:
+        raise ImportError("使用 --model-type gbdt 需要安装 lightgbm: pip install lightgbm") from exc
+
+    X_train, y_train = _stack_dense_samples(train_dense_samples)
+    class_weights, class_weight_vec = _compute_class_weight_vector(y_train, class_weight)
+    sample_weights = class_weight_vec[y_train]
+    train_set = lgb.Dataset(X_train, label=y_train, weight=sample_weights, free_raw_data=False)
+
+    valid_sets = [train_set]
+    valid_names = ["train"]
+    if valid_dense_samples:
+        X_valid, y_valid = _stack_dense_samples(valid_dense_samples)
+        valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set, free_raw_data=False)
+        valid_sets.append(valid_set)
+        valid_names.append("valid")
+
+    params = {
+        "objective": "multiclass",
+        "num_class": len(RELATION_CLASSES),
+        "metric": "multi_logloss",
+        "learning_rate": learning_rate,
+        "lambda_l2": l2,
+        "num_leaves": int(num_leaves),
+        "min_data_in_leaf": int(min_data_in_leaf),
+        "seed": int(seed),
+        "verbosity": -1,
+        "force_col_wise": True,
+    }
+    evals_result: dict = {}
+    callbacks = [
+        lgb.record_evaluation(evals_result),
+        lgb.log_evaluation(period=1 if show_progress else 0),
+    ]
+    if valid_dense_samples and early_stop_patience > 0:
+        callbacks.append(lgb.early_stopping(early_stop_patience, verbose=show_progress))
+
+    booster = lgb.train(
+        params,
+        train_set,
+        num_boost_round=max(1, int(epochs)),
+        valid_sets=valid_sets,
+        valid_names=valid_names,
+        callbacks=callbacks,
+    )
+    best_iteration = int(booster.best_iteration or booster.current_iteration())
+    weights = {
+        "model_type": "gbdt",
+        "booster": booster,
+        "best_iteration": best_iteration,
+    }
+    train_metrics = _evaluate_dense_matrix(X_train, y_train, weights, None)
+    valid_metrics = None
+    if valid_dense_samples:
+        valid_metrics = _evaluate_dense_matrix(X_valid, y_valid, weights, None)
+
+    # 构造逐轮 history，把 LightGBM record_evaluation 抓到的 multi_logloss 转成
+    # 与 softmax/mlp 同形态的列表；只在 best_iteration 那一轮带上完整 metrics。
+    train_logloss_per_iter = evals_result.get("train", {}).get("multi_logloss", [])
+    valid_logloss_per_iter = evals_result.get("valid", {}).get("multi_logloss", []) if valid_dense_samples else []
+    total_iters = max(
+        len(train_logloss_per_iter),
+        len(valid_logloss_per_iter),
+        booster.current_iteration(),
+    )
+    history = []
+    for idx in range(total_iters):
+        history.append({
+            "epoch": idx + 1,
+            "train_logloss": float(train_logloss_per_iter[idx]) if idx < len(train_logloss_per_iter) else None,
+            "valid_logloss": float(valid_logloss_per_iter[idx]) if idx < len(valid_logloss_per_iter) else None,
+        })
+    if 0 < best_iteration <= len(history):
+        history[best_iteration - 1]["train"] = train_metrics
+        history[best_iteration - 1]["valid"] = valid_metrics
+
+    return {
+        "model_type": "gbdt",
+        "model_string": booster.model_to_string(num_iteration=best_iteration),
+        "booster": booster,
+        "best_iteration": best_iteration,
+        "best_epoch": best_iteration,
+        "stopped_epoch": int(booster.current_iteration()),
+        "class_weights": class_weights,
+        "history": history,
+        "params": params,
+        "train_metrics": train_metrics,
+        "valid_metrics": valid_metrics,
+    }
 
 
 def build_feature_importance(feature_names, weights, top_k=80):
     rows = []
+    if isinstance(weights, dict) and weights.get("model_type") == "gbdt":
+        booster = weights.get("booster")
+        if booster is None:
+            import lightgbm as lgb
+
+            booster = lgb.Booster(model_str=weights["model_string"])
+        scores = booster.feature_importance(importance_type="gain")
+        for feature_index, feature_name in enumerate(feature_names):
+            rows.append({"feature": feature_name, "max_abs_weight": float(scores[feature_index])})
+        rows.sort(key=lambda item: (-item["max_abs_weight"], item["feature"]))
+        return rows[:top_k]
+    if isinstance(weights, dict) and weights.get("model_type") == "mlp":
+        hidden_weights = np.asarray(weights["hidden_weights"], dtype=np.float64)
+        output_weights = np.asarray(weights["output_weights"], dtype=np.float64)
+        # 粗略重要性：输入到隐藏层的绝对权重，经输出层强度加权。
+        hidden_strength = np.max(np.abs(output_weights), axis=0)
+        scores = np.abs(hidden_weights).T @ hidden_strength
+        for feature_index, feature_name in enumerate(feature_names):
+            rows.append({"feature": feature_name, "max_abs_weight": float(scores[feature_index])})
+        rows.sort(key=lambda item: (-item["max_abs_weight"], item["feature"]))
+        return rows[:top_k]
     for feature_index, feature_name in enumerate(feature_names):
         max_abs_weight = max(abs(weights[class_idx][feature_index]) for class_idx in range(len(weights)))
         rows.append({"feature": feature_name, "max_abs_weight": max_abs_weight})
@@ -1287,6 +1749,7 @@ def _candidate_targets_for_site(context, left_site_id, sites, rng=None):
         10,
     )
     candidate_targets.update(nearest)
+    candidate_targets.discard(left_site_id)
     candidate_targets = list(candidate_targets)
     if rng is not None:
         rng.shuffle(candidate_targets)

@@ -64,8 +64,18 @@ def main():
     parser.add_argument("--summary-output", default="", help="样本统计 JSON；默认与输出同名前缀")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--none-per-positive", type=float, default=2.0, help="none 样本数 / 非 none 样本数，默认: 2.0")
-    parser.add_argument("--same-region-negatives", type=int, default=1, help="同区域 hard none 采样数，默认: 1")
-    parser.add_argument("--same-domain-negatives", type=int, default=1, help="同主 domain hard none 采样数，默认: 1")
+    parser.add_argument(
+        "--same-region-negatives",
+        type=int,
+        default=1,
+        help="同区域 hard none 每侧采样数；源侧和目标侧会分别尝试，默认: 1",
+    )
+    parser.add_argument(
+        "--same-domain-negatives",
+        type=int,
+        default=1,
+        help="同主 domain hard none 每侧采样数；源侧和目标侧会分别尝试，默认: 1",
+    )
     parser.add_argument("--nearest-negatives", type=int, default=1, help="近距离 hard none 采样数，默认: 1")
     parser.add_argument("--random-negative-ratio", type=float, default=1.0, help="随机 none 补充比例，默认: 1.0")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")

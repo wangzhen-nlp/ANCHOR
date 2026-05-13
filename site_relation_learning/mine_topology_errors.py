@@ -61,7 +61,7 @@ def _known_relation_samples(context):
 
 
 def _predict_pair_rows(samples, model_payload, feature_names, weights, biases, no_progress=False, label="候选"):
-    from site_relation_learning.core import predict_probabilities
+    from site_relation_learning.core import predict_probabilities_batch
 
     dense = vectorize_samples(
         samples,
@@ -70,10 +70,10 @@ def _predict_pair_rows(samples, model_payload, feature_names, weights, biases, n
         show_progress=not no_progress,
         progress_label=f"向量化{label}",
     )
-    probabilities = [
-        predict_probabilities(weights, biases, item["x"])
-        for item in dense
-    ]
+    if not dense:
+        return build_pair_level_prediction_rows(dense, [])
+    X = [item["x"] for item in dense]
+    probabilities = predict_probabilities_batch(weights, biases, X).tolist()
     return build_pair_level_prediction_rows(dense, probabilities)
 
 
@@ -87,7 +87,6 @@ def _predict_missing_error_rows_streaming(
     max_candidate_count,
     max_samples_per_chunk,
     seed,
-    top_k=0,
     output_file=None,
     output_state=None,
     no_progress=False,
@@ -123,7 +122,7 @@ def _predict_missing_error_rows_streaming(
             if error_type:
                 chunk_error_rows.append(_format_error_row(row, error_type))
         if output_file is not None and output_state is not None and chunk_error_rows:
-            _write_error_rows(output_file, chunk_error_rows, output_state, top_k=top_k)
+            _write_error_rows(output_file, chunk_error_rows, output_state)
         if not no_progress and (chunk_count == 1 or chunk_count % 10 == 0):
             print(
                 f"已处理缺边候选: chunks={chunk_count}, ordered_samples={sample_count}, "
@@ -180,12 +179,10 @@ def _new_output_state():
     }
 
 
-def _write_error_rows(output_file, rows, state, top_k=0):
+def _write_error_rows(output_file, rows, state):
     rows = sorted(rows, key=_error_sort_key)
     written = 0
     for row in rows:
-        if top_k > 0 and state["retained_error_count"] >= top_k:
-            break
         output_file.write(json.dumps(row, ensure_ascii=False) + "\n")
         state["retained_error_count"] += 1
         state["error_type_counts"][row["error_type"]] = state["error_type_counts"].get(row["error_type"], 0) + 1
@@ -228,7 +225,6 @@ def main():
         default=20000,
         help="missing 候选每批最多 ordered samples 数，防止单批源站点候选过大，默认: 20000",
     )
-    parser.add_argument("--top-k", type=int, default=0, help="最多输出前 K 条；0 表示不限制")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
     args = parser.parse_args()
@@ -267,7 +263,7 @@ def main():
 
     print(f"写出已知关系错例: {args.output}")
     with open(args.output, "w", encoding="utf-8") as output_file:
-        _write_error_rows(output_file, known_error_rows, output_state, top_k=args.top_k)
+        _write_error_rows(output_file, known_error_rows, output_state)
         print(f"已知关系错例已写出: {output_state['retained_error_count']}")
 
         print("构造并流式预测潜在缺边候选...")
@@ -281,7 +277,6 @@ def main():
             max_candidate_count=args.max_candidate_count,
             max_samples_per_chunk=args.candidate_max_samples_per_chunk,
             seed=args.seed,
-            top_k=args.top_k,
             output_file=output_file,
             output_state=output_state,
             no_progress=args.no_progress,

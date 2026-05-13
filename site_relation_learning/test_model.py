@@ -147,6 +147,26 @@ def _load_model(model_file):
     if tuple(classes) != RELATION_CLASSES:
         raise ValueError(f"模型类别不兼容: {classes}")
     feature_names = payload["feature_names"]
+    model_type = payload.get("model_type", "site_relation_softmax_v1")
+    if model_type == "site_relation_gbdt_v1":
+        import lightgbm as lgb
+
+        weights = {
+            "model_type": "gbdt",
+            "model_string": payload["gbdt_model_string"],
+            "booster": lgb.Booster(model_str=payload["gbdt_model_string"]),
+            "best_iteration": payload.get("gbdt_best_iteration", 0),
+        }
+        return payload, feature_names, weights, None
+    if model_type == "site_relation_mlp_v1":
+        weights = {
+            "model_type": "mlp",
+            "hidden_weights": payload["hidden_weights"],
+            "hidden_biases": payload["hidden_biases"],
+            "output_weights": payload["output_weights"],
+            "output_biases": payload["output_biases"],
+        }
+        return payload, feature_names, weights, None
     weights = [
         [payload["weights"].get(label, {}).get(feature_name, 0.0) for feature_name in feature_names]
         for label in RELATION_CLASSES
