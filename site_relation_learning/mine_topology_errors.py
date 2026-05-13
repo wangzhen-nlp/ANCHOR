@@ -14,7 +14,7 @@ from site_relation_learning.core import (
     build_pair_level_prediction_rows,
     build_relation_sample,
     build_site_relation_context,
-    generate_candidate_relation_samples,
+    iter_candidate_relation_sample_chunks,
     vectorize_samples,
     write_json,
     write_jsonl,
@@ -77,6 +77,63 @@ def _predict_pair_rows(samples, model_payload, feature_names, weights, biases, n
     return build_pair_level_prediction_rows(dense, probabilities)
 
 
+def _predict_missing_error_rows_streaming(
+    context,
+    model_payload,
+    feature_names,
+    weights,
+    biases,
+    threshold,
+    max_candidate_count,
+    chunk_size,
+    seed,
+    top_k=0,
+    no_progress=False,
+):
+    error_rows = []
+    sample_count = 0
+    pair_count = 0
+    chunk_count = 0
+
+    chunks = iter_candidate_relation_sample_chunks(
+        context,
+        max_candidate_count=max_candidate_count,
+        seed=seed,
+        chunk_size=chunk_size,
+        show_progress=not no_progress,
+        progress_label="扫描潜在缺边候选站点",
+    )
+    for samples in chunks:
+        chunk_count += 1
+        sample_count += len(samples)
+        rows = _predict_pair_rows(
+            samples,
+            model_payload,
+            feature_names,
+            weights,
+            biases,
+            no_progress=True,
+            label="缺边候选样本",
+        )
+        pair_count += len(rows)
+        for row in rows:
+            error_type = _classify_missing_relation_error(row, threshold)
+            if error_type:
+                _append_ranked_error_row(error_rows, _format_error_row(row, error_type), top_k=top_k)
+        if not no_progress and (chunk_count == 1 or chunk_count % 10 == 0):
+            print(
+                f"已处理缺边候选: chunks={chunk_count}, ordered_samples={sample_count}, "
+                f"pairs={pair_count}, retained={len(error_rows)}"
+            )
+
+    if not no_progress:
+        print(
+            f"缺边候选处理完成: chunks={chunk_count}, ordered_samples={sample_count}, "
+            f"pairs={pair_count}, retained={len(error_rows)}"
+        )
+    return error_rows, sample_count, pair_count
+
+
 def _classify_known_relation_error(row, min_score):
     gold = row.get("gold_relation", "none")
     pred = row.get("predicted_relation", "none")
@@ -107,6 +164,17 @@ def _format_error_row(row, error_type):
     return output
 
 
+def _error_sort_key(row):
+    return (-float(row.get("score", 0.0) or 0.0), row["error_type"], row["sample_id"])
+
+
+def _append_ranked_error_row(rows, row, top_k=0):
+    rows.append(row)
+    if top_k > 0 and len(rows) > max(top_k * 2, top_k + 1000):
+        rows.sort(key=_error_sort_key)
+        del rows[top_k:]
+
+
 def main():
     parser = ArgumentParser(description="基于站点关系模型挖掘 site_chains.json 中的拓扑错例: 缺/错/多")
     parser.add_argument("--model", required=True, help="site_relation_learning/train_model.py 输出模型 JSON")
@@ -130,6 +198,7 @@ def main():
     parser.add_argument("--wrong-min-score", type=float, default=-1.0, help="错方向阈值；<0 使用 --min-score")
     parser.add_argument("--extra-min-score", type=float, default=-1.0, help="多边阈值；<0 使用 --min-score")
     parser.add_argument("--max-candidate-count", type=int, default=50000, help="missing 候选池上限，默认: 50000")
+    parser.add_argument("--candidate-chunk-size", type=int, default=2000, help="missing 候选流式预测 chunk 大小，默认: 2000")
     parser.add_argument("--top-k", type=int, default=0, help="最多输出前 K 条；0 表示不限制")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认: 42")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条")
@@ -157,21 +226,19 @@ def main():
         label="已知关系样本",
     )
 
-    print("构造潜在缺边候选...")
-    missing_samples = generate_candidate_relation_samples(
+    print("构造并流式预测潜在缺边候选...")
+    missing_error_rows, missing_sample_count, missing_pair_count = _predict_missing_error_rows_streaming(
         context,
-        max_candidate_count=args.max_candidate_count,
-        seed=args.seed,
-    )
-    print(f"缺边候选有序样本数: {len(missing_samples)}")
-    missing_rows = _predict_pair_rows(
-        missing_samples,
         model_payload,
         feature_names,
         weights,
         biases,
+        threshold=missing_threshold,
+        max_candidate_count=args.max_candidate_count,
+        chunk_size=args.candidate_chunk_size,
+        seed=args.seed,
+        top_k=args.top_k,
         no_progress=args.no_progress,
-        label="缺边候选样本",
     )
 
     error_rows = []
@@ -181,14 +248,11 @@ def main():
             extra_threshold if row.get("predicted_relation") == "none" else wrong_threshold,
         )
         if error_type:
-            error_rows.append(_format_error_row(row, error_type))
+            _append_ranked_error_row(error_rows, _format_error_row(row, error_type), top_k=args.top_k)
 
-    for row in missing_rows:
-        error_type = _classify_missing_relation_error(row, missing_threshold)
-        if error_type:
-            error_rows.append(_format_error_row(row, error_type))
+    error_rows.extend(missing_error_rows)
 
-    error_rows.sort(key=lambda item: (-float(item.get("score", 0.0) or 0.0), item["error_type"], item["sample_id"]))
+    error_rows.sort(key=_error_sort_key)
     if args.top_k > 0:
         error_rows = error_rows[: args.top_k]
 
@@ -208,7 +272,8 @@ def main():
             "site_graph": args.site_graph,
             "site_device_counts": args.site_device_counts,
             "known_pair_count": len(known_rows),
-            "missing_candidate_pair_count": len(missing_rows),
+            "missing_candidate_ordered_sample_count": missing_sample_count,
+            "missing_candidate_pair_count": missing_pair_count,
             "retained_error_count": len(error_rows),
             "error_type_counts": counts,
             "predicted_relation_counts": relation_counts,
@@ -222,7 +287,8 @@ def main():
     )
 
     print(f"已知关系 pair 数: {len(known_rows)}")
-    print(f"缺边候选 pair 数: {len(missing_rows)}")
+    print(f"缺边候选有序样本数: {missing_sample_count}")
+    print(f"缺边候选 pair 数: {missing_pair_count}")
     print(f"错例候选数: {len(error_rows)}")
     print(f"错例类型分布: {counts}")
     print(f"输出: {args.output}")
@@ -231,4 +297,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
