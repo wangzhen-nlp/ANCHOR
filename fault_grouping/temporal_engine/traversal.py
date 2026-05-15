@@ -3,6 +3,12 @@ import collections
 
 class TemporalGraphEngineTraversalMixin:
     def _matches_node_structure_cached(self, node, node_config, helper, structure_match_cache=None):
+        role_site_index = getattr(self, "role_site_index", None)
+        if role_site_index is not None:
+            indexed_result = role_site_index.matches_config(node, node_config)
+            if indexed_result is not None:
+                return indexed_result
+
         if structure_match_cache is None:
             return helper.matches_node_structure(self.sites_domain_map.get(node, {}), node_config)
 
@@ -13,6 +19,83 @@ class TemporalGraphEngineTraversalMixin:
                 node_config
             )
         return structure_match_cache[cache_key]
+
+    def _role_filtered_candidate_hops(
+        self,
+        rule_name,
+        target_role,
+        candidate_hops,
+    ):
+        role_site_index = getattr(self, "role_site_index", None)
+        if role_site_index is None or not candidate_hops:
+            return candidate_hops
+
+        role_candidates = role_site_index.role_candidates(rule_name, target_role)
+        if not role_candidates:
+            return {}
+        return {
+            site_id: hop
+            for site_id, hop in candidate_hops.items()
+            if site_id in role_candidates
+        }
+
+    def _traverse_graph_role_filtered(
+        self,
+        rule_name,
+        start_node,
+        target_role,
+        direction,
+        max_hops=None,
+        reference_ts=None,
+        edge_window=0,
+        path_requirements=None,
+        node_rule_helper=None,
+        traversal_cache=None,
+        path_validation_cache=None,
+        filtered_neighbor_cache=None,
+    ):
+        """Traverse topology and filter candidates by static target role structure.
+
+        The cross-batch cache is used only when path requirements are absent,
+        because then the result depends solely on static topology and static
+        role/site compatibility.
+        """
+        directions = self._normalize_traverse_directions(direction)
+        static_cache_key = None
+        if path_requirements is None:
+            static_cache_key = (
+                rule_name,
+                target_role,
+                start_node,
+                directions,
+                max_hops,
+            )
+            with self._topo_cache_lock:
+                cached = self.global_role_filtered_neighbor_cache.get(static_cache_key)
+                if cached is not None:
+                    self.global_role_filtered_neighbor_cache.move_to_end(static_cache_key)
+                    return cached
+
+        candidate_hops = self._traverse_graph(
+            start_node=start_node,
+            direction=direction,
+            max_hops=max_hops,
+            reference_ts=reference_ts,
+            edge_window=edge_window,
+            path_requirements=path_requirements,
+            node_rule_helper=node_rule_helper,
+            traversal_cache=traversal_cache,
+            path_validation_cache=path_validation_cache,
+            filtered_neighbor_cache=filtered_neighbor_cache,
+        )
+        filtered = self._role_filtered_candidate_hops(rule_name, target_role, candidate_hops)
+        if static_cache_key is not None:
+            with self._topo_cache_lock:
+                self.global_role_filtered_neighbor_cache[static_cache_key] = filtered
+                self.global_role_filtered_neighbor_cache.move_to_end(static_cache_key)
+                if len(self.global_role_filtered_neighbor_cache) > self.max_role_filtered_neighbor_cache_size:
+                    self.global_role_filtered_neighbor_cache.popitem(last=False)
+        return filtered
 
     def _get_precomputed_site_chain_candidates(self, start_node, direction, max_hops=None):
         """从 site_chains.json 预计算结果中取候选 hop；不支持混合多跳 either。"""

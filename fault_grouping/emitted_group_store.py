@@ -2,6 +2,8 @@ import copy
 import collections
 
 from fault_grouping.temporal_engine.utils import (
+    _add_nodes_to_role_mapping,
+    _role_key_for_merged_source,
     get_match_alarm_keys,
     get_match_symptom_overlap_keys,
     get_symptom_overlap_base_key,
@@ -52,6 +54,14 @@ class EmittedGroupStore:
             return self._merge_with_related_by_eid(match_result)
         return self._merge_with_related_by_overlap(match_result)
 
+    @staticmethod
+    def _qualified_role_mapping(match_result, field_name):
+        qualified = {}
+        for role, nodes in match_result.get(field_name, {}).items():
+            role_key = _role_key_for_merged_source(match_result, role)
+            _add_nodes_to_role_mapping(qualified, role_key, nodes)
+        return qualified
+
     def _merge_with_related_by_eid(self, match_result):
         related_groups = []
         current_alarm_keys = self._get_alarm_keys(match_result.get("symptoms", []))
@@ -75,8 +85,8 @@ class EmittedGroupStore:
             "uuid": match_result.get("uuid"),
             "rule": match_result.get("rule"),
             "merged_rules": list(match_result.get("merged_rules", [match_result.get("rule")])),
-            "inferred_roots": copy.deepcopy(match_result.get("inferred_roots", {})),
-            "role_mapping": copy.deepcopy(match_result.get("role_mapping", {})),
+            "inferred_roots": self._qualified_role_mapping(match_result, "inferred_roots"),
+            "role_mapping": self._qualified_role_mapping(match_result, "role_mapping"),
             "symptoms": list(match_result.get("symptoms", []))
         }
         if "_expire_ts_hint" in match_result:
@@ -107,12 +117,12 @@ class EmittedGroupStore:
             previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
             merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
             for role, nodes in previous_match.get("inferred_roots", {}).items():
-                merged["inferred_roots"].setdefault(role, [])
-                merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
+                role_key = _role_key_for_merged_source(previous_match, role)
+                _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
 
             for role, nodes in previous_match.get("role_mapping", {}).items():
-                merged["role_mapping"].setdefault(role, [])
-                merged["role_mapping"][role] = sorted(set(merged["role_mapping"][role]) | set(nodes))
+                role_key = _role_key_for_merged_source(previous_match, role)
+                _add_nodes_to_role_mapping(merged["role_mapping"], role_key, nodes)
 
             for symptom in previous_match.get("symptoms", []):
                 alarm_key = self._get_alarm_key(symptom)
@@ -153,8 +163,8 @@ class EmittedGroupStore:
             "uuid": match_result.get("uuid"),
             "rule": match_result.get("rule"),
             "merged_rules": list(match_result.get("merged_rules", [match_result.get("rule")])),
-            "inferred_roots": copy.deepcopy(match_result.get("inferred_roots", {})),
-            "role_mapping": copy.deepcopy(match_result.get("role_mapping", {})),
+            "inferred_roots": self._qualified_role_mapping(match_result, "inferred_roots"),
+            "role_mapping": self._qualified_role_mapping(match_result, "role_mapping"),
             "symptoms": list(match_result.get("symptoms", []))
         }
         if "_expire_ts_hint" in match_result:
@@ -182,12 +192,12 @@ class EmittedGroupStore:
             previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
             merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
             for role, nodes in previous_match.get("inferred_roots", {}).items():
-                merged["inferred_roots"].setdefault(role, [])
-                merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
+                role_key = _role_key_for_merged_source(previous_match, role)
+                _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
 
             for role, nodes in previous_match.get("role_mapping", {}).items():
-                merged["role_mapping"].setdefault(role, [])
-                merged["role_mapping"][role] = sorted(set(merged["role_mapping"][role]) | set(nodes))
+                role_key = _role_key_for_merged_source(previous_match, role)
+                _add_nodes_to_role_mapping(merged["role_mapping"], role_key, nodes)
 
             merged["symptoms"].extend(previous_match.get("symptoms", []))
 

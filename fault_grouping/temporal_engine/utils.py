@@ -203,6 +203,53 @@ def _interval_end_sort_value(end_ts):
     return float("inf") if end_ts is None else end_ts
 
 
+def _append_unique_value(values, value):
+    if value in (None, "") or value in values:
+        return
+    values.append(value)
+
+
+def _collect_symptom_values(symptom, single_field, list_field):
+    values = []
+    raw_values = symptom.get(list_field)
+    if isinstance(raw_values, list):
+        for value in raw_values:
+            _append_unique_value(values, value)
+    _append_unique_value(values, symptom.get(single_field))
+    return values
+
+
+def merge_symptom_role_metadata(existing_symptom, incoming_symptom):
+    """合并同一告警/时段被多个规则或 role 命中的归属信息。"""
+    merged = dict(existing_symptom)
+
+    for single_field, list_field in (
+        ("matched_rule", "matched_rule_list"),
+        ("matched_role", "matched_role_list"),
+        ("matched_role_key", "matched_role_key_list"),
+    ):
+        values = []
+        for symptom in (existing_symptom, incoming_symptom):
+            for value in _collect_symptom_values(symptom, single_field, list_field):
+                _append_unique_value(values, value)
+        if values:
+            merged[list_field] = values
+            if merged.get(single_field) in (None, ""):
+                merged[single_field] = values[0]
+
+    for field_name in (
+        "node",
+        "alarm",
+        "alarm_source",
+        "alarm_source_domain",
+        "time_str",
+    ):
+        if merged.get(field_name) in (None, "") and incoming_symptom.get(field_name) not in (None, ""):
+            merged[field_name] = incoming_symptom[field_name]
+
+    return merged
+
+
 def _merge_interval_end(left_end_ts, right_end_ts):
     if left_end_ts is None or right_end_ts is None:
         return None
@@ -289,11 +336,15 @@ def merge_symptom_records(existing_symptom, incoming_symptom):
         "alarm",
         "alarm_source",
         "alarm_source_domain",
+        "matched_rule",
         "matched_role",
+        "matched_role_key",
         "time_str",
     ):
         if not merged.get(field_name) and other_symptom.get(field_name):
             merged[field_name] = other_symptom[field_name]
+
+    merged = merge_symptom_role_metadata(merged, other_symptom)
 
     if merged.get("eid") in (None, "") and other_symptom.get("eid") not in (None, ""):
         merged["eid"] = other_symptom["eid"]
@@ -379,6 +430,48 @@ def get_match_site_keys(match_result):
     return site_keys
 
 
+def qualify_role_key(rule_name, role):
+    rule_name = str(rule_name or "").strip()
+    role = str(role or "").strip()
+    if not role:
+        return role
+    if not rule_name:
+        return role
+    qualified_prefix = f"{rule_name}."
+    if role.startswith(qualified_prefix):
+        return role
+    return f"{qualified_prefix}{role}"
+
+
+def _role_key_for_merged_source(source, role):
+    role = str(role or "").strip()
+    if not role:
+        return role
+
+    merged_rules = [
+        str(rule).strip()
+        for rule in source.get("merged_rules", [source.get("rule")])
+        if str(rule or "").strip()
+    ]
+    for rule_name in merged_rules:
+        if role.startswith(f"{rule_name}."):
+            return role
+
+    if len(merged_rules) == 1:
+        return qualify_role_key(merged_rules[0], role)
+
+    source_rule = str(source.get("rule") or "").strip()
+    if source_rule and " + " not in source_rule:
+        return qualify_role_key(source_rule, role)
+
+    return role
+
+
+def _add_nodes_to_role_mapping(role_mapping, role, nodes):
+    role_mapping.setdefault(role, [])
+    role_mapping[role] = sorted(set(role_mapping[role]) | set(nodes))
+
+
 def merge_match_component(component_matches, use_alarm_period_cache=False):
     """合并一组通过 eid 或告警时段 overlap 连通的候选组。"""
     merged_rules = sorted({
@@ -408,12 +501,12 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
             expire_ts_hint = source_expire_ts_hint if expire_ts_hint is None else max(expire_ts_hint, source_expire_ts_hint)
 
         for role, nodes in source.get("inferred_roots", {}).items():
-            merged["inferred_roots"].setdefault(role, [])
-            merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
+            role_key = _role_key_for_merged_source(source, role)
+            _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
 
         for role, nodes in source.get("role_mapping", {}).items():
-            merged["role_mapping"].setdefault(role, [])
-            merged["role_mapping"][role] = sorted(set(merged["role_mapping"][role]) | set(nodes))
+            role_key = _role_key_for_merged_source(source, role)
+            _add_nodes_to_role_mapping(merged["role_mapping"], role_key, nodes)
 
         if use_alarm_period_cache:
             collected_symptoms.extend(source.get("symptoms", []))
@@ -422,7 +515,11 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
                 alarm_key = symptom.get("eid")
                 if alarm_key in (None, ""):
                     continue
-                symptom_map[alarm_key] = symptom
+                existing_symptom = symptom_map.get(alarm_key)
+                if existing_symptom is None:
+                    symptom_map[alarm_key] = symptom
+                else:
+                    symptom_map[alarm_key] = merge_symptom_role_metadata(existing_symptom, symptom)
 
         related_group_uuids.update(source.get("related_group_uuids", []))
 

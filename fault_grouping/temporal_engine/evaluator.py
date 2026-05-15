@@ -2,7 +2,7 @@ import uuid
 
 from datetime import datetime
 
-from fault_grouping.temporal_engine.utils import clone_instance_with_updates
+from fault_grouping.temporal_engine.utils import clone_instance_with_updates, qualify_role_key
 
 
 class TemporalGraphEngineEvaluatorMixin:
@@ -81,6 +81,8 @@ class TemporalGraphEngineEvaluatorMixin:
         path_validation_cache,
         structure_match_cache,
         filtered_neighbor_cache,
+        rule_name=None,
+        match_mode="ANY",
     ):
         selector = edge.get("candidate_selector") or {}
         selector_mode = selector.get("mode", "default")
@@ -111,18 +113,34 @@ class TemporalGraphEngineEvaluatorMixin:
             raw_candidates = sorted(candidate_hops.keys(), key=lambda n: (candidate_hops[n], str(n)))
             candidates = list(raw_candidates)
         else:
-            candidate_hops = self._traverse_graph(
-                start_node=curr_phys,
-                direction=edge["traverse_dir"],
-                max_hops=edge["hops"],
-                reference_ts=ref_ts,
-                edge_window=edge["win"],
-                path_requirements=edge.get("path_requirements"),
-                node_rule_helper=helper,
-                traversal_cache=traversal_cache,
-                path_validation_cache=path_validation_cache,
-                filtered_neighbor_cache=filtered_neighbor_cache,
-            )
+            if match_mode == "ALL":
+                candidate_hops = self._traverse_graph(
+                    start_node=curr_phys,
+                    direction=edge["traverse_dir"],
+                    max_hops=edge["hops"],
+                    reference_ts=ref_ts,
+                    edge_window=edge["win"],
+                    path_requirements=edge.get("path_requirements"),
+                    node_rule_helper=helper,
+                    traversal_cache=traversal_cache,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                )
+            else:
+                candidate_hops = self._traverse_graph_role_filtered(
+                    rule_name=rule_name,
+                    start_node=curr_phys,
+                    target_role=tgt_role,
+                    direction=edge["traverse_dir"],
+                    max_hops=edge["hops"],
+                    reference_ts=ref_ts,
+                    edge_window=edge["win"],
+                    path_requirements=edge.get("path_requirements"),
+                    node_rule_helper=helper,
+                    traversal_cache=traversal_cache,
+                    path_validation_cache=path_validation_cache,
+                    filtered_neighbor_cache=filtered_neighbor_cache,
+                )
             candidate_hops, symmetric_deduped_count = self._filter_symmetric_pair_candidates(
                 candidate_hops,
                 curr_role,
@@ -146,6 +164,198 @@ class TemporalGraphEngineEvaluatorMixin:
             "selector_mode": selector_mode,
             "symmetric_deduped_count": symmetric_deduped_count,
         }
+
+    def _candidate_support_count(
+        self,
+        rule_name,
+        role,
+        site_id,
+        nodes_cfg,
+        trigger_role,
+        reference_ts,
+        helper,
+        caches,
+    ):
+        cache_key = (rule_name, role, site_id, reference_ts)
+        support_count_cache = caches.get("support_count_cache", {})
+        if cache_key in support_count_cache:
+            return support_count_cache[cache_key]
+
+        total = 0
+        for edge in self._get_rule_pattern_adj(rule_name).get(role, ()):
+            neighbor_role = edge["role"]
+            neighbor_cfg = nodes_cfg[neighbor_role]
+            candidate_hops = self._traverse_graph_role_filtered(
+                rule_name=rule_name,
+                start_node=site_id,
+                target_role=neighbor_role,
+                direction=edge["traverse_dir"],
+                max_hops=edge["hops"],
+                reference_ts=reference_ts,
+                edge_window=edge["win"],
+                path_requirements=edge.get("path_requirements"),
+                node_rule_helper=helper,
+                traversal_cache=caches["traversal_cache"],
+                path_validation_cache=caches["path_validation_cache"],
+                filtered_neighbor_cache=caches["filtered_neighbor_cache"],
+            )
+            for neighbor_site in candidate_hops:
+                valid, _events = self._validate_node_cached_for_support(
+                    neighbor_site,
+                    neighbor_role,
+                    neighbor_cfg,
+                    edge,
+                    rule_name,
+                    trigger_role,
+                    reference_ts,
+                    helper,
+                    caches["validation_cache"],
+                )
+                if valid:
+                    total += 1
+        support_count_cache[cache_key] = total
+        return total
+
+    def _validate_node_cached_for_support(
+        self,
+        site_id,
+        role,
+        node_config,
+        edge,
+        rule_name,
+        trigger_role,
+        reference_ts,
+        helper,
+        validation_cache,
+    ):
+        window_cache_key = self._make_edge_window_cache_key(edge["win"])
+        cache_key = (
+            "support_node",
+            rule_name,
+            role,
+            id(node_config),
+            site_id,
+            reference_ts,
+            window_cache_key,
+        )
+        if cache_key in validation_cache:
+            return validation_cache[cache_key]
+        site_domain = self.sites_domain_map.get(site_id, {})
+        result = helper.validate_node(
+            site_id,
+            site_domain,
+            node_config,
+            reference_ts,
+            edge["win"],
+            exclude_consumed_trigger_rule=(rule_name if role == trigger_role else None),
+        )
+        validation_cache[cache_key] = result
+        return result
+
+    def _get_rule_pattern_adj(self, rule_name):
+        plan = self.rule_execution_plans.get(rule_name) or self._get_eval_plan(rule_name, self.rules[rule_name])
+        pattern_adj = plan.get("pattern_adj")
+        if pattern_adj is None:
+            pattern_adj = {}
+        return pattern_adj
+
+    def _candidate_has_required_support(
+        self,
+        rule_name,
+        role,
+        site_id,
+        nodes_cfg,
+        trigger_role,
+        reference_ts,
+        helper,
+        caches,
+        bound_roles=None,
+    ):
+        bound_roles = bound_roles or set()
+        cache_key = (
+            rule_name,
+            role,
+            site_id,
+            reference_ts,
+            tuple(sorted(bound_roles)),
+        )
+        support_cache = caches.get("support_cache", {})
+        if cache_key in support_cache:
+            return support_cache[cache_key]
+
+        for edge in self._get_rule_pattern_adj(rule_name).get(role, ()):
+            if edge.get("optional"):
+                continue
+            neighbor_role = edge["role"]
+            if neighbor_role in bound_roles:
+                continue
+            neighbor_cfg = nodes_cfg[neighbor_role]
+            candidate_hops = self._traverse_graph_role_filtered(
+                rule_name=rule_name,
+                start_node=site_id,
+                target_role=neighbor_role,
+                direction=edge["traverse_dir"],
+                max_hops=edge["hops"],
+                reference_ts=reference_ts,
+                edge_window=edge["win"],
+                path_requirements=edge.get("path_requirements"),
+                node_rule_helper=helper,
+                traversal_cache=caches["traversal_cache"],
+                path_validation_cache=caches["path_validation_cache"],
+                filtered_neighbor_cache=caches["filtered_neighbor_cache"],
+            )
+            has_support = False
+            for neighbor_site in candidate_hops:
+                valid, _events = self._validate_node_cached_for_support(
+                    neighbor_site,
+                    neighbor_role,
+                    neighbor_cfg,
+                    edge,
+                    rule_name,
+                    trigger_role,
+                    reference_ts,
+                    helper,
+                    caches["validation_cache"],
+                )
+                if valid:
+                    has_support = True
+                    break
+            if not has_support:
+                support_cache[cache_key] = False
+                return False
+
+        support_cache[cache_key] = True
+        return True
+
+    def _sort_candidates_by_support_count(
+        self,
+        candidates,
+        rule_name,
+        role,
+        nodes_cfg,
+        trigger_role,
+        reference_ts,
+        helper,
+        caches,
+    ):
+        if len(candidates) <= 1:
+            return candidates
+        return sorted(
+            candidates,
+            key=lambda site_id: (
+                self._candidate_support_count(
+                    rule_name,
+                    role,
+                    site_id,
+                    nodes_cfg,
+                    trigger_role,
+                    reference_ts,
+                    helper,
+                    caches,
+                ),
+                str(site_id),
+            ),
+        )
 
     def _append_candidate_collection_failures(
         self,
@@ -201,6 +411,7 @@ class TemporalGraphEngineEvaluatorMixin:
         candidates,
         tgt_role,
         tgt_cfg,
+        nodes_cfg,
         ref_ts,
         edge,
         rule_name,
@@ -208,6 +419,8 @@ class TemporalGraphEngineEvaluatorMixin:
         match_mode,
         helper,
         validation_cache,
+        caches=None,
+        bound_roles=None,
         edge_trace=None,
     ):
         curr_valid_targets = {}
@@ -216,7 +429,15 @@ class TemporalGraphEngineEvaluatorMixin:
         candidate_failure_details = []
 
         for cand_phys in candidates:
-            cache_key = (cand_phys, tgt_role, ref_ts, window_cache_key)
+            cache_key = (
+                "candidate_node",
+                rule_name,
+                tgt_role,
+                id(tgt_cfg),
+                cand_phys,
+                ref_ts,
+                window_cache_key,
+            )
             if cache_key in validation_cache:
                 is_valid, events = validation_cache[cache_key]
             else:
@@ -232,6 +453,23 @@ class TemporalGraphEngineEvaluatorMixin:
                 validation_cache[cache_key] = (is_valid, events)
 
             if is_valid:
+                support_ref_ts = events[0]["ts"] if events else ref_ts
+                if match_mode != "ALL" and caches is not None and not self._candidate_has_required_support(
+                    rule_name,
+                    tgt_role,
+                    cand_phys,
+                    nodes_cfg,
+                    trigger_role,
+                    support_ref_ts,
+                    helper,
+                    caches,
+                    bound_roles=bound_roles,
+                ):
+                    if edge_trace is not None:
+                        candidate_failure_details.append(
+                            f"{cand_phys}: 缺少必选邻接 role 的活跃支撑，support check 剪枝"
+                        )
+                    continue
                 curr_valid_targets[cand_phys] = events
                 continue
 
@@ -266,6 +504,9 @@ class TemporalGraphEngineEvaluatorMixin:
         trigger_ts,
         match_mode,
         helper,
+        nodes_cfg,
+        caches,
+        bound_roles,
         validation_cache,
         traversal_cache,
         path_validation_cache,
@@ -274,6 +515,7 @@ class TemporalGraphEngineEvaluatorMixin:
         edge_trace=None,
     ):
         ref_ts = curr_events[0]["ts"] if curr_events else trigger_ts
+        bound_roles = set(bound_roles or ())
         branch_failure_reasons = []
         candidate_info = self._collect_edge_candidates(
             curr_phys,
@@ -287,6 +529,8 @@ class TemporalGraphEngineEvaluatorMixin:
             path_validation_cache,
             structure_match_cache,
             filtered_neighbor_cache,
+            rule_name=rule_name,
+            match_mode=match_mode,
         )
         if self._append_candidate_collection_failures(
             curr_role,
@@ -299,10 +543,24 @@ class TemporalGraphEngineEvaluatorMixin:
         ):
             return {}, branch_failure_reasons
 
+        ordered_candidates = candidate_info["candidates"]
+        if match_mode != "ALL":
+            ordered_candidates = self._sort_candidates_by_support_count(
+                ordered_candidates,
+                rule_name,
+                tgt_role,
+                nodes_cfg,
+                trigger_role,
+                ref_ts,
+                helper,
+                caches,
+            )
+
         curr_valid_targets, all_passed, candidate_failure_details = self._validate_candidate_nodes_for_edge(
-            candidate_info["candidates"],
+            ordered_candidates,
             tgt_role,
             tgt_cfg,
+            nodes_cfg,
             ref_ts,
             edge,
             rule_name,
@@ -310,6 +568,8 @@ class TemporalGraphEngineEvaluatorMixin:
             match_mode,
             helper,
             validation_cache,
+            caches=caches,
+            bound_roles=bound_roles | {curr_role},
             edge_trace=edge_trace,
         )
 
@@ -348,6 +608,8 @@ class TemporalGraphEngineEvaluatorMixin:
         trigger_ts,
         match_mode,
         helper,
+        nodes_cfg,
+        caches,
         validation_cache,
         traversal_cache,
         path_validation_cache,
@@ -359,6 +621,7 @@ class TemporalGraphEngineEvaluatorMixin:
         surviving_curr_phys = {}
         curr_support_targets = {}
         branch_failure_reasons = []
+        bound_roles = set(inst.get("roles", {}).keys())
 
         for curr_phys, curr_events in inst["roles"][curr_role]["nodes"].items():
             curr_valid_targets, source_failure_reasons = self._evaluate_edge_source_node(
@@ -373,6 +636,9 @@ class TemporalGraphEngineEvaluatorMixin:
                 trigger_ts,
                 match_mode,
                 helper,
+                nodes_cfg,
+                caches,
+                bound_roles,
                 validation_cache,
                 traversal_cache,
                 path_validation_cache,
@@ -453,6 +719,7 @@ class TemporalGraphEngineEvaluatorMixin:
         path_validation_cache,
         structure_match_cache,
         filtered_neighbor_cache,
+        caches,
         edge_trace=None,
     ):
         inst_roles = inst["roles"]
@@ -480,6 +747,8 @@ class TemporalGraphEngineEvaluatorMixin:
                 trigger_ts,
                 tgt_cfg.get("match", "ANY"),
                 helper,
+                nodes_cfg,
+                caches,
                 validation_cache,
                 traversal_cache,
                 path_validation_cache,
@@ -596,6 +865,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     caches["path_validation_cache"],
                     caches["structure_match_cache"],
                     caches["filtered_neighbor_cache"],
+                    caches,
                     edge_trace=edge_trace,
                 )
             )
@@ -606,7 +876,7 @@ class TemporalGraphEngineEvaluatorMixin:
             debug_trace["edges"].append(edge_trace)
         return next_instances, edge_trace
 
-    def _build_symptoms_and_role_mapping_from_instance(self, inst_roles):
+    def _build_symptoms_and_role_mapping_from_instance(self, inst_roles, rule_name):
         symptoms_by_key = {}
         role_mapping = {}
 
@@ -615,15 +885,17 @@ class TemporalGraphEngineEvaluatorMixin:
             for phys_node, events in role_state["nodes"].items():
                 valid_phys_nodes.append(phys_node)
                 for event in events:
-                    self._add_event_to_symptom_dict(symptoms_by_key, event, role)
+                    self._add_event_to_symptom_dict(symptoms_by_key, event, role, rule_name)
             if valid_phys_nodes:
                 role_mapping[role] = valid_phys_nodes
 
         return symptoms_by_key, role_mapping
 
-    def _add_event_to_symptom_dict(self, symptoms_by_key, event, role):
+    def _add_event_to_symptom_dict(self, symptoms_by_key, event, role, rule_name):
         event_enriched = dict(event)
         event_enriched["matched_role"] = role
+        event_enriched["matched_rule"] = rule_name
+        event_enriched["matched_role_key"] = qualify_role_key(rule_name, role)
         event_enriched["time_str"] = datetime.fromtimestamp(event["ts"]).strftime("%Y-%m-%d %H:%M:%S")
         hit_event_id = event.get("eid")
         event_enriched["eid_list"] = [hit_event_id] if hit_event_id not in (None, "") else []
@@ -673,7 +945,7 @@ class TemporalGraphEngineEvaluatorMixin:
             root_role: list(inst_roles.get(root_role, {}).get("nodes", {}).keys())
             for root_role in root_roles
         }
-        symptoms_by_key, role_mapping = self._build_symptoms_and_role_mapping_from_instance(inst_roles)
+        symptoms_by_key, role_mapping = self._build_symptoms_and_role_mapping_from_instance(inst_roles, rule_name)
         return {
             "uuid": str(uuid.uuid4()),
             "rule": rule_name,
@@ -783,6 +1055,22 @@ class TemporalGraphEngineEvaluatorMixin:
                 debug_trace["final_reason"] = (
                     debug_trace["trigger_validation"].get("reason", "trigger 节点未通过校验")
                 )
+                return [], debug_trace
+            return []
+
+        if not self._candidate_has_required_support(
+            rule_name,
+            trigger_role,
+            trigger_node,
+            nodes_cfg,
+            trigger_role,
+            trigger_ts,
+            helper,
+            caches,
+            bound_roles={trigger_role},
+        ):
+            if debug_trace is not None:
+                debug_trace["final_reason"] = "trigger 节点缺少必选邻接 role 的活跃支撑，support check 剪枝"
                 return [], debug_trace
             return []
 

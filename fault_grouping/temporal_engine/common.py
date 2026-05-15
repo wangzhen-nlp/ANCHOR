@@ -40,6 +40,8 @@ class TemporalGraphEngineCommonMixin:
             "path_validation_cache": {},
             "structure_match_cache": {},
             "filtered_neighbor_cache": {},
+            "support_cache": {},
+            "support_count_cache": {},
         }
 
     @staticmethod

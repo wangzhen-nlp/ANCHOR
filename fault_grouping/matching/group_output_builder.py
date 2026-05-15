@@ -133,7 +133,7 @@ def build_group_output(
             group_site_ids.add(site_id)
         site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
 
-        ne_alarms[ne_id].append({
+        alarm_output = {
             "alarm_id": representative_eid,
             "alarm_type": symptom.get("alarm", ""),
             "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
@@ -142,9 +142,16 @@ def build_group_output(
             "site_id": site_id,
             "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
+            "matched_rule": symptom.get("matched_rule", ""),
+            "matched_role_key": symptom.get("matched_role_key", ""),
             "工单号": symptom.get("工单号", ""),
             "故障组ID": symptom.get("故障组ID", ""),
-        })
+        }
+        for field_name in ("matched_rule_list", "matched_role_list", "matched_role_key_list"):
+            field_value = symptom.get(field_name)
+            if isinstance(field_value, list) and field_value:
+                alarm_output[field_name] = field_value
+        ne_alarms[ne_id].append(alarm_output)
         if include_eid_list and eid_list:
             ne_alarms[ne_id][-1]["alarm_id_list"] = eid_list
 

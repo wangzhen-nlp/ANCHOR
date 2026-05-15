@@ -12,6 +12,7 @@ from fault_grouping.temporal_engine.common import TemporalGraphEngineCommonMixin
 from fault_grouping.temporal_engine.constraints import TemporalGraphEngineConstraintMixin
 from fault_grouping.temporal_engine.dependencies import TemporalGraphEngineDependencyMixin
 from fault_grouping.temporal_engine.evaluator import TemporalGraphEngineEvaluatorMixin
+from fault_grouping.temporal_engine.indexes import RoleSiteIndex
 from fault_grouping.temporal_engine.output import TemporalGraphEngineOutputMixin
 from fault_grouping.temporal_engine.runtime import TemporalGraphEngineRuntimeMixin
 from fault_grouping.temporal_engine.traversal import TemporalGraphEngineTraversalMixin
@@ -63,6 +64,7 @@ class TemporalGraphEngine(
 
         return {
             "trigger_role": trigger_role,
+            "pattern_adj": pattern_adj,
             "edges_to_explore": tuple(edges_to_explore),
             "root_roles": root_roles,
         }
@@ -125,6 +127,9 @@ class TemporalGraphEngine(
         # nearest_matching 在不带 path_requirements 时只依赖静态拓扑和站点画像，可跨批次复用
         self.global_nearest_match_cache = collections.OrderedDict()
         self.max_nearest_match_cache_size = 10000
+        # role-filtered topology candidate cache: topology and role structure are static.
+        self.global_role_filtered_neighbor_cache = collections.OrderedDict()
+        self.max_role_filtered_neighbor_cache_size = 20000
 
         # 故障传播等待时间
         self.aggregation_wait_sec = aggregation_wait_sec
@@ -157,6 +162,12 @@ class TemporalGraphEngine(
             lambda node: self.event_cache.get(node, []),
             self.alarm_source_domain_map,
         )
+        self.role_site_index = RoleSiteIndex(
+            self.rules,
+            self.sites_domain_map,
+            self.node_rule_helper,
+        )
+        self.optimization_stats = collections.Counter()
 
         # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
         self.rule_execution_plans = {}
@@ -480,11 +491,29 @@ class TemporalGraphEngine(
             }
             for symptom in match.get("symptoms", []):
                 matched_role = symptom.get("matched_role")
-                matched_rule_names = {
-                    rule_name
-                    for rule_name, trigger_role in rule_to_trigger_role.items()
-                    if matched_role == trigger_role
-                }
+                matched_rule_names = set()
+
+                raw_matched_rules = symptom.get("matched_rule_list")
+                if not isinstance(raw_matched_rules, list):
+                    raw_matched_rules = [symptom.get("matched_rule")]
+                raw_matched_roles = symptom.get("matched_role_list")
+                if not isinstance(raw_matched_roles, list):
+                    raw_matched_roles = [matched_role]
+
+                for raw_rule in raw_matched_rules:
+                    matched_rule = str(raw_rule or "").strip()
+                    if not matched_rule or matched_rule not in rule_to_trigger_role:
+                        continue
+                    trigger_role = rule_to_trigger_role[matched_rule]
+                    if trigger_role in raw_matched_roles or matched_role == trigger_role:
+                        matched_rule_names.add(matched_rule)
+
+                if not matched_rule_names:
+                    matched_rule_names = {
+                        rule_name
+                        for rule_name, trigger_role in rule_to_trigger_role.items()
+                        if matched_role == trigger_role
+                    }
                 if not matched_rule_names:
                     continue
                 node = symptom.get("node")

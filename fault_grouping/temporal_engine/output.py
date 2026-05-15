@@ -1,5 +1,7 @@
 import collections
 
+from fault_grouping.temporal_engine.utils import qualify_role_key
+
 
 class TemporalGraphEngineOutputMixin:
     @staticmethod
@@ -16,7 +18,11 @@ class TemporalGraphEngineOutputMixin:
             rule = self.rules.get(rule_name)
             if not rule:
                 continue
-            node_config = rule.get("nodes", {}).get(role)
+            raw_role = role
+            prefix = f"{rule_name}."
+            if isinstance(role, str) and role.startswith(prefix):
+                raw_role = role[len(prefix):]
+            node_config = rule.get("nodes", {}).get(raw_role)
             if node_config is not None:
                 return node_config
         return {}
@@ -25,10 +31,12 @@ class TemporalGraphEngineOutputMixin:
         """仅过滤最终输出视图，不影响规则匹配和 result_constraints 判断。"""
         alarm_nodes_by_role = collections.defaultdict(set)
         for symptom in match_result.get("symptoms", []):
-            role = symptom.get("matched_role")
             node = symptom.get("node")
-            if role and node not in (None, ""):
-                alarm_nodes_by_role[role].add(node)
+            if node in (None, ""):
+                continue
+            for role in (symptom.get("matched_role"), symptom.get("matched_role_key")):
+                if role:
+                    alarm_nodes_by_role[role].add(node)
 
         filtered_role_mapping = {}
         for role, nodes in match_result.get("role_mapping", {}).items():
@@ -80,16 +88,24 @@ class TemporalGraphEngineOutputMixin:
             rule = self.rules.get(rule_name)
             if not rule:
                 continue
+            role_key_prefix = f"{rule_name}."
+            raw_role = role
+            qualified = False
+            if isinstance(role, str) and role.startswith(role_key_prefix):
+                raw_role = role[len(role_key_prefix):]
+                qualified = True
             for edge in rule.get("edges", []):
                 source = edge.get("source")
                 target = edge.get("target")
                 directions = self._normalize_traverse_directions(edge.get("direction", "downstream"))
-                if source == role and "upstream" in directions:
+                if source == raw_role and "upstream" in directions:
                     parent_role = target
-                elif target == role and "downstream" in directions:
+                elif target == raw_role and "downstream" in directions:
                     parent_role = source
                 else:
                     continue
+                if qualified:
+                    parent_role = qualify_role_key(rule_name, parent_role)
                 if parent_role and parent_role not in seen:
                     seen.add(parent_role)
                     parent_roles.append(parent_role)
@@ -182,17 +198,26 @@ class TemporalGraphEngineOutputMixin:
 
     def _get_exclusive_site_role_groups_for_output(self, match_result, available_roles):
         groups = []
+        available_role_set = set(available_roles)
         merged_rules = match_result.get("merged_rules", [match_result.get("rule")])
         for rule_name in merged_rules:
             rule = self.rules.get(rule_name)
             if not rule:
                 continue
-            groups.extend(
-                self._normalize_exclusive_site_role_groups(
-                    rule.get("exclusive_site_roles"),
-                    available_roles,
-                )
+            raw_groups = self._normalize_exclusive_site_role_groups(
+                rule.get("exclusive_site_roles"),
+                list(rule.get("nodes", {}).keys()),
             )
+            for raw_group in raw_groups:
+                group = []
+                seen = set()
+                for raw_role in raw_group:
+                    for role in (raw_role, qualify_role_key(rule_name, raw_role)):
+                        if role in available_role_set and role not in seen:
+                            seen.add(role)
+                            group.append(role)
+                if len(group) > 1:
+                    groups.append(group)
         return groups
 
     def _apply_default_output_site_role_ownership(self, match_result):
@@ -253,7 +278,16 @@ class TemporalGraphEngineOutputMixin:
             if role in remove_by_role and node in remove_by_role.get(role, set()):
                 owner_role = owner_by_removed_role_site.get((role, node))
                 if owner_role and node in filtered_role_mapping.get(owner_role, []):
-                    symptom = {**symptom, "matched_role": owner_role}
+                    matched_rule = symptom.get("matched_rule")
+                    matched_role = owner_role
+                    if isinstance(owner_role, str) and "." in owner_role:
+                        matched_rule, matched_role = owner_role.split(".", 1)
+                    symptom = {
+                        **symptom,
+                        "matched_role": matched_role,
+                        "matched_rule": matched_rule,
+                        "matched_role_key": owner_role,
+                    }
                 else:
                     continue
             filtered_symptoms.append(symptom)
