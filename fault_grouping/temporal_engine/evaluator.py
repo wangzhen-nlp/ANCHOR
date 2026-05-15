@@ -142,6 +142,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     traversal_cache=traversal_cache,
                     path_validation_cache=path_validation_cache,
                     filtered_neighbor_cache=filtered_neighbor_cache,
+                    target_node_config=tgt_cfg,
                 )
             candidate_hops, symmetric_deduped_count = self._filter_symmetric_pair_candidates(
                 candidate_hops,
@@ -200,6 +201,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 traversal_cache=caches["traversal_cache"],
                 path_validation_cache=caches["path_validation_cache"],
                 filtered_neighbor_cache=caches["filtered_neighbor_cache"],
+                target_node_config=neighbor_cfg,
             )
             for neighbor_site in candidate_hops:
                 valid, _events = self._validate_node_cached_for_support(
@@ -231,15 +233,25 @@ class TemporalGraphEngineEvaluatorMixin:
         validation_cache,
     ):
         window_cache_key = self._make_edge_window_cache_key(edge["win"])
-        cache_key = (
-            "support_node",
-            rule_name,
-            role,
-            id(node_config),
-            site_id,
-            reference_ts,
-            window_cache_key,
-        )
+        exclude_consumed_trigger_rule = rule_name if role == trigger_role else None
+        if exclude_consumed_trigger_rule is None:
+            cache_key = (
+                "support_node_shared",
+                id(node_config),
+                site_id,
+                reference_ts,
+                window_cache_key,
+            )
+        else:
+            cache_key = (
+                "support_node",
+                rule_name,
+                role,
+                id(node_config),
+                site_id,
+                reference_ts,
+                window_cache_key,
+            )
         if cache_key in validation_cache:
             return validation_cache[cache_key]
         site_domain = self.sites_domain_map.get(site_id, {})
@@ -249,7 +261,7 @@ class TemporalGraphEngineEvaluatorMixin:
             node_config,
             reference_ts,
             edge["win"],
-            exclude_consumed_trigger_rule=(rule_name if role == trigger_role else None),
+            exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
         )
         validation_cache[cache_key] = result
         return result
@@ -305,6 +317,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 traversal_cache=caches["traversal_cache"],
                 path_validation_cache=caches["path_validation_cache"],
                 filtered_neighbor_cache=caches["filtered_neighbor_cache"],
+                target_node_config=neighbor_cfg,
             )
             has_support = False
             for neighbor_site in candidate_hops:
@@ -431,15 +444,25 @@ class TemporalGraphEngineEvaluatorMixin:
         candidate_failure_details = []
 
         for cand_phys in candidates:
-            cache_key = (
-                "candidate_node",
-                rule_name,
-                tgt_role,
-                id(tgt_cfg),
-                cand_phys,
-                ref_ts,
-                window_cache_key,
-            )
+            exclude_consumed_trigger_rule = rule_name if tgt_role == trigger_role else None
+            if exclude_consumed_trigger_rule is None:
+                cache_key = (
+                    "candidate_node_shared",
+                    id(tgt_cfg),
+                    cand_phys,
+                    ref_ts,
+                    window_cache_key,
+                )
+            else:
+                cache_key = (
+                    "candidate_node",
+                    rule_name,
+                    tgt_role,
+                    id(tgt_cfg),
+                    cand_phys,
+                    ref_ts,
+                    window_cache_key,
+                )
             if cache_key in validation_cache:
                 is_valid, events = validation_cache[cache_key]
             else:
@@ -450,7 +473,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     tgt_cfg,
                     ref_ts,
                     edge["win"],
-                    exclude_consumed_trigger_rule=(rule_name if tgt_role == trigger_role else None),
+                    exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
                 )
                 validation_cache[cache_key] = (is_valid, events)
 
@@ -487,7 +510,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     tgt_cfg,
                     ref_ts,
                     edge["win"],
-                    exclude_consumed_trigger_rule=(rule_name if tgt_role == trigger_role else None),
+                    exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
                 )
                 candidate_failure_details.append(
                     f"{cand_phys}: {explain.get('reason', '节点校验失败')}"

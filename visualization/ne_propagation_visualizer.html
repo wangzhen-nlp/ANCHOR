@@ -2048,11 +2048,6 @@
                             <span>Ran</span>
                         </label>
                         <label class="device-filter-item">
-                            <input type="checkbox" data-device-filter="MICROWAVE" checked onchange="updateDeviceTypeFilter(this)">
-                            <span class="device-filter-dot" style="background:#9370DB;"></span>
-                            <span>Microwave</span>
-                        </label>
-                        <label class="device-filter-item">
                             <input type="checkbox" data-device-filter="OTHER" checked onchange="updateDeviceTypeFilter(this)">
                             <span class="device-filter-dot" style="background:#808080;"></span>
                             <span>Other</span>
@@ -2085,10 +2080,6 @@
                         <span>RAN / Wireless</span>
                     </div>
                     <div class="legend-item">
-                        <div class="legend-symbol" style="color: #9370DB;">◆</div>
-                        <span>Microwave</span>
-                    </div>
-                    <div class="legend-item">
                         <div class="legend-symbol" style="color: #808080;">●</div>
                         <span>Unknown / Other</span>
                     </div>
@@ -2104,6 +2095,12 @@
                                 <line x1="0" y1="2" x2="30" y2="2" stroke="#666" stroke-width="2" stroke-dasharray="5,3"/>
                             </svg>
                             <span>Distance 类型边</span>
+                        </div>
+                        <div class="legend-item">
+                            <svg width="30" height="4" style="margin-right: 8px;">
+                                <line x1="0" y1="2" x2="30" y2="2" stroke="#dc2626" stroke-width="3" stroke-dasharray="9,4,2,4"/>
+                            </svg>
+                            <span>弱拓扑预测边</span>
                         </div>
                         <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #cf222e; border-radius: 50%;"></div>
@@ -2184,11 +2181,10 @@
             'IP': { color: '#00BFFF', shape: 'square', label: 'IP/Router', symbol: '■' },
             'Transmission': { color: '#FF8C00', shape: 'circle', label: 'Optical/WDM', symbol: '●' },
             'RAN': { color: '#32CD32', shape: 'triangle', label: 'RAN/Wireless', symbol: '▲' },
-            'MICROWAVE': { color: '#9370DB', shape: 'diamond', label: 'Microwave', symbol: '◆' },
             'DEFAULT': { color: '#808080', shape: 'circle', label: 'Unknown', symbol: '●' }
         };
 
-        const EDGE_DOMAIN_PRIORITY = ['IP', 'Transmission', 'RAN', 'MICROWAVE', 'DEFAULT'];
+        const EDGE_DOMAIN_PRIORITY = ['IP', 'Transmission', 'RAN', 'DEFAULT'];
         const NODE_ROLE_BORDER_STYLE = {
             associated_site: { color: '#16a34a', width: 3.5, label: '关联站点告警设备' },
             missing_site: { color: '#f59e0b', width: 3.5, label: '缺失站点告警设备' },
@@ -2203,12 +2199,10 @@
 
             if (d.includes('IP') || d.includes('ROUTER') || d.includes('DATA') || d.includes('METRO')) {
                 return 'IP';
-            } else if (d.includes('TRANSMISSION') || d.includes('DWDM') || d.includes('OTN') || d.includes('OPTICAL') || d.includes('RTN') || d.includes('WDM')) {
+            } else if (d.includes('TRANSMISSION') || d.includes('DWDM') || d.includes('OTN') || d.includes('OPTICAL') || d.includes('RTN') || d.includes('WDM') || d.includes('MICROWAVE') || d.includes('MW')) {
                 return 'Transmission';
             } else if (d.includes('RAN') || d.includes('WIRELESS') || d.includes('NODEB') || d.includes('BTS') || d.includes('LTE')) {
                 return 'RAN';
-            } else if (d.includes('MICROWAVE') || d.includes('MW')) {
-                return 'MICROWAVE';
             } else {
                 return 'DEFAULT';
             }
@@ -2223,7 +2217,6 @@
             DATA: { label: 'Data', domainKeys: ['IP'] },
             TRANSMISSION: { label: 'Transmission', domainKeys: ['Transmission'] },
             RAN: { label: 'Ran', domainKeys: ['RAN'] },
-            MICROWAVE: { label: 'Microwave', domainKeys: ['MICROWAVE'] },
             OTHER: { label: 'Other', domainKeys: ['DEFAULT'] }
         };
 
@@ -2231,7 +2224,6 @@
             DATA: true,
             TRANSMISSION: true,
             RAN: true,
-            MICROWAVE: true,
             OTHER: true
         };
 
@@ -2240,7 +2232,6 @@
             if (domainKey === 'IP') return 'DATA';
             if (domainKey === 'Transmission') return 'TRANSMISSION';
             if (domainKey === 'RAN') return 'RAN';
-            if (domainKey === 'MICROWAVE') return 'MICROWAVE';
             return 'OTHER';
         }
 
@@ -2359,7 +2350,14 @@
             return !!(link && link.supplemental_fault_pattern_context);
         }
 
+        function isMissingTopologyLink(link) {
+            return !!(link && link.missing_topology_prediction);
+        }
+
         function getMapLinkDashArray(link) {
+            if (isMissingTopologyLink(link)) {
+                return '9, 4, 2, 4';
+            }
             if (isSupplementalContextLink(link)) {
                 return '4, 5';
             }
@@ -2373,6 +2371,9 @@
             if (selected) {
                 return '#cf222e';
             }
+            if (isMissingTopologyLink(link)) {
+                return '#dc2626';
+            }
             if (isSupplementalContextLink(link)) {
                 return '#8c959f';
             }
@@ -2383,7 +2384,100 @@
             if (selected) {
                 return 1;
             }
+            if (isMissingTopologyLink(link)) {
+                return 0.95;
+            }
             return isSupplementalContextLink(link) ? 0.65 : 0.8;
+        }
+
+        function getMissingTopologyEdges(data) {
+            const edges = [];
+            const seen = new Set();
+
+            function append(edgeList) {
+                if (!Array.isArray(edgeList)) return;
+                edgeList.forEach(function(edge) {
+                    if (!edge || typeof edge !== 'object') return;
+                    const sourceSite = String(edge.source_site || edge.source || '').trim();
+                    const targetSite = String(edge.target_site || edge.target || '').trim();
+                    const relation = String(edge.relation || edge.predicted_relation || '').trim();
+                    const score = edge.score !== undefined ? String(edge.score) : '';
+                    const key = [sourceSite, targetSite, relation, score, edge.sample_id || '', edge.inferred_hops || ''].join('|');
+                    if (!sourceSite || !targetSite || seen.has(key)) return;
+                    seen.add(key);
+                    edges.push(edge);
+                });
+            }
+
+            append(data && data.missing_topology_edges);
+            append(data && data.match_info && data.match_info.missing_topology_edges);
+            return edges;
+        }
+
+        function buildSiteRepresentativeNodeMap(nodes) {
+            const siteToNodeId = new Map();
+            (nodes || []).forEach(function(node) {
+                const siteId = String(node.site_id || '').trim();
+                if (!siteId || siteToNodeId.has(siteId)) return;
+                siteToNodeId.set(siteId, node.id);
+            });
+            return siteToNodeId;
+        }
+
+        function appendMissingTopologyLinks(data, nodes, links, linkSet) {
+            const missingEdges = getMissingTopologyEdges(data);
+            if (!missingEdges.length) return 0;
+
+            const siteToNodeId = buildSiteRepresentativeNodeMap(nodes);
+            let addedCount = 0;
+
+            missingEdges.forEach(function(edge) {
+                const sourceSite = String(edge.source_site || edge.source || '').trim();
+                const targetSite = String(edge.target_site || edge.target || '').trim();
+                const sourceNodeId = siteToNodeId.get(sourceSite);
+                const targetNodeId = siteToNodeId.get(targetSite);
+                if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) return;
+
+                const relation = edge.relation || edge.predicted_relation || 'missing';
+                const key = ['missing_topology', sourceNodeId, targetNodeId, sourceSite, targetSite, relation, edge.sample_id || '', edge.inferred_hops || ''].join('|');
+                if (linkSet && linkSet.has(key)) return;
+                if (linkSet) linkSet.add(key);
+
+                links.push({
+                    source: sourceNodeId,
+                    target: targetNodeId,
+                    connection_type: 'missing_topology_prediction',
+                    topology: relation,
+                    time_window: '',
+                    distance: 0,
+                    left_alarm: null,
+                    right_alarm: null,
+                    missing_topology_prediction: true,
+                    predicted_relation: relation,
+                    predicted_score: edge.score,
+                    source_site: sourceSite,
+                    target_site: targetSite,
+                    sample_id: edge.sample_id || '',
+                    inferred_from_missing_topology: !!edge.inferred_from_missing_topology,
+                    inferred_hops: edge.inferred_hops || 0,
+                    via_missing_edges: edge.via_missing_edges || []
+                });
+                addedCount += 1;
+            });
+
+            return addedCount;
+        }
+
+        function getMissingTopologyTooltip(link, sourceId, targetId) {
+            const relation = link.predicted_relation || link.topology || '-';
+            let score = '';
+            if (link.predicted_score !== undefined && link.predicted_score !== null && link.predicted_score !== '') {
+                const scoreValue = Number(link.predicted_score);
+                score = '，score=' + (Number.isFinite(scoreValue) ? scoreValue.toFixed(4) : escapeHtml(link.predicted_score));
+            }
+            return '<div style="font-weight: bold; color: #dc2626;">弱拓扑预测边</div>' +
+                '<div>' + escapeHtml(link.source_site || sourceId) + ' → ' + escapeHtml(link.target_site || targetId) + '</div>' +
+                '<div>类型: ' + escapeHtml(relation) + score + '</div>';
         }
 
         // ==========================================
@@ -4564,7 +4658,10 @@
                 polyline.isNeighborExpandedEdge = isNeighborExpandedEdge;
                 polyline.isSupplementalContextEdge = isSupplementalContextEdge;
 
-                polyline.bindTooltip(sourceId + ' → ' + targetId + (isDistance ? ' (Distance)' : ''), {
+                const tooltipHtml = isMissingTopologyLink(link)
+                    ? getMissingTopologyTooltip(link, sourceId, targetId)
+                    : sourceId + ' → ' + targetId + (isDistance ? ' (Distance)' : '');
+                polyline.bindTooltip(tooltipHtml, {
                     permanent: false,
                     direction: 'center'
                 });
@@ -4662,6 +4759,7 @@
             const targetNode = allNodes.find(function(n) { return n.id === targetId; });
             
             const isDistance = isDistanceLink(link);
+            const isMissingTopology = isMissingTopologyLink(link);
             const connectionType = link.connection_type || '未知';
             const distance = link.distance || 0;
             const topology = link.topology || '-';
@@ -4676,12 +4774,23 @@
             // 边类型标识
             html += '<div style="margin-bottom: 10px;">';
             html += '<span class="edge-type-badge ' + (isDistance ? 'distance' : 'normal') + '">' + 
-                    (isDistance ? '📏 Distance' : '🔗 普通连接') + '</span>';
+                    (isMissingTopology ? '🧩 弱拓扑预测' : (isDistance ? '📏 Distance' : '🔗 普通连接')) + '</span>';
             html += '</div>';
             
             // 连接信息
             html += '<div class="edge-link-info">';
             html += '<div class="link-row"><span class="link-label">连接类型:</span><span class="link-value">' + connectionType + '</span></div>';
+            if (isMissingTopology) {
+                html += '<div class="link-row"><span class="link-label">预测关系:</span><span class="link-value">' + escapeHtml(link.predicted_relation || topology) + '</span></div>';
+                if (link.predicted_score !== undefined && link.predicted_score !== null && link.predicted_score !== '') {
+                    const scoreValue = Number(link.predicted_score);
+                    html += '<div class="link-row"><span class="link-label">预测分数:</span><span class="link-value">' + (Number.isFinite(scoreValue) ? scoreValue.toFixed(4) : escapeHtml(link.predicted_score)) + '</span></div>';
+                }
+                html += '<div class="link-row"><span class="link-label">站点关系:</span><span class="link-value">' + escapeHtml(link.source_site || '-') + ' → ' + escapeHtml(link.target_site || '-') + '</span></div>';
+                if (link.inferred_from_missing_topology) {
+                    html += '<div class="link-row"><span class="link-label">来源:</span><span class="link-value">由缺失拓扑传递补全' + (link.inferred_hops ? '，hops=' + escapeHtml(link.inferred_hops) : '') + '</span></div>';
+                }
+            }
             if (distance > 0) {
                 html += '<div class="link-row"><span class="link-label">距离:</span><span class="link-value">' + distance + ' km</span></div>';
             }
@@ -5186,6 +5295,7 @@
                 }
             }
 
+            appendMissingTopologyLinks(data, allNodes, allLinks, linkSet);
             window.edgeDetails = edgeDetails;
             graphData.group_info = buildDisplayGroupInfo(data.group_info || {}, hiddenNeIds, hiddenSiteIds);
 
@@ -5213,7 +5323,8 @@
                 const style = getDomainStyle(domain);
                 return Object.assign({}, n, { domainStyle: style });
             });
-            allLinks = data.links || [];
+            allLinks = (data.links || []).map(function(link) { return Object.assign({}, link); });
+            appendMissingTopologyLinks(data, allNodes, allLinks, new Set());
             if (data.edge_details) {
                 window.edgeDetails = data.edge_details;
             }

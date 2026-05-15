@@ -49,5 +49,8 @@ class RoleSiteIndex:
     def role_candidates(self, rule_name, role):
         return self._by_rule_role.get((rule_name, role), frozenset())
 
+    def config_candidates(self, node_config):
+        return self._by_config_id.get(id(node_config), frozenset())
+
     def site_rule_roles(self, site_id):
         return self._by_site.get(site_id, frozenset())

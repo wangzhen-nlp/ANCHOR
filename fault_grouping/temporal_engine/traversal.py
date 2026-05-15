@@ -25,12 +25,16 @@ class TemporalGraphEngineTraversalMixin:
         rule_name,
         target_role,
         candidate_hops,
+        target_node_config=None,
     ):
         role_site_index = getattr(self, "role_site_index", None)
         if role_site_index is None or not candidate_hops:
             return candidate_hops
 
-        role_candidates = role_site_index.role_candidates(rule_name, target_role)
+        if target_node_config is not None:
+            role_candidates = role_site_index.config_candidates(target_node_config)
+        else:
+            role_candidates = role_site_index.role_candidates(rule_name, target_role)
         if not role_candidates:
             return {}
         return {
@@ -53,6 +57,7 @@ class TemporalGraphEngineTraversalMixin:
         traversal_cache=None,
         path_validation_cache=None,
         filtered_neighbor_cache=None,
+        target_node_config=None,
     ):
         """Traverse topology and filter candidates by static target role structure.
 
@@ -63,9 +68,9 @@ class TemporalGraphEngineTraversalMixin:
         directions = self._normalize_traverse_directions(direction)
         static_cache_key = None
         if path_requirements is None:
+            structure_key = ("config", id(target_node_config)) if target_node_config is not None else ("role", rule_name, target_role)
             static_cache_key = (
-                rule_name,
-                target_role,
+                structure_key,
                 start_node,
                 directions,
                 max_hops,
@@ -88,7 +93,12 @@ class TemporalGraphEngineTraversalMixin:
             path_validation_cache=path_validation_cache,
             filtered_neighbor_cache=filtered_neighbor_cache,
         )
-        filtered = self._role_filtered_candidate_hops(rule_name, target_role, candidate_hops)
+        filtered = self._role_filtered_candidate_hops(
+            rule_name,
+            target_role,
+            candidate_hops,
+            target_node_config=target_node_config,
+        )
         if static_cache_key is not None:
             with self._topo_cache_lock:
                 self.global_role_filtered_neighbor_cache[static_cache_key] = filtered

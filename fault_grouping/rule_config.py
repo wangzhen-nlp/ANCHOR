@@ -99,6 +99,27 @@ UNDERNEATH_OFFLINE_COMPOUND_NODE = {
   ]
 }
 
+TRANSMISSION_OFFLINE_NODE = {
+  "type": "primitive",
+  "site_rules": [
+    {
+      "include": ["Transmission"],
+      "expected_alarms": OFFLINE_ALARMS
+    }
+  ]
+}
+
+TRANSMISSION_DOWNSTREAM_COMPOUND_NODE = {
+  "type": "compound",
+  "min_count": 1,
+  "patterns": [
+    {
+      "type": "primitive",
+      "site_rules": TRANSMISSION_SITE_RULES
+    }
+  ]
+}
+
 transmission_rule = {
   "pattern_name": "bounded_silent_cross_domain_storm",
   "description": "无告警 -> 断站? -> 断站?",
@@ -135,16 +156,7 @@ transmission_rule = {
       "type": "primitive",
       "site_rules": TRANSMISSION_SITE_RULES
     },
-    "downstream_compound_node": {
-      "type": "compound",
-      "min_count": 1,
-      "patterns": [
-        {
-          "type": "primitive",
-          "site_rules": TRANSMISSION_SITE_RULES
-        }
-      ]
-    }
+    "downstream_compound_node": TRANSMISSION_DOWNSTREAM_COMPOUND_NODE
   },
   "edges": [
     {
@@ -178,15 +190,7 @@ link_rule = {
   "max_stay_time_sec": 3600,
   "trigger_role": "link_child_offline_node",
   "nodes": {
-    "link_child_offline_node": {
-      "type": "primitive",
-      "site_rules": [
-        {
-          "include": ["Transmission"],
-          "expected_alarms": OFFLINE_ALARMS
-        }
-      ]
-    },
+    "link_child_offline_node": TRANSMISSION_OFFLINE_NODE,
     "link_parent_node": {
       "type": "primitive",
       "site_rules": [
@@ -214,15 +218,7 @@ power_rule = {
   "max_stay_time_sec": 10800,
   "trigger_role": "offline_node",
   "nodes": {
-    "offline_node": {
-      "type": "primitive",
-      "site_rules": [
-        {
-          "include": ["Transmission"],
-          "expected_alarms": OFFLINE_ALARMS
-        }
-      ]
-    },
+    "offline_node": TRANSMISSION_OFFLINE_NODE,
     "power_node": {
       "type": "primitive",
       "site_rules": [
@@ -264,16 +260,7 @@ data_rule = {
         }
       ]
     },
-    "data_underneath_compound_node": {
-      "type": "compound",
-      "min_count": 1,
-      "patterns": [
-        {
-          "type": "primitive",
-          "site_rules": TRANSMISSION_SITE_RULES
-        }
-      ]
-    }
+    "data_underneath_compound_node": TRANSMISSION_DOWNSTREAM_COMPOUND_NODE
   },
   "edges": [
     {
