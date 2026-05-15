@@ -2258,6 +2258,9 @@
         }
 
         function isLinkVisibleByDeviceFilter(link) {
+            if (isMissingTopologyLink(link)) {
+                return true;
+            }
             const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
             const targetId = typeof link.target === 'object' ? link.target.id : link.target;
             return isNodeVisibleByDeviceFilter(getCurrentNodeById(sourceId)) &&
@@ -3895,6 +3898,35 @@
             });
         }
 
+        function buildSitePositionLookup(renderCoords) {
+            const nodesWithRenderedCoords = currentNodes.filter(function(node) {
+                return renderCoords && renderCoords[node.id];
+            });
+            const siteLocations = getCurrentSiteLocations(nodesWithRenderedCoords, renderCoords);
+            const lookup = new Map();
+            siteLocations.forEach(function(site) {
+                const pos = [site.latitude, site.longitude];
+                [site.siteId, site.siteName, site.label].forEach(function(siteKey) {
+                    const normalized = String(siteKey || '').trim();
+                    if (normalized && !lookup.has(normalized)) {
+                        lookup.set(normalized, pos);
+                    }
+                });
+            });
+            return lookup;
+        }
+
+        function getMissingTopologyEndpointPosition(link, endpoint, fallbackNodeId, renderCoords, sitePositionLookup) {
+            const siteKey = endpoint === 'source'
+                ? (link.source_site || link.sourceSite)
+                : (link.target_site || link.targetSite);
+            const normalizedSiteKey = String(siteKey || '').trim();
+            if (normalizedSiteKey && sitePositionLookup && sitePositionLookup.has(normalizedSiteKey)) {
+                return sitePositionLookup.get(normalizedSiteKey);
+            }
+            return renderCoords[fallbackNodeId];
+        }
+
         function getNodeSiteTitle(node) {
             return node.site_id || node.site_name || '未知站点';
         }
@@ -4656,13 +4688,18 @@
 
         // 绘制连线（使用扰动坐标）- 支持distance类型虚线和点击事件（需求3）
         function drawMapConnections(jitteredCoords) {
+            const sitePositionLookup = buildSitePositionLookup(jitteredCoords);
             currentLinks.forEach(function(link) {
                 const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
                 const targetId = typeof link.target === 'object' ? link.target.id : link.target;
                 
                 // 使用扰动后的坐标
-                const sourcePos = jitteredCoords[sourceId];
-                const targetPos = jitteredCoords[targetId];
+                const sourcePos = isMissingTopologyLink(link)
+                    ? getMissingTopologyEndpointPosition(link, 'source', sourceId, jitteredCoords, sitePositionLookup)
+                    : jitteredCoords[sourceId];
+                const targetPos = isMissingTopologyLink(link)
+                    ? getMissingTopologyEndpointPosition(link, 'target', targetId, jitteredCoords, sitePositionLookup)
+                    : jitteredCoords[targetId];
                 
                 if (!sourcePos || !targetPos) return;
 
