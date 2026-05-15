@@ -2432,6 +2432,8 @@
             let addedCount = 0;
 
             missingEdges.forEach(function(edge) {
+                // 传播图只画模型直接预测的一跳弱拓扑边；传递补齐边仍保留在数据里用于筛选/标识。
+                if (edge.inferred_from_missing_topology) return;
                 const sourceSite = String(edge.source_site || edge.source || '').trim();
                 const targetSite = String(edge.target_site || edge.target || '').trim();
                 const sourceNodeId = siteToNodeId.get(sourceSite);
