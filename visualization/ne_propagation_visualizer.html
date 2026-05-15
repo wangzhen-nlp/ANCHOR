@@ -2098,21 +2098,21 @@
                         </div>
                         <div class="legend-item">
                             <svg width="30" height="4" style="margin-right: 8px;">
-                                <line x1="0" y1="2" x2="30" y2="2" stroke="#16a34a" stroke-width="3" stroke-dasharray="9,4,2,4"/>
+                                <defs>
+                                    <linearGradient id="missingDirectedLegendGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                        <stop offset="0%" stop-color="#0f5132"/>
+                                        <stop offset="100%" stop-color="#bbf7d0"/>
+                                    </linearGradient>
+                                </defs>
+                                <line x1="0" y1="2" x2="30" y2="2" stroke="url(#missingDirectedLegendGradient)" stroke-width="3"/>
                             </svg>
-                            <span>弱拓扑 downstream</span>
-                        </div>
-                        <div class="legend-item">
-                            <svg width="30" height="4" style="margin-right: 8px;">
-                                <line x1="0" y1="2" x2="30" y2="2" stroke="#2563eb" stroke-width="3" stroke-dasharray="9,4,2,4"/>
-                            </svg>
-                            <span>弱拓扑 upstream</span>
+                            <span>弱拓扑有向边（深→浅）</span>
                         </div>
                         <div class="legend-item">
                             <svg width="30" height="4" style="margin-right: 8px;">
                                 <line x1="0" y1="2" x2="30" y2="2" stroke="#7c3aed" stroke-width="3" stroke-dasharray="9,4,2,4"/>
                             </svg>
-                            <span>弱拓扑 bidirection</span>
+                            <span>弱拓扑无向边</span>
                         </div>
                         <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #cf222e; border-radius: 50%;"></div>
@@ -2369,9 +2369,13 @@
             return !!(link && link.missing_topology_prediction);
         }
 
+        const MISSING_TOPOLOGY_DIRECTED_START_COLOR = '#0f5132';
+        const MISSING_TOPOLOGY_DIRECTED_END_COLOR = '#bbf7d0';
+        const MISSING_TOPOLOGY_DIRECTED_SEGMENTS = 9;
+
         const MISSING_TOPOLOGY_RELATION_STYLE = {
-            downstream: { color: '#16a34a', label: 'downstream' },
-            upstream: { color: '#2563eb', label: 'upstream' },
+            downstream: { color: MISSING_TOPOLOGY_DIRECTED_START_COLOR, label: 'directed' },
+            upstream: { color: MISSING_TOPOLOGY_DIRECTED_START_COLOR, label: 'directed' },
             bidirection: { color: '#7c3aed', label: 'bidirection' },
             default: { color: '#dc2626', label: 'unknown' }
         };
@@ -2390,6 +2394,31 @@
         function getMissingTopologyRelationStyle(linkOrRelation) {
             const relationKey = normalizeMissingTopologyRelation(linkOrRelation);
             return MISSING_TOPOLOGY_RELATION_STYLE[relationKey] || MISSING_TOPOLOGY_RELATION_STYLE.default;
+        }
+
+        function isDirectedMissingTopologyLink(link) {
+            const relationKey = normalizeMissingTopologyRelation(link);
+            return relationKey === 'downstream' || relationKey === 'upstream';
+        }
+
+        function hexToRgb(hexColor) {
+            const normalized = String(hexColor || '').replace('#', '').trim();
+            if (normalized.length !== 6) return { r: 220, g: 38, b: 38 };
+            return {
+                r: parseInt(normalized.slice(0, 2), 16),
+                g: parseInt(normalized.slice(2, 4), 16),
+                b: parseInt(normalized.slice(4, 6), 16)
+            };
+        }
+
+        function interpolateHexColor(startColor, endColor, ratio) {
+            const start = hexToRgb(startColor);
+            const end = hexToRgb(endColor);
+            const t = Math.max(0, Math.min(1, ratio));
+            const channel = function(a, b) {
+                return Math.round(a + (b - a) * t).toString(16).padStart(2, '0');
+            };
+            return '#' + channel(start.r, end.r) + channel(start.g, end.g) + channel(start.b, end.b);
         }
 
         function getMapLinkDashArray(link) {
@@ -3927,6 +3956,20 @@
             return renderCoords[fallbackNodeId];
         }
 
+        function getMissingTopologyDirectionalPositions(link, sourcePos, targetPos) {
+            const relationKey = normalizeMissingTopologyRelation(link);
+            if (relationKey === 'upstream') {
+                return {
+                    upstreamPos: targetPos,
+                    downstreamPos: sourcePos
+                };
+            }
+            return {
+                upstreamPos: sourcePos,
+                downstreamPos: targetPos
+            };
+        }
+
         function getNodeSiteTitle(node) {
             return node.site_id || node.site_name || '未知站点';
         }
@@ -4455,10 +4498,10 @@
                 const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
                 const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
                 polyline.setStyle({ 
-                    color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
-                    weight: 2.5, 
+                    color: polyline.segmentColor || getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
+                    weight: polyline.segmentColor ? 3 : 2.5,
                     opacity: getMapLinkOpacity(polyline.linkData, false),
-                    dashArray: getMapLinkDashArray(polyline.linkData)
+                    dashArray: polyline.segmentColor ? null : getMapLinkDashArray(polyline.linkData)
                 });
             });
         }
@@ -4717,6 +4760,72 @@
                 // 检查是否为distance类型连接
                 const isDistance = isDistanceLink(link);
                 const isNeighborExpandedEdge = !!link.isNeighborExpanded;
+
+                if (isMissingTopologyLink(link) && isDirectedMissingTopologyLink(link)) {
+                    const directedPositions = getMissingTopologyDirectionalPositions(link, sourcePos, targetPos);
+                    const tooltipHtml = getMissingTopologyTooltip(link, sourceId, targetId);
+                    for (let segmentIndex = 0; segmentIndex < MISSING_TOPOLOGY_DIRECTED_SEGMENTS; segmentIndex++) {
+                        const startRatio = segmentIndex / MISSING_TOPOLOGY_DIRECTED_SEGMENTS;
+                        const endRatio = (segmentIndex + 1) / MISSING_TOPOLOGY_DIRECTED_SEGMENTS;
+                        const segmentStart = [
+                            directedPositions.upstreamPos[0] + (directedPositions.downstreamPos[0] - directedPositions.upstreamPos[0]) * startRatio,
+                            directedPositions.upstreamPos[1] + (directedPositions.downstreamPos[1] - directedPositions.upstreamPos[1]) * startRatio
+                        ];
+                        const segmentEnd = [
+                            directedPositions.upstreamPos[0] + (directedPositions.downstreamPos[0] - directedPositions.upstreamPos[0]) * endRatio,
+                            directedPositions.upstreamPos[1] + (directedPositions.downstreamPos[1] - directedPositions.upstreamPos[1]) * endRatio
+                        ];
+                        const segmentColor = interpolateHexColor(
+                            MISSING_TOPOLOGY_DIRECTED_START_COLOR,
+                            MISSING_TOPOLOGY_DIRECTED_END_COLOR,
+                            (startRatio + endRatio) / 2
+                        );
+                        const segmentPolyline = L.polyline([segmentStart, segmentEnd], {
+                            color: segmentColor,
+                            weight: 3,
+                            opacity: getMapLinkOpacity(link, false),
+                            dashArray: null
+                        }).addTo(map);
+
+                        segmentPolyline.linkData = link;
+                        segmentPolyline.sourceId = sourceId;
+                        segmentPolyline.targetId = targetId;
+                        segmentPolyline.segmentColor = segmentColor;
+                        segmentPolyline.isDistance = isDistance;
+                        segmentPolyline.isNeighborExpandedEdge = isNeighborExpandedEdge;
+                        segmentPolyline.isSupplementalContextEdge = isSupplementalContextEdge;
+
+                        segmentPolyline.bindTooltip(tooltipHtml, {
+                            permanent: false,
+                            direction: 'center'
+                        });
+                        segmentPolyline.on('click', function(e) {
+                            L.DomEvent.stopPropagation(e);
+                            selectEdge(this.linkData, this.sourceId, this.targetId);
+                        });
+                        segmentPolyline.on('mouseover', function(e) {
+                            this.setStyle({
+                                weight: 5,
+                                opacity: 1,
+                                dashArray: null
+                            });
+                        });
+                        segmentPolyline.on('mouseout', function(e) {
+                            const isSelected = selectedEdge &&
+                                ((selectedEdge.source === this.sourceId && selectedEdge.target === this.targetId) ||
+                                 (selectedEdge.source === this.targetId && selectedEdge.target === this.sourceId));
+                            this.setStyle({
+                                weight: 3,
+                                opacity: getMapLinkOpacity(this.linkData, isSelected),
+                                color: isSelected ? getMapLinkColor(this.linkData, sourceNode, targetNode, true) : this.segmentColor,
+                                dashArray: null
+                            });
+                        });
+
+                        mapPolylines.push(segmentPolyline);
+                    }
+                    return;
+                }
                 
                 const polyline = L.polyline(latlngs, {
                     color: edgeColor,
@@ -4763,8 +4872,8 @@
                     this.setStyle({ 
                         weight: isDistance ? 2.5 : 2.5, 
                         opacity: getMapLinkOpacity(this.linkData, isSelected),
-                        color: getMapLinkColor(this.linkData, sourceNode, targetNode, isSelected),
-                        dashArray: getMapLinkDashArray(this.linkData)
+                        color: isSelected ? getMapLinkColor(this.linkData, sourceNode, targetNode, true) : (this.segmentColor || getMapLinkColor(this.linkData, sourceNode, targetNode, false)),
+                        dashArray: this.segmentColor ? null : getMapLinkDashArray(this.linkData)
                     });
                 });
 
@@ -4811,10 +4920,10 @@
                     polyline.bringToFront();
                 } else {
                     polyline.setStyle({ 
-                        color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
-                        weight: 2.5, 
+                        color: polyline.segmentColor || getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
+                        weight: polyline.segmentColor ? 3 : 2.5,
                         opacity: getMapLinkOpacity(polyline.linkData, false),
-                        dashArray: getMapLinkDashArray(polyline.linkData)
+                        dashArray: polyline.segmentColor ? null : getMapLinkDashArray(polyline.linkData)
                     });
                 }
             });
