@@ -2098,9 +2098,21 @@
                         </div>
                         <div class="legend-item">
                             <svg width="30" height="4" style="margin-right: 8px;">
-                                <line x1="0" y1="2" x2="30" y2="2" stroke="#dc2626" stroke-width="3" stroke-dasharray="9,4,2,4"/>
+                                <line x1="0" y1="2" x2="30" y2="2" stroke="#16a34a" stroke-width="3" stroke-dasharray="9,4,2,4"/>
                             </svg>
-                            <span>弱拓扑预测边</span>
+                            <span>弱拓扑 downstream</span>
+                        </div>
+                        <div class="legend-item">
+                            <svg width="30" height="4" style="margin-right: 8px;">
+                                <line x1="0" y1="2" x2="30" y2="2" stroke="#2563eb" stroke-width="3" stroke-dasharray="9,4,2,4"/>
+                            </svg>
+                            <span>弱拓扑 upstream</span>
+                        </div>
+                        <div class="legend-item">
+                            <svg width="30" height="4" style="margin-right: 8px;">
+                                <line x1="0" y1="2" x2="30" y2="2" stroke="#7c3aed" stroke-width="3" stroke-dasharray="9,4,2,4"/>
+                            </svg>
+                            <span>弱拓扑 bidirection</span>
                         </div>
                         <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #cf222e; border-radius: 50%;"></div>
@@ -2354,6 +2366,29 @@
             return !!(link && link.missing_topology_prediction);
         }
 
+        const MISSING_TOPOLOGY_RELATION_STYLE = {
+            downstream: { color: '#16a34a', label: 'downstream' },
+            upstream: { color: '#2563eb', label: 'upstream' },
+            bidirection: { color: '#7c3aed', label: 'bidirection' },
+            default: { color: '#dc2626', label: 'unknown' }
+        };
+
+        function normalizeMissingTopologyRelation(linkOrRelation) {
+            const rawRelation = typeof linkOrRelation === 'string'
+                ? linkOrRelation
+                : (linkOrRelation && (linkOrRelation.predicted_relation || linkOrRelation.topology || linkOrRelation.relation));
+            const relation = String(rawRelation || '').toLowerCase().trim();
+            if (relation === 'downstream' || relation === '->') return 'downstream';
+            if (relation === 'upstream' || relation === '<-') return 'upstream';
+            if (relation === 'bidirection' || relation === 'bidirectional' || relation === '<->') return 'bidirection';
+            return 'default';
+        }
+
+        function getMissingTopologyRelationStyle(linkOrRelation) {
+            const relationKey = normalizeMissingTopologyRelation(linkOrRelation);
+            return MISSING_TOPOLOGY_RELATION_STYLE[relationKey] || MISSING_TOPOLOGY_RELATION_STYLE.default;
+        }
+
         function getMapLinkDashArray(link) {
             if (isMissingTopologyLink(link)) {
                 return '9, 4, 2, 4';
@@ -2372,7 +2407,7 @@
                 return '#cf222e';
             }
             if (isMissingTopologyLink(link)) {
-                return '#dc2626';
+                return getMissingTopologyRelationStyle(link).color;
             }
             if (isSupplementalContextLink(link)) {
                 return '#8c959f';
@@ -2472,12 +2507,13 @@
 
         function getMissingTopologyTooltip(link, sourceId, targetId) {
             const relation = link.predicted_relation || link.topology || '-';
+            const relationStyle = getMissingTopologyRelationStyle(link);
             let score = '';
             if (link.predicted_score !== undefined && link.predicted_score !== null && link.predicted_score !== '') {
                 const scoreValue = Number(link.predicted_score);
                 score = '，score=' + (Number.isFinite(scoreValue) ? scoreValue.toFixed(4) : escapeHtml(link.predicted_score));
             }
-            return '<div style="font-weight: bold; color: #dc2626;">弱拓扑预测边</div>' +
+            return '<div style="font-weight: bold; color: ' + relationStyle.color + ';">弱拓扑预测边 / ' + escapeHtml(relationStyle.label) + '</div>' +
                 '<div>' + escapeHtml(link.source_site || sourceId) + ' → ' + escapeHtml(link.target_site || targetId) + '</div>' +
                 '<div>类型: ' + escapeHtml(relation) + score + '</div>';
         }
