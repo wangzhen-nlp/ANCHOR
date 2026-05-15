@@ -46,8 +46,10 @@ from fault_grouping.alarm_events.sorted_cache import (
 )
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.site_topology import (
+    apply_missing_topology_predictions,
     build_site_to_ne_ids,
     build_site_topology_from_ne_graph,
+    load_missing_topology_predictions,
     load_site_chain_index,
 )
 
@@ -64,6 +66,7 @@ class LoadedStaticContext:
     alarm_source_domain_map: dict
     site_to_ne_ids: dict
     ne_link_info_cache: dict
+    missing_topology_edges: dict
 
 
 @dataclass
@@ -127,6 +130,8 @@ def validate_main_args(parser, args):
         parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
     if args.site_chains and not os.path.exists(args.site_chains):
         parser.error(f"site_chains 文件不存在: {args.site_chains}")
+    if args.missing_topology and not os.path.exists(args.missing_topology):
+        parser.error(f"missing_topology 文件不存在: {args.missing_topology}")
     return start_ts, end_ts
 
 
@@ -151,6 +156,23 @@ def load_static_context(args):
         site_chain_index, site_chain_valid_sites = load_site_chain_index(args.site_chains)
         valid_sites.update(site_chain_valid_sites)
         print(f"预计算站点链路站点数: {len(site_chain_index)}")
+
+    missing_topology_edges = {}
+    if args.missing_topology:
+        print(f"加载弱拓扑缺边预测: {args.missing_topology}")
+        missing_topology_predictions = load_missing_topology_predictions(
+            args.missing_topology,
+            min_score=args.missing_topology_min_score,
+        )
+        topo_downstream_map, site_chain_index, missing_topology_edges = apply_missing_topology_predictions(
+            topo_downstream_map,
+            site_chain_index,
+            missing_topology_predictions,
+        )
+        for source_site, target_site in missing_topology_edges:
+            valid_sites.add(source_site)
+            valid_sites.add(target_site)
+        print(f"弱拓扑补偿边数: {len(missing_topology_edges)}")
 
     site_domain_map = json.load(open(args.site_domain, 'r', encoding='utf-8'))
     site_graph_data = json.load(open(args.site_graph, 'r', encoding='utf-8'))
@@ -187,6 +209,7 @@ def load_static_context(args):
         alarm_source_domain_map=alarm_source_domain_map,
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
+        missing_topology_edges=missing_topology_edges,
     )
 
 
@@ -213,6 +236,12 @@ def print_run_configuration(args, static_context, valid_alarm_titles):
         print("候选 support 剪枝: 开启")
     if args.enable_support_count_sort:
         print("候选 support count 排序: 开启")
+    if args.missing_topology:
+        print(
+            "弱拓扑补偿: 开启，"
+            f"方向化边数={len(static_context.missing_topology_edges)}, "
+            f"min_score={args.missing_topology_min_score:g}"
+        )
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
 
 
@@ -286,6 +315,7 @@ def initialize_engine(args, static_context, rules_config, batch_site_merge_helpe
         use_alarm_period_cache=args.use_alarm_period_cache,
         enable_support_pruning=args.enable_support_pruning,
         enable_support_count_sort=args.enable_support_count_sort,
+        missing_topology_edges=static_context.missing_topology_edges,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
     return engine

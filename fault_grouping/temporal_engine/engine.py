@@ -88,6 +88,7 @@ class TemporalGraphEngine(
         use_alarm_period_cache=False,
         enable_support_pruning=False,
         enable_support_count_sort=False,
+        missing_topology_edges=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -171,6 +172,7 @@ class TemporalGraphEngine(
         )
         self.enable_support_pruning = bool(enable_support_pruning)
         self.enable_support_count_sort = bool(enable_support_count_sort)
+        self.missing_topology_edges = dict(missing_topology_edges or {})
         self.optimization_stats = collections.Counter()
 
         # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。

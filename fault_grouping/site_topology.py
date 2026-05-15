@@ -64,6 +64,216 @@ def build_site_topology_from_ne_graph(ne_graph_data):
     }, all_sites
 
 
+def _iter_json_or_jsonl(path):
+    with open(path, "r", encoding="utf-8") as f:
+        first = f.read(1)
+        f.seek(0)
+        if first == "[":
+            data = json.load(f)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        yield item
+            return
+
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict):
+                yield item
+
+
+def _normalize_predicted_relation(row):
+    relation = str(
+        row.get("site_a_to_site_b_relation")
+        or row.get("predicted_relation")
+        or ""
+    ).strip()
+    if relation in {"downstream", "upstream", "bidirection"}:
+        return relation
+    return ""
+
+
+def load_missing_topology_predictions(path, min_score=0.0):
+    """加载 site_relation_learning/infer.py --mode topology-errors 输出的 missing 预测。"""
+    predictions = []
+    if not path:
+        return predictions
+
+    for row in _iter_json_or_jsonl(path):
+        if str(row.get("error_type", "")).strip() != "missing":
+            continue
+        try:
+            score = float(row.get("score", row.get("predicted_score", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if score < min_score:
+            continue
+
+        site_a = str(row.get("site_a", "") or "").strip()
+        site_b = str(row.get("site_b", "") or "").strip()
+        relation = _normalize_predicted_relation(row)
+        if not site_a or not site_b or site_a == site_b or not relation:
+            continue
+
+        predictions.append({
+            "site_a": site_a,
+            "site_b": site_b,
+            "relation": relation,
+            "score": score,
+            "sample_id": row.get("sample_id", f"{site_a}__{site_b}"),
+        })
+    return predictions
+
+
+def apply_missing_topology_predictions(topo_downstream_map, site_chain_index, predictions):
+    """把高置信缺边预测注入站点拓扑，并返回方向化弱拓扑边索引。"""
+    if not predictions:
+        return topo_downstream_map, site_chain_index, {}
+
+    augmented_topo = defaultdict(set)
+    for site_id, downstream_sites in (topo_downstream_map or {}).items():
+        site_id = str(site_id).strip()
+        if not site_id:
+            continue
+        augmented_topo[site_id].update(str(item).strip() for item in downstream_sites if str(item).strip())
+
+    augmented_chain = {}
+    if isinstance(site_chain_index, dict):
+        for site_id, info in site_chain_index.items():
+            augmented_chain[site_id] = {
+                "downstream_site_hops": dict(info.get("downstream_site_hops", {})),
+                "upstream_site_hops": dict(info.get("upstream_site_hops", {})),
+                "bidirectional_sites": set(info.get("bidirectional_sites", set())),
+            }
+
+    weak_edges = {}
+    direct_downstream_edges = set()
+
+    def ensure_chain(site_id):
+        if not isinstance(site_chain_index, dict):
+            return None
+        return augmented_chain.setdefault(site_id, {
+            "downstream_site_hops": {},
+            "upstream_site_hops": {},
+            "bidirectional_sites": set(),
+        })
+
+    def upsert_weak_edge(edge_key, edge_meta):
+        existing = weak_edges.get(edge_key)
+        if existing and float(existing.get("score", 0.0) or 0.0) > float(edge_meta.get("score", 0.0) or 0.0):
+            return
+        weak_edges[edge_key] = edge_meta
+
+    def add_downstream(source_site, target_site, prediction, relation_label, propagate=True):
+        if not source_site or not target_site or source_site == target_site:
+            return
+        augmented_topo[source_site].add(target_site)
+        augmented_topo[target_site]
+        source_chain = ensure_chain(source_site)
+        target_chain = ensure_chain(target_site)
+        if source_chain is not None:
+            previous_hop = source_chain["downstream_site_hops"].get(target_site)
+            if previous_hop is None or previous_hop > 1:
+                source_chain["downstream_site_hops"][target_site] = 1
+        if target_chain is not None:
+            previous_hop = target_chain["upstream_site_hops"].get(source_site)
+            if previous_hop is None or previous_hop > 1:
+                target_chain["upstream_site_hops"][source_site] = 1
+        if propagate:
+            direct_downstream_edges.add((source_site, target_site))
+        edge_key = (source_site, target_site)
+        upsert_weak_edge(edge_key, {
+            "source_site": source_site,
+            "target_site": target_site,
+            "relation": relation_label,
+            "score": prediction.get("score", 0.0),
+            "sample_id": prediction.get("sample_id", ""),
+            "inferred_from_missing_topology": False,
+        })
+
+    for prediction in predictions:
+        site_a = prediction["site_a"]
+        site_b = prediction["site_b"]
+        relation = prediction["relation"]
+        if relation == "downstream":
+            add_downstream(site_a, site_b, prediction, relation)
+        elif relation == "upstream":
+            add_downstream(site_b, site_a, prediction, relation)
+        elif relation == "bidirection":
+            add_downstream(site_a, site_b, prediction, relation, propagate=False)
+            add_downstream(site_b, site_a, prediction, relation, propagate=False)
+            ensure_a = ensure_chain(site_a)
+            ensure_b = ensure_chain(site_b)
+            if ensure_a is not None:
+                ensure_a["bidirectional_sites"].add(site_b)
+            if ensure_b is not None:
+                ensure_b["bidirectional_sites"].add(site_a)
+
+    def update_chain_hop(source_site, target_site, hop):
+        if not isinstance(site_chain_index, dict):
+            return False
+        if not source_site or not target_site or source_site == target_site or hop <= 0:
+            return False
+        source_chain = ensure_chain(source_site)
+        target_chain = ensure_chain(target_site)
+        changed = False
+        previous_downstream_hop = source_chain["downstream_site_hops"].get(target_site)
+        if previous_downstream_hop is None or hop < previous_downstream_hop:
+            source_chain["downstream_site_hops"][target_site] = hop
+            changed = True
+        previous_upstream_hop = target_chain["upstream_site_hops"].get(source_site)
+        if previous_upstream_hop is None or hop < previous_upstream_hop:
+            target_chain["upstream_site_hops"][source_site] = hop
+            changed = True
+        return changed
+
+    if isinstance(site_chain_index, dict) and direct_downstream_edges:
+        # 新增 u->v 后，所有 u 的上游都应可达 v 的所有下游：
+        # ancestor -> u -> v -> descendant。循环到稳定以覆盖连续多条补边。
+        changed = True
+        while changed:
+            changed = False
+            for source_site, target_site in direct_downstream_edges:
+                source_chain = ensure_chain(source_site)
+                target_chain = ensure_chain(target_site)
+                ancestor_hops = {source_site: 0, **source_chain["upstream_site_hops"]}
+                descendant_hops = {target_site: 0, **target_chain["downstream_site_hops"]}
+                for ancestor_site, ancestor_hop in ancestor_hops.items():
+                    for descendant_site, descendant_hop in descendant_hops.items():
+                        inferred_hop = int(ancestor_hop) + 1 + int(descendant_hop)
+                        if update_chain_hop(ancestor_site, descendant_site, inferred_hop):
+                            changed = True
+                            direct_meta = weak_edges.get((source_site, target_site), {})
+                            direct_edge = {
+                                "source_site": source_site,
+                                "target_site": target_site,
+                                "relation": direct_meta.get("relation", "downstream"),
+                                "score": direct_meta.get("score", 0.0),
+                                "sample_id": direct_meta.get("sample_id", ""),
+                            }
+                            edge_key = (ancestor_site, descendant_site)
+                            if edge_key != (source_site, target_site):
+                                upsert_weak_edge(edge_key, {
+                                    "source_site": ancestor_site,
+                                    "target_site": descendant_site,
+                                    "relation": "downstream",
+                                    "score": direct_edge["score"],
+                                    "sample_id": f"{ancestor_site}__{descendant_site}",
+                                    "inferred_from_missing_topology": True,
+                                    "inferred_hops": inferred_hop,
+                                    "via_missing_edges": [direct_edge],
+                                })
+
+    normalized_topo = {
+        site_id: sorted(downstream_sites)
+        for site_id, downstream_sites in augmented_topo.items()
+    }
+    return normalized_topo, augmented_chain if isinstance(site_chain_index, dict) else site_chain_index, weak_edges
+
+
 def normalize_site_chain_hops(hops_map):
     normalized = {}
     if not isinstance(hops_map, dict):

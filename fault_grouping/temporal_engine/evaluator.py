@@ -6,6 +6,8 @@ from fault_grouping.temporal_engine.utils import clone_instance_with_updates, qu
 
 
 class TemporalGraphEngineEvaluatorMixin:
+    MISSING_TOPOLOGY_RULE = "missing_topology_rule"
+
     def _make_rule_debug_trace(self, rule_name, trigger_node, trigger_ts):
         return {
             "rule": rule_name,
@@ -944,6 +946,72 @@ class TemporalGraphEngineEvaluatorMixin:
 
         existing_symptom["_segment_key"] = self._build_output_symptom_interval_key(existing_symptom)
 
+    def _get_missing_topology_edge_meta_for_direction(self, source_site, target_site, direction):
+        if not self.missing_topology_edges:
+            return None
+        source_site = str(source_site or "").strip()
+        target_site = str(target_site or "").strip()
+        if not source_site or not target_site or source_site == target_site:
+            return None
+
+        for single_direction in self._normalize_traverse_directions(direction):
+            if single_direction == "upstream":
+                meta = self.missing_topology_edges.get((target_site, source_site))
+            elif single_direction in {"bidirection", "bidirectional"}:
+                meta = self.missing_topology_edges.get((source_site, target_site))
+                if meta and meta.get("relation") != "bidirection":
+                    meta = None
+            elif single_direction == "either":
+                meta = (
+                    self.missing_topology_edges.get((source_site, target_site))
+                    or self.missing_topology_edges.get((target_site, source_site))
+                )
+            else:
+                meta = self.missing_topology_edges.get((source_site, target_site))
+            if meta:
+                return dict(meta)
+        return None
+
+    def _collect_missing_topology_edges_for_match(self, role_mapping, rule):
+        if not self.missing_topology_edges:
+            return []
+
+        used_edges = {}
+        for edge in rule.get("edges", []):
+            source_role = edge.get("source")
+            target_role = edge.get("target")
+            if not source_role or not target_role:
+                continue
+            for source_site in role_mapping.get(source_role, []):
+                for target_site in role_mapping.get(target_role, []):
+                    meta = self._get_missing_topology_edge_meta_for_direction(
+                        source_site,
+                        target_site,
+                        edge.get("direction", "downstream"),
+                    )
+                    if not meta:
+                        continue
+                    edge_key = (
+                        meta.get("source_site", ""),
+                        meta.get("target_site", ""),
+                        meta.get("relation", ""),
+                    )
+                    used_edges[edge_key] = {
+                        **meta,
+                        "source_role": source_role,
+                        "target_role": target_role,
+                        "rule_direction": edge.get("direction", "downstream"),
+                    }
+
+        return sorted(
+            used_edges.values(),
+            key=lambda item: (
+                str(item.get("source_site", "")),
+                str(item.get("target_site", "")),
+                str(item.get("relation", "")),
+            ),
+        )
+
     def _build_match_result_from_instance(self, inst, rule_name, rule, root_roles, trigger_ts):
         inst_roles = inst["roles"]
         inferred_roots = {
@@ -951,7 +1019,7 @@ class TemporalGraphEngineEvaluatorMixin:
             for root_role in root_roles
         }
         symptoms_by_key, role_mapping = self._build_symptoms_and_role_mapping_from_instance(inst_roles, rule_name)
-        return {
+        match_result = {
             "uuid": str(uuid.uuid4()),
             "rule": rule_name,
             "merged_rules": [rule_name],
@@ -963,6 +1031,12 @@ class TemporalGraphEngineEvaluatorMixin:
                 + rule.get("max_stay_time_sec", self.global_ttl)
             ),
         }
+        missing_topology_edges = self._collect_missing_topology_edges_for_match(role_mapping, rule)
+        if missing_topology_edges:
+            match_result["uses_missing_topology"] = True
+            match_result["missing_topology_edges"] = missing_topology_edges
+            match_result["merged_rules"] = [rule_name, self.MISSING_TOPOLOGY_RULE]
+        return match_result
 
     def _build_match_results_from_instances(
         self,

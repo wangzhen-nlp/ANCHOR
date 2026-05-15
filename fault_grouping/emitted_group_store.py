@@ -62,6 +62,40 @@ class EmittedGroupStore:
             _add_nodes_to_role_mapping(qualified, role_key, nodes)
         return qualified
 
+    @staticmethod
+    def _merge_missing_topology_metadata(target, source):
+        edges = {
+            (
+                str(edge.get("source_site", "")),
+                str(edge.get("target_site", "")),
+                str(edge.get("relation", "")),
+                str(edge.get("sample_id", "")),
+            ): dict(edge)
+            for edge in target.get("missing_topology_edges", [])
+            if isinstance(edge, dict)
+        }
+        for edge in source.get("missing_topology_edges", []):
+            if not isinstance(edge, dict):
+                continue
+            edge_key = (
+                str(edge.get("source_site", "")),
+                str(edge.get("target_site", "")),
+                str(edge.get("relation", "")),
+                str(edge.get("sample_id", "")),
+            )
+            edges[edge_key] = dict(edge)
+        if edges:
+            target["uses_missing_topology"] = True
+            target["missing_topology_edges"] = sorted(
+                edges.values(),
+                key=lambda item: (
+                    str(item.get("source_site", "")),
+                    str(item.get("target_site", "")),
+                    str(item.get("relation", "")),
+                    str(item.get("sample_id", "")),
+                ),
+            )
+
     def _merge_with_related_by_eid(self, match_result):
         related_groups = []
         current_alarm_keys = self._get_alarm_keys(match_result.get("symptoms", []))
@@ -91,6 +125,7 @@ class EmittedGroupStore:
         }
         if "_expire_ts_hint" in match_result:
             merged["_expire_ts_hint"] = match_result["_expire_ts_hint"]
+        self._merge_missing_topology_metadata(merged, match_result)
 
         symptom_map = {}
         for symptom in merged["symptoms"]:
@@ -116,6 +151,7 @@ class EmittedGroupStore:
             related_group_uuids.update(previous_match.get("related_group_uuids", []))
             previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
             merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
+            self._merge_missing_topology_metadata(merged, previous_match)
             for role, nodes in previous_match.get("inferred_roots", {}).items():
                 role_key = _role_key_for_merged_source(previous_match, role)
                 _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
@@ -169,6 +205,7 @@ class EmittedGroupStore:
         }
         if "_expire_ts_hint" in match_result:
             merged["_expire_ts_hint"] = match_result["_expire_ts_hint"]
+        self._merge_missing_topology_metadata(merged, match_result)
 
         merged_group_indexes = set()
         related_group_uuids = set()
@@ -191,6 +228,7 @@ class EmittedGroupStore:
             related_group_uuids.update(previous_match.get("related_group_uuids", []))
             previous_merged_rules = previous_match.get("merged_rules", [previous_match.get("rule")])
             merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
+            self._merge_missing_topology_metadata(merged, previous_match)
             for role, nodes in previous_match.get("inferred_roots", {}).items():
                 role_key = _role_key_for_merged_source(previous_match, role)
                 _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)

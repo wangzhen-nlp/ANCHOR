@@ -491,6 +491,7 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
     }
 
     related_group_uuids = set()
+    missing_topology_edges = {}
     expire_ts_hint = None
     collected_symptoms = []
     symptom_map = {}
@@ -522,6 +523,16 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
                     symptom_map[alarm_key] = merge_symptom_role_metadata(existing_symptom, symptom)
 
         related_group_uuids.update(source.get("related_group_uuids", []))
+        for edge in source.get("missing_topology_edges", []):
+            if not isinstance(edge, dict):
+                continue
+            edge_key = (
+                str(edge.get("source_site", "")),
+                str(edge.get("target_site", "")),
+                str(edge.get("relation", "")),
+                str(edge.get("sample_id", "")),
+            )
+            missing_topology_edges[edge_key] = dict(edge)
 
     if use_alarm_period_cache:
         merged["symptoms"] = merge_overlapping_symptoms(collected_symptoms)
@@ -529,6 +540,17 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
         merged["symptoms"] = list(symptom_map.values())
     if related_group_uuids:
         merged["related_group_uuids"] = sorted(related_group_uuids)
+    if missing_topology_edges:
+        merged["uses_missing_topology"] = True
+        merged["missing_topology_edges"] = sorted(
+            missing_topology_edges.values(),
+            key=lambda item: (
+                str(item.get("source_site", "")),
+                str(item.get("target_site", "")),
+                str(item.get("relation", "")),
+                str(item.get("sample_id", "")),
+            ),
+        )
     if expire_ts_hint is not None:
         merged["_expire_ts_hint"] = expire_ts_hint
 

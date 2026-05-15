@@ -213,6 +213,8 @@ def build_group_output(
             "related_group_uuids": match.get("related_group_uuids", []),
             "inferred_roots": match.get("inferred_roots", {}),
             "role_mapping": match.get("role_mapping", {}),
+            "uses_missing_topology": bool(match.get("uses_missing_topology")),
+            "missing_topology_edges": match.get("missing_topology_edges", []),
         },
         "ne_info": ne_info,
         "group_info": {

@@ -83,6 +83,8 @@ def _build_arg_parser():
     parser.add_argument('--sorted-alarms-output', type=str, default='', help='从原始告警加载并排序后，额外写出排序告警缓存；后缀为 .zip 时写压缩包，供后续快速加载')
     parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
     parser.add_argument('--use-alarm-period-cache', action='store_true', help='可选：把 event_cache 切换为“设备告警时段”模式；默认关闭，保持旧版逐条活跃告警缓存逻辑')
+    parser.add_argument('--missing-topology', type=str, default='', help='可选：site_relation_learning/infer.py --mode topology-errors 输出 JSONL；加载其中 error_type=missing 的高置信缺边作为弱拓扑补偿边')
+    parser.add_argument('--missing-topology-min-score', type=float, default=0.95, help='加载 --missing-topology 时的最低 score 阈值；默认 0.95，与 infer.py --mode topology-errors 默认缺边阈值一致')
     parser.add_argument('--enable-support-pruning', action='store_true', help='可选：启用候选邻接 role 支撑剪枝；默认关闭以避免额外邻居扫描开销')
     parser.add_argument('--enable-support-count-sort', action='store_true', help='可选：按候选支撑数量排序；默认关闭，因为会提前计算所有候选支撑，可能变慢')
     return parser
