@@ -454,16 +454,21 @@ class TemporalGraphEngineEvaluatorMixin:
 
             if is_valid:
                 support_ref_ts = events[0]["ts"] if events else ref_ts
-                if match_mode != "ALL" and caches is not None and not self._candidate_has_required_support(
-                    rule_name,
-                    tgt_role,
-                    cand_phys,
-                    nodes_cfg,
-                    trigger_role,
-                    support_ref_ts,
-                    helper,
-                    caches,
-                    bound_roles=bound_roles,
+                if (
+                    self.enable_support_pruning
+                    and match_mode != "ALL"
+                    and caches is not None
+                    and not self._candidate_has_required_support(
+                        rule_name,
+                        tgt_role,
+                        cand_phys,
+                        nodes_cfg,
+                        trigger_role,
+                        support_ref_ts,
+                        helper,
+                        caches,
+                        bound_roles=bound_roles,
+                    )
                 ):
                     if edge_trace is not None:
                         candidate_failure_details.append(
@@ -544,7 +549,7 @@ class TemporalGraphEngineEvaluatorMixin:
             return {}, branch_failure_reasons
 
         ordered_candidates = candidate_info["candidates"]
-        if match_mode != "ALL":
+        if self.enable_support_count_sort and match_mode != "ALL":
             ordered_candidates = self._sort_candidates_by_support_count(
                 ordered_candidates,
                 rule_name,
@@ -1058,7 +1063,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 return [], debug_trace
             return []
 
-        if not self._candidate_has_required_support(
+        if self.enable_support_pruning and not self._candidate_has_required_support(
             rule_name,
             trigger_role,
             trigger_node,

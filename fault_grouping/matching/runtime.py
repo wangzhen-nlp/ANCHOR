@@ -209,6 +209,10 @@ def print_run_configuration(args, static_context, valid_alarm_titles):
             f"min_radius={args.batch_merge_density_min_meters:g}m, "
             f"max_radius={args.batch_merge_density_max_meters:g}m"
         )
+    if args.enable_support_pruning:
+        print("候选 support 剪枝: 开启")
+    if args.enable_support_count_sort:
+        print("候选 support count 排序: 开启")
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
 
 
@@ -280,6 +284,8 @@ def initialize_engine(args, static_context, rules_config, batch_site_merge_helpe
         site_merge_helper=batch_site_merge_helper,
         site_chain_index=static_context.site_chain_index,
         use_alarm_period_cache=args.use_alarm_period_cache,
+        enable_support_pruning=args.enable_support_pruning,
+        enable_support_count_sort=args.enable_support_count_sort,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
     return engine
