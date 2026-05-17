@@ -79,7 +79,6 @@ from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.temporal_engine.utils import (
     matches_expected_alarm,
     merge_match_batch,
-    build_empty_merge_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -776,10 +775,8 @@ class IncrementalFaultEngine(TemporalGraphEngine):
                 if trigger_site in reachable2:
                     return True
             return False
-        trigger_role = rule.get("trigger_role", "")
         # non_trigger_role 未知时作双向全边检查
         for edge in rule.get("edges", []):
-            src_role = edge.get("source", "")
             tgt_role = edge.get("target", "")
             direction = edge.get("direction", "downstream")
             max_hops = edge.get("max_hops")

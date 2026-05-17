@@ -62,11 +62,49 @@ class TemporalGraphEngine(
         targets = {edge["target"] for edge in edges_cfg}
         root_roles = tuple(role for role in nodes_cfg.keys() if role not in targets)
 
+        # 解析每个 role 的 alarm_source_ne_anchor 配置 —— 把隐式 anchor_role 标记
+        # "<edge_source>" 替换成具体 role 名，运行时直接查表使用。
+        alarm_source_ne_anchors = {}
+        for role, node_cfg in nodes_cfg.items():
+            if not isinstance(node_cfg, dict):
+                continue
+            anchor_cfg = node_cfg.get("alarm_source_ne_anchor")
+            if not anchor_cfg:
+                continue
+            anchor_role = anchor_cfg.get("anchor_role", "<edge_source>")
+            if anchor_role == "<edge_source>":
+                incoming_sources = [e["source"] for e in edges_cfg if e["target"] == role]
+                if len(incoming_sources) == 1:
+                    anchor_role = incoming_sources[0]
+                elif not incoming_sources:
+                    raise ValueError(
+                        f"role {role!r} 有 alarm_source_ne_anchor 但没有入边；"
+                        f"<edge_source> 隐式 anchor_role 无法解析"
+                    )
+                else:
+                    raise ValueError(
+                        f"role {role!r} 有多个入边 {incoming_sources!r}，"
+                        f"alarm_source_ne_anchor.anchor_role 必须显式给出"
+                    )
+            if anchor_role not in nodes_cfg:
+                raise ValueError(
+                    f"role {role!r} 的 alarm_source_ne_anchor.anchor_role={anchor_role!r} "
+                    f"不在规则 nodes 中"
+                )
+            max_hops = int(anchor_cfg.get("max_ne_hops", 1))
+            if max_hops < 0:
+                raise ValueError(f"role {role!r} alarm_source_ne_anchor.max_ne_hops 必须 ≥ 0")
+            alarm_source_ne_anchors[role] = {
+                "anchor_role": anchor_role,
+                "max_ne_hops": max_hops,
+            }
+
         return {
             "trigger_role": trigger_role,
             "pattern_adj": pattern_adj,
             "edges_to_explore": tuple(edges_to_explore),
             "root_roles": root_roles,
+            "alarm_source_ne_anchors": alarm_source_ne_anchors,
         }
 
     def _compile_rule_execution_plans(self):
@@ -75,6 +113,60 @@ class TemporalGraphEngine(
             rule_name: self._compile_rule_execution_plan(rule)
             for rule_name, rule in self.rules.items()
         }
+
+    def _build_ne_adjacency(self):
+        """从 ne_graph_data 构造 NE 级双向邻接表（任一方向有 link 即视为相邻）。"""
+        adj = collections.defaultdict(set)
+        for src_ne, info in self._ne_graph_data.items():
+            if not isinstance(info, dict):
+                continue
+            links = info.get("link")
+            if not isinstance(links, dict):
+                continue
+            for tgt_ne in links.keys():
+                if tgt_ne is None or tgt_ne == src_ne:
+                    continue
+                adj[src_ne].add(tgt_ne)
+                adj[tgt_ne].add(src_ne)
+        return adj
+
+    def _compute_anchor_ne_reachable_set(self, anchor_site, max_ne_hops):
+        """以 anchor_site 内的所有 NE 为起点，BFS 在 NE 图上扩展 max_ne_hops 跳。
+
+        - 引擎未配置 NE 数据（site_to_ne_ids 为空）时，返回 None，表示"NE 锚点过滤不可用，
+          降级为不过滤"——这是为了向后兼容（旧用法不传 NE 数据时，含 alarm_source_ne_anchor
+          的规则也能跑，仅退化为站点级语义）。
+        - 配置了 NE 数据但 anchor_site 自身无 NE：返回空 frozenset，所有 alarm 都被过滤掉。
+        - 正常情况：返回 frozenset(reachable_ne_ids)（含起点 NE 自身）。
+
+        结果按 (anchor_site, max_ne_hops) 缓存，跨规则、跨 trigger 自动复用。
+        """
+        if not self._site_to_ne_ids:
+            return None
+        cache_key = (anchor_site, max_ne_hops)
+        cached = self._anchor_ne_reachable_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        anchor_nes = self._site_to_ne_ids.get(anchor_site, ())
+        if not anchor_nes:
+            result = frozenset()
+        else:
+            visited = set(anchor_nes)
+            if max_ne_hops > 0 and self._ne_adjacency:
+                frontier = set(anchor_nes)
+                for _ in range(max_ne_hops):
+                    next_frontier = set()
+                    for ne in frontier:
+                        for nb in self._ne_adjacency.get(ne, ()):
+                            if nb not in visited:
+                                next_frontier.add(nb)
+                    if not next_frontier:
+                        break
+                    visited.update(next_frontier)
+                    frontier = next_frontier
+            result = frozenset(visited)
+        self._anchor_ne_reachable_cache[cache_key] = result
+        return result
 
     def __init__(
         self,
@@ -89,6 +181,8 @@ class TemporalGraphEngine(
         enable_support_pruning=False,
         enable_support_count_sort=False,
         missing_topology_edges=None,
+        ne_graph_data=None,
+        site_to_ne_ids=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
@@ -174,6 +268,19 @@ class TemporalGraphEngine(
         self.enable_support_count_sort = bool(enable_support_count_sort)
         self.missing_topology_edges = dict(missing_topology_edges or {})
         self.optimization_stats = collections.Counter()
+
+        # NE 级拓扑数据（用于 alarm_source_ne_anchor 约束）。
+        # ne_graph_data: {ne_id: {"site_id": ..., "link": {neighbor_ne_id: {...}}}}
+        # site_to_ne_ids: {site_id: (ne_id, ...)}
+        self._ne_graph_data = ne_graph_data or {}
+        self._site_to_ne_ids = {
+            site_id: tuple(ne_ids)
+            for site_id, ne_ids in (site_to_ne_ids or {}).items()
+        }
+        self._ne_adjacency = self._build_ne_adjacency()
+        # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
+        # 不含规则名，跨规则、跨 trigger 自动复用。
+        self._anchor_ne_reachable_cache = {}
 
         # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
         self.rule_execution_plans = {}

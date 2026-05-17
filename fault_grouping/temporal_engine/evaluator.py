@@ -437,11 +437,16 @@ class TemporalGraphEngineEvaluatorMixin:
         caches=None,
         bound_roles=None,
         edge_trace=None,
+        allowed_alarm_source_nes=None,
     ):
         curr_valid_targets = {}
         all_passed = True
         window_cache_key = self._make_edge_window_cache_key(edge["win"])
         candidate_failure_details = []
+
+        # 当 NE 锚点约束生效时，allowed_alarm_source_nes 是 frozenset；为 None 时不过滤。
+        # cache_key 必须区分这一维度，否则不同 anchor 绑定的实例会复用错误结果。
+        ne_filter_key = allowed_alarm_source_nes if allowed_alarm_source_nes is not None else None
 
         for cand_phys in candidates:
             exclude_consumed_trigger_rule = rule_name if tgt_role == trigger_role else None
@@ -452,6 +457,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     cand_phys,
                     ref_ts,
                     window_cache_key,
+                    ne_filter_key,
                 )
             else:
                 cache_key = (
@@ -462,6 +468,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     cand_phys,
                     ref_ts,
                     window_cache_key,
+                    ne_filter_key,
                 )
             if cache_key in validation_cache:
                 is_valid, events = validation_cache[cache_key]
@@ -474,6 +481,7 @@ class TemporalGraphEngineEvaluatorMixin:
                     ref_ts,
                     edge["win"],
                     exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
+                    allowed_alarm_source_nes=allowed_alarm_source_nes,
                 )
                 validation_cache[cache_key] = (is_valid, events)
 
@@ -543,6 +551,7 @@ class TemporalGraphEngineEvaluatorMixin:
         structure_match_cache,
         filtered_neighbor_cache,
         edge_trace=None,
+        allowed_alarm_source_nes=None,
     ):
         ref_ts = curr_events[0]["ts"] if curr_events else trigger_ts
         bound_roles = set(bound_roles or ())
@@ -601,6 +610,7 @@ class TemporalGraphEngineEvaluatorMixin:
             caches=caches,
             bound_roles=bound_roles | {curr_role},
             edge_trace=edge_trace,
+            allowed_alarm_source_nes=allowed_alarm_source_nes,
         )
 
         if match_mode == "ALL" and not all_passed:
@@ -625,6 +635,37 @@ class TemporalGraphEngineEvaluatorMixin:
                     f"{curr_role}:{curr_phys} 没有满足 {tgt_role} 的节点"
                 )
         return {}, branch_failure_reasons
+
+    def _compute_allowed_alarm_source_nes_for_role(self, rule_name, tgt_role, inst):
+        """若 tgt_role 配置了 alarm_source_ne_anchor，查询 anchor_role 已绑定的 site，
+        返回允许的 alarm_source NE 集合（多个 anchor site 合并）。
+
+        返回 None 表示无 NE 锚点约束（或引擎未配置 NE 数据，降级为不过滤）。
+        """
+        plan = self.rule_execution_plans.get(rule_name)
+        if not plan:
+            return None
+        anchors = plan.get("alarm_source_ne_anchors") or {}
+        anchor_cfg = anchors.get(tgt_role)
+        if not anchor_cfg:
+            return None
+        anchor_role = anchor_cfg["anchor_role"]
+        max_hops = anchor_cfg["max_ne_hops"]
+        anchor_nodes = inst.get("roles", {}).get(anchor_role, {}).get("nodes", {})
+        if not anchor_nodes:
+            # anchor 尚未绑定（按理 BFS 顺序保证已绑定，这里防御性返回 None）
+            return None
+        combined = None
+        for anchor_site in anchor_nodes.keys():
+            reachable = self._compute_anchor_ne_reachable_set(anchor_site, max_hops)
+            if reachable is None:
+                # 引擎未配置 NE 数据，直接降级为不过滤
+                return None
+            if combined is None:
+                combined = set(reachable)
+            else:
+                combined.update(reachable)
+        return frozenset(combined) if combined is not None else frozenset()
 
     def _collect_instance_edge_targets(
         self,
@@ -653,6 +694,11 @@ class TemporalGraphEngineEvaluatorMixin:
         branch_failure_reasons = []
         bound_roles = set(inst.get("roles", {}).keys())
 
+        # 计算 NE 锚点允许 alarm_source NE 集合（如果 tgt_role 配置了 alarm_source_ne_anchor）
+        allowed_alarm_source_nes = self._compute_allowed_alarm_source_nes_for_role(
+            rule_name, tgt_role, inst,
+        )
+
         for curr_phys, curr_events in inst["roles"][curr_role]["nodes"].items():
             curr_valid_targets, source_failure_reasons = self._evaluate_edge_source_node(
                 curr_phys,
@@ -675,6 +721,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 structure_match_cache,
                 filtered_neighbor_cache,
                 edge_trace=edge_trace,
+                allowed_alarm_source_nes=allowed_alarm_source_nes,
             )
             branch_failure_reasons.extend(source_failure_reasons)
             if not curr_valid_targets:

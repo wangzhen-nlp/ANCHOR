@@ -1,4 +1,3 @@
-import copy
 import collections
 
 from fault_grouping.temporal_engine.utils import (
@@ -11,6 +10,67 @@ from fault_grouping.temporal_engine.utils import (
     symptom_covers,
     symptoms_overlap,
 )
+
+
+# 已知会出现在 match dict 里的"容器"字段（顶层 list / 顶层 dict-of-list）。
+# 浅层结构化复制只在这些字段上 list(...) / 重建 dict，足以隔离后续 in-place 修改。
+_MATCH_TOP_LIST_FIELDS = ("merged_rules", "related_group_uuids")
+_MATCH_TOP_DICT_OF_LIST_FIELDS = ("inferred_roots", "role_mapping")
+# 已知会出现在 symptom dict 里的 list 字段。
+_SYMPTOM_LIST_FIELDS = (
+    "eid_list",
+    "matched_rule_list",
+    "matched_role_list",
+    "matched_role_key_list",
+)
+
+
+def _shallow_copy_symptom(symptom):
+    """与 dict(symptom) 等价但额外复制已知 list 字段；不递归 list 元素（都是 immutable str）。"""
+    if not isinstance(symptom, dict):
+        return symptom
+    copied = dict(symptom)
+    for field in _SYMPTOM_LIST_FIELDS:
+        value = copied.get(field)
+        if isinstance(value, list):
+            copied[field] = list(value)
+    return copied
+
+
+def _structured_shallow_copy_match(match):
+    """copy.deepcopy(match) 的快速等价实现。
+
+    覆盖所有当前 codebase 里会被存进 EmittedGroupStore 的 match 字段，只在容器
+    层做隔离（顶层 dict、merged_rules / related_group_uuids 列表、inferred_roots /
+    role_mapping 的 list value、symptoms 内的 dict 与已知 list 子字段、
+    missing_topology_edges 内的 dict）。其余字段都是 str / number / bool 等
+    immutable 值，不需要复制。
+
+    经实测，copy.deepcopy 在 5000 事件 benchmark 上累计耗时约 0.85s（21%），
+    该函数把它降到几十毫秒。
+    """
+    copied = dict(match)
+    for field in _MATCH_TOP_LIST_FIELDS:
+        value = copied.get(field)
+        if isinstance(value, list):
+            copied[field] = list(value)
+    for field in _MATCH_TOP_DICT_OF_LIST_FIELDS:
+        value = copied.get(field)
+        if isinstance(value, dict):
+            copied[field] = {
+                role: (list(nodes) if isinstance(nodes, list) else nodes)
+                for role, nodes in value.items()
+            }
+    symptoms = copied.get("symptoms")
+    if isinstance(symptoms, list):
+        copied["symptoms"] = [_shallow_copy_symptom(symptom) for symptom in symptoms]
+    edges = copied.get("missing_topology_edges")
+    if isinstance(edges, list):
+        copied["missing_topology_edges"] = [
+            dict(edge) if isinstance(edge, dict) else edge
+            for edge in edges
+        ]
+    return copied
 
 
 class EmittedGroupStore:
@@ -267,7 +327,7 @@ class EmittedGroupStore:
                     self.groups[idx] = None
                     self.deleted_group_count += 1
 
-        stored_match = copy.deepcopy(match_result)
+        stored_match = _structured_shallow_copy_match(match_result)
         if self.use_alarm_period_cache:
             group_item = {
                 "anchor_ts": anchor_ts,

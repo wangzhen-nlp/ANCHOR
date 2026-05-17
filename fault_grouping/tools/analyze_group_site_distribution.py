@@ -203,19 +203,19 @@ def analyze(jsonl_path, max_explicit=20):
 def print_summary(result):
     """在终端打印可读摘要。"""
     o = result["overall"]
-    print(f"\n故障组站点数分布摘要")
+    print("\n故障组站点数分布摘要")
     print(f"{'=' * 50}")
     print(f"故障组总数: {result['meta']['total_groups']}")
     print(f"平均站点数: {o['mean']}")
     print(f"中位数: {o['median']}")
     print(f"最小: {o['min']}, 最大: {o['max']}")
-    print(f"\n百分位数:")
+    print("\n百分位数:")
     for k, v in o["percentiles"].items():
         print(f"  {k}: {v}")
-    print(f"\n最常见站点数 Top-5:")
+    print("\n最常见站点数 Top-5:")
     for item in o["top_modes"]:
         print(f"  {item['site_count']:>3} 个站点: {item['group_count']:>5} 组 ({item['ratio']*100:.2f}%)")
-    print(f"\n按规则统计:")
+    print("\n按规则统计:")
     for rule, stats in result["by_rule"].items():
         print(f"  {rule:<40s}: 共 {stats['count']:>5} 组, 平均 {stats['mean']:.2f}, 中位 {stats['median']}, 最大 {stats['max']}")
     print(f"{'=' * 50}\n")

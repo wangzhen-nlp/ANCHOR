@@ -40,7 +40,6 @@ class NodeRuleHelper:
             alarm = None
             alarm_source = ""
             consumed_trigger_rules = ()
-            end_ts = None
             raw_event_items = None
             raw_event_ts_list = None
             consumed_cutoff_by_rule = {}
@@ -51,7 +50,6 @@ class NodeRuleHelper:
                 alarm = cached_event.get("alarm")
                 alarm_source = cached_event.get("alarm_source", "")
                 consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
-                end_ts = cached_event.get("end_ts")
                 raw_event_items = cached_event.get("_raw_event_items")
                 raw_event_ts_list = cached_event.get("_raw_event_ts_list")
                 consumed_cutoff_by_rule = cached_event.get("_consumed_cutoff_by_rule") or {}
@@ -504,8 +502,12 @@ class NodeRuleHelper:
             "reason": f"未知节点类型: {node_type}",
         }
 
-    def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None):
-        """按结构与时间窗口告警共同校验一个节点是否满足规则定义。"""
+    def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None, allowed_alarm_source_nes=None):
+        """按结构与时间窗口告警共同校验一个节点是否满足规则定义。
+
+        allowed_alarm_source_nes: 可选 frozenset，若提供则仅保留 alarm_source 在该集合内
+        的 events 参与谓词判定（用于实现 alarm_source_ne_anchor 的 NE 级过滤）。
+        """
         if not self.matches_node_structure(physical_node_domain, node_config):
             return False, []
 
@@ -518,6 +520,11 @@ class NodeRuleHelper:
             events_in_win = self.events_in_window(
                 physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule
             )
+            if allowed_alarm_source_nes is not None:
+                events_in_win = [
+                    e for e in events_in_win
+                    if e.get("alarm_source") in allowed_alarm_source_nes
+                ]
 
             if expected == "NONE":
                 has_crit = any(e["alarm"] in self.critical_alarms for e in events_in_win)
@@ -605,7 +612,8 @@ class NodeRuleHelper:
                     pattern,
                     reference_ts,
                     edge_window,
-                    exclude_consumed_trigger_rule
+                    exclude_consumed_trigger_rule,
+                    allowed_alarm_source_nes=allowed_alarm_source_nes,
                 )
                 if is_valid:
                     matched_patterns += 1

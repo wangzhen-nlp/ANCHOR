@@ -1097,7 +1097,6 @@ def _compute_metrics_from_confusion(confusion):
     per_class = {}
     macro_f1 = 0.0
     macro_class_count = 0
-    class_count = len(RELATION_CLASSES)
     for idx, label in enumerate(RELATION_CLASSES):
         tp = int(confusion[idx, idx])
         fp = int(confusion[:, idx].sum() - tp)

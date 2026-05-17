@@ -316,6 +316,8 @@ def initialize_engine(args, static_context, rules_config, batch_site_merge_helpe
         enable_support_pruning=args.enable_support_pruning,
         enable_support_count_sort=args.enable_support_count_sort,
         missing_topology_edges=static_context.missing_topology_edges,
+        ne_graph_data=static_context.ne_graph_data,
+        site_to_ne_ids=static_context.site_to_ne_ids,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
     return engine

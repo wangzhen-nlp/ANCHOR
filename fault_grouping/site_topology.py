@@ -33,7 +33,7 @@ def build_site_topology_from_ne_graph(ne_graph_data):
 
     topo_downstream_map = defaultdict(set)
     for site_id in all_sites:
-        topo_downstream_map[site_id]
+        topo_downstream_map.setdefault(site_id, set())
 
     for source_ne, source_info in ne_graph_data.items():
         source_site = ne_to_site.get(source_ne)
@@ -171,7 +171,7 @@ def apply_missing_topology_predictions(topo_downstream_map, site_chain_index, pr
         if not source_site or not target_site or source_site == target_site:
             return
         augmented_topo[source_site].add(target_site)
-        augmented_topo[target_site]
+        augmented_topo.setdefault(target_site, set())
         source_chain = ensure_chain(source_site)
         target_chain = ensure_chain(target_site)
         if source_chain is not None:

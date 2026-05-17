@@ -3,10 +3,7 @@ import threading
 
 from dataclasses import dataclass, field
 
-from fault_grouping.matching.group_output_builder import (
-    build_alarm_metadata_index,
-    build_jsonl_match_output,
-)
+from fault_grouping.matching.group_output_builder import build_jsonl_match_output
 from fault_grouping.matching.reports import generate_incident_report
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 

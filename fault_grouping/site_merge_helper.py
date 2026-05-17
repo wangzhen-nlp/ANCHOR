@@ -31,7 +31,6 @@ class BatchSiteMergeHelper:
         self._topo_undirected = collections.defaultdict(set)
 
         for up, downs in topo_downstream_map.items():
-            self._topo_undirected[up]
             for down in downs:
                 self._topo_undirected[up].add(down)
                 self._topo_undirected[down].add(up)

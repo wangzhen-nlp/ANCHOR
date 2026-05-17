@@ -273,6 +273,16 @@ data_rule = {
   ]
 }
 
+REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED = {
+  **REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+  # 仅召回 alarm_source 在"与入边 source 角色站点的 NE 拓扑相邻"的 NE 集合内的告警。
+  # anchor_role 用 "<edge_source>" 在编译期由 evaluator 解析到唯一入边的 source。
+  "alarm_source_ne_anchor": {
+    "anchor_role": "<edge_source>",
+    "max_ne_hops": 1
+  }
+}
+
 data_link_adjacent_no_offline_rule = {
   "pattern_name": "data_link_adjacent_no_offline_context",
   "description": "本路由Data link且无Data offline，邻接路由无Data offline -> 下挂断站",
@@ -284,7 +294,7 @@ data_link_adjacent_no_offline_rule = {
     "data_link_underneath_compound_node"
   ],
   "nodes": {
-    "data_link_adjacent_data_neighbor_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_adjacent_data_neighbor_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED,
     "data_link_parent_data_node": NO_OFFLINE_DATA_NODE,
     "data_link_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
