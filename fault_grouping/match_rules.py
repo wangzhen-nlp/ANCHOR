@@ -21,6 +21,7 @@ from fault_grouping.matching.group_output_builder import (
     build_alarm_metadata_index,
 )
 from fault_grouping.matching.group_output_session import MatchOutputSession
+from fault_grouping.matching.profiling import PhaseTimer, enable_engine_profiling
 from fault_grouping.matching.runtime import (
     AlarmLoadResult,
     LoadedStaticContext,
@@ -87,6 +88,7 @@ def _build_arg_parser():
     parser.add_argument('--missing-topology-min-score', type=float, default=0.95, help='加载 --missing-topology 时的最低 score 阈值；默认 0.95，与 infer.py --mode topology-errors 默认缺边阈值一致')
     parser.add_argument('--enable-support-pruning', action='store_true', help='可选：启用候选邻接 role 支撑剪枝；默认关闭以避免额外邻居扫描开销')
     parser.add_argument('--enable-support-count-sort', action='store_true', help='可选：按候选支撑数量排序；默认关闭，因为会提前计算所有候选支撑，可能变慢')
+    parser.add_argument('--profile', action='store_true', help='打开后在结束时打印主要阶段耗时（init/ingest/harvest/evaluate/merge/finalize/output/flush），便于定位瓶颈')
     return parser
 
 
@@ -105,27 +107,36 @@ def _build_output_session(args, engine, static_context, alarm_metadata_index):
     return output_session
 
 
-def _prepare_runtime_execution(parser, args):
+def _prepare_runtime_execution(parser, args, timer=None):
+    def _phase(name):
+        # 没开 profile 时退化为 contextlib.nullcontext，零开销。
+        return timer.time(name) if timer is not None else _NullCtx()
+
     start_ts, end_ts = validate_main_args(parser, args)
-    static_context = load_static_context(args)
+    with _phase("init.load_static_context"):
+        static_context = load_static_context(args)
     valid_alarm_titles = default_valid_alarm_titles()
     print_run_configuration(args, static_context, valid_alarm_titles)
     rules_config = build_rules_config(args, parser)
     batch_site_merge_helper = build_batch_site_merge_helper(args, static_context.topo_downstream_map)
-    engine = initialize_engine(args, static_context, rules_config, batch_site_merge_helper)
+    with _phase("init.initialize_engine"):
+        engine = initialize_engine(args, static_context, rules_config, batch_site_merge_helper)
     start_time = time.time()
-    alarm_load_result = load_alarm_data(
-        args,
-        parser,
-        static_context,
-        valid_alarm_titles,
-        start_ts,
-        end_ts,
-    )
-    alarm_metadata_index = build_alarm_metadata_index(alarm_load_result.valid_alarms)
+    with _phase("init.load_alarm_data"):
+        alarm_load_result = load_alarm_data(
+            args,
+            parser,
+            static_context,
+            valid_alarm_titles,
+            start_ts,
+            end_ts,
+        )
+    with _phase("init.build_alarm_metadata_index"):
+        alarm_metadata_index = build_alarm_metadata_index(alarm_load_result.valid_alarms)
     print_alarm_load_summary(alarm_load_result)
     debug_targets = parse_debug_targets(args)
-    output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
+    with _phase("init.build_output_session"):
+        output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
     return RuntimeExecutionPlan(
         static_context=static_context,
         rules_config=rules_config,
@@ -136,6 +147,13 @@ def _prepare_runtime_execution(parser, args):
         output_session=output_session,
         start_time=start_time,
     )
+
+
+class _NullCtx:
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
 
 
 def _maybe_compute_ticket_recall(args):
@@ -165,15 +183,26 @@ def _maybe_compute_ticket_recall(args):
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
-    runtime_plan = _prepare_runtime_execution(parser, args)
-    run_matching_pipeline(
-        args,
-        runtime_plan.engine,
-        runtime_plan.alarm_load_result.valid_alarms,
-        runtime_plan.output_session,
-        runtime_plan.debug_targets,
-        runtime_plan.rules_config,
-    )
+
+    timer = PhaseTimer() if args.profile else None
+    if timer is not None:
+        timer.mark_wall_start()
+
+    runtime_plan = _prepare_runtime_execution(parser, args, timer=timer)
+
+    # 启用引擎/输出关键路径的方法级计时（monkey-patch；仅 --profile 下生效）
+    if timer is not None:
+        enable_engine_profiling(timer, runtime_plan.engine, runtime_plan.output_session)
+
+    with (timer.time("pipeline.run_matching_pipeline") if timer else _NullCtx()):
+        run_matching_pipeline(
+            args,
+            runtime_plan.engine,
+            runtime_plan.alarm_load_result.valid_alarms,
+            runtime_plan.output_session,
+            runtime_plan.debug_targets,
+            runtime_plan.rules_config,
+        )
     elapsed = time.time() - runtime_plan.start_time
     print_final_summary(
         args,
@@ -184,6 +213,10 @@ def main():
         elapsed,
     )
     _maybe_compute_ticket_recall(args)
+
+    if timer is not None:
+        timer.mark_wall_end()
+        timer.print_summary()
 
 
 if __name__ == "__main__":
