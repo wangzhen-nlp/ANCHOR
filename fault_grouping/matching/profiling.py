@@ -157,6 +157,68 @@ class PhaseTimer:
             print(fmt_row("(harvest.self = total − 子阶段)", self_time, None, indent=4,
                           suffix="  ← _collect_pending_matches 自身框架开销"))
 
+        # [finalize] 块 —— 进一步拆 harvest.finalize 内部
+        finalize_total = self._phases.get("harvest.finalize")
+        finalize_direct = [
+            "finalize.prune_state",
+            "finalize.merge_with_history",
+            "finalize.apply_role_owner",
+            "finalize.apply_visibility",
+        ]
+        finalize_history_children = [
+            "finalize.emit.prune_groups",
+            "finalize.emit.merge_related",
+            "finalize.emit.replace_store",
+            "finalize.emit.extend_expire",
+            "finalize.prune_consumed_alarm",
+        ]
+        finalize_present = (
+            finalize_total is not None
+            and any(n in self._phases for n in finalize_direct + finalize_history_children)
+        )
+        if finalize_present:
+            f_total, _f_count = finalize_total
+            print()
+            print(f"[finalize] harvest.finalize 内部分解（{f_total:.3f}s, 占 wall {pct(f_total):.1f}%）")
+            history_total = self._phases.get("finalize.merge_with_history")
+            for name in finalize_direct:
+                kv = self._phases.get(name)
+                if kv is None:
+                    continue
+                total, count = kv
+                pct_in_f = (total / f_total * 100) if f_total > 0 else 0.0
+                hint = ""
+                if name == "finalize.prune_state":
+                    hint = "  ← 滑窗清理 event_cache"
+                elif name == "finalize.merge_with_history":
+                    hint = "  ← per-match 与历史故障组合并"
+                elif name == "finalize.apply_role_owner":
+                    hint = "  ← 给 match 补 default site→role 归属"
+                elif name == "finalize.apply_visibility":
+                    hint = "  ← 可见性过滤"
+                print(fmt_row(name, total, count, indent=2,
+                              suffix=f"  占 finalize {pct_in_f:>5.1f}%{hint}"))
+                # 展开 merge_with_history 的子阶段
+                if name == "finalize.merge_with_history" and history_total is not None:
+                    hist_t = total
+                    for child_name in finalize_history_children:
+                        ckv = self._phases.get(child_name)
+                        if ckv is None:
+                            continue
+                        c_total, c_count = ckv
+                        pct_in_h = (c_total / hist_t * 100) if hist_t > 0 else 0.0
+                        chint = ""
+                        if child_name == "finalize.emit.merge_related":
+                            chint = "  ← eid 重叠合并（通常最重）"
+                        elif child_name == "finalize.emit.replace_store":
+                            chint = "  ← 替换 + 重建 eid 索引"
+                        elif child_name == "finalize.emit.prune_groups":
+                            chint = "  ← 历史组 TTL 清理"
+                        elif child_name == "finalize.prune_consumed_alarm":
+                            chint = "  ← 清已消费 alarm 历史"
+                        print(fmt_row(child_name, c_total, c_count, indent=4,
+                                      suffix=f"  占 merge_with_history {pct_in_h:>5.1f}%{chint}"))
+
         print()
         print("-" * line_w)
         print("说明：")
@@ -174,9 +236,18 @@ def enable_engine_profiling(timer, engine, output_session):
     覆盖的关键路径（offline 模式下每条告警都会走）：
       ingest:      engine.process_event 内部（事件入 cache + trigger 入 pending）
       harvest:     engine._collect_pending_matches（事件触发同步收割）
-        evaluate:    _evaluate_mature_pending_items（最重，规则匹配）
+        evaluate:    _evaluate_mature_pending_items（规则匹配）
         merge:       _merge_and_expand_raw_matches（批内合并 + pending 上下文扩展）
         finalize:    _finalize_expanded_matches_for_output（历史合并 + 可见性过滤）
+          prune_state:       _prune_expired_state_locked（滑动游标式清 event_cache）
+          merge_with_history: _finalize_matches_with_history（per-match 与历史组合并）
+            emit.prune_groups:  emitted_group_store.prune_expired
+            emit.merge_related: emitted_group_store.merge_with_related（eid 重叠合并，通常最重）
+            emit.replace_store: emitted_group_store.replace_and_store
+            emit.extend_expire: emitted_group_store.extend_related_expire_ts
+          prune_consumed_alarm:_prune_consumed_alarm_history（清已消费 alarm）
+          apply_role_owner:  _apply_default_output_site_role_ownership_to_matches
+          apply_visibility:  _apply_output_visibility_filters_to_matches
       output:      output_session.write_matches（落盘）
       flush:       engine.flush_pending（流末尾强制收割）
     """
@@ -188,3 +259,16 @@ def enable_engine_profiling(timer, engine, output_session):
     timer.wrap_method(engine, "flush_pending", "flush.total")
     if output_session is not None:
         timer.wrap_method(output_session, "write_matches", "output.write_matches")
+
+    # finalize 内部拆细
+    timer.wrap_method(engine, "_prune_expired_state_locked", "finalize.prune_state")
+    timer.wrap_method(engine, "_finalize_matches_with_history", "finalize.merge_with_history")
+    timer.wrap_method(engine, "_prune_consumed_alarm_history", "finalize.prune_consumed_alarm")
+    timer.wrap_method(engine, "_apply_default_output_site_role_ownership_to_matches", "finalize.apply_role_owner")
+    timer.wrap_method(engine, "_apply_output_visibility_filters_to_matches", "finalize.apply_visibility")
+    if getattr(engine, "emitted_group_store", None) is not None:
+        store = engine.emitted_group_store
+        timer.wrap_method(store, "prune_expired", "finalize.emit.prune_groups")
+        timer.wrap_method(store, "merge_with_related", "finalize.emit.merge_related")
+        timer.wrap_method(store, "replace_and_store", "finalize.emit.replace_store")
+        timer.wrap_method(store, "extend_related_expire_ts", "finalize.emit.extend_expire")

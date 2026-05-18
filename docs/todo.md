@@ -169,3 +169,27 @@
   先做静态、低风险的多规则共享：  
   `规则/边约束签名归并` -> `公共 pattern fragment 识别` -> `batch 内公共片段 partial match 缓存` -> `多规则共享 matching order`。  
   暂不建议优先做完整 `self_LI / nbr_LI` 动态维护，除非 profile 证明多规则重复 support check 已经成为主热点。
+
+## 弱拓扑补偿输出语义
+
+- [ ] 只在故障组“真实依赖缺失拓扑边”时标记 `missing_topology_rule`  
+  当前 `--missing-topology` 会先把高置信预测边注入 `topo_downstream_map` / `site_chain_index`，  
+  并把这些预测边记录到 `missing_topology_edges`。故障组输出阶段只要规则边的 role_mapping 命中
+  `missing_topology_edges`，就会设置 `uses_missing_topology=true`、追加 `missing_topology_rule`，  
+  同时传播图页面会绘制对应弱拓扑预测边。  
+  这会带来一个语义问题：如果某个站点对在原始拓扑 / 原始 `site_chains` 下本来已经连通，  
+  但预测文件里也给出了同一对 missing 边，当前仍可能把该故障组标成弱拓扑补偿命中。  
+  结果是总览页按 `missing_topology_rule` 筛选会筛出“其实不依赖缺失边”的故障组，  
+  传播图也会额外展示一条并非必要的弱拓扑边。
+
+  推荐方案是在后端生成故障组时解决，而不是只在可视化层隐藏：  
+  - 在 `load_static_context()` 调用 `apply_missing_topology_predictions()` 之前，保留一份原始
+    `topo_downstream_map` 和原始 `site_chain_index` 快照。  
+  - 将原始拓扑快照传入 `TemporalGraphEngine`，或封装成“按原始拓扑判断 rule edge 是否可达”的 helper。  
+  - 在 `_collect_missing_topology_edges_for_match()` 中，命中 `missing_topology_edges` 后，继续判断该
+    `(source_site, target_site, direction, max_hops)` 在原始拓扑 / 原始 `site_chains` 下是否已经可达。  
+  - 如果原始拓扑已可达，则不把该边计入 `missing_topology_edges`；只有原始拓扑不可达、补偿拓扑可达的边，
+    才设置 `uses_missing_topology` 并追加 `missing_topology_rule`。  
+
+  这样可以保证：总览页筛选 `missing_topology_rule` 时只得到真正依赖弱拓扑补偿的故障组，  
+  传播图页面也只展示“为了连通该规则匹配确实需要补偿”的弱拓扑边。
