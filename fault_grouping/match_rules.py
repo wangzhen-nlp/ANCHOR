@@ -21,7 +21,7 @@ from fault_grouping.matching.group_output_builder import (
     build_alarm_metadata_index,
 )
 from fault_grouping.matching.group_output_session import MatchOutputSession
-from fault_grouping.matching.profiling import PhaseTimer, enable_engine_profiling
+from fault_grouping.matching.profiling import PhaseTimer, enable_engine_profiling, enable_output_profiling
 from fault_grouping.matching.runtime import (
     AlarmLoadResult,
     LoadedStaticContext,
@@ -193,6 +193,7 @@ def main():
     # 启用引擎/输出关键路径的方法级计时（monkey-patch；仅 --profile 下生效）
     if timer is not None:
         enable_engine_profiling(timer, runtime_plan.engine, runtime_plan.output_session)
+        enable_output_profiling(timer, runtime_plan.output_session)
 
     with (timer.time("pipeline.run_matching_pipeline") if timer else _NullCtx()):
         run_matching_pipeline(

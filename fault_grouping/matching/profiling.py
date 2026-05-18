@@ -3,6 +3,7 @@
 - 仅在 --profile 开启时由 match_rules.py 装配，平时零侵入。
 - 通过 monkey-patch 给 engine / output 关键方法包一层计时，不修改业务代码。
 """
+import json
 import time
 from contextlib import contextmanager
 
@@ -82,9 +83,16 @@ class PhaseTimer:
             key=lambda x: -x[1],
         )
         pipeline_total = self._phases.get("pipeline.run_matching_pipeline")
+        # 只取 pipeline 的顶层直接子；output/finalize 等子阶段在各自 [block] 内展开
+        pipeline_direct_names = (
+            "ingest.process_event",
+            "output.write_matches",
+            "flush.total",
+        )
         pipeline_children = []
-        for n, kv in self._phases.items():
-            if n.startswith(("ingest.", "output.", "flush.")):
+        for n in pipeline_direct_names:
+            kv = self._phases.get(n)
+            if kv is not None:
                 pipeline_children.append((n, *kv))
         pipeline_children.sort(key=lambda x: -x[1])
         harvest_total = self._phases.get("harvest.total")
@@ -132,13 +140,16 @@ class PhaseTimer:
             if pipeline_total is not None:
                 p_total, p_count = pipeline_total
                 print(fmt_row("pipeline.run_matching_pipeline", p_total, p_count, indent=2))
+            child_indent = 4 if pipeline_total is not None else 2
             for name, total, count in pipeline_children:
                 marker = ""
                 if name == "ingest.process_event":
                     marker = "  ← 每条事件内嵌一次 harvest（offline 模式）"
                 elif name == "flush.total":
                     marker = "  ← 内嵌一次 harvest（force=True）"
-                print(fmt_row(name, total, count, indent=4, suffix=marker))
+                elif name == "output.write_matches":
+                    marker = "  ← 每批 match 落盘，详见 [output] 块"
+                print(fmt_row(name, total, count, indent=child_indent, suffix=marker))
 
         # [harvest] 块
         if harvest_total is not None:
@@ -156,6 +167,47 @@ class PhaseTimer:
                               suffix=f"  ← 占 harvest {pct_in_h:>5.1f}%"))
             print(fmt_row("(harvest.self = total − 子阶段)", self_time, None, indent=4,
                           suffix="  ← _collect_pending_matches 自身框架开销"))
+
+        # [output] 块 —— 拆 output.write_matches 内部
+        output_total = self._phases.get("output.write_matches")
+        output_children_names = (
+            "output.enrich_symptoms",
+            "output.build_group_output",
+            "output.json_dumps",
+            "output.file_io",
+            "output.refresh_progress",
+        )
+        output_present = output_total is not None and any(
+            n in self._phases for n in output_children_names
+        )
+        if output_present:
+            o_total, _o_count = output_total
+            print()
+            print(f"[output] output.write_matches 内部分解（{o_total:.3f}s, 占 wall {pct(o_total):.1f}%）")
+            children_sum_o = 0.0
+            for name in output_children_names:
+                kv = self._phases.get(name)
+                if kv is None:
+                    continue
+                total, count = kv
+                children_sum_o += total
+                pct_in_o = (total / o_total * 100) if o_total > 0 else 0.0
+                hint = ""
+                if name == "output.enrich_symptoms":
+                    hint = "  ← per-match: 复制 symptom + 查 alarm_metadata"
+                elif name == "output.build_group_output":
+                    hint = "  ← per-match: 富化 ne_info / group_info（含 strftime/排序）"
+                elif name == "output.json_dumps":
+                    hint = "  ← per-match: json.dumps 序列化"
+                elif name == "output.file_io":
+                    hint = "  ← per-batch: open + writelines + close"
+                elif name == "output.refresh_progress":
+                    hint = "  ← per-batch: 取 engine 锁 + 拷 stats"
+                print(fmt_row(name, total, count, indent=2,
+                              suffix=f"  占 output {pct_in_o:>5.1f}%{hint}"))
+            self_o = max(o_total - children_sum_o, 0.0)
+            print(fmt_row("(output.self = total − 子阶段)", self_o, None, indent=2,
+                          suffix="  ← 框架开销（dict 构造/lock 取释放等）"))
 
         # [finalize] 块 —— 进一步拆 harvest.finalize 内部
         finalize_total = self._phases.get("harvest.finalize")
@@ -257,8 +309,7 @@ def enable_engine_profiling(timer, engine, output_session):
     timer.wrap_method(engine, "_merge_and_expand_raw_matches", "harvest.merge_expand")
     timer.wrap_method(engine, "_finalize_expanded_matches_for_output", "harvest.finalize")
     timer.wrap_method(engine, "flush_pending", "flush.total")
-    if output_session is not None:
-        timer.wrap_method(output_session, "write_matches", "output.write_matches")
+    # output.write_matches 由 enable_output_profiling 单独装配（含内部子阶段拆分）
 
     # finalize 内部拆细
     timer.wrap_method(engine, "_prune_expired_state_locked", "finalize.prune_state")
@@ -272,3 +323,64 @@ def enable_engine_profiling(timer, engine, output_session):
         timer.wrap_method(store, "merge_with_related", "finalize.emit.merge_related")
         timer.wrap_method(store, "replace_and_store", "finalize.emit.replace_store")
         timer.wrap_method(store, "extend_related_expire_ts", "finalize.emit.extend_expire")
+
+
+def enable_output_profiling(timer, output_session):
+    """给 output 路径拆细计时。替换 write_matches 为内部带子计时的版本。
+
+    覆盖的子阶段（按调用顺序）：
+      output.write_matches                       (outer, 含全部以下)
+        ├ output.enrich_symptoms                 (build_jsonl_match_output → enrich_match_symptoms)
+        ├ output.build_group_output              (build_jsonl_match_output → build_group_output)
+        ├ output.json_dumps                      (每条 match 一次 json.dumps，累计)
+        ├ output.file_io                         (open + writelines + close)
+        └ output.refresh_progress                (engine.get_batch_merge_stats_snapshot 取锁)
+
+    注意：为了让 file_io 与 json_dumps/富化清晰分开，重写时把 open() 放在循环之后
+    （原版是循环外层 open）。lock 仍然包整段。
+    """
+    if output_session is None:
+        return
+
+    # 1) 富化函数 monkey-patch（在模块作用域，因为 build_jsonl_match_output 内部按名查找）
+    from fault_grouping.matching import group_output_builder as gob
+    timer.wrap_method(gob, "enrich_match_symptoms", "output.enrich_symptoms")
+    timer.wrap_method(gob, "build_group_output", "output.build_group_output")
+
+    # 2) 直接替换 write_matches，把内部 json/io/progress 拆开计时
+    from fault_grouping.matching.group_output_builder import build_jsonl_match_output
+    from fault_grouping.matching.reports import generate_incident_report
+
+    def instrumented_write_matches(matches):
+        t_outer = time.perf_counter()
+        with output_session.output_lock:
+            output_lines = []
+            for match in matches:
+                if output_session.args.verbose_groups:
+                    generate_incident_report(match)
+                enriched_match = build_jsonl_match_output(
+                    match,
+                    output_session.ne_graph_data,
+                    output_session.site_graph_data,
+                    output_session.alarm_metadata_index,
+                    site_to_ne_ids=output_session.site_to_ne_ids,
+                    ne_link_info_cache=output_session.ne_link_info_cache,
+                    compact_output=output_session.args.compact_output,
+                    include_eid_list=output_session.args.use_alarm_period_cache,
+                )
+                t_d = time.perf_counter()
+                output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + "\n")
+                timer._record("output.json_dumps", time.perf_counter() - t_d)
+
+            t_io = time.perf_counter()
+            with open(output_session.output_path, "a", encoding="utf-8") as fw:
+                fw.writelines(output_lines)
+            timer._record("output.file_io", time.perf_counter() - t_io)
+
+            output_session.match_count += len(matches)
+            t_p = time.perf_counter()
+            output_session.refresh_progress_extra_text()
+            timer._record("output.refresh_progress", time.perf_counter() - t_p)
+        timer._record("output.write_matches", time.perf_counter() - t_outer)
+
+    output_session.write_matches = instrumented_write_matches
