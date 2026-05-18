@@ -300,6 +300,10 @@ class TemporalGraphEngine(
 
         # 延迟触发队列：记录“当前仍在等待聚合”的 trigger 起点锚点，结构为 (ts, seq)
         self.pending_triggers = {}
+        # node -> {(node, rule_name)} 反向索引，供 _expand_matches_with_pending_context
+        # 按本批 non-trigger 节点直接定位相关 pending，避免扫全量。
+        # 与 pending_triggers 在同一把 self._lock 下同步维护。
+        self._pending_triggers_by_node = collections.defaultdict(set)
         # 延迟触发最小堆：按 ready_ts 排序，快速摘取已成熟的 pending trigger
         self.pending_trigger_heap = []
         # 保存某个 (node, rule) 下所有还能作为 trigger 候选的事件，结构为 (ts, event_id, seq, alarm_type)
@@ -486,9 +490,24 @@ class TemporalGraphEngine(
     def _set_pending_trigger(self, trigger_key, first_trigger_ts, trigger_seq):
         trigger_anchor = (first_trigger_ts, trigger_seq)
         self.pending_triggers[trigger_key] = trigger_anchor
+        # 反向索引同步维护：set.add 幂等，重复 set 同一 trigger_key 也安全。
+        self._pending_triggers_by_node[trigger_key[0]].add(trigger_key)
         ready_ts = first_trigger_ts + self.aggregation_wait_sec
         heapq.heappush(self.pending_trigger_heap, (ready_ts, first_trigger_ts, trigger_seq, trigger_key))
         self._maybe_rebuild_pending_heap_locked()
+
+    def _remove_pending_trigger(self, trigger_key):
+        """从 pending_triggers 和反向索引同时移除。返回原 anchor 或 None。"""
+        anchor = self.pending_triggers.pop(trigger_key, None)
+        if anchor is None:
+            return None
+        node = trigger_key[0]
+        bucket = self._pending_triggers_by_node.get(node)
+        if bucket is not None:
+            bucket.discard(trigger_key)
+            if not bucket:
+                del self._pending_triggers_by_node[node]
+        return anchor
 
     def _maybe_rebuild_pending_heap_locked(self):
         if len(self.pending_trigger_heap) <= max(64, len(self.pending_triggers) * self._pending_heap_rebuild_factor):
@@ -572,7 +591,7 @@ class TemporalGraphEngine(
 
         if force:
             for trigger_key, trigger_anchor in list(self.pending_triggers.items()):
-                self.pending_triggers.pop(trigger_key, None)
+                self._remove_pending_trigger(trigger_key)
                 mature_items.append((trigger_key, trigger_anchor))
             return mature_items
 
@@ -586,7 +605,7 @@ class TemporalGraphEngine(
             if current_pending_anchor != (first_trigger_ts, trigger_seq):
                 continue
 
-            self.pending_triggers.pop(trigger_key, None)
+            self._remove_pending_trigger(trigger_key)
             self._prune_trigger_index_before(trigger_key, trigger_seq)
             mature_items.append((trigger_key, (first_trigger_ts, trigger_seq)))
 
@@ -729,7 +748,7 @@ class TemporalGraphEngine(
 
             if not trigger_events:
                 self.trigger_event_index.pop(trigger_key, None)
-                self.pending_triggers.pop(trigger_key, None)
+                self._remove_pending_trigger(trigger_key)
         self._maybe_rebuild_pending_heap_locked()
 
     def _prune_trigger_index_before(self, trigger_key, cutoff_seq):
@@ -793,7 +812,7 @@ class TemporalGraphEngine(
             # 清除后只允许把 pending 起点推进到“原 trigger 之后”的下一条，避免回退到同一时间更早的故障上下文。
             next_trigger_anchor = self._find_next_trigger_anchor(node, rule_name, original_pending_anchor)
             if next_trigger_anchor is None:
-                del self.pending_triggers[trigger_key]
+                self._remove_pending_trigger(trigger_key)
             else:
                 next_trigger_ts, next_trigger_seq = next_trigger_anchor
                 self._set_pending_trigger(trigger_key, next_trigger_ts, next_trigger_seq)
@@ -924,10 +943,11 @@ class TemporalGraphEngine(
             return matches, build_empty_merge_stats()
 
         with self._lock:
+            # 通过反向索引按 non_trigger_nodes 直接取 pending，避免扫全量 pending_triggers。
             pending_candidates = [
-                ((node, rule_name), trigger_anchor)
-                for (node, rule_name), trigger_anchor in self.pending_triggers.items()
-                if node in non_trigger_nodes
+                (trigger_key, self.pending_triggers[trigger_key])
+                for node in non_trigger_nodes
+                for trigger_key in self._pending_triggers_by_node.get(node, ())
             ]
 
         if not pending_candidates:
