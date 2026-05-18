@@ -57,26 +57,114 @@ class PhaseTimer:
         return original
 
     def print_summary(self, title="match_rules 性能分析"):
+        """按嵌套结构分组打印：init / pipeline / harvest 三个块。
+
+        嵌套关系（硬编码，与 enable_engine_profiling 对应）：
+          pipeline.run_matching_pipeline 是 wall 容器
+            ├── ingest.process_event          ─┐
+            ├── output.write_matches           │
+            └── flush.total                   ─┤
+          harvest.total（被 ingest 和 flush 共同嵌套调用）
+            ├── harvest.evaluate
+            ├── harvest.merge_expand
+            └── harvest.finalize
+
+        每个阶段的 cum(累计) 含其子阶段；同时给出 self(本阶段自身排除子阶段)，
+        互斥的叶子节点之和 ≈ wall。
+        """
         wall = self.wall_elapsed
-        rows = sorted(self._phases.items(), key=lambda kv: -kv[1][0])
-        if not rows and wall <= 0:
+        if not self._phases and wall <= 0:
             return
 
-        name_w = max([len(n) for n, _ in rows] + [16])
-        line_w = name_w + 50
+        # 拆桶
+        init_rows = sorted(
+            [(n, *kv) for n, kv in self._phases.items() if n.startswith("init.")],
+            key=lambda x: -x[1],
+        )
+        pipeline_total = self._phases.get("pipeline.run_matching_pipeline")
+        pipeline_children = []
+        for n, kv in self._phases.items():
+            if n.startswith(("ingest.", "output.", "flush.")):
+                pipeline_children.append((n, *kv))
+        pipeline_children.sort(key=lambda x: -x[1])
+        harvest_total = self._phases.get("harvest.total")
+        harvest_children_names = ("harvest.evaluate", "harvest.merge_expand", "harvest.finalize")
+        harvest_children = [
+            (n, *self._phases[n]) for n in harvest_children_names if n in self._phases
+        ]
+
+        def pct(t):
+            return (t / wall * 100) if wall > 0 else 0.0
+
+        def fmt_row(name, total, count, indent=0, suffix=""):
+            prefix = " " * indent
+            if count is None:
+                # 派生行（如 harvest.self / init 合计），不展示调用次数与 avg。
+                count_str = f"{'—':>5}"
+                avg_str = f"{'—':>15}"
+            else:
+                count_str = f"{count:>5}次"
+                avg_ms = total / max(count, 1) * 1000 if count else 0.0
+                avg_str = f"avg={avg_ms:>10.3f}ms"
+            return f"{prefix}{name:<{40 - indent}} {total:>9.3f}s {count_str} {pct(total):>6.1f}%  {avg_str}{suffix}"
+
+        line_w = 96
         print()
         print("=" * line_w)
         print(f"{title}（wall={wall:.3f}s）")
         print("=" * line_w)
-        print(f"{'阶段':<{name_w}} {'总耗时(s)':>10} {'次数':>9} {'占比wall':>9} {'avg(ms)':>10}")
+
+        # [init] 块
+        if init_rows:
+            print()
+            print("[init] 准备阶段（互不嵌套）")
+            init_sum = 0.0
+            for name, total, count in init_rows:
+                print(fmt_row(name, total, count, indent=2))
+                init_sum += total
+            print(f"  {'─' * 70}")
+            print(fmt_row("init 合计", init_sum, None, indent=2))
+
+        # [pipeline] 块
+        if pipeline_total is not None or pipeline_children:
+            print()
+            print("[pipeline] 主流程（wall 容器；三个子阶段互不重叠，但分别向 [harvest] 调用）")
+            if pipeline_total is not None:
+                p_total, p_count = pipeline_total
+                print(fmt_row("pipeline.run_matching_pipeline", p_total, p_count, indent=2))
+            for name, total, count in pipeline_children:
+                marker = ""
+                if name == "ingest.process_event":
+                    marker = "  ← 每条事件内嵌一次 harvest（offline 模式）"
+                elif name == "flush.total":
+                    marker = "  ← 内嵌一次 harvest（force=True）"
+                print(fmt_row(name, total, count, indent=4, suffix=marker))
+
+        # [harvest] 块
+        if harvest_total is not None:
+            h_total, h_count = harvest_total
+            children_sum = sum(t for _, t, _ in harvest_children)
+            self_time = max(h_total - children_sum, 0.0)
+            print()
+            print("[harvest] 收割路径（嵌套在 ingest.process_event / flush.total 内，时间双重计入它们）")
+            print(fmt_row("harvest.total", h_total, h_count, indent=2,
+                          suffix=f"  ← 累计被调用 {h_count} 次"))
+            for name, total, count in harvest_children:
+                # 在 harvest 内的占比，给一个更直观的"占 harvest" 数字
+                pct_in_h = (total / h_total * 100) if h_total > 0 else 0.0
+                print(fmt_row(name, total, count, indent=4,
+                              suffix=f"  ← 占 harvest {pct_in_h:>5.1f}%"))
+            print(fmt_row("(harvest.self = total − 子阶段)", self_time, None, indent=4,
+                          suffix="  ← _collect_pending_matches 自身框架开销"))
+
+        print()
         print("-" * line_w)
-        for name, (total_sec, count) in rows:
-            avg_ms = total_sec / max(count, 1) * 1000
-            pct = total_sec / wall * 100 if wall > 0 else 0.0
-            print(f"{name:<{name_w}} {total_sec:>10.3f} {count:>9d} {pct:>8.1f}% {avg_ms:>10.4f}")
-        print("-" * line_w)
-        print("说明：阶段之间可能嵌套（例如 harvest 包含 evaluate+merge+finalize），")
-        print("      因此各项之和可能超过 wall。重点看占比 wall 高的阶段。")
+        print("说明：")
+        print("  • cum(s) = 累计耗时（含其子阶段）；wall% 同口径")
+        print("  • harvest.* 不在 pipeline 之外，它内嵌在 ingest 和 flush 里，时间被双重计入")
+        print("  • 互斥（叶子）耗时:  init.* + harvest.evaluate + harvest.merge_expand")
+        print("                     + harvest.finalize + harvest.self + ingest.self + output.* + flush.self")
+        print("                     之和 ≈ wall")
         print("=" * line_w)
 
 
