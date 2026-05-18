@@ -529,6 +529,311 @@ class TemporalGraphEngineEvaluatorMixin:
 
         return curr_valid_targets, all_passed, candidate_failure_details
 
+    @staticmethod
+    def _normalize_mutual_alarm_source_ne_anchor_config(edge):
+        cfg = edge.get("mutual_alarm_source_ne_anchor")
+        if not cfg:
+            return None
+        if cfg is True:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            return None
+        return {
+            "max_ne_hops": int(cfg.get("max_ne_hops", 1)),
+        }
+
+    def _validate_role_node_with_ne_anchor(
+        self,
+        phys_node,
+        role_cfg,
+        reference_ts,
+        edge_window,
+        helper,
+        allowed_alarm_source_nes,
+        rule_name=None,
+        role_name=None,
+        trigger_role=None,
+        validation_cache=None,
+    ):
+        exclude_consumed_trigger_rule = rule_name if role_name == trigger_role else None
+        if validation_cache is None:
+            return helper.validate_node(
+                phys_node,
+                self.sites_domain_map.get(phys_node, {}),
+                role_cfg,
+                reference_ts,
+                edge_window,
+                exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
+                allowed_alarm_source_nes=allowed_alarm_source_nes,
+            )
+
+        cache_key = (
+            "mutual_ne_anchor_node",
+            rule_name if exclude_consumed_trigger_rule else None,
+            role_name if exclude_consumed_trigger_rule else None,
+            id(role_cfg),
+            phys_node,
+            reference_ts,
+            self._make_edge_window_cache_key(edge_window),
+            allowed_alarm_source_nes,
+        )
+        cached = validation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        result = helper.validate_node(
+            phys_node,
+            self.sites_domain_map.get(phys_node, {}),
+            role_cfg,
+            reference_ts,
+            edge_window,
+            exclude_consumed_trigger_rule=exclude_consumed_trigger_rule,
+            allowed_alarm_source_nes=allowed_alarm_source_nes,
+        )
+        validation_cache[cache_key] = result
+        return result
+
+    def _alarm_source_nes_within_hops(self, source_ne, target_ne, max_hops):
+        if source_ne and target_ne:
+            left_ne, right_ne = sorted((source_ne, target_ne), key=str)
+            cache_key = (left_ne, right_ne, max_hops)
+        else:
+            cache_key = (source_ne, target_ne, max_hops)
+        cached = self._alarm_source_ne_reachability_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if not source_ne or not target_ne:
+            self._alarm_source_ne_reachability_cache[cache_key] = False
+            return False
+        if source_ne == target_ne:
+            self._alarm_source_ne_reachability_cache[cache_key] = True
+            return True
+        if max_hops <= 0 or not self._ne_adjacency:
+            self._alarm_source_ne_reachability_cache[cache_key] = False
+            return False
+        visited = {source_ne}
+        frontier = {source_ne}
+        for _ in range(max_hops):
+            next_frontier = set()
+            for ne_id in frontier:
+                for neighbor in self._ne_adjacency.get(ne_id, ()):
+                    if neighbor == target_ne:
+                        self._alarm_source_ne_reachability_cache[cache_key] = True
+                        return True
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        next_frontier.add(neighbor)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        self._alarm_source_ne_reachability_cache[cache_key] = False
+        return False
+
+    def _get_required_alarm_set_for_role(self, phys_node, role_cfg, helper):
+        cache = getattr(self, "_required_alarm_set_cache", None)
+        cache_key = (id(role_cfg), phys_node)
+        if cache is not None and cache_key in cache:
+            return cache[cache_key]
+
+        expected = helper.resolve_expected_alarms(
+            self.sites_domain_map.get(phys_node, {}),
+            role_cfg,
+        )
+        required_alarms = expected.get("required_alarms") if isinstance(expected, dict) else None
+        result = frozenset(required_alarms) if required_alarms else None
+        if cache is not None:
+            cache[cache_key] = result
+        return result
+
+    def _get_required_alarm_events_for_role(self, phys_node, role_cfg, events, helper):
+        required_alarms = self._get_required_alarm_set_for_role(phys_node, role_cfg, helper)
+        if not required_alarms:
+            return list(events)
+        return [
+            event for event in events
+            if event.get("alarm") in required_alarms
+        ]
+
+    @staticmethod
+    def _alarm_sources_from_events(events):
+        return {
+            event.get("alarm_source")
+            for event in events
+            if event.get("alarm_source")
+        }
+
+    def _filter_events_by_supported_alarm_sources(self, events, supported_alarm_sources):
+        filtered = [
+            event for event in events
+            if event.get("alarm_source") in supported_alarm_sources
+        ]
+        return filtered
+
+    def _event_alarm_sources_known_and_disjoint(self, events, allowed_alarm_source_nes):
+        if allowed_alarm_source_nes is None:
+            return False
+        event_sources = self._alarm_sources_from_events(events)
+        if not event_sources:
+            return False
+        return event_sources.isdisjoint(allowed_alarm_source_nes)
+
+    def _filter_mutual_ne_supported_events(
+        self,
+        curr_phys,
+        curr_cfg,
+        curr_events,
+        target_phys,
+        tgt_cfg,
+        target_events,
+        helper,
+        max_ne_hops,
+    ):
+        # 没有 NE 数据时与 role-level anchor 一致：降级为不做 NE 级精确裁剪。
+        if not self._site_to_ne_ids:
+            return curr_events, target_events
+
+        curr_required_events = self._get_required_alarm_events_for_role(
+            curr_phys, curr_cfg, curr_events, helper
+        )
+        target_required_events = self._get_required_alarm_events_for_role(
+            target_phys, tgt_cfg, target_events, helper
+        )
+        if not curr_required_events or not target_required_events:
+            return [], []
+
+        curr_required_sources = self._alarm_sources_from_events(curr_required_events)
+        target_required_sources = self._alarm_sources_from_events(target_required_events)
+        if not curr_required_sources or not target_required_sources:
+            return [], []
+
+        curr_supported_sources = set()
+        target_supported_sources = set()
+        for curr_alarm_source in curr_required_sources:
+            for target_alarm_source in target_required_sources:
+                if self._alarm_source_nes_within_hops(curr_alarm_source, target_alarm_source, max_ne_hops):
+                    curr_supported_sources.add(curr_alarm_source)
+                    target_supported_sources.add(target_alarm_source)
+
+        if not curr_supported_sources or not target_supported_sources:
+            return [], []
+
+        return (
+            self._filter_events_by_supported_alarm_sources(curr_events, curr_supported_sources),
+            self._filter_events_by_supported_alarm_sources(target_events, target_supported_sources),
+        )
+
+    def _apply_mutual_alarm_source_ne_anchor_for_edge(
+        self,
+        curr_phys,
+        curr_events,
+        curr_role,
+        curr_cfg,
+        tgt_role,
+        tgt_cfg,
+        curr_valid_targets,
+        edge,
+        rule_name,
+        trigger_role,
+        ref_ts,
+        helper,
+        validation_cache=None,
+        edge_trace=None,
+    ):
+        anchor_cfg = self._normalize_mutual_alarm_source_ne_anchor_config(edge)
+        if not anchor_cfg or not curr_valid_targets:
+            return curr_valid_targets, {
+                target_phys: curr_events
+                for target_phys in curr_valid_targets
+            }
+
+        max_ne_hops = anchor_cfg["max_ne_hops"]
+        filtered_targets = {}
+        curr_events_by_target = {}
+        failure_details = []
+        allowed_for_target = self._compute_anchor_ne_reachable_set(curr_phys, max_ne_hops)
+
+        for target_phys, target_events in curr_valid_targets.items():
+            allowed_for_curr = self._compute_anchor_ne_reachable_set(target_phys, max_ne_hops)
+
+            # target 侧不再重 validate：进入这里前 _validate_candidate_nodes_for_edge
+            # 已经用 role-level allowed_alarm_source_nes 过滤过 target_events，并完成
+            # forbidden/required 等谓词校验。mutual 阶段只需把 events 收敛到当前 curr_phys
+            # 单点对应的更紧 allowed_for_target（role-level 在多 anchor 站点场景下会取
+            # 并集，比 mutual 略宽；单 anchor 时两者完全一致，filter 为 identity）。
+            if allowed_for_target is None:
+                filtered_target_events = target_events
+            else:
+                filtered_target_events = [
+                    e for e in target_events
+                    if e.get("alarm_source") in allowed_for_target
+                ]
+            if not filtered_target_events:
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{target_phys}: {tgt_role} 没有 alarm_source 落在 {curr_phys} 的 NE 拓扑邻域内"
+                    )
+                continue
+
+            # curr 侧仍需 disjoint 早退 + 重 validate：curr_events 来自 trigger
+            # validation（edge_window=0），mutual 需要 edge_window=edge["win"] 的更宽
+            # 视角并在新窗口内复查 forbidden。disjoint 检查能在 curr_events 完全不命中
+            # 时省掉一次 validate_node 调用。
+            if self._event_alarm_sources_known_and_disjoint(curr_events, allowed_for_curr):
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{curr_phys}: 已命中告警源不在 {target_phys} 的 NE 拓扑邻域内，跳过 mutual anchor 校验"
+                    )
+                continue
+
+            if allowed_for_curr is None:
+                curr_valid, filtered_curr_events = True, curr_events
+            else:
+                curr_ref_ts = filtered_target_events[0]["ts"] if filtered_target_events else ref_ts
+                curr_valid, filtered_curr_events = self._validate_role_node_with_ne_anchor(
+                    curr_phys,
+                    curr_cfg,
+                    curr_ref_ts,
+                    edge["win"],
+                    helper,
+                    allowed_for_curr,
+                    rule_name=rule_name,
+                    role_name=curr_role,
+                    trigger_role=trigger_role,
+                    validation_cache=validation_cache,
+                )
+
+            if not curr_valid:
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{curr_phys}: {curr_role} 没有 alarm_source 落在 {target_phys} 的 NE 拓扑邻域内"
+                    )
+                continue
+
+            filtered_curr_events, filtered_target_events = self._filter_mutual_ne_supported_events(
+                curr_phys,
+                curr_cfg,
+                filtered_curr_events,
+                target_phys,
+                tgt_cfg,
+                filtered_target_events,
+                helper,
+                max_ne_hops,
+            )
+            if not filtered_curr_events or not filtered_target_events:
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{curr_phys}<->{target_phys}: 两侧 required 告警的 alarm_source NE 之间没有拓扑支撑边"
+                    )
+                continue
+
+            filtered_targets[target_phys] = filtered_target_events
+            curr_events_by_target[target_phys] = filtered_curr_events
+
+        if edge_trace is not None and failure_details:
+            edge_trace["failures"].extend(failure_details[:4])
+
+        return filtered_targets, curr_events_by_target
+
     def _evaluate_edge_source_node(
         self,
         curr_phys,
@@ -536,6 +841,7 @@ class TemporalGraphEngineEvaluatorMixin:
         curr_role,
         tgt_role,
         tgt_cfg,
+        curr_cfg,
         edge,
         rule_name,
         trigger_role,
@@ -580,7 +886,7 @@ class TemporalGraphEngineEvaluatorMixin:
             edge_trace,
             branch_failure_reasons,
         ):
-            return {}, branch_failure_reasons
+            return {}, branch_failure_reasons, {}
 
         ordered_candidates = candidate_info["candidates"]
         if self.enable_support_count_sort and match_mode != "ALL":
@@ -613,16 +919,33 @@ class TemporalGraphEngineEvaluatorMixin:
             allowed_alarm_source_nes=allowed_alarm_source_nes,
         )
 
+        curr_valid_targets, curr_events_by_target = self._apply_mutual_alarm_source_ne_anchor_for_edge(
+            curr_phys,
+            curr_events,
+            curr_role,
+            curr_cfg,
+            tgt_role,
+            tgt_cfg,
+            curr_valid_targets,
+            edge,
+            rule_name,
+            trigger_role,
+            ref_ts,
+            helper,
+            validation_cache=validation_cache,
+            edge_trace=edge_trace,
+        )
+
         if match_mode == "ALL" and not all_passed:
             if edge_trace is not None:
                 detail = candidate_failure_details[0] if candidate_failure_details else "存在候选节点未通过 ALL 校验"
                 branch_failure_reasons.append(
                     f"{curr_role}:{curr_phys} 在 ALL 模式下失败，{detail}"
                 )
-            return {}, branch_failure_reasons
+            return {}, branch_failure_reasons, {}
 
         if curr_valid_targets:
-            return curr_valid_targets, branch_failure_reasons
+            return curr_valid_targets, branch_failure_reasons, curr_events_by_target
 
         if edge_trace is not None:
             if candidate_failure_details:
@@ -634,7 +957,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 branch_failure_reasons.append(
                     f"{curr_role}:{curr_phys} 没有满足 {tgt_role} 的节点"
                 )
-        return {}, branch_failure_reasons
+        return {}, branch_failure_reasons, {}
 
     def _compute_allowed_alarm_source_nes_for_role(self, rule_name, tgt_role, inst):
         """若 tgt_role 配置了 alarm_source_ne_anchor，查询 anchor_role 已绑定的 site，
@@ -653,10 +976,15 @@ class TemporalGraphEngineEvaluatorMixin:
         max_hops = anchor_cfg["max_ne_hops"]
         anchor_nodes = inst.get("roles", {}).get(anchor_role, {}).get("nodes", {})
         if not anchor_nodes:
-            # anchor 尚未绑定（按理 BFS 顺序保证已绑定，这里防御性返回 None）
+            # anchor 尚未绑定（编译期 bind_order 校验排除该路径，这里保留防御性返回 None）
             return None
+        anchor_sites = list(anchor_nodes.keys())
+        # 单 anchor 时直接复用 _compute_anchor_ne_reachable_set 的 frozenset，
+        # 避免一次 set->frozenset 复制；多 anchor 时合并后再 frozenset。
+        if len(anchor_sites) == 1:
+            return self._compute_anchor_ne_reachable_set(anchor_sites[0], max_hops)
         combined = None
-        for anchor_site in anchor_nodes.keys():
+        for anchor_site in anchor_sites:
             reachable = self._compute_anchor_ne_reachable_set(anchor_site, max_hops)
             if reachable is None:
                 # 引擎未配置 NE 数据，直接降级为不过滤
@@ -691,8 +1019,10 @@ class TemporalGraphEngineEvaluatorMixin:
         valid_targets = {}
         surviving_curr_phys = {}
         curr_support_targets = {}
+        curr_events_by_target = {}
         branch_failure_reasons = []
         bound_roles = set(inst.get("roles", {}).keys())
+        curr_cfg = nodes_cfg[curr_role]
 
         # 计算 NE 锚点允许 alarm_source NE 集合（如果 tgt_role 配置了 alarm_source_ne_anchor）
         allowed_alarm_source_nes = self._compute_allowed_alarm_source_nes_for_role(
@@ -700,12 +1030,13 @@ class TemporalGraphEngineEvaluatorMixin:
         )
 
         for curr_phys, curr_events in inst["roles"][curr_role]["nodes"].items():
-            curr_valid_targets, source_failure_reasons = self._evaluate_edge_source_node(
+            curr_valid_targets, source_failure_reasons, source_events_by_target = self._evaluate_edge_source_node(
                 curr_phys,
                 curr_events,
                 curr_role,
                 tgt_role,
                 tgt_cfg,
+                curr_cfg,
                 edge,
                 rule_name,
                 trigger_role,
@@ -727,12 +1058,28 @@ class TemporalGraphEngineEvaluatorMixin:
             if not curr_valid_targets:
                 continue
 
-            surviving_curr_phys[curr_phys] = curr_events
+            combined_curr_events = []
+            seen_curr_event_ids = set()
+            for target_phys in curr_valid_targets:
+                for event in source_events_by_target.get(target_phys, curr_events):
+                    event_id = event.get("eid") or (
+                        event.get("node"),
+                        event.get("ts"),
+                        event.get("alarm"),
+                        event.get("alarm_source"),
+                    )
+                    if event_id in seen_curr_event_ids:
+                        continue
+                    seen_curr_event_ids.add(event_id)
+                    combined_curr_events.append(event)
+                curr_events_by_target[(curr_phys, target_phys)] = source_events_by_target.get(target_phys, curr_events)
+
+            surviving_curr_phys[curr_phys] = combined_curr_events or curr_events
             curr_support_targets[curr_phys] = set(curr_valid_targets)
             for key, value in curr_valid_targets.items():
                 valid_targets[key] = value
 
-        return valid_targets, surviving_curr_phys, curr_support_targets, branch_failure_reasons
+        return valid_targets, surviving_curr_phys, curr_support_targets, curr_events_by_target, branch_failure_reasons
 
     def _materialize_edge_advanced_instances(
         self,
@@ -744,6 +1091,7 @@ class TemporalGraphEngineEvaluatorMixin:
         surviving_curr_phys,
         valid_targets,
         curr_support_targets,
+        curr_events_by_target=None,
         edge_trace=None,
     ):
         existing_targets = inst["roles"].get(tgt_role, {}).get("nodes", {})
@@ -760,6 +1108,7 @@ class TemporalGraphEngineEvaluatorMixin:
                 valid_targets,
                 curr_support_targets,
                 nodes_cfg,
+                curr_events_by_target=curr_events_by_target,
             )
 
         if len(merged_targets) < min_count:
@@ -812,7 +1161,7 @@ class TemporalGraphEngineEvaluatorMixin:
             return [inst]
 
         tgt_cfg = nodes_cfg[tgt_role]
-        valid_targets, surviving_curr_phys, curr_support_targets, branch_failure_reasons = (
+        valid_targets, surviving_curr_phys, curr_support_targets, curr_events_by_target, branch_failure_reasons = (
             self._collect_instance_edge_targets(
                 inst,
                 curr_role,
@@ -864,6 +1213,7 @@ class TemporalGraphEngineEvaluatorMixin:
             surviving_curr_phys,
             valid_targets,
             curr_support_targets,
+            curr_events_by_target=curr_events_by_target,
             edge_trace=edge_trace,
         )
 
@@ -876,13 +1226,20 @@ class TemporalGraphEngineEvaluatorMixin:
         valid_targets,
         curr_support_targets,
         nodes_cfg,
+        curr_events_by_target=None,
     ):
         next_instances = []
+        curr_events_by_target = curr_events_by_target or {}
         for target_node, target_events in valid_targets.items():
+            target_surviving_curr_phys = {
+                curr_node: curr_events_by_target.get((curr_node, target_node), curr_events)
+                for curr_node, curr_events in surviving_curr_phys.items()
+                if target_node in curr_support_targets.get(curr_node, set())
+            }
             new_inst = clone_instance_with_updates(
                 inst,
                 curr_role,
-                surviving_curr_phys,
+                target_surviving_curr_phys,
                 tgt_role,
                 {target_node: target_events},
             )

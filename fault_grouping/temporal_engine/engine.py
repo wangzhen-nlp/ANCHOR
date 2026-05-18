@@ -21,6 +21,7 @@ from fault_grouping.temporal_engine.utils import (
     build_pattern_adj,
     build_empty_merge_stats,
     matches_expected_alarm,
+    node_has_required_alarm_anchor,
     merge_match_batch,
 )
 
@@ -42,8 +43,16 @@ class TemporalGraphEngine(
         nodes_cfg = rule.get("nodes", {})
         edges_cfg = rule.get("edges", [])
         trigger_role = rule["trigger_role"]
+        enriched_edges_cfg = []
+        for edge_cfg in edges_cfg:
+            source_role = edge_cfg.get("source")
+            target_role = edge_cfg.get("target")
+            enriched_edge = dict(edge_cfg)
+            enriched_edge["source_node"] = nodes_cfg.get(source_role)
+            enriched_edge["target_node"] = nodes_cfg.get(target_role)
+            enriched_edges_cfg.append(enriched_edge)
 
-        pattern_adj = build_pattern_adj(edges_cfg)
+        pattern_adj = build_pattern_adj(enriched_edges_cfg)
 
         edges_to_explore = []
         visited_edges = set()
@@ -64,6 +73,28 @@ class TemporalGraphEngine(
 
         # 解析每个 role 的 alarm_source_ne_anchor 配置 —— 把隐式 anchor_role 标记
         # "<edge_source>" 替换成具体 role 名，运行时直接查表使用。
+        # BFS 绑定顺序由 edges_to_explore 决定：每条 (curr, tgt, edge) 触发 tgt 绑定。
+        # 这里建立 role → 首次被绑定的 BFS step，用于校验 anchor 早于 target。
+        bind_order = {trigger_role: 0}
+        for step_idx, (_, tgt_role_, _) in enumerate(edges_to_explore, start=1):
+            bind_order.setdefault(tgt_role_, step_idx)
+
+        def role_has_mutual_ne_anchor_edge(role_name):
+            for edge_cfg in enriched_edges_cfg:
+                constraints = edge_cfg.get("constraints", {})
+                source_node = edge_cfg.get("source_node")
+                target_node = edge_cfg.get("target_node")
+                source_has_required_anchor = node_has_required_alarm_anchor(source_node)
+                target_has_required_anchor = node_has_required_alarm_anchor(target_node)
+                if not (
+                    constraints.get("mutual_alarm_source_ne_anchor")
+                    or (source_has_required_anchor and target_has_required_anchor)
+                ):
+                    continue
+                if role_name in {edge_cfg.get("source"), edge_cfg.get("target")}:
+                    return True
+            return False
+
         alarm_source_ne_anchors = {}
         for role, node_cfg in nodes_cfg.items():
             if not isinstance(node_cfg, dict):
@@ -73,23 +104,54 @@ class TemporalGraphEngine(
                 continue
             anchor_role = anchor_cfg.get("anchor_role", "<edge_source>")
             if anchor_role == "<edge_source>":
-                incoming_sources = [e["source"] for e in edges_cfg if e["target"] == role]
+                # 去重：相同 source 的多条 edge 视为单个入边
+                incoming_sources = list(dict.fromkeys(
+                    e["source"] for e in edges_cfg if e["target"] == role
+                ))
                 if len(incoming_sources) == 1:
                     anchor_role = incoming_sources[0]
                 elif not incoming_sources:
+                    if role == trigger_role and role_has_mutual_ne_anchor_edge(role):
+                        # trigger role 没有入边，无法用 role-level "<edge_source>" 解析。
+                        # 这类场景由“边两端 role 都配置 alarm_source_ne_anchor”隐式启用的
+                        # pair 级双向 NE 告警源约束处理。
+                        continue
                     raise ValueError(
                         f"role {role!r} 有 alarm_source_ne_anchor 但没有入边；"
                         f"<edge_source> 隐式 anchor_role 无法解析"
                     )
                 else:
                     raise ValueError(
-                        f"role {role!r} 有多个入边 {incoming_sources!r}，"
+                        f"role {role!r} 有多个不同入边 source={incoming_sources!r}，"
                         f"alarm_source_ne_anchor.anchor_role 必须显式给出"
                     )
             if anchor_role not in nodes_cfg:
                 raise ValueError(
                     f"role {role!r} 的 alarm_source_ne_anchor.anchor_role={anchor_role!r} "
                     f"不在规则 nodes 中"
+                )
+            if anchor_role == role:
+                raise ValueError(
+                    f"role {role!r} 的 alarm_source_ne_anchor.anchor_role 不能指向自身"
+                )
+            # 强校验：role 本身必须被 BFS 绑定，否则该 role 永远不参与匹配，
+            # 配 alarm_source_ne_anchor 无意义。
+            if role not in bind_order:
+                raise ValueError(
+                    f"role {role!r} 从 trigger {trigger_role!r} 不可达（BFS 不会绑定），"
+                    f"alarm_source_ne_anchor 配置无效"
+                )
+            # 强校验：anchor_role 必须在 BFS 顺序上先于 target_role 绑定，
+            # 否则运行时 anchor 还未绑定，allowed_nes 会被悄悄置 None（降级不过滤）
+            if anchor_role not in bind_order:
+                raise ValueError(
+                    f"role {role!r} 的 alarm_source_ne_anchor.anchor_role={anchor_role!r} "
+                    f"从 trigger {trigger_role!r} 不可达，BFS 不会绑定该 anchor"
+                )
+            if bind_order[anchor_role] >= bind_order[role]:
+                raise ValueError(
+                    f"role {role!r}（BFS 顺序 {bind_order[role]}）的 anchor_role="
+                    f"{anchor_role!r}（BFS 顺序 {bind_order[anchor_role]}）必须更早绑定"
                 )
             max_hops = int(anchor_cfg.get("max_ne_hops", 1))
             if max_hops < 0:
@@ -118,13 +180,13 @@ class TemporalGraphEngine(
         """从 ne_graph_data 构造 NE 级双向邻接表（任一方向有 link 即视为相邻）。"""
         adj = collections.defaultdict(set)
         for src_ne, info in self._ne_graph_data.items():
-            if not isinstance(info, dict):
+            if not src_ne or not isinstance(info, dict):
                 continue
             links = info.get("link")
             if not isinstance(links, dict):
                 continue
             for tgt_ne in links.keys():
-                if tgt_ne is None or tgt_ne == src_ne:
+                if not tgt_ne or tgt_ne == src_ne:
                     continue
                 adj[src_ne].add(tgt_ne)
                 adj[tgt_ne].add(src_ne)
@@ -281,6 +343,12 @@ class TemporalGraphEngine(
         # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
         # 不含规则名，跨规则、跨 trigger 自动复用。
         self._anchor_ne_reachable_cache = {}
+        # 缓存键: (source_ne, target_ne, max_ne_hops) -> bool。
+        # 用于边级 mutual_alarm_source_ne_anchor，避免两侧 link 告警较多时重复 BFS。
+        self._alarm_source_ne_reachability_cache = {}
+        # 缓存每个站点/role 配置解析出的 required alarm 集合，供 mutual NE anchor
+        # 做事件源精确过滤时复用，避免同一候选对反复解析 site_rules。
+        self._required_alarm_set_cache = {}
 
         # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
         self.rule_execution_plans = {}

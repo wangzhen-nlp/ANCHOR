@@ -41,6 +41,20 @@ def _format_edge_directions(directions):
     return directions[0] if len(directions) == 1 else directions
 
 
+def node_has_required_alarm_anchor(node_cfg):
+    """判断节点配置是否同时具备 alarm_source_ne_anchor 与 required_alarms。
+
+    mutual NE anchor 仅在边两端节点都"既配 anchor、又有 required 告警"时才有意义。
+    """
+    if not isinstance(node_cfg, dict) or not node_cfg.get("alarm_source_ne_anchor"):
+        return False
+    for site_rule in node_cfg.get("site_rules") or ():
+        expected = site_rule.get("expected_alarms") if isinstance(site_rule, dict) else None
+        if isinstance(expected, dict) and expected.get("required_alarms"):
+            return True
+    return False
+
+
 def build_pattern_adj(edges_cfg):
     """把规则边展开成支持双向遍历的模式邻接表。"""
     pattern_adj = collections.defaultdict(list)
@@ -62,10 +76,33 @@ def build_pattern_adj(edges_cfg):
         path_requirements = constraints.get("path_node_requirements")
         source_candidate_selector = constraints.get("source_candidate_selector")
         target_candidate_selector = constraints.get("target_candidate_selector")
+        source_node = edge.get("source_node")
+        target_node = edge.get("target_node")
         dedupe_symmetric_pair = bool(
             edge.get("dedupe_symmetric_pair")
             or constraints.get("dedupe_symmetric_pair")
         )
+        mutual_alarm_source_ne_anchor = constraints.get("mutual_alarm_source_ne_anchor")
+        if mutual_alarm_source_ne_anchor is None:
+            source_anchor_cfg = (
+                source_node.get("alarm_source_ne_anchor")
+                if isinstance(source_node, dict) else None
+            )
+            target_anchor_cfg = (
+                target_node.get("alarm_source_ne_anchor")
+                if isinstance(target_node, dict) else None
+            )
+            if (
+                source_anchor_cfg and target_anchor_cfg
+                and node_has_required_alarm_anchor(source_node)
+                and node_has_required_alarm_anchor(target_node)
+            ):
+                mutual_alarm_source_ne_anchor = {
+                    "max_ne_hops": min(
+                        int(source_anchor_cfg.get("max_ne_hops", 1)),
+                        int(target_anchor_cfg.get("max_ne_hops", 1)),
+                    )
+                }
         optional = bool(edge.get("optional", False))
 
         pattern_adj[source].append({
@@ -78,6 +115,7 @@ def build_pattern_adj(edges_cfg):
             "path_requirements": path_requirements,
             "candidate_selector": target_candidate_selector,
             "dedupe_symmetric_pair": dedupe_symmetric_pair,
+            "mutual_alarm_source_ne_anchor": mutual_alarm_source_ne_anchor,
             "optional": optional,
         })
         pattern_adj[target].append({
@@ -90,6 +128,7 @@ def build_pattern_adj(edges_cfg):
             "path_requirements": path_requirements,
             "candidate_selector": source_candidate_selector,
             "dedupe_symmetric_pair": dedupe_symmetric_pair,
+            "mutual_alarm_source_ne_anchor": mutual_alarm_source_ne_anchor,
             "optional": optional,
         })
     return pattern_adj

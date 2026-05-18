@@ -326,7 +326,7 @@ data_link_adjacent_offline_rule = {
     "data_link_offline_underneath_compound_node"
   ],
   "nodes": {
-    "data_link_offline_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
+    "data_link_offline_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED,
     "data_link_offline_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
     "data_link_offline_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
   },
@@ -358,8 +358,8 @@ data_link_adjacent_link_rule = {
     "data_link_pair_adjacent_data_node"
   ],
   "nodes": {
-    "data_link_pair_current_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE,
-    "data_link_pair_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE
+    "data_link_pair_current_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED,
+    "data_link_pair_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED
   },
   "edges": [
     {
