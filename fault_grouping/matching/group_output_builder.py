@@ -1,5 +1,58 @@
+import time
 from collections import defaultdict
 from datetime import datetime
+from functools import lru_cache
+from operator import itemgetter
+
+
+_SORT_ALARM_KEY = itemgetter("alarm_time", "alarm_id")
+_EMPTY_DICT = {}  # 共享只读空 dict，避免 site_id 为空时每次创建新 dict
+
+
+# timestamp → "%Y-%m-%d %H:%M:%S"。
+# - lru_cache(4096)：上限 4096 个唯一整秒（~70 分钟），内存 ≤600KB，自动 LRU 淘汰，
+#   无周期性 clear() 抖动；告警流量再大也不会膨胀。
+# - 命中时 ~50ns；未命中走手写 f-string + time.localtime（C 实现），
+#   比 datetime.fromtimestamp().strftime() 快 ~2 倍，即使长时间分散数据也不会更慢。
+@lru_cache(maxsize=4096)
+def _format_int_ts(int_ts):
+    lt = time.localtime(int_ts)
+    return f"{lt.tm_year:04d}-{lt.tm_mon:02d}-{lt.tm_mday:02d} {lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+
+
+def _format_ts(ts):
+    if ts is None:
+        return ""
+    return _format_int_ts(int(ts))
+
+
+# 模块级 NE 静态字段缓存：把 build_group_output 内每个 NE 每次都跑一遍的
+# .get(...) / str(...).upper() 等静态字段一次性算好。
+# key 用 id(ne_graph_data)，不同 engine / reload 自动隔离。
+_NE_STATIC_CACHE = {}
+
+
+def _get_ne_static_info(ne_graph_data, ne_id):
+    """返回某 NE 的静态展示字段 dict（name/type/manufacturer/domain/...）。"""
+    cache = _NE_STATIC_CACHE.setdefault(id(ne_graph_data), {})
+    cached = cache.get(ne_id)
+    if cached is not None:
+        return cached
+    ne_graph_entry = ne_graph_data.get(ne_id, {})
+    info = {
+        "ne_graph_entry": ne_graph_entry,  # 留一份给 resolve_ne_site_context 等仍要 raw entry 的地方
+        "name": ne_graph_entry.get("name", ne_id),
+        "type": str(ne_graph_entry.get("type", "")).upper(),
+        "network_type": str(ne_graph_entry.get("network_type", "")).upper(),
+        "manufacturer": str(ne_graph_entry.get("manufacturer", "")).upper(),
+        "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
+        "domain_upper": str(ne_graph_entry.get("domain", "")).upper(),
+        "domain_raw": ne_graph_entry.get("domain", ""),
+        "site_id_from_ne": ne_graph_entry.get("site_id", ""),
+        "site_name_from_ne": ne_graph_entry.get("site_name", ""),
+    }
+    cache[ne_id] = info
+    return info
 
 
 def format_ne_link_info(ne_graph_entry, compact_output=False):
@@ -74,17 +127,57 @@ def build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache
     return link_info
 
 
-def resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data):
+# 静态 site context 缓存：当 NE 在 ne_graph 中已有 site_id 时（典型情况），
+# resolve_ne_site_context 的结果完全由 (ne_graph_data, site_graph_data, ne_id) 决定，
+# 与运行时 alarms 无关，可以一次性缓存。
+# key 用 (id(ne_graph_data), id(site_graph_data), ne_id)，不同 engine 自动隔离。
+# 内存上限：NE 数 × 引擎实例数（典型 1-2），与告警流量无关。
+_NE_STATIC_SITE_CONTEXT_SENTINEL = object()  # 表示"NE 没有静态 site_id，走慢路径"
+_NE_STATIC_SITE_CONTEXT_CACHE = {}
+
+
+def _get_static_site_context(ne_graph_data, site_graph_data, ne_id):
+    """若 NE 自身有 site_id，返回缓存的静态 site context；否则返回 None。"""
+    cache_key = (id(ne_graph_data), id(site_graph_data), ne_id)
+    cached = _NE_STATIC_SITE_CONTEXT_CACHE.get(cache_key)
+    if cached is _NE_STATIC_SITE_CONTEXT_SENTINEL:
+        return None
+    if cached is not None:
+        return cached
+
     ne_graph_entry = ne_graph_data.get(ne_id, {})
     resolved_site_id = ne_graph_entry.get("site_id", "")
+    if not resolved_site_id:
+        _NE_STATIC_SITE_CONTEXT_CACHE[cache_key] = _NE_STATIC_SITE_CONTEXT_SENTINEL
+        return None
 
+    site_graph_entry = site_graph_data.get(resolved_site_id, {})
+    result = {
+        "site_id": resolved_site_id,
+        "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
+        "site_type": ne_graph_entry.get("site_type", "") or site_graph_entry.get("site_type", ""),
+        "region_id": ne_graph_entry.get("region_id", "") or site_graph_entry.get("region_id", ""),
+        "longitude": ne_graph_entry.get("longitude", "") or site_graph_entry.get("longitude", ""),
+        "latitude": ne_graph_entry.get("latitude", "") or site_graph_entry.get("latitude", ""),
+    }
+    _NE_STATIC_SITE_CONTEXT_CACHE[cache_key] = result
+    return result
+
+
+def resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data):
+    # 快路径：NE 自身有 site_id → 与 alarms 无关，复用静态结果
+    static_ctx = _get_static_site_context(ne_graph_data, site_graph_data, ne_id)
+    if static_ctx is not None:
+        return static_ctx
+
+    # 慢路径：NE 没有静态 site_id，需要看 alarms 单点收敛
+    ne_graph_entry = ne_graph_data.get(ne_id, {})
     alarm_site_ids = sorted({
         alarm.get("site_id", "")
         for alarm in alarms
         if alarm.get("site_id")
     })
-    if not resolved_site_id and len(alarm_site_ids) == 1:
-        resolved_site_id = alarm_site_ids[0]
+    resolved_site_id = alarm_site_ids[0] if len(alarm_site_ids) == 1 else ""
 
     site_graph_entry = site_graph_data.get(resolved_site_id, {}) if resolved_site_id else {}
     return {
@@ -111,6 +204,11 @@ def build_group_output(
     ne_alarms = defaultdict(list)
     group_site_ids = set()
 
+    # per-call 本地 memoize：同一 match 内多个 symptom 常落在相同 NE / site，
+    # 用 dict 直接做内联缓存（不走 closure，避免 Python 调用开销）。
+    local_ne_static = {}
+    local_site_entry = {}
+
     for nodes in match.get("role_mapping", {}).values():
         for site_id in nodes:
             if site_id:
@@ -128,19 +226,27 @@ def build_group_output(
         ]
         representative_eid = symptom.get("eid", "") or (eid_list[0] if eid_list else "")
 
-        ne_graph_entry = ne_graph_data.get(ne_id, {})
+        ne_static = local_ne_static.get(ne_id)
+        if ne_static is None:
+            ne_static = _get_ne_static_info(ne_graph_data, ne_id)
+            local_ne_static[ne_id] = ne_static
         if site_id:
             group_site_ids.add(site_id)
-        site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
+            site_graph_entry = local_site_entry.get(site_id)
+            if site_graph_entry is None:
+                site_graph_entry = site_graph_data.get(site_id, _EMPTY_DICT)
+                local_site_entry[site_id] = site_graph_entry
+        else:
+            site_graph_entry = _EMPTY_DICT
 
         alarm_output = {
             "alarm_id": representative_eid,
             "alarm_type": symptom.get("alarm", ""),
-            "alarm_time": datetime.fromtimestamp(symptom["ts"]).strftime("%Y-%m-%d %H:%M:%S") if symptom.get("ts") is not None else "",
+            "alarm_time": _format_ts(symptom.get("ts")),
             "alarm_clear_time": symptom.get("告警清除时间", ""),
-            "domain": ne_graph_entry.get("domain", ""),
+            "domain": ne_static["domain_raw"],
             "site_id": site_id,
-            "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
+            "site_name": ne_static["site_name_from_ne"] or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
             "matched_rule": symptom.get("matched_rule", ""),
             "matched_role_key": symptom.get("matched_role_key", ""),
@@ -169,11 +275,11 @@ def build_group_output(
     group_ne_id_set = set(group_ne_ids)
 
     for ne_id in group_ne_ids:
-        ne_graph_entry = ne_graph_data.get(ne_id, {})
-        alarms = sorted(
-            ne_alarms.get(ne_id, []),
-            key=lambda alarm: (alarm.get("alarm_time", ""), alarm.get("alarm_id", ""))
-        )
+        ne_static = local_ne_static.get(ne_id)
+        if ne_static is None:
+            ne_static = _get_ne_static_info(ne_graph_data, ne_id)
+            local_ne_static[ne_id] = ne_static
+        alarms = sorted(ne_alarms.get(ne_id, []), key=_SORT_ALARM_KEY)
         site_context = resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data)
         site_id = site_context["site_id"]
         if site_id:
@@ -188,14 +294,14 @@ def build_group_output(
                 compact_output=compact_output,
             ),
             "group": group_id,
-            "name": ne_graph_entry.get("name", ne_id),
+            "name": ne_static["name"],
             "site_id": site_id,
             "site_name": site_context["site_name"],
-            "type": str(ne_graph_entry.get("type", "")).upper(),
-            "network_type": str(ne_graph_entry.get("network_type", "")).upper(),
-            "manufacturer": str(ne_graph_entry.get("manufacturer", "")).upper(),
-            "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
-            "domain": str(ne_graph_entry.get("domain", "")).upper(),
+            "type": ne_static["type"],
+            "network_type": ne_static["network_type"],
+            "manufacturer": ne_static["manufacturer"],
+            "running_status": ne_static["running_status"],
+            "domain": ne_static["domain_upper"],
             "region_id": site_context["region_id"],
             "longitude": site_context["longitude"],
             "latitude": site_context["latitude"],
@@ -310,9 +416,6 @@ def build_jsonl_match_output(
     group_anchor_ts = min(timestamps) if timestamps else None
 
     enriched_match["group_anchor_ts"] = group_anchor_ts
-    enriched_match["group_anchor_time"] = (
-        datetime.fromtimestamp(group_anchor_ts).strftime("%Y-%m-%d %H:%M:%S")
-        if group_anchor_ts is not None else ""
-    )
+    enriched_match["group_anchor_time"] = _format_ts(group_anchor_ts)
     enriched_match.update(group_output)
     return enriched_match

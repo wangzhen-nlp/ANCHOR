@@ -8,6 +8,21 @@ from fault_grouping.matching.reports import generate_incident_report
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 
 
+# orjson 比 stdlib json 在 dumps 上快约 3~5×，且默认 UTF-8 二进制输出（省去 encode）。
+# 输出格式仅差在分隔符紧凑（无空格），仍是合法 JSONL，任何 JSON 解析器都能读。
+# orjson 未安装时自动回退到 stdlib 实现。
+try:
+    import orjson
+    _ORJSON_OPTS = orjson.OPT_NON_STR_KEYS  # 容忍 dict 里非字符串 key（保持与 stdlib 行为一致）
+    _NEWLINE_BYTES = b"\n"
+
+    def _dumps_line(obj):
+        return orjson.dumps(obj, option=_ORJSON_OPTS) + _NEWLINE_BYTES
+except ImportError:
+    def _dumps_line(obj):
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 @dataclass
 class MatchOutputSession:
     args: object
@@ -48,7 +63,8 @@ class MatchOutputSession:
 
     def write_matches(self, matches):
         with self.output_lock:
-            with open(self.output_path, 'a', encoding='utf-8') as fw:
+            # 二进制 append：与 _dumps_line 的 bytes 输出对接，避免 UTF-8 编码两次。
+            with open(self.output_path, 'ab') as fw:
                 output_lines = []
                 for match in matches:
                     if self.args.verbose_groups:
@@ -63,7 +79,7 @@ class MatchOutputSession:
                         compact_output=self.args.compact_output,
                         include_eid_list=self.args.use_alarm_period_cache,
                     )
-                    output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + '\n')
+                    output_lines.append(_dumps_line(enriched_match))
                 fw.writelines(output_lines)
             self.match_count += len(matches)
             self.refresh_progress_extra_text()

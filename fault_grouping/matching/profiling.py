@@ -348,7 +348,10 @@ def enable_output_profiling(timer, output_session):
     timer.wrap_method(gob, "build_group_output", "output.build_group_output")
 
     # 2) 直接替换 write_matches，把内部 json/io/progress 拆开计时
+    # 注意：复用 group_output_session._dumps_line 以保持与生产路径完全一致
+    # （orjson 或 stdlib，取决于 orjson 是否安装），避免 profile 模式误测 stdlib。
     from fault_grouping.matching.group_output_builder import build_jsonl_match_output
+    from fault_grouping.matching.group_output_session import _dumps_line
     from fault_grouping.matching.reports import generate_incident_report
 
     def instrumented_write_matches(matches):
@@ -369,11 +372,11 @@ def enable_output_profiling(timer, output_session):
                     include_eid_list=output_session.args.use_alarm_period_cache,
                 )
                 t_d = time.perf_counter()
-                output_lines.append(json.dumps(enriched_match, ensure_ascii=False) + "\n")
+                output_lines.append(_dumps_line(enriched_match))
                 timer._record("output.json_dumps", time.perf_counter() - t_d)
 
             t_io = time.perf_counter()
-            with open(output_session.output_path, "a", encoding="utf-8") as fw:
+            with open(output_session.output_path, "ab") as fw:
                 fw.writelines(output_lines)
             timer._record("output.file_io", time.perf_counter() - t_io)
 
