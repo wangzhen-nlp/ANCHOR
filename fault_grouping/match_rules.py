@@ -195,15 +195,20 @@ def main():
         enable_engine_profiling(timer, runtime_plan.engine, runtime_plan.output_session)
         enable_output_profiling(timer, runtime_plan.output_session)
 
-    with (timer.time("pipeline.run_matching_pipeline") if timer else _NullCtx()):
-        run_matching_pipeline(
-            args,
-            runtime_plan.engine,
-            runtime_plan.alarm_load_result.valid_alarms,
-            runtime_plan.output_session,
-            runtime_plan.debug_targets,
-            runtime_plan.rules_config,
-        )
+    try:
+        with (timer.time("pipeline.run_matching_pipeline") if timer else _NullCtx()):
+            run_matching_pipeline(
+                args,
+                runtime_plan.engine,
+                runtime_plan.alarm_load_result.valid_alarms,
+                runtime_plan.output_session,
+                runtime_plan.debug_targets,
+                runtime_plan.rules_config,
+            )
+    finally:
+        # 关闭持久输出文件句柄，确保 flush 落盘；后续 ticket_recall 等读路径才能拿到完整内容。
+        runtime_plan.output_session.close()
+
     elapsed = time.time() - runtime_plan.start_time
     print_final_summary(
         args,

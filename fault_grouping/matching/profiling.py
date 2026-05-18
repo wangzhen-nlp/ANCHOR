@@ -376,8 +376,12 @@ def enable_output_profiling(timer, output_session):
                 timer._record("output.json_dumps", time.perf_counter() - t_d)
 
             t_io = time.perf_counter()
-            with open(output_session.output_path, "ab") as fw:
-                fw.writelines(output_lines)
+            fw = output_session._fw
+            if fw is None:
+                fw = open(output_session.output_path, "ab")
+                output_session._fw = fw
+            fw.writelines(output_lines)
+            fw.flush()
             timer._record("output.file_io", time.perf_counter() - t_io)
 
             output_session.match_count += len(matches)

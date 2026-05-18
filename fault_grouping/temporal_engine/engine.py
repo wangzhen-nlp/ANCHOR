@@ -456,7 +456,17 @@ class TemporalGraphEngine(
 
         # 离线模式通过事件触发收割
         if collect_matches:
-            return self._collect_pending_matches(force=False)
+            # 快路径：没有 mature pending trigger 时跳过 _collect_pending_matches，
+            # 省掉一次 lock acquire + helper 准备的开销。
+            # race 安全（仅在 live 模式的后台 harvest 线程下才有 race）：
+            #   - 假阴性（实际有 mature）→ 下一个事件会重试，最多延迟一个 ingest 周期
+            #   - 假阳性（heap 顶是 stale anchor 但满足 ts 条件）→ 落回慢路径，
+            #     _collect_mature_pending_locked 会正确丢弃 stale 项
+            heap = self.pending_trigger_heap
+            if heap:
+                effective_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
+                if heap[0][0] <= effective_ts:
+                    return self._collect_pending_matches(force=False)
 
         return []
 

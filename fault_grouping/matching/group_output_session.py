@@ -36,9 +36,36 @@ class MatchOutputSession:
     match_count: int = 0
     process_progress: object = None
     output_lock: threading.Lock = field(default_factory=threading.Lock)
+    # 持久 append-mode 文件句柄，避免每批 open+close 的 syscall 开销。
+    # reset_output_file() 截断 + 打开；close() 显式收尾。多线程下由 output_lock 保护。
+    _fw: object = field(default=None, init=False, repr=False)
 
     def reset_output_file(self):
-        with open(self.output_path, 'w', encoding='utf-8'):
+        # 先关掉旧句柄（如果有），再截断文件并打开新句柄
+        # 实际只在初始化阶段（单线程）调用，加锁是防御性写法
+        with self.output_lock:
+            self._close_fw_locked()
+            with open(self.output_path, 'wb'):
+                pass
+            self._fw = open(self.output_path, 'ab')
+
+    def close(self):
+        with self.output_lock:
+            self._close_fw_locked()
+
+    def _close_fw_locked(self):
+        fw = self._fw
+        if fw is None:
+            return
+        # 无论 flush/close 是否抛异常，都把 _fw 清空，避免下次 write 复用已损坏句柄
+        self._fw = None
+        try:
+            fw.flush()
+        except Exception:
+            pass
+        try:
+            fw.close()
+        except Exception:
             pass
 
     def build_progress_extra_text(self):
@@ -63,23 +90,27 @@ class MatchOutputSession:
 
     def write_matches(self, matches):
         with self.output_lock:
-            # 二进制 append：与 _dumps_line 的 bytes 输出对接，避免 UTF-8 编码两次。
-            with open(self.output_path, 'ab') as fw:
-                output_lines = []
-                for match in matches:
-                    if self.args.verbose_groups:
-                        generate_incident_report(match)
-                    enriched_match = build_jsonl_match_output(
-                        match,
-                        self.ne_graph_data,
-                        self.site_graph_data,
-                        self.alarm_metadata_index,
-                        site_to_ne_ids=self.site_to_ne_ids,
-                        ne_link_info_cache=self.ne_link_info_cache,
-                        compact_output=self.args.compact_output,
-                        include_eid_list=self.args.use_alarm_period_cache,
-                    )
-                    output_lines.append(_dumps_line(enriched_match))
-                fw.writelines(output_lines)
+            # 复用 reset_output_file 打开的持久 fd；fallback 仅用于异常路径（不应触达）。
+            fw = self._fw
+            if fw is None:
+                fw = open(self.output_path, 'ab')
+                self._fw = fw
+            output_lines = []
+            for match in matches:
+                if self.args.verbose_groups:
+                    generate_incident_report(match)
+                enriched_match = build_jsonl_match_output(
+                    match,
+                    self.ne_graph_data,
+                    self.site_graph_data,
+                    self.alarm_metadata_index,
+                    site_to_ne_ids=self.site_to_ne_ids,
+                    ne_link_info_cache=self.ne_link_info_cache,
+                    compact_output=self.args.compact_output,
+                    include_eid_list=self.args.use_alarm_period_cache,
+                )
+                output_lines.append(_dumps_line(enriched_match))
+            fw.writelines(output_lines)
+            fw.flush()  # 保证 ticket_recall 等下游能立刻读到最新输出
             self.match_count += len(matches)
             self.refresh_progress_extra_text()
