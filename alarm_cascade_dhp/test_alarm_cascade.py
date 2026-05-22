@@ -11,6 +11,7 @@ from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
 from alarm_cascade_dhp.run_cascades import (
+    _apply_input_mode_defaults,
     _load_sorted_events,
     _process_sorted_events,
     _resolve_groups_output,
@@ -63,6 +64,32 @@ class TopologyTests(unittest.TestCase):
 
         self.assertEqual(topology.relation(left, neighbor), "hop_1")
         self.assertEqual(topology.relation(left, disconnected), "disconnected")
+
+    def test_explicit_ne_relations_are_stricter_than_same_site_context(self):
+        topology = TopologyIndex(
+            ne_graph={
+                "ne-a": {"site_id": "site-a", "link": {"ne-b": {}}},
+                "ne-b": {"site_id": "site-a"},
+                "ne-c": {"site_id": "site-a"},
+            }
+        )
+        features = AlarmFeatureBuilder(topology=topology)
+        left = features.from_alarm_record(_alarm("a1", 10, "A", "ne-a", "site-a"))
+        linked = features.from_alarm_record(_alarm("a2", 11, "B", "ne-b", "site-a"))
+        colocated = features.from_alarm_record(_alarm("a3", 12, "C", "ne-c", "site-a"))
+
+        self.assertEqual(topology.relation(left, linked), "ne_hop_1")
+        self.assertEqual(topology.explicit_ne_relation(left, linked), "ne_hop_1")
+        self.assertEqual(topology.relation(left, colocated), "same_site")
+        self.assertEqual(topology.explicit_ne_relation(left, colocated), "")
+
+    def test_missing_topology_without_shared_domain_is_disconnected(self):
+        topology = TopologyIndex()
+        features = AlarmFeatureBuilder(topology=topology)
+        left = features.from_alarm_record(_alarm("a1", 10, "A", "ne-a", ""))
+        right = features.from_alarm_record(_alarm("a2", 11, "B", "ne-b", ""))
+
+        self.assertEqual(topology.relation(left, right), "disconnected")
 
 
 class StreamPolicyTests(unittest.TestCase):
@@ -200,6 +227,41 @@ class EngineTests(unittest.TestCase):
 
         self.assertEqual(decisions[-1].candidate_count, 2)
 
+    def test_topology_candidate_gate_requires_explicit_ne_support(self):
+        topology = TopologyIndex(
+            ne_graph={
+                "ne-a": {"site_id": "site-a", "link": {"ne-b": {}}},
+                "ne-b": {"site_id": "site-a"},
+                "ne-c": {"site_id": "site-a"},
+            }
+        )
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(
+                particle_count=1,
+                assignment_strategy="map",
+                base_intensity=0.0001,
+                active_window_sec=600,
+                cooling_after_sec=600,
+                close_after_sec=600,
+                require_topology_candidate=True,
+            ),
+            stream_config=StreamPolicyConfig(reorder_lag_sec=0),
+            topology=topology,
+        )
+
+        decisions = []
+        for event_id, ts, source in (
+            ("a1", 100, "ne-a"),
+            ("a2", 101, "ne-c"),
+            ("a3", 102, "ne-b"),
+        ):
+            decisions.extend(
+                engine.observe_alarm_record(_alarm(event_id, ts, "A", source, "site-a"))
+            )
+
+        self.assertNotEqual(decisions[0].cascade_id, decisions[1].cascade_id)
+        self.assertEqual(decisions[0].cascade_id, decisions[2].cascade_id)
+
     def test_progress_snapshot_tracks_reorder_buffer_and_cascades(self):
         engine = AlarmCascadeEngine(
             model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
@@ -322,6 +384,28 @@ class EngineTests(unittest.TestCase):
         _Args.groups_output = ""
         _Args.visual_output = ""
         self.assertEqual(_resolve_groups_output(_Args()), "decisions.groups.json")
+
+    def test_cli_reorder_default_follows_input_mode(self):
+        class _Args:
+            preserve_input_order = False
+            reorder_lag_sec = None
+
+        offline_args = _apply_input_mode_defaults(_Args())
+        self.assertEqual(offline_args.reorder_lag_sec, 0.0)
+
+        class _LiveArgs:
+            preserve_input_order = True
+            reorder_lag_sec = None
+
+        live_args = _apply_input_mode_defaults(_LiveArgs())
+        self.assertEqual(live_args.reorder_lag_sec, 300.0)
+
+        class _ExplicitArgs:
+            preserve_input_order = False
+            reorder_lag_sec = 12.0
+
+        explicit_args = _apply_input_mode_defaults(_ExplicitArgs())
+        self.assertEqual(explicit_args.reorder_lag_sec, 12.0)
 
 
 class VisualOutputTests(unittest.TestCase):

@@ -118,7 +118,7 @@ class _Cluster:
             relation = topology.relation(event, support, max_hops=config.topology_max_hops)
             base_weight = config.topology_relation_weights.get(
                 relation,
-                config.topology_relation_weights["unknown"],
+                config.topology_relation_weights["disconnected"],
             )
             relation_count = self.topology_relation_counts.get(relation, 0)
             learned_weight = (
@@ -129,6 +129,16 @@ class _Cluster:
             if affinity >= 1.0:
                 break
         return affinity if saw_relation else 1.0
+
+    def has_explicit_ne_topology(self, event, topology, config):
+        for support in reversed(self.supports[-config.max_support_events :]):
+            if topology.explicit_ne_relation(
+                event,
+                support,
+                max_hops=config.topology_max_hops,
+            ):
+                return True
+        return False
 
     def add(self, event, topology, config):
         old_supports = self.supports[-config.max_support_events :]
@@ -417,6 +427,11 @@ class TopologyPoweredDHP:
         )
 
     def _existing_cluster_proposal(self, cluster, event):
+        if (
+            self.config.require_topology_candidate
+            and not cluster.has_explicit_ne_topology(event, self.topology, self.config)
+        ):
+            return None
         time_rate = cluster.time_rate(event.ts, self.config)
         if time_rate <= 0:
             return None

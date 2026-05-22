@@ -15,21 +15,22 @@ def _iter_neighbors(raw_neighbors):
 
 
 class TopologyIndex:
-    """Small topology facade for site-hop relations and NE metadata.
+    """Topology facade for explicit NE links plus weaker site context.
 
-    The current rule pipeline already maintains a site graph and an NE graph.
-    Cascade clustering uses the site graph as an undirected affinity graph; it
-    does not require root-cause direction to cluster alarms.
+    The gateable relations come from same-NE or ne_graph link hops. Site graph
+    relations remain undirected soft affinity signals for cascade clustering.
     """
 
     def __init__(self, site_graph=None, ne_graph=None):
         self.site_graph = site_graph or {}
         self.ne_graph = ne_graph or {}
         self.adjacency = defaultdict(set)
+        self.ne_adjacency = defaultdict(set)
         self.ne_to_site = {}
         self.ne_to_domain = {}
         self.ne_to_type = {}
         self._hop_cache = {}
+        self._ne_hop_cache = {}
         self._build_site_adjacency(self.site_graph)
         self._build_ne_indexes(self.ne_graph)
 
@@ -78,6 +79,12 @@ class TopologyIndex:
                 self.ne_to_domain[ne_id] = domain
             if device_type:
                 self.ne_to_type[ne_id] = device_type
+            self.ne_adjacency.setdefault(ne_id, set())
+            for raw_neighbor in _iter_neighbors(raw_info.get("link", {})):
+                neighbor = _text(raw_neighbor)
+                if neighbor and neighbor != ne_id:
+                    self.ne_adjacency[ne_id].add(neighbor)
+                    self.ne_adjacency[neighbor].add(ne_id)
 
     def resolve_site(self, site_id="", alarm_source=""):
         return _text(site_id) or self.ne_to_site.get(_text(alarm_source), "")
@@ -89,43 +96,47 @@ class TopologyIndex:
         return self.ne_to_type.get(_text(alarm_source), _text(fallback))
 
     def hop_distance(self, left_site, right_site, max_hops=2):
-        left_site = _text(left_site)
-        right_site = _text(right_site)
-        if not left_site or not right_site:
-            return None
-        if left_site == right_site:
-            return 0
-        max_hops = max(int(max_hops), 0)
-        cache_key = (left_site, right_site, max_hops)
-        if cache_key in self._hop_cache:
-            return self._hop_cache[cache_key]
+        return _hop_distance(
+            left_site,
+            right_site,
+            self.adjacency,
+            self._hop_cache,
+            max_hops=max_hops,
+        )
 
-        queue = deque([(left_site, 0)])
-        seen = {left_site}
-        found = None
-        while queue:
-            site_id, hop = queue.popleft()
-            if hop >= max_hops:
-                continue
-            for neighbor in self.adjacency.get(site_id, ()):
-                if neighbor in seen:
-                    continue
-                next_hop = hop + 1
-                if neighbor == right_site:
-                    found = next_hop
-                    queue.clear()
-                    break
-                seen.add(neighbor)
-                queue.append((neighbor, next_hop))
-        self._hop_cache[cache_key] = found
-        self._hop_cache[(right_site, left_site, max_hops)] = found
-        return found
+    def ne_hop_distance(self, left_ne, right_ne, max_hops=2):
+        return _hop_distance(
+            left_ne,
+            right_ne,
+            self.ne_adjacency,
+            self._ne_hop_cache,
+            max_hops=max_hops,
+        )
 
-    def relation(self, left_event, right_event, max_hops=2):
+    def explicit_ne_relation(self, left_event, right_event, max_hops=2):
+        """Return only same-NE or explicit ne_graph link relations."""
         left_source = _text(left_event.alarm_source)
         right_source = _text(right_event.alarm_source)
         if left_source and left_source == right_source:
             return "same_device"
+
+        hop = self.ne_hop_distance(left_source, right_source, max_hops=max_hops)
+        if hop == 1:
+            return "ne_hop_1"
+        if hop == 2:
+            return "ne_hop_2"
+        if hop is not None:
+            return "ne_hop_far"
+        return ""
+
+    def relation(self, left_event, right_event, max_hops=2):
+        explicit_relation = self.explicit_ne_relation(
+            left_event,
+            right_event,
+            max_hops=max_hops,
+        )
+        if explicit_relation:
+            return explicit_relation
 
         left_site = _text(left_event.site_id)
         right_site = _text(right_event.site_id)
@@ -140,12 +151,13 @@ class TopologyIndex:
         if hop is not None:
             return "hop_far"
 
+        if left_site and right_site:
+            return "disconnected"
+
         left_domain = _text(left_event.device_domain)
         right_domain = _text(right_event.device_domain)
         if left_domain and left_domain == right_domain:
             return "same_domain"
-        if not left_site or not right_site:
-            return "unknown"
         return "disconnected"
 
     def content_context_tokens(self, site_id, alarm_source, max_hops=1, limit=16):
@@ -185,6 +197,40 @@ class TopologyIndex:
                     break
                 queue.append((neighbor, next_hop))
         return tokens
+
+
+def _hop_distance(left, right, adjacency, cache, max_hops=2):
+    left = _text(left)
+    right = _text(right)
+    if not left or not right:
+        return None
+    if left == right:
+        return 0
+    max_hops = max(int(max_hops), 0)
+    cache_key = (left, right, max_hops)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    queue = deque([(left, 0)])
+    seen = {left}
+    found = None
+    while queue:
+        item, hop = queue.popleft()
+        if hop >= max_hops:
+            continue
+        for neighbor in adjacency.get(item, ()):
+            if neighbor in seen:
+                continue
+            next_hop = hop + 1
+            if neighbor == right:
+                found = next_hop
+                queue.clear()
+                break
+            seen.add(neighbor)
+            queue.append((neighbor, next_hop))
+    cache[cache_key] = found
+    cache[(right, left, max_hops)] = found
+    return found
 
 
 def _load_json_if_present(path):

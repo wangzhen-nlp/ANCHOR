@@ -5,12 +5,15 @@ def _relation_weights():
     # Weights are priors for online cluster-local topology affinities.
     return {
         "same_device": 1.0,
-        "same_site": 0.92,
+        "ne_hop_1": 0.92,
+        "ne_hop_2": 0.72,
+        "ne_hop_far": 0.48,
+        # Site/domain fallbacks stay soft when the NE graph has no support.
+        "same_site": 0.64,
         "hop_1": 0.72,
         "hop_2": 0.48,
         "hop_far": 0.28,
-        "same_domain": 0.40,
-        "unknown": 0.82,
+        "same_domain": 0.32,
         "disconnected": 0.12,
     }
 
@@ -41,6 +44,7 @@ class AlarmDHPConfig:
     topology_strength: float = 1.0
     topology_prior_mass: float = 3.0
     topology_max_hops: int = 2
+    require_topology_candidate: bool = False
     topology_context_hops: int = 1
     topology_context_limit: int = 16
     topology_relation_weights: dict = field(default_factory=_relation_weights)
@@ -66,6 +70,8 @@ class AlarmDHPConfig:
             raise ValueError("active and close windows must be positive")
         if self.max_candidate_cascades < 0:
             raise ValueError("max_candidate_cascades must be non-negative")
+        if self.topology_max_hops < 0:
+            raise ValueError("topology_max_hops must be non-negative")
 
 
 @dataclass

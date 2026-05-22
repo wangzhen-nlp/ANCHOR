@@ -18,6 +18,10 @@ from alarm_tools.progress_utils import ProgressBar
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON
 
 
+_OFFLINE_REORDER_LAG_SEC = 0.0
+_LIVE_REORDER_LAG_SEC = 300.0
+
+
 def _build_arg_parser():
     parser = ArgumentParser(
         description="Cluster streaming alarms into topology-aware powered-DHP cascades."
@@ -87,6 +91,17 @@ def _build_arg_parser():
         help="multiplier for explicit topology affinity",
     )
     parser.add_argument(
+        "--topology-max-hops",
+        type=int,
+        default=2,
+        help="maximum explicit NE/site topology hops scored for an alarm",
+    )
+    parser.add_argument(
+        "--require-topology-candidate",
+        action="store_true",
+        help="let existing cascades compete only when same-NE or ne_graph links support them",
+    )
+    parser.add_argument(
         "--active-window-sec",
         type=float,
         default=7200.0,
@@ -113,8 +128,8 @@ def _build_arg_parser():
     parser.add_argument(
         "--reorder-lag-sec",
         type=float,
-        default=300.0,
-        help="event-time reorder buffer lag",
+        default=None,
+        help="event-time reorder buffer lag; default: 0 after offline sorting, 300 with --preserve-input-order",
     )
     parser.add_argument(
         "--late-tolerance-sec",
@@ -170,6 +185,8 @@ def _build_engine(args):
         base_intensity=args.base_intensity,
         time_power=args.time_power,
         topology_strength=args.topology_strength,
+        topology_max_hops=args.topology_max_hops,
+        require_topology_candidate=args.require_topology_candidate,
         active_window_sec=args.active_window_sec,
         cooling_after_sec=args.cooling_after_sec,
         close_after_sec=args.close_after_sec,
@@ -189,6 +206,16 @@ def _build_engine(args):
         model_config=model_config,
         stream_config=stream_config,
     )
+
+
+def _apply_input_mode_defaults(args):
+    if args.reorder_lag_sec is None:
+        args.reorder_lag_sec = (
+            _LIVE_REORDER_LAG_SEC
+            if args.preserve_input_order
+            else _OFFLINE_REORDER_LAG_SEC
+        )
+    return args
 
 
 def _write_decisions(handle, decisions, counts, timer=None, debug_skips=False):
@@ -273,8 +300,11 @@ def _print_run_configuration(args):
         f"particles={args.particles}, "
         f"assignment={args.assignment}, "
         f"time_power={args.time_power:g}, "
-        f"topology_strength={args.topology_strength:g}"
+        f"topology_strength={args.topology_strength:g}, "
+        f"topology_max_hops={args.topology_max_hops}"
     )
+    if args.require_topology_candidate:
+        print("拓扑候选 gate: 开启，仅同 NE 或 ne_graph 明确可达设备簇可参与已有 cascade 打分")
     candidate_limit = (
         "不限制"
         if args.max_candidate_cascades == 0
@@ -459,7 +489,7 @@ def _emit_remaining_visual_output(visual_output, engine, decisions, timer=None):
 
 def main():
     parser = _build_arg_parser()
-    args = parser.parse_args()
+    args = _apply_input_mode_defaults(parser.parse_args())
     groups_output = _resolve_groups_output(args)
     timer = PhaseTimer() if args.profile else None
     if timer is not None:

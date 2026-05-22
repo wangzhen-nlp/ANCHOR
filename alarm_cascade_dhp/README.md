@@ -18,8 +18,9 @@ root-cause direction or a learned propagation graph.
 4. `topology.py` exposes baseline topology tokens such as site/device/hop
    context, so topology is present in DHP content likelihoods.
 5. `model.py` also multiplies candidate cluster scores by an explicit
-   cluster-local topology affinity over same-device, same-site, hop, domain,
-   unknown, and disconnected relations.
+   cluster-local topology affinity. NE links from `ne_graph` have strict
+   `ne_hop_*` relations; same-site, site-hop, domain, and disconnected
+   relations remain softer fallbacks.
 6. `time_power` in `AlarmDHPConfig` and the CLI is the PDHP-style powered
    temporal prior for existing cascade intensities.
 
@@ -90,13 +91,16 @@ view should also include other devices at the cascade sites.
 The CLI reads the same raw CSV, JSONL, ZIP, or directory inputs supported by
 `alarm_tools.alarm_inputs`. File inputs are loaded and sorted by event time by
 default before they are pushed through the same online engine, matching the
-offline ordering expectation of `fault_grouping.match_rules`. Pass
+offline ordering expectation of `fault_grouping.match_rules`. Offline sorted
+runs use `reorder_lag_sec=0` by default, so sorted events enter clustering
+without an extra watermark delay. Pass
 `--preserve-input-order` only when the source order is already a real live
 stream and bounded disorder should be handled by the reorder buffer through
-`--reorder-lag-sec`; very late live records are surfaced as `skipped`
-decisions. The default offline loading path shows source-file read progress
-while it builds sortable cascade events; `--show-progress` enables the same
-source read display for `--preserve-input-order`.
+`--reorder-lag-sec`; that live path defaults to a 300-second reorder lag, and
+very late live records are surfaced as `skipped` decisions. The default offline
+loading path shows source-file read progress while it builds sortable cascade
+events; `--show-progress` enables the same source read display for
+`--preserve-input-order`.
 While the stream runs, the CLI prints a processing progress line with read
 alarm count, clustered/clear/skipped decisions, current cascade count, and
 reorder-buffer depth. It prints a flush message and a final run summary after
@@ -126,5 +130,9 @@ when one exists.
   from measured alarm delay distributions.
 - Tune `--topology-strength` down if the topology graph has many missing or
   noisy links.
+- Pass `--require-topology-candidate` when an existing cascade should compete
+  only if the new alarm shares the same NE or reaches one of the cascade's
+  recent alarms through `ne_graph.link` within `--topology-max-hops`. Same site,
+  site graph hop, same domain, and disconnected relations do not pass that gate.
 - Keep `--assignment map` for reproducible evaluation. Use particles with the
   default sampled assignment for online uncertainty experiments.
