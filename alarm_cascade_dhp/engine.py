@@ -3,7 +3,7 @@ from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.model import TopologyPoweredDHP
 from alarm_cascade_dhp.streaming import AlarmStreamSanitizer
 from alarm_cascade_dhp.topology import TopologyIndex
-from alarm_cascade_dhp.types import CascadeDecision
+from alarm_cascade_dhp.event_types import CascadeDecision
 
 
 class AlarmCascadeEngine:

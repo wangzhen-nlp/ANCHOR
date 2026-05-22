@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import datetime
 from itertools import count
 
-from alarm_cascade_dhp.types import AlarmEvent
+from alarm_cascade_dhp.event_types import AlarmEvent
 
 
 _TITLE_PIECES = re.compile(r"[A-Za-z0-9_.:/-]+|[\u4e00-\u9fff]+")

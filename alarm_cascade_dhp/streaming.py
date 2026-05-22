@@ -1,7 +1,7 @@
 import heapq
 
 from alarm_cascade_dhp.config import StreamPolicyConfig
-from alarm_cascade_dhp.types import SanitizedEvent
+from alarm_cascade_dhp.event_types import SanitizedEvent
 
 
 class AlarmStreamSanitizer:

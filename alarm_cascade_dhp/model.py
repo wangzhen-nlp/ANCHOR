@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from alarm_cascade_dhp.config import AlarmDHPConfig
 from alarm_cascade_dhp.topology import TopologyIndex
-from alarm_cascade_dhp.types import CascadeDecision
+from alarm_cascade_dhp.event_types import CascadeDecision
 
 
 @dataclass
