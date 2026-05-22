@@ -12,6 +12,7 @@ from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
 from alarm_cascade_dhp.run_cascades import (
     _load_sorted_events,
+    _process_sorted_events,
     _resolve_groups_output,
     _write_decisions,
 )
@@ -251,6 +252,34 @@ class EngineTests(unittest.TestCase):
         self.assertIn("duplicate_raise_compressed", debug_line)
         self.assertIn('"role": "previous_raise"', debug_line)
         self.assertIn('"event_id": "a1"', debug_line)
+
+    def test_sorted_processing_accepts_debug_skip_flag(self):
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
+            stream_config=StreamPolicyConfig(
+                reorder_lag_sec=0,
+                duplicate_window_sec=10,
+                debug_skips=True,
+            ),
+        )
+        events = [
+            engine.features.from_alarm_record(_alarm("a1", 100, "A", "ne-a", "site-a")),
+            engine.features.from_alarm_record(_alarm("a2", 101, "A", "ne-a", "site-a")),
+        ]
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            processed = _process_sorted_events(
+                events,
+                engine,
+                io.StringIO(),
+                {},
+                timer=None,
+                debug_skips=True,
+            )
+
+        self.assertEqual(processed, 2)
+        self.assertIn("duplicate_raise_compressed", stdout.getvalue())
 
     def test_cli_event_loader_sorts_raw_alarm_records_by_event_time(self):
         class _Args:

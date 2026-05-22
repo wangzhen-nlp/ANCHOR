@@ -393,7 +393,15 @@ def _process_alarm_records(args, engine, output_handle, counts, timer, visual_ou
     return processed_count
 
 
-def _process_sorted_events(events, engine, output_handle, counts, timer, visual_output=None):
+def _process_sorted_events(
+    events,
+    engine,
+    output_handle,
+    counts,
+    timer,
+    visual_output=None,
+    debug_skips=False,
+):
     processed_count = 0
     process_progress = _StreamProcessProgress(total=len(events))
     process_progress.refresh(processed_count, engine, counts, force=True)
@@ -406,7 +414,7 @@ def _process_sorted_events(events, engine, output_handle, counts, timer, visual_
                     decisions,
                     counts,
                     timer=timer,
-                    debug_skips=args.debug_skips,
+                    debug_skips=debug_skips,
                 )
                 _emit_closed_visual_output(
                     visual_output,
@@ -499,6 +507,7 @@ def main():
                     counts,
                     timer,
                     visual_output=visual_output,
+                    debug_skips=args.debug_skips,
                 )
 
             print("⏳ 数据流读取完毕，正在清空乱序缓冲并输出剩余 cascade 决策...")
