@@ -123,7 +123,7 @@ def _build_arg_parser():
     parser.add_argument(
         "--show-progress",
         action="store_true",
-        help="show source file read progress",
+        help="show source file read progress in --preserve-input-order mode; offline sorting shows it by default",
     )
     parser.add_argument(
         "--preserve-input-order",
@@ -280,8 +280,10 @@ def _next_alarm(alarm_stream, timer):
         return next(alarm_stream)
 
 
-def _iter_input_alarm_records(args, timer):
-    alarm_stream = iter(stream_alarm_inputs(args.alarms, show_progress=args.show_progress))
+def _iter_input_alarm_records(args, timer, show_progress=None):
+    if show_progress is None:
+        show_progress = args.show_progress
+    alarm_stream = iter(stream_alarm_inputs(args.alarms, show_progress=show_progress))
     while True:
         try:
             yield _next_alarm(alarm_stream, timer)
@@ -293,7 +295,7 @@ def _load_sorted_events(args, engine, timer=None):
     print("⏳ 正在加载告警并构造 cascade 事件...")
     events = []
     with _time_phase(timer, "input.load_events"):
-        for alarm in _iter_input_alarm_records(args, timer):
+        for alarm in _iter_input_alarm_records(args, timer, show_progress=True):
             events.append(engine.features.from_alarm_record(alarm))
 
     print("⏳ 正在按事件时间排序 cascade 告警...")

@@ -82,7 +82,9 @@ offline ordering expectation of `fault_grouping.match_rules`. Pass
 `--preserve-input-order` only when the source order is already a real live
 stream and bounded disorder should be handled by the reorder buffer through
 `--reorder-lag-sec`; very late live records are surfaced as `skipped`
-decisions.
+decisions. The default offline loading path shows source-file read progress
+while it builds sortable cascade events; `--show-progress` enables the same
+source read display for `--preserve-input-order`.
 While the stream runs, the CLI prints a processing progress line with read
 alarm count, clustered/clear/skipped decisions, current cascade count, and
 reorder-buffer depth. It prints a flush message and a final run summary after
