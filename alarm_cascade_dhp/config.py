@@ -28,7 +28,7 @@ class AlarmDHPConfig:
 
     particle_count: int = 4
     seed: int = 1024
-    assignment_strategy: str = "sample"
+    assignment_strategy: str = "map"
     theta0: float = 0.08
     base_intensity: float = 0.0001
     time_power: float = 1.0

@@ -75,7 +75,7 @@ def _build_arg_parser():
     parser.add_argument(
         "--assignment",
         choices=("sample", "map"),
-        default="sample",
+        default="map",
         help="sample particles online or use MAP assignment",
     )
     parser.add_argument(

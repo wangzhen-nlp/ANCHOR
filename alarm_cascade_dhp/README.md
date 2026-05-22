@@ -134,5 +134,5 @@ when one exists.
   only if the new alarm shares the same NE or reaches one of the cascade's
   recent alarms through `ne_graph.link` within `--topology-max-hops`. Same site,
   site graph hop, same domain, and disconnected relations do not pass that gate.
-- Keep `--assignment map` for reproducible evaluation. Use particles with the
-  default sampled assignment for online uncertainty experiments.
+- MAP assignment is the default for reproducible clustering and tuning. Pass
+  `--assignment sample` for particle-sampled online uncertainty experiments.

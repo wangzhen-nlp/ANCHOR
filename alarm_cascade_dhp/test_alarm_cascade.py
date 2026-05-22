@@ -153,6 +153,9 @@ class StreamPolicyTests(unittest.TestCase):
 
 
 class EngineTests(unittest.TestCase):
+    def test_default_assignment_is_map(self):
+        self.assertEqual(AlarmDHPConfig().assignment_strategy, "map")
+
     def test_engine_clusters_related_match_rules_items_and_splits_far_alarm(self):
         topology = TopologyIndex(site_graph={"site-a": ["site-b"], "site-c": []})
         engine = AlarmCascadeEngine(
