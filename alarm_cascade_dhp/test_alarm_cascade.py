@@ -1,12 +1,17 @@
+import json
+import tempfile
 import unittest
+
+from pathlib import Path
 
 from alarm_cascade_dhp.config import AlarmDHPConfig, StreamPolicyConfig
 from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
-from alarm_cascade_dhp.run_cascades import _load_sorted_events
+from alarm_cascade_dhp.run_cascades import _load_sorted_events, _resolve_groups_output
 from alarm_cascade_dhp.streaming import AlarmStreamSanitizer
 from alarm_cascade_dhp.topology import TopologyIndex
+from alarm_cascade_dhp.visual_output import CascadeVisualOutputSession
 
 
 def _alarm(event_id, ts, title, source, site, **extra):
@@ -226,6 +231,88 @@ class EngineTests(unittest.TestCase):
             events = _load_sorted_events(_Args(), engine)
 
         self.assertEqual([event.event_id for event in events], ["a1", "a2", "a3"])
+
+    def test_visual_output_disables_implicit_group_snapshot(self):
+        class _Args:
+            output = "decisions.jsonl"
+            groups_output = ""
+            visual_output = "groups.jsonl"
+
+        self.assertEqual(_resolve_groups_output(_Args()), "")
+
+        _Args.groups_output = "snapshots.json"
+        self.assertEqual(_resolve_groups_output(_Args()), "snapshots.json")
+
+        _Args.groups_output = ""
+        _Args.visual_output = ""
+        self.assertEqual(_resolve_groups_output(_Args()), "decisions.groups.json")
+
+
+class VisualOutputTests(unittest.TestCase):
+    def test_closed_visual_output_is_match_rules_compatible_and_written_once(self):
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(
+                particle_count=1,
+                assignment_strategy="map",
+                close_after_sec=10,
+            ),
+            stream_config=StreamPolicyConfig(reorder_lag_sec=0),
+        )
+        engine.observe_alarm_record(
+            _alarm("a1", 100, "链路中断", "ne-a", "site-a", **{"工单号": "ticket-a"})
+        )
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            output_path = Path(output_dir) / "cascade_visual.jsonl"
+            session = CascadeVisualOutputSession(
+                output_path,
+                ne_graph_data={"ne-a": {"site_id": "site-a", "name": "NE A"}},
+                site_graph_data={"site-a": {"site_name": "Site A"}},
+            )
+            session.reset_output_file()
+
+            self.assertEqual(session.emit_closed(engine, now_ts=105), 0)
+            self.assertEqual(session.emit_closed(engine, now_ts=120), 1)
+            self.assertEqual(session.emit_closed(engine, now_ts=120), 0)
+            session.close()
+
+            records = [
+                json.loads(line)
+                for line in output_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["uuid"], "cascade-1")
+        self.assertEqual(record["symptoms"][0]["eid"], "a1")
+        self.assertEqual(record["symptoms"][0]["工单号"], "ticket-a")
+        self.assertEqual(record["match_info"]["uuid"], "cascade-1")
+        self.assertIn("cascade-1", record["group_info"])
+        self.assertIn("ne-a", record["ne_info"])
+        self.assertEqual(record["cascade_info"]["finalization_reason"], "closed")
+
+    def test_stream_end_visual_output_emits_unclosed_cascades(self):
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
+            stream_config=StreamPolicyConfig(reorder_lag_sec=0),
+        )
+        engine.observe_alarm_record(_alarm("a1", 100, "A", "ne-a", "site-a"))
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            output_path = Path(output_dir) / "cascade_visual.jsonl"
+            session = CascadeVisualOutputSession(
+                output_path,
+                ne_graph_data={"ne-a": {"site_id": "site-a"}},
+                site_graph_data={"site-a": {}},
+            )
+            session.reset_output_file()
+
+            self.assertEqual(session.emit_remaining(engine), 1)
+            session.close()
+            record = json.loads(output_path.read_text(encoding="utf-8").strip())
+
+        self.assertEqual(record["cascade_info"]["state"], "active")
+        self.assertEqual(record["cascade_info"]["finalization_reason"], "stream_end")
 
 
 if __name__ == "__main__":

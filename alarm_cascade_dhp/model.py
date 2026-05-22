@@ -53,6 +53,7 @@ class _Cluster:
     total_feature_count: int = 0
     supports: list = field(default_factory=list)
     event_ids: list = field(default_factory=list)
+    visual_symptoms: list = field(default_factory=list)
     alarm_titles: Counter = field(default_factory=Counter)
     sites: Counter = field(default_factory=Counter)
     alarm_sources: Counter = field(default_factory=Counter)
@@ -136,6 +137,7 @@ class _Cluster:
         self.feature_counts.update(event.feature_counts)
         self.total_feature_count += sum(event.feature_counts.values())
         self.event_ids.append(event.event_id)
+        self.visual_symptoms.append(_visual_symptom(event))
         if event.alarm_title:
             self.alarm_titles[event.alarm_title] += 1
         if event.site_id:
@@ -175,6 +177,29 @@ class _Cluster:
             ],
             "time_kernel_weights": self.kernel_weights(),
             "topology_relation_counts": dict(self.topology_relation_counts),
+        }
+
+    def visual_match(self, now_ts, config):
+        state = self.state_at(now_ts, config)
+        return {
+            "uuid": self.cascade_id,
+            "rule": "alarm_cascade_dhp",
+            "merged_rules": [],
+            "related_group_uuids": [],
+            "inferred_roots": {},
+            "role_mapping": {"cascade": [name for name, _ in self.sites.most_common()]},
+            "symptoms": [dict(symptom) for symptom in self.visual_symptoms],
+            "cascade_info": {
+                "cascade_id": self.cascade_id,
+                "state": state,
+                "created_ts": self.created_ts,
+                "last_ts": self.last_ts,
+                "event_count": len(self.event_ids),
+                "active_alarm_key_count": sum(self.active_event_keys.values()),
+                "alarm_titles": [name for name, _ in self.alarm_titles.most_common()],
+                "alarm_sources": [name for name, _ in self.alarm_sources.most_common()],
+                "sites": [name for name, _ in self.sites.most_common()],
+            },
         }
 
     def _update_time_kernel(self, event, old_supports, config):
@@ -273,6 +298,7 @@ class TopologyPoweredDHP:
         return decision
 
     def observe_clear(self, event):
+        self.last_ts = max(self.last_ts, event.ts)
         cleared_by_particle = []
         for particle in self.particles:
             cleared = [
@@ -296,6 +322,19 @@ class TopologyPoweredDHP:
             best.clusters[cascade_id].snapshot(now_ts, self.config)
             for cascade_id in sorted(best.clusters, key=_cascade_sort_key)
         ]
+
+    def cascade_visual_matches(self, now_ts=None, states=None):
+        now_ts = self.last_ts if now_ts is None else now_ts
+        best = self._best_particle()
+        allowed_states = set(states) if states is not None else None
+        visual_matches = []
+        for cascade_id in sorted(best.clusters, key=_cascade_sort_key):
+            cluster = best.clusters[cascade_id]
+            state = cluster.state_at(now_ts, self.config)
+            if allowed_states is not None and state not in allowed_states:
+                continue
+            visual_matches.append(cluster.visual_match(now_ts, self.config))
+        return visual_matches
 
     def cascade_count(self):
         return len(self._best_particle().clusters)
@@ -467,3 +506,19 @@ def _cascade_sort_key(cascade_id):
         return int(str(cascade_id).rsplit("-", 1)[1])
     except (IndexError, ValueError):
         return str(cascade_id)
+
+
+def _visual_symptom(event):
+    symptom = {
+        "eid": event.event_id,
+        "ts": event.ts,
+        "node": event.site_id,
+        "alarm": event.alarm_title,
+        "alarm_source": event.alarm_source,
+    }
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    for field_name in ("工单号", "故障组ID", "告警清除时间"):
+        value = raw.get(field_name)
+        if value not in (None, ""):
+            symptom[field_name] = value
+    return symptom

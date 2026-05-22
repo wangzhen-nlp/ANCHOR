@@ -59,6 +59,9 @@ class AlarmCascadeEngine:
     def cascade_snapshots(self, now_ts=None):
         return self.model.cascade_snapshots(now_ts=now_ts)
 
+    def cascade_visual_matches(self, now_ts=None, states=None):
+        return self.model.cascade_visual_matches(now_ts=now_ts, states=states)
+
     def progress_snapshot(self):
         return {
             "cascade_count": self.model.cascade_count(),

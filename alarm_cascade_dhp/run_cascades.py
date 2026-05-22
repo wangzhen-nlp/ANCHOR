@@ -12,9 +12,10 @@ if __package__ in (None, ""):
 from alarm_cascade_dhp.config import AlarmDHPConfig, StreamPolicyConfig
 from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
+from alarm_cascade_dhp.visual_output import CascadeVisualOutputSession
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from alarm_tools.progress_utils import ProgressBar
-from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON
 
 
 def _build_arg_parser():
@@ -27,7 +28,13 @@ def _build_arg_parser():
         "--groups-output",
         type=str,
         default="",
-        help="final cascade snapshot JSON; default: <output>.groups.json",
+        help="final cascade snapshot JSON; default: replace output suffix with .groups.json unless --visual-output is set",
+    )
+    parser.add_argument(
+        "--visual-output",
+        type=str,
+        default="",
+        help="finalized cascade JSONL for the fault group browser and propagation visualizer",
     )
     parser.add_argument(
         "--topo",
@@ -40,6 +47,12 @@ def _build_arg_parser():
         type=str,
         default=NE_GRAPH_JSON,
         help="NE metadata JSON used to resolve source site/domain/type",
+    )
+    parser.add_argument(
+        "--site-graph",
+        type=str,
+        default=SITE_GRAPH_JSON,
+        help="site metadata JSON used by --visual-output",
     )
     parser.add_argument("--particles", type=int, default=4, help="particle count")
     parser.add_argument("--seed", type=int, default=1024, help="random seed")
@@ -173,6 +186,14 @@ def _write_decisions(handle, decisions, counts, timer=None):
         return _write_decisions_now(handle, decisions, counts)
 
 
+def _resolve_groups_output(args):
+    if args.groups_output:
+        return args.groups_output
+    if args.visual_output:
+        return ""
+    return str(Path(args.output).with_suffix(".groups.json"))
+
+
 def _write_decisions_now(handle, decisions, counts):
     for decision in decisions:
         payload = decision.to_dict()
@@ -257,6 +278,8 @@ def _print_run_configuration(args):
     )
     if args.profile:
         print("性能分析: 开启，结束后打印主要阶段累计耗时")
+    if args.visual_output:
+        print("可视化输出: cascade 关闭时写 JSONL，输入结束时补写仍未关闭的 cascade")
 
 
 def _time_phase(timer, phase_name):
@@ -305,17 +328,19 @@ def _load_sorted_events(args, engine, timer=None):
     return events
 
 
-def _process_alarm_records(args, engine, output_handle, counts, timer):
+def _process_alarm_records(args, engine, output_handle, counts, timer, visual_output=None):
     processed_count = 0
     process_progress = _StreamProcessProgress()
     process_progress.refresh(processed_count, engine, counts, force=True)
     try:
         with _time_phase(timer, "pipeline.process_stream"):
             for alarm in _iter_input_alarm_records(args, timer):
-                _write_decisions(
-                    output_handle,
-                    engine.observe(alarm),
-                    counts,
+                decisions = engine.observe(alarm)
+                _write_decisions(output_handle, decisions, counts, timer=timer)
+                _emit_closed_visual_output(
+                    visual_output,
+                    engine,
+                    decisions,
                     timer=timer,
                 )
                 processed_count += 1
@@ -326,17 +351,19 @@ def _process_alarm_records(args, engine, output_handle, counts, timer):
     return processed_count
 
 
-def _process_sorted_events(events, engine, output_handle, counts, timer):
+def _process_sorted_events(events, engine, output_handle, counts, timer, visual_output=None):
     processed_count = 0
     process_progress = _StreamProcessProgress(total=len(events))
     process_progress.refresh(processed_count, engine, counts, force=True)
     try:
         with _time_phase(timer, "pipeline.process_stream"):
             for event in events:
-                _write_decisions(
-                    output_handle,
-                    engine.observe_event(event),
-                    counts,
+                decisions = engine.observe_event(event)
+                _write_decisions(output_handle, decisions, counts, timer=timer)
+                _emit_closed_visual_output(
+                    visual_output,
+                    engine,
+                    decisions,
                     timer=timer,
                 )
                 processed_count += 1
@@ -347,64 +374,116 @@ def _process_sorted_events(events, engine, output_handle, counts, timer):
     return processed_count
 
 
+def _decision_now_ts(engine, decisions):
+    now_ts = engine.model.last_ts
+    for decision in decisions:
+        now_ts = max(now_ts, decision.event.ts)
+    return now_ts
+
+
+def _emit_closed_visual_output(visual_output, engine, decisions, timer=None):
+    if visual_output is None or not decisions:
+        return 0
+    with _time_phase(timer, "output.write_visual_groups"):
+        return visual_output.emit_closed(
+            engine,
+            now_ts=_decision_now_ts(engine, decisions),
+        )
+
+
+def _emit_remaining_visual_output(visual_output, engine, decisions, timer=None):
+    if visual_output is None:
+        return 0
+    with _time_phase(timer, "output.write_visual_groups"):
+        return visual_output.emit_remaining(
+            engine,
+            now_ts=_decision_now_ts(engine, decisions),
+        )
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
-    groups_output = args.groups_output or f"{args.output}.groups.json"
+    groups_output = _resolve_groups_output(args)
     timer = PhaseTimer() if args.profile else None
     if timer is not None:
         timer.mark_wall_start()
     _print_run_configuration(args)
     with _time_phase(timer, "init.build_engine"):
         engine = _build_engine(args)
+    visual_output = None
+    if args.visual_output:
+        with _time_phase(timer, "init.build_visual_output"):
+            visual_output = CascadeVisualOutputSession.from_files(
+                args.visual_output,
+                args.ne_graph,
+                args.site_graph,
+            )
+            visual_output.reset_output_file()
     if timer is not None:
         enable_engine_profiling(timer, engine)
     counts = {}
     start_time = time.time()
     sorted_events = None
-    if not args.preserve_input_order:
-        sorted_events = _load_sorted_events(args, engine, timer=timer)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as output_handle:
-        if sorted_events is None:
-            processed_count = _process_alarm_records(
-                args,
-                engine,
-                output_handle,
-                counts,
-                timer,
-            )
-        else:
-            processed_count = _process_sorted_events(
-                sorted_events,
-                engine,
-                output_handle,
-                counts,
-                timer,
-            )
+    try:
+        if not args.preserve_input_order:
+            sorted_events = _load_sorted_events(args, engine, timer=timer)
 
-        print("⏳ 数据流读取完毕，正在清空乱序缓冲并输出剩余 cascade 决策...")
-        with _time_phase(timer, "pipeline.flush"):
-            _write_decisions(output_handle, engine.flush(), counts, timer=timer)
+        with output_path.open("w", encoding="utf-8") as output_handle:
+            if sorted_events is None:
+                processed_count = _process_alarm_records(
+                    args,
+                    engine,
+                    output_handle,
+                    counts,
+                    timer,
+                    visual_output=visual_output,
+                )
+            else:
+                processed_count = _process_sorted_events(
+                    sorted_events,
+                    engine,
+                    output_handle,
+                    counts,
+                    timer,
+                    visual_output=visual_output,
+                )
 
-    group_path = Path(groups_output)
-    group_path.parent.mkdir(parents=True, exist_ok=True)
-    with _time_phase(timer, "output.write_groups"):
-        snapshots = engine.cascade_snapshots()
-        with group_path.open("w", encoding="utf-8") as group_handle:
-            json.dump(
-                {
-                    "decision_counts": counts,
-                    "cascade_count": len(snapshots),
-                    "cascades": snapshots,
-                },
-                group_handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-            group_handle.write("\n")
+            print("⏳ 数据流读取完毕，正在清空乱序缓冲并输出剩余 cascade 决策...")
+            with _time_phase(timer, "pipeline.flush"):
+                flush_decisions = engine.flush()
+                _write_decisions(output_handle, flush_decisions, counts, timer=timer)
+                _emit_remaining_visual_output(
+                    visual_output,
+                    engine,
+                    flush_decisions,
+                    timer=timer,
+                )
+    finally:
+        if visual_output is not None:
+            visual_output.close()
+
+    snapshots = engine.cascade_snapshots()
+    group_path = None
+    if groups_output:
+        group_path = Path(groups_output)
+        group_path.parent.mkdir(parents=True, exist_ok=True)
+        with _time_phase(timer, "output.write_groups"):
+            with group_path.open("w", encoding="utf-8") as group_handle:
+                json.dump(
+                    {
+                        "decision_counts": counts,
+                        "cascade_count": len(snapshots),
+                        "cascades": snapshots,
+                    },
+                    group_handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                group_handle.write("\n")
 
     elapsed = time.time() - start_time
     print(
@@ -416,7 +495,10 @@ def main():
         f"耗时 {elapsed:.4f} 秒。"
     )
     print(f"决策输出: {output_path}")
-    print(f"cascade 输出: {group_path}")
+    if group_path is not None:
+        print(f"cascade 输出: {group_path}")
+    if visual_output is not None:
+        print(f"可视化输出: {visual_output.output_path} ({visual_output.emitted_count} 个 cascade)")
     if timer is not None:
         timer.mark_wall_end()
         timer.print_summary()

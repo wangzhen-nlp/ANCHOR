@@ -67,13 +67,22 @@ python3 -m alarm_cascade_dhp.run_cascades \
   output/cascade_decisions.jsonl \
   --topo topology_resources/site_graph_by_ne.json \
   --ne-graph topology_resources/ne_graph.json \
+  --visual-output output/cascade_visual_groups.jsonl \
   --time-power 1.4 \
   --assignment map
 ```
 
 The decisions JSONL records clustered raises, clear controls, and stream-policy
 skips. The final group snapshot defaults to
-`output/cascade_decisions.jsonl.groups.json`.
+`output/cascade_decisions.groups.json` unless `--visual-output` is set.
+Pass `--groups-output` explicitly when both snapshot JSON and visual JSONL are
+needed.
+When `--visual-output` is set, the CLI also writes match_rules-compatible
+group JSONL for `visualization/fault_group_browser.html` and
+`visualization/ne_propagation_visualizer.html`. Closed cascades are appended
+while the stream runs; cascades still active when the input ends are finalized
+with `cascade_info.finalization_reason=stream_end` during the final flush.
+`--site-graph` controls the site metadata used by that visualization output.
 
 The CLI reads the same raw CSV, JSONL, ZIP, or directory inputs supported by
 `alarm_tools.alarm_inputs`. File inputs are loaded and sorted by event time by
