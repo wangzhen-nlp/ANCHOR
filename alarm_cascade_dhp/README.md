@@ -76,9 +76,13 @@ skips. The final group snapshot defaults to
 `output/cascade_decisions.jsonl.groups.json`.
 
 The CLI reads the same raw CSV, JSONL, ZIP, or directory inputs supported by
-`alarm_tools.alarm_inputs`. Input should be roughly event-time ordered when
-possible. The reorder buffer handles bounded disorder through
-`--reorder-lag-sec`; very late records are surfaced as `skipped` decisions.
+`alarm_tools.alarm_inputs`. File inputs are loaded and sorted by event time by
+default before they are pushed through the same online engine, matching the
+offline ordering expectation of `fault_grouping.match_rules`. Pass
+`--preserve-input-order` only when the source order is already a real live
+stream and bounded disorder should be handled by the reorder buffer through
+`--reorder-lag-sec`; very late live records are surfaced as `skipped`
+decisions.
 While the stream runs, the CLI prints a processing progress line with read
 alarm count, clustered/clear/skipped decisions, current cascade count, and
 reorder-buffer depth. It prints a flush message and a final run summary after

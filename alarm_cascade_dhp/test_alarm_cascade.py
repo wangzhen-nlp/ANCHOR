@@ -4,6 +4,7 @@ from alarm_cascade_dhp.config import AlarmDHPConfig, StreamPolicyConfig
 from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
+from alarm_cascade_dhp.run_cascades import _load_sorted_events
 from alarm_cascade_dhp.streaming import AlarmStreamSanitizer
 from alarm_cascade_dhp.topology import TopologyIndex
 
@@ -198,6 +199,33 @@ class EngineTests(unittest.TestCase):
         self.assertIn("stream.sanitizer_push", phases)
         self.assertIn("model.observe_raise", phases)
         self.assertIn("update.cluster_add", phases)
+
+    def test_cli_event_loader_sorts_raw_alarm_records_by_event_time(self):
+        class _Args:
+            alarms = "unused"
+            show_progress = False
+
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
+            stream_config=StreamPolicyConfig(reorder_lag_sec=0),
+        )
+        unsorted_records = iter(
+            [
+                _alarm("a3", 300, "C", "ne-c", "site-c"),
+                _alarm("a1", 100, "A", "ne-a", "site-a"),
+                _alarm("a2", 200, "B", "ne-b", "site-b"),
+            ]
+        )
+
+        from unittest.mock import patch
+
+        with patch(
+            "alarm_cascade_dhp.run_cascades._iter_input_alarm_records",
+            return_value=unsorted_records,
+        ):
+            events = _load_sorted_events(_Args(), engine)
+
+        self.assertEqual([event.event_id for event in events], ["a1", "a2", "a3"])
 
 
 if __name__ == "__main__":

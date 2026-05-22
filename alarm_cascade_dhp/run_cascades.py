@@ -126,6 +126,11 @@ def _build_arg_parser():
         help="show source file read progress",
     )
     parser.add_argument(
+        "--preserve-input-order",
+        action="store_true",
+        help="skip the default offline event-time sort and consume source order as a live stream",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="print phase timings for input, features, stream policy, model scoring, and output",
@@ -195,10 +200,10 @@ def _refresh_process_progress(progress, engine, counts, force=False):
 
 
 class _StreamProcessProgress:
-    """Throttle an unknown-total ProgressBar for a real alarm stream."""
+    """Throttle processing progress for sorted files or a real stream."""
 
-    def __init__(self, interval_sec=0.2):
-        self.bar = ProgressBar(0, "处理告警流")
+    def __init__(self, total=0, interval_sec=0.2):
+        self.bar = ProgressBar(total, "处理告警流")
         self.interval_sec = interval_sec
         self.last_refresh = 0.0
 
@@ -242,6 +247,14 @@ def _print_run_configuration(args):
         f"duplicate_window={args.duplicate_window_sec:g}s, "
         f"flap_window={args.flap_window_sec:g}s"
     )
+    print(
+        "输入顺序: "
+        + (
+            "保留源顺序，按实时流入口处理"
+            if args.preserve_input_order
+            else "离线文件默认按事件时间排序后聚类"
+        )
+    )
     if args.profile:
         print("性能分析: 开启，结束后打印主要阶段累计耗时")
 
@@ -267,6 +280,71 @@ def _next_alarm(alarm_stream, timer):
         return next(alarm_stream)
 
 
+def _iter_input_alarm_records(args, timer):
+    alarm_stream = iter(stream_alarm_inputs(args.alarms, show_progress=args.show_progress))
+    while True:
+        try:
+            yield _next_alarm(alarm_stream, timer)
+        except StopIteration:
+            break
+
+
+def _load_sorted_events(args, engine, timer=None):
+    print("⏳ 正在加载告警并构造 cascade 事件...")
+    events = []
+    with _time_phase(timer, "input.load_events"):
+        for alarm in _iter_input_alarm_records(args, timer):
+            events.append(engine.features.from_alarm_record(alarm))
+
+    print("⏳ 正在按事件时间排序 cascade 告警...")
+    with _time_phase(timer, "input.sort_events"):
+        events.sort(key=lambda event: event.ts)
+    print(f"✅ 已准备 {len(events)} 条按事件时间排序的告警事件")
+    return events
+
+
+def _process_alarm_records(args, engine, output_handle, counts, timer):
+    processed_count = 0
+    process_progress = _StreamProcessProgress()
+    process_progress.refresh(processed_count, engine, counts, force=True)
+    try:
+        with _time_phase(timer, "pipeline.process_stream"):
+            for alarm in _iter_input_alarm_records(args, timer):
+                _write_decisions(
+                    output_handle,
+                    engine.observe(alarm),
+                    counts,
+                    timer=timer,
+                )
+                processed_count += 1
+                process_progress.refresh(processed_count, engine, counts)
+    finally:
+        process_progress.refresh(processed_count, engine, counts, force=True)
+        process_progress.close()
+    return processed_count
+
+
+def _process_sorted_events(events, engine, output_handle, counts, timer):
+    processed_count = 0
+    process_progress = _StreamProcessProgress(total=len(events))
+    process_progress.refresh(processed_count, engine, counts, force=True)
+    try:
+        with _time_phase(timer, "pipeline.process_stream"):
+            for event in events:
+                _write_decisions(
+                    output_handle,
+                    engine.observe_event(event),
+                    counts,
+                    timer=timer,
+                )
+                processed_count += 1
+                process_progress.refresh(processed_count, engine, counts)
+    finally:
+        process_progress.refresh(processed_count, engine, counts, force=True)
+        process_progress.close()
+    return processed_count
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -280,33 +358,30 @@ def main():
     if timer is not None:
         enable_engine_profiling(timer, engine)
     counts = {}
-    processed_count = 0
     start_time = time.time()
+    sorted_events = None
+    if not args.preserve_input_order:
+        sorted_events = _load_sorted_events(args, engine, timer=timer)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as output_handle:
-        process_progress = _StreamProcessProgress()
-        process_progress.refresh(processed_count, engine, counts, force=True)
-        try:
-            alarm_stream = iter(stream_alarm_inputs(args.alarms, show_progress=args.show_progress))
-            with _time_phase(timer, "pipeline.process_stream"):
-                while True:
-                    try:
-                        alarm = _next_alarm(alarm_stream, timer)
-                    except StopIteration:
-                        break
-                    _write_decisions(
-                        output_handle,
-                        engine.observe(alarm),
-                        counts,
-                        timer=timer,
-                    )
-                    processed_count += 1
-                    process_progress.refresh(processed_count, engine, counts)
-        finally:
-            process_progress.refresh(processed_count, engine, counts, force=True)
-            process_progress.close()
+        if sorted_events is None:
+            processed_count = _process_alarm_records(
+                args,
+                engine,
+                output_handle,
+                counts,
+                timer,
+            )
+        else:
+            processed_count = _process_sorted_events(
+                sorted_events,
+                engine,
+                output_handle,
+                counts,
+                timer,
+            )
 
         print("⏳ 数据流读取完毕，正在清空乱序缓冲并输出剩余 cascade 决策...")
         with _time_phase(timer, "pipeline.flush"):
