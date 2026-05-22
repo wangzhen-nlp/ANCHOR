@@ -266,7 +266,10 @@ class VisualOutputTests(unittest.TestCase):
             output_path = Path(output_dir) / "cascade_visual.jsonl"
             session = CascadeVisualOutputSession(
                 output_path,
-                ne_graph_data={"ne-a": {"site_id": "site-a", "name": "NE A"}},
+                ne_graph_data={
+                    "ne-a": {"site_id": "site-a", "name": "NE A"},
+                    "ne-idle": {"site_id": "site-a", "name": "Idle NE"},
+                },
                 site_graph_data={"site-a": {"site_name": "Site A"}},
             )
             session.reset_output_file()
@@ -289,6 +292,8 @@ class VisualOutputTests(unittest.TestCase):
         self.assertEqual(record["match_info"]["uuid"], "cascade-1")
         self.assertIn("cascade-1", record["group_info"])
         self.assertIn("ne-a", record["ne_info"])
+        self.assertNotIn("ne-idle", record["ne_info"])
+        self.assertEqual(record["group_info"]["cascade-1"]["ne_list"], ["ne-a"])
         self.assertEqual(record["cascade_info"]["finalization_reason"], "closed")
 
     def test_stream_end_visual_output_emits_unclosed_cascades(self):
@@ -313,6 +318,35 @@ class VisualOutputTests(unittest.TestCase):
 
         self.assertEqual(record["cascade_info"]["state"], "active")
         self.assertEqual(record["cascade_info"]["finalization_reason"], "stream_end")
+
+    def test_site_context_visual_output_includes_quiet_devices_at_cascade_sites(self):
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
+            stream_config=StreamPolicyConfig(reorder_lag_sec=0),
+        )
+        engine.observe_alarm_record(_alarm("a1", 100, "A", "ne-a", "site-a"))
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            output_path = Path(output_dir) / "cascade_visual.jsonl"
+            session = CascadeVisualOutputSession(
+                output_path,
+                ne_graph_data={
+                    "ne-a": {"site_id": "site-a"},
+                    "ne-quiet": {"site_id": "site-a"},
+                },
+                site_graph_data={"site-a": {}},
+                ne_scope="site-context",
+            )
+            session.reset_output_file()
+            session.emit_remaining(engine)
+            session.close()
+            record = json.loads(output_path.read_text(encoding="utf-8").strip())
+
+        self.assertEqual(
+            record["group_info"]["cascade-1"]["ne_list"],
+            ["ne-a", "ne-quiet"],
+        )
+        self.assertIn("ne-quiet", record["ne_info"])
 
 
 if __name__ == "__main__":

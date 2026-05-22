@@ -83,6 +83,9 @@ group JSONL for `visualization/fault_group_browser.html` and
 while the stream runs; cascades still active when the input ends are finalized
 with `cascade_info.finalization_reason=stream_end` during the final flush.
 `--site-graph` controls the site metadata used by that visualization output.
+The visual group includes only devices with clustered cascade alarms by
+default. Pass `--visual-ne-scope site-context` when the browser and propagation
+view should also include other devices at the cascade sites.
 
 The CLI reads the same raw CSV, JSONL, ZIP, or directory inputs supported by
 `alarm_tools.alarm_inputs`. File inputs are loaded and sorted by event time by

@@ -54,6 +54,12 @@ def _build_arg_parser():
         default=SITE_GRAPH_JSON,
         help="site metadata JSON used by --visual-output",
     )
+    parser.add_argument(
+        "--visual-ne-scope",
+        choices=("alarm-only", "site-context"),
+        default="alarm-only",
+        help="NEs in --visual-output: clustered alarm devices only, or all devices at cascade sites",
+    )
     parser.add_argument("--particles", type=int, default=4, help="particle count")
     parser.add_argument("--seed", type=int, default=1024, help="random seed")
     parser.add_argument(
@@ -280,6 +286,14 @@ def _print_run_configuration(args):
         print("性能分析: 开启，结束后打印主要阶段累计耗时")
     if args.visual_output:
         print("可视化输出: cascade 关闭时写 JSONL，输入结束时补写仍未关闭的 cascade")
+        print(
+            "可视化设备范围: "
+            + (
+                "仅 cascade 中发生告警的设备"
+                if args.visual_ne_scope == "alarm-only"
+                else "cascade 站点内全部设备"
+            )
+        )
 
 
 def _time_phase(timer, phase_name):
@@ -418,6 +432,7 @@ def main():
                 args.visual_output,
                 args.ne_graph,
                 args.site_graph,
+                ne_scope=args.visual_ne_scope,
             )
             visual_output.reset_output_file()
     if timer is not None:

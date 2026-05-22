@@ -6,6 +6,9 @@ from fault_grouping.matching.group_output_builder import build_jsonl_match_outpu
 from fault_grouping.site_topology import build_site_to_ne_ids
 
 
+_VISUAL_NE_SCOPES = {"alarm-only", "site-context"}
+
+
 def load_json_object(path):
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -31,22 +34,30 @@ def build_visual_group_record(
 class CascadeVisualOutputSession:
     """Append finalized cascades in match_rules visualization JSONL format."""
 
-    def __init__(self, output_path, ne_graph_data, site_graph_data):
+    def __init__(self, output_path, ne_graph_data, site_graph_data, ne_scope="alarm-only"):
+        if ne_scope not in _VISUAL_NE_SCOPES:
+            raise ValueError(f"unsupported visual NE scope: {ne_scope}")
         self.output_path = Path(output_path)
         self.ne_graph_data = ne_graph_data
         self.site_graph_data = site_graph_data
-        self.site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
+        self.ne_scope = ne_scope
+        self.site_to_ne_ids = (
+            build_site_to_ne_ids(ne_graph_data)
+            if ne_scope == "site-context"
+            else {}
+        )
         self.ne_link_info_cache = {}
         self.emitted_cascade_ids = set()
         self.emitted_count = 0
         self._handle = None
 
     @classmethod
-    def from_files(cls, output_path, ne_graph_path, site_graph_path):
+    def from_files(cls, output_path, ne_graph_path, site_graph_path, ne_scope="alarm-only"):
         return cls(
             output_path=output_path,
             ne_graph_data=load_json_object(ne_graph_path),
             site_graph_data=load_json_object(site_graph_path),
+            ne_scope=ne_scope,
         )
 
     def reset_output_file(self):
