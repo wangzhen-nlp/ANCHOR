@@ -107,6 +107,11 @@ run: input parsing, feature construction, reorder/dedupe handling, model
 assignment, existing-cascade scoring, cluster updates, topology calls, and
 output writing.
 
+Add `--debug-skips` when skipped alarms need to be explained on screen. Each
+skipped alarm prints its stream-policy reason, current alarm event/raw record,
+event key, and the prior raise/clear/emitted event that triggered a collision
+when one exists.
+
 ## Main tuning knobs
 
 - Raise `--time-power` when cascades should be more burst-driven; lower it when

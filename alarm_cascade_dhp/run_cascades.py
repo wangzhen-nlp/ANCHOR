@@ -140,6 +140,11 @@ def _build_arg_parser():
         help="emit clear controls even when no matching active raise is known",
     )
     parser.add_argument(
+        "--debug-skips",
+        action="store_true",
+        help="print skipped alarm details and stream-policy collision context",
+    )
+    parser.add_argument(
         "--show-progress",
         action="store_true",
         help="show source file read progress in --preserve-input-order mode; offline sorting shows it by default",
@@ -176,6 +181,7 @@ def _build_engine(args):
         duplicate_window_sec=args.duplicate_window_sec,
         flap_window_sec=args.flap_window_sec,
         emit_orphan_clears=args.emit_orphan_clears,
+        debug_skips=args.debug_skips,
     )
     return AlarmCascadeEngine.from_topology_files(
         site_graph_path=args.topo,
@@ -185,11 +191,11 @@ def _build_engine(args):
     )
 
 
-def _write_decisions(handle, decisions, counts, timer=None):
+def _write_decisions(handle, decisions, counts, timer=None, debug_skips=False):
     if timer is None:
-        return _write_decisions_now(handle, decisions, counts)
+        return _write_decisions_now(handle, decisions, counts, debug_skips=debug_skips)
     with timer.time("output.write_decisions"):
-        return _write_decisions_now(handle, decisions, counts)
+        return _write_decisions_now(handle, decisions, counts, debug_skips=debug_skips)
 
 
 def _resolve_groups_output(args):
@@ -200,11 +206,25 @@ def _resolve_groups_output(args):
     return str(Path(args.output).with_suffix(".groups.json"))
 
 
-def _write_decisions_now(handle, decisions, counts):
+def _write_decisions_now(handle, decisions, counts, debug_skips=False):
     for decision in decisions:
         payload = decision.to_dict()
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         counts[payload["status"]] = counts.get(payload["status"], 0) + 1
+        if debug_skips and decision.status == "skipped":
+            _print_skip_debug(decision)
+
+
+def _print_skip_debug(decision):
+    debug = (decision.details or {}).get("skip_debug") or {
+        "event_key": decision.event.event_key,
+        "current_event": decision.event.compact(),
+    }
+    payload = {
+        "reason": decision.reason,
+        **debug,
+    }
+    print("跳过告警 debug: " + json.dumps(payload, ensure_ascii=False, default=str))
 
 
 def _status_count(counts, status):
@@ -284,6 +304,8 @@ def _print_run_configuration(args):
     )
     if args.profile:
         print("性能分析: 开启，结束后打印主要阶段累计耗时")
+    if args.debug_skips:
+        print("跳过告警 debug: 开启，逐条打印当前告警与清洗碰撞上下文")
     if args.visual_output:
         print("可视化输出: cascade 关闭时写 JSONL，输入结束时补写仍未关闭的 cascade")
         print(
@@ -350,7 +372,13 @@ def _process_alarm_records(args, engine, output_handle, counts, timer, visual_ou
         with _time_phase(timer, "pipeline.process_stream"):
             for alarm in _iter_input_alarm_records(args, timer):
                 decisions = engine.observe(alarm)
-                _write_decisions(output_handle, decisions, counts, timer=timer)
+                _write_decisions(
+                    output_handle,
+                    decisions,
+                    counts,
+                    timer=timer,
+                    debug_skips=args.debug_skips,
+                )
                 _emit_closed_visual_output(
                     visual_output,
                     engine,
@@ -373,7 +401,13 @@ def _process_sorted_events(events, engine, output_handle, counts, timer, visual_
         with _time_phase(timer, "pipeline.process_stream"):
             for event in events:
                 decisions = engine.observe_event(event)
-                _write_decisions(output_handle, decisions, counts, timer=timer)
+                _write_decisions(
+                    output_handle,
+                    decisions,
+                    counts,
+                    timer=timer,
+                    debug_skips=args.debug_skips,
+                )
                 _emit_closed_visual_output(
                     visual_output,
                     engine,
@@ -470,7 +504,13 @@ def main():
             print("⏳ 数据流读取完毕，正在清空乱序缓冲并输出剩余 cascade 决策...")
             with _time_phase(timer, "pipeline.flush"):
                 flush_decisions = engine.flush()
-                _write_decisions(output_handle, flush_decisions, counts, timer=timer)
+                _write_decisions(
+                    output_handle,
+                    flush_decisions,
+                    counts,
+                    timer=timer,
+                    debug_skips=args.debug_skips,
+                )
                 _emit_remaining_visual_output(
                     visual_output,
                     engine,

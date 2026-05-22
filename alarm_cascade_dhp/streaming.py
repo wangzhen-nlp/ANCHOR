@@ -13,9 +13,12 @@ class AlarmStreamSanitizer:
         self._sequence = 0
         self._max_seen_ts = None
         self._last_emitted_ts = None
+        self._last_emitted_event = None
         self._last_raise_by_key = {}
+        self._last_raise_event_by_key = {}
         self._active_by_key = {}
         self._last_clear_by_key = {}
+        self._last_clear_event_by_key = {}
 
     def push(self, event):
         self._sequence += 1
@@ -42,11 +45,20 @@ class AlarmStreamSanitizer:
             self._last_emitted_ts is not None
             and event.ts + self.config.late_tolerance_sec < self._last_emitted_ts
         ):
-            return SanitizedEvent("skip", event, "late_after_reorder_watermark")
+            return self._skip(
+                event,
+                "late_after_reorder_watermark",
+                event.event_key or event.event_id,
+                collision_role="last_emitted_event",
+                collision_event=self._last_emitted_event,
+                last_emitted_ts=self._last_emitted_ts,
+                late_tolerance_sec=self.config.late_tolerance_sec,
+            )
 
         self._last_emitted_ts = (
             event.ts if self._last_emitted_ts is None else max(self._last_emitted_ts, event.ts)
         )
+        self._last_emitted_event = event
         key = event.event_key or event.event_id
         if event.is_clear:
             return self._handle_clear(key, event)
@@ -59,7 +71,16 @@ class AlarmStreamSanitizer:
             and 0 <= event.ts - previous_clear_ts <= self.config.flap_window_sec
         ):
             self._last_raise_by_key[key] = event.ts
-            return SanitizedEvent("skip", event, "flap_reopen_compressed")
+            self._last_raise_event_by_key[key] = event
+            return self._skip(
+                event,
+                "flap_reopen_compressed",
+                key,
+                collision_role="previous_clear",
+                collision_event=self._last_clear_event_by_key.get(key),
+                delta_sec=event.ts - previous_clear_ts,
+                flap_window_sec=self.config.flap_window_sec,
+            )
 
         previous_raise_ts = self._last_raise_by_key.get(key)
         if (
@@ -67,16 +88,58 @@ class AlarmStreamSanitizer:
             and previous_raise_ts is not None
             and 0 <= event.ts - previous_raise_ts <= self.config.duplicate_window_sec
         ):
+            previous_raise_event = self._last_raise_event_by_key.get(key)
             self._last_raise_by_key[key] = event.ts
-            return SanitizedEvent("skip", event, "duplicate_raise_compressed")
+            self._last_raise_event_by_key[key] = event
+            return self._skip(
+                event,
+                "duplicate_raise_compressed",
+                key,
+                collision_role="previous_raise",
+                collision_event=previous_raise_event or self._active_by_key.get(key),
+                delta_sec=event.ts - previous_raise_ts,
+                duplicate_window_sec=self.config.duplicate_window_sec,
+            )
 
         self._last_raise_by_key[key] = event.ts
+        self._last_raise_event_by_key[key] = event
         self._active_by_key[key] = event
         return SanitizedEvent("raise", event)
 
     def _handle_clear(self, key, event):
         self._last_clear_by_key[key] = event.ts
+        self._last_clear_event_by_key[key] = event
         active_event = self._active_by_key.pop(key, None)
         if active_event is None and not self.config.emit_orphan_clears:
-            return SanitizedEvent("skip", event, "orphan_clear")
+            return self._skip(
+                event,
+                "orphan_clear",
+                key,
+                collision_role="last_known_raise",
+                collision_event=self._last_raise_event_by_key.get(key),
+            )
         return SanitizedEvent("clear", event)
+
+    def _skip(self, event, reason, key, collision_role="", collision_event=None, **context):
+        if not self.config.debug_skips:
+            return SanitizedEvent("skip", event, reason)
+
+        debug = {
+            "event_key": key,
+            "current_event": _debug_event(event),
+        }
+        if collision_event is not None:
+            debug["collision"] = {
+                "role": collision_role,
+                "event": _debug_event(collision_event),
+            }
+        if context:
+            debug["context"] = context
+        return SanitizedEvent("skip", event, reason, {"skip_debug": debug})
+
+
+def _debug_event(event):
+    debug = event.compact()
+    if event.raw:
+        debug["raw_alarm"] = dict(event.raw)
+    return debug

@@ -68,3 +68,4 @@ class SanitizedEvent:
     action: str
     event: AlarmEvent
     reason: str = ""
+    details: dict[str, Any] = field(default_factory=dict)

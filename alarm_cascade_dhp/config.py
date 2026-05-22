@@ -77,6 +77,7 @@ class StreamPolicyConfig:
     duplicate_window_sec: float = 120.0
     flap_window_sec: float = 300.0
     emit_orphan_clears: bool = False
+    debug_skips: bool = False
 
     def __post_init__(self):
         for name in (

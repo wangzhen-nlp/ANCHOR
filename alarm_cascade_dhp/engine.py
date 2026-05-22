@@ -82,6 +82,7 @@ class AlarmCascadeEngine:
                         status="skipped",
                         event=sanitized.event,
                         reason=sanitized.reason or "stream_policy_skip",
+                        details=sanitized.details,
                     )
                 )
         return decisions

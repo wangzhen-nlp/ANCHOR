@@ -1,14 +1,20 @@
 import json
+import io
 import tempfile
 import unittest
 
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from alarm_cascade_dhp.config import AlarmDHPConfig, StreamPolicyConfig
 from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.features import AlarmFeatureBuilder
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
-from alarm_cascade_dhp.run_cascades import _load_sorted_events, _resolve_groups_output
+from alarm_cascade_dhp.run_cascades import (
+    _load_sorted_events,
+    _resolve_groups_output,
+    _write_decisions,
+)
 from alarm_cascade_dhp.streaming import AlarmStreamSanitizer
 from alarm_cascade_dhp.topology import TopologyIndex
 from alarm_cascade_dhp.visual_output import CascadeVisualOutputSession
@@ -96,6 +102,26 @@ class StreamPolicyTests(unittest.TestCase):
                 ("skip", "flap_reopen_compressed"),
             ],
         )
+
+    def test_debug_skip_context_points_to_previous_duplicate_raise(self):
+        features = AlarmFeatureBuilder()
+        sanitizer = AlarmStreamSanitizer(
+            StreamPolicyConfig(
+                reorder_lag_sec=0,
+                duplicate_window_sec=10,
+                debug_skips=True,
+            )
+        )
+        sanitizer.push(features.from_alarm_record(_alarm("a1", 10, "A", "ne-a", "site-a")))
+        output = sanitizer.push(
+            features.from_alarm_record(_alarm("a2", 11, "A", "ne-a", "site-a"))
+        )
+
+        debug = output[0].details["skip_debug"]
+        self.assertEqual(output[0].reason, "duplicate_raise_compressed")
+        self.assertEqual(debug["current_event"]["event_id"], "a2")
+        self.assertEqual(debug["collision"]["role"], "previous_raise")
+        self.assertEqual(debug["collision"]["event"]["event_id"], "a1")
 
 
 class EngineTests(unittest.TestCase):
@@ -204,6 +230,27 @@ class EngineTests(unittest.TestCase):
         self.assertIn("stream.sanitizer_push", phases)
         self.assertIn("model.observe_raise", phases)
         self.assertIn("update.cluster_add", phases)
+
+    def test_debug_skip_writer_prints_skip_collision_context(self):
+        engine = AlarmCascadeEngine(
+            model_config=AlarmDHPConfig(particle_count=1, assignment_strategy="map"),
+            stream_config=StreamPolicyConfig(
+                reorder_lag_sec=0,
+                duplicate_window_sec=10,
+                debug_skips=True,
+            ),
+        )
+        engine.observe_alarm_record(_alarm("a1", 100, "A", "ne-a", "site-a"))
+        decisions = engine.observe_alarm_record(_alarm("a2", 101, "A", "ne-a", "site-a"))
+        stdout = io.StringIO()
+
+        with redirect_stdout(stdout):
+            _write_decisions(io.StringIO(), decisions, {}, debug_skips=True)
+
+        debug_line = stdout.getvalue()
+        self.assertIn("duplicate_raise_compressed", debug_line)
+        self.assertIn('"role": "previous_raise"', debug_line)
+        self.assertIn('"event_id": "a1"', debug_line)
 
     def test_cli_event_loader_sorts_raw_alarm_records_by_event_time(self):
         class _Args:
