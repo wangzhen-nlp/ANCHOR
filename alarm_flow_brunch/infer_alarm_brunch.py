@@ -15,8 +15,9 @@ if __package__ in (None, ""):
 
 from alarm_flow_brunch.aggregator import infer_alarm_flow, load_alarm_brunch_artifact
 from alarm_flow_brunch.region_filter import parse_regions
+from alarm_flow_brunch.visual_output import write_visual_groups
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
-from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, resource_display
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON, resource_display
 
 
 def _write_json(path, payload):
@@ -41,6 +42,11 @@ def main():
     parser.add_argument("-o", "--output", required=True, help="Output fault group JSON.")
     parser.add_argument("--edges-output", default="", help="Optional branching edge JSONL.")
     parser.add_argument(
+        "--visual-output",
+        default="",
+        help="Optional visualization JSONL compatible with the fault group browser and propagation visualizer.",
+    )
+    parser.add_argument(
         "--topo",
         default=SITE_GRAPH_BY_NE_JSON,
         help=f"Site topology for raw alarm inputs. Default: {resource_display('site_graph_by_ne.json')}.",
@@ -49,6 +55,17 @@ def main():
         "--ne-graph",
         default=NE_GRAPH_JSON,
         help=f"NE graph for raw alarm inputs. Default: {resource_display('ne_graph.json')}.",
+    )
+    parser.add_argument(
+        "--site-graph",
+        default=SITE_GRAPH_JSON,
+        help=f"Site metadata for --visual-output. Default: {resource_display('site_graph.json')}.",
+    )
+    parser.add_argument(
+        "--visual-ne-scope",
+        choices=("alarm-only", "site-context"),
+        default="alarm-only",
+        help="NEs in --visual-output: grouped alarm devices only, or all devices at group sites.",
     )
     parser.add_argument("--start-time", default="", help="Raw-input first occurrence lower bound.")
     parser.add_argument("--end-time", default="", help="Raw-input first occurrence upper bound.")
@@ -125,6 +142,15 @@ def main():
     if args.edges_output:
         edge_count = _write_jsonl(args.edges_output, output.edges)
         print(f"branching edges written to: {args.edges_output}; edges={edge_count}")
+    if args.visual_output:
+        visual_count = write_visual_groups(
+            args.visual_output,
+            output.groups,
+            ne_graph_path=args.ne_graph,
+            site_graph_path=args.site_graph,
+            ne_scope=args.visual_ne_scope,
+        )
+        print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
 
 
 if __name__ == "__main__":
