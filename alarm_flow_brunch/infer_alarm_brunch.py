@@ -59,6 +59,15 @@ def main():
     parser.add_argument("--no-warm-start", action="store_true", help="Disable nearest-in-window warm start.")
     parser.add_argument("--min-group-events", type=int, default=1, help="Drop groups smaller than this.")
     parser.add_argument(
+        "--parent-selection",
+        choices=("sample", "argmax"),
+        default=None,
+        help=(
+            "Override artifact parent selection. sample keeps stochastic inference; "
+            "argmax uses deterministic maximum-weight parents."
+        ),
+    )
+    parser.add_argument(
         "--regions",
         "--region",
         dest="regions",
@@ -74,6 +83,7 @@ def main():
 
     artifact = load_alarm_brunch_artifact(args.model)
     regions = parse_regions(args.regions) if args.regions is not None else artifact.config.regions
+    parent_selection = args.parent_selection or artifact.config.parent_selection
     infer_config = replace(
         artifact.config,
         n_sweeps=args.n_sweeps,
@@ -82,6 +92,7 @@ def main():
         warm_start=not args.no_warm_start,
         min_group_events=args.min_group_events,
         regions=regions,
+        parent_selection=parent_selection,
         seed=args.seed,
     )
     alarm_events, alarm_metadata = load_ordered_alarm_events(

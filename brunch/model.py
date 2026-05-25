@@ -8,7 +8,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 from .events import EventCollection
-from .media import run_media
+from .media import PARENT_SELECTION_MODES, run_media
 from .params import HawkesParams
 from .state import BranchingState
 
@@ -29,6 +29,8 @@ class BRUNCHConfig:
     seed: int = 0
     verbose: bool = False
     log_every: int = 10
+    progress_every: int = 50000
+    parent_selection: str = "sample"
 
     def __post_init__(self):
         if self.M < 1:
@@ -41,6 +43,10 @@ class BRUNCHConfig:
             raise ValueError("max_active_sources_per_dim must be positive when set")
         if self.log_every < 1:
             raise ValueError("log_every must be positive")
+        if self.progress_every < 0:
+            raise ValueError("progress_every must be non-negative")
+        if self.parent_selection not in PARENT_SELECTION_MODES:
+            raise ValueError(f"parent_selection must be one of {sorted(PARENT_SELECTION_MODES)}")
         if self.links is None:
             self.links = ["linear"] * self.M
         elif len(self.links) != self.M:
@@ -106,6 +112,8 @@ class BRUNCH:
             refit_params=cfg.refit_params,
             verbose=cfg.verbose,
             log_every=cfg.log_every,
+            progress_every=cfg.progress_every,
+            parent_selection=cfg.parent_selection,
         )
         # Reconstruct the BEST state to materialize derived structures.
         best_state = BranchingState(events)

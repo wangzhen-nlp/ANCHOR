@@ -102,13 +102,18 @@ def survival_integral(events: EventCollection, params: HawkesParams) -> np.ndarr
     prev_t = 0.0
     # First rectangle: from 0 to times[0] uses baseline-only rate.
     out += _apply_links_vector(params.mu, params.links) * times[0]
+    targets_intp = targets.astype(np.intp, copy=False)
     for m in range(n):
         t = times[m]
         if m > 0 and edge_count:
             dt = t - prev_t
-            old = edge_contrib.copy()
-            edge_contrib *= np.exp(-edge_beta * dt)
-            np.add.at(accumulator, targets, edge_contrib - old)
+            # In-place decay: edge_contrib' = edge_contrib · exp(-β · dt)
+            # Δ = edge_contrib' − edge_contrib pushed back into accumulator via
+            # bincount (vectorized scatter — np.add.at would be 30–100× slower).
+            decay = np.exp(-edge_beta * dt)
+            delta = edge_contrib * (decay - 1.0)
+            edge_contrib *= decay
+            accumulator += np.bincount(targets_intp, weights=delta, minlength=M)
         # λ at t_m: F_i(μ_i + Σ_j active α_ij · s_ij)
         lam = _apply_links_vector(accumulator, params.links)
         # Width of rectangle ending at t_m
@@ -124,7 +129,10 @@ def survival_integral(events: EventCollection, params: HawkesParams) -> np.ndarr
         if end > start:
             delta = edge_alpha[start:end] * edge_beta[start:end]
             edge_contrib[start:end] += delta
-            np.add.at(accumulator, targets[start:end], delta)
+            # For a fixed source_dim j, targets[start:end] is a deduplicated set
+            # (sparse storage drops duplicate (target, source) pairs), so plain
+            # indexed accumulation is safe and faster than np.add.at.
+            accumulator[targets[start:end]] += delta
         prev_t = t
     return out
 

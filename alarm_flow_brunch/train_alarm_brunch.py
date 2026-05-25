@@ -119,6 +119,7 @@ def _build_config(args):
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
         regions=parse_regions(args.regions),
+        parent_selection=args.parent_selection,
     )
 
 
@@ -182,6 +183,15 @@ def main():
     parser.add_argument("--topology-prefer-multiplier", type=float, default=2.0)
     parser.add_argument("--topology-fallback-sources-per-dim", type=int, default=2)
     parser.add_argument(
+        "--parent-selection",
+        choices=("sample", "argmax"),
+        default="sample",
+        help=(
+            "How to choose event/cluster parents inside each sweep. "
+            "sample keeps stochastic BRUNCH inference; argmax uses deterministic maximum-weight parents."
+        ),
+    )
+    parser.add_argument(
         "--regions",
         "--region",
         dest="regions",
@@ -198,12 +208,23 @@ def main():
         default=1,
         help="Print BRUNCH sweep progress every N sweeps. Default: 1.",
     )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=50000,
+        help=(
+            "Print within-sweep progress every N events/clusters. "
+            "Use 0 to show only phase start/end. Default: 50000."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="Only print the final training summary.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     if args.log_every < 1:
         parser.error("--log-every must be >= 1")
+    if args.progress_every < 0:
+        parser.error("--progress-every must be >= 0")
 
     config = _build_config(args)
     _print_progress("[train] loading alarms...", args)
@@ -256,6 +277,7 @@ def main():
         progress_callback=_training_progress if _progress_enabled(args) else None,
         verbose=_progress_enabled(args),
         log_every=args.log_every,
+        progress_every=args.progress_every,
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata

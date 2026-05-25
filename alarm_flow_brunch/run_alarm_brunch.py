@@ -56,6 +56,7 @@ def _build_config(args):
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
         regions=parse_regions(args.regions),
+        parent_selection=args.parent_selection,
     )
 
 
@@ -159,6 +160,15 @@ def main():
         type=int,
         default=2,
         help="Non-topology fallback source dimensions kept per target in prefer mode. Default: 2.",
+    )
+    parser.add_argument(
+        "--parent-selection",
+        choices=("sample", "argmax"),
+        default="sample",
+        help=(
+            "How to choose event/cluster parents inside each sweep. "
+            "sample keeps stochastic BRUNCH inference; argmax uses deterministic maximum-weight parents."
+        ),
     )
     parser.add_argument(
         "--min-group-events",

@@ -100,13 +100,22 @@ class BranchingState:
         self._cluster_of = cluster_of
         self._cluster_events = cluster_events
         clusters_by_dim: List[List[int]] = [[] for _ in range(self.events.M)]
+        # Per-cluster earliest/latest event time cached so outer_candidate_parents
+        # can do O(1) admissibility checks instead of an O(size) np-min per cluster.
+        K = len(cluster_events)
+        cluster_earliest = np.empty(K, dtype=np.float64)
+        cluster_latest = np.empty(K, dtype=np.float64)
         for cid, cluster in enumerate(cluster_events):
-            if cluster:
-                dim = int(self.events.dims[cluster[0]])
-                clusters_by_dim[dim].append(cid)
+            times = self.events.times[cluster]
+            cluster_earliest[cid] = float(times.min())
+            cluster_latest[cid] = float(times.max())
+            dim = int(self.events.dims[cluster[0]])
+            clusters_by_dim[dim].append(cid)
         self._clusters_by_dim = clusters_by_dim
+        self._cluster_earliest_arr = cluster_earliest
+        self._cluster_latest_arr = cluster_latest
         # Reset cluster_parent (length and ids change when clusters restructure).
-        self._cluster_parent = -np.ones(len(cluster_events), dtype=np.int64)
+        self._cluster_parent = -np.ones(K, dtype=np.int64)
         self._dirty_clusters = False
         self._dirty_cascades = True
 
@@ -206,7 +215,21 @@ class BranchingState:
 
     def cluster_earliest_time(self, c: int) -> float:
         self._ensure_clusters()
-        return float(self.events.times[self._cluster_events[c]].min())
+        return float(self._cluster_earliest_arr[c])
+
+    def cluster_latest_time(self, c: int) -> float:
+        self._ensure_clusters()
+        return float(self._cluster_latest_arr[c])
+
+    @property
+    def cluster_earliest_array(self) -> np.ndarray:
+        self._ensure_clusters()
+        return self._cluster_earliest_arr
+
+    @property
+    def cluster_latest_array(self) -> np.ndarray:
+        self._ensure_clusters()
+        return self._cluster_latest_arr
 
     @property
     def cascade_of(self) -> np.ndarray:

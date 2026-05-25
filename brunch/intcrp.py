@@ -111,13 +111,21 @@ def outer_candidate_parents(
     state: BranchingState,
     events: EventCollection,
     params: HawkesParams | None = None,
+    window: float | None = None,
 ) -> List[int]:
     """All clusters that could be the cross-dim parent of `target_cluster`:
-    different dim, and at least one event preceding target's earliest event.
-    Self-loop (target_cluster, i.e. 'no parent') handled separately via -1.
+    different dim, at least one event preceding target's earliest event, and
+    (optionally) at least one event no older than `t_je - window`.
+
+    Uses per-cluster earliest/latest caches in `state` for O(1) admissibility
+    checks, so the total cost is O(M + Σ_d |clusters_in_dim(d)|) rather than
+    O(M · K · avg_cluster_size). Self-loop ('no parent') handled separately.
     """
     target_dim = state.cluster_dim(target_cluster)
     t_je = state.cluster_earliest_time(target_cluster)
+    earliest_arr = state.cluster_earliest_array
+    latest_arr = state.cluster_latest_array
+    earliest_cutoff = -np.inf if window is None else (t_je - float(window))
     parents: List[int] = []
     if params is None:
         source_dims = [d for d in range(events.M) if d != target_dim]
@@ -131,8 +139,9 @@ def outer_candidate_parents(
         for c in state.clusters_in_dim(source_dim):
             if c == target_cluster:
                 continue
-            src_events = state.cluster_events(c)
-            if float(events.times[src_events].min()) >= t_je:
-                continue  # no event in c could possibly precede target's earliest
+            if earliest_arr[c] >= t_je:
+                continue  # cluster has no event strictly preceding target's earliest
+            if latest_arr[c] <= earliest_cutoff:
+                continue  # cluster's most recent event is beyond the look-back window
             parents.append(c)
     return parents

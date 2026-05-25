@@ -22,6 +22,7 @@ from alarm_flow_brunch.region_filter import filter_alarm_events_by_regions, pars
 
 
 TOPOLOGY_EDGE_POLICIES = frozenset({"off", "prefer", "require"})
+PARENT_SELECTION_MODES = frozenset({"sample", "argmax"})
 ARTIFACT_TYPE = "alarm_flow_brunch.v1"
 
 
@@ -52,6 +53,7 @@ class AlarmBRUNCHConfig:
     topology_prefer_multiplier: float = 2.0
     topology_fallback_sources_per_dim: int = 2
     regions: tuple = ()
+    parent_selection: str = "sample"
 
     def __post_init__(self):
         object.__setattr__(self, "regions", parse_regions(self.regions))
@@ -72,6 +74,8 @@ class AlarmBRUNCHConfig:
             raise ValueError("topology_prefer_multiplier must be >= 1")
         if self.topology_fallback_sources_per_dim < 0:
             raise ValueError("topology_fallback_sources_per_dim must be >= 0")
+        if self.parent_selection not in PARENT_SELECTION_MODES:
+            raise ValueError(f"parent_selection must be one of {sorted(PARENT_SELECTION_MODES)}")
         del sequence_config  # consumed for its validation side effects above
 
     def sequence_config(self) -> AlarmSequenceConfig:
@@ -418,6 +422,7 @@ def _fit_sequence_with_progress(
     topology_index=None,
     verbose=False,
     log_every=10,
+    progress_every=50000,
 ):
     M = len(vocabs.type_vocab)
     events = _build_event_collection(sequence, M)
@@ -438,6 +443,8 @@ def _fit_sequence_with_progress(
         materialize_branching_matrix=False,
         verbose=verbose,
         log_every=log_every,
+        progress_every=progress_every,
+        parent_selection=config.parent_selection,
     )
     return BRUNCH(brunch_config).fit(events, init_params=init_params)
 
@@ -609,6 +616,7 @@ def train_alarm_brunch(
     verbose=False,
     log_every=10,
     region_filter_stats=None,
+    progress_every=50000,
 ) -> AlarmBRUNCHArtifact:
     """Fit reusable BRUNCH type-level parameters from an ordered alarm stream."""
     config = config or AlarmBRUNCHConfig()
@@ -653,6 +661,7 @@ def train_alarm_brunch(
         topology_index=topology_index,
         verbose=verbose,
         log_every=log_every,
+        progress_every=progress_every,
     )
     _emit_progress(
         progress_callback,
