@@ -334,8 +334,6 @@ class AlarmFlowISAHP(nn.Module if nn else object):
         history_alarm_type_ids,
         history_mask,
         topology_pair_features=None,
-        *,
-        num_mc_samples=20,
     ):
         intensities, mu, alpha, gamma, pair_mask = self.intensity_at_events(
             target_times,
@@ -352,32 +350,26 @@ class AlarmFlowISAHP(nn.Module if nn else object):
         event_intensities = intensities.gather(-1, target_type_ids[:, None]).squeeze(-1)
         log_term = torch.log(event_intensities.clamp_min(self.config.eps)).sum()
 
+        # 闭式积分：∫_{t_{i-1}}^{t_i} (μ_k + Σ_j α γ exp(-γ(t'-t_j))) dt'
+        # = μ_k · interval_dt + Σ_j α [exp(-γ(t_{i-1}-t_j)) - exp(-γ(t_i-t_j))]
         interval_dts = interval_dts.clamp_min(0.0)
-        sample_offsets = torch.rand(
-            target_times.shape[0],
-            num_mc_samples,
-            dtype=target_times.dtype,
-            device=target_times.device,
+        history_dt_target = (target_times[:, None] - history_times).clamp_min(0.0)
+        history_dt_prev = (history_dt_target - interval_dts[:, None]).clamp_min(0.0)
+        decay_integral = alpha * (
+            torch.exp(-gamma * history_dt_prev[..., None])
+            - torch.exp(-gamma * history_dt_target[..., None])
         )
-        sample_times = target_times[:, None] - interval_dts[:, None] + sample_offsets * interval_dts[:, None]
-        history_dt = (sample_times[:, :, None] - history_times[:, None, :]).clamp_min(0.0)
-        sampled_decayed = (
-            alpha[:, None, :, :]
-            * gamma[:, None, :, :]
-            * torch.exp(-gamma[:, None, :, :] * history_dt[..., None])
-        )
-        sampled_decayed = sampled_decayed.masked_fill(~pair_mask[:, None, :, None], 0.0)
-        sampled_intensities = mu[:, None, :] + sampled_decayed.sum(dim=2)
-        total_intensity = sampled_intensities.sum(dim=-1).mean(dim=-1)
-        integral = (interval_dts * total_intensity).sum()
+        decay_integral = decay_integral.masked_fill(~pair_mask[..., None], 0.0)
+        integral = (mu.sum(-1) * interval_dts + decay_integral.sum(dim=(1, 2))).sum()
 
         denominator = target_type_ids.new_tensor(target_type_ids.numel()).clamp_min(1)
         nll = (integral - log_term) / denominator
-        return nll, {
+        metrics = {
             "nll": nll.detach(),
             "integral": (integral / denominator).detach(),
             "negative_log_term": (-log_term / denominator).detach(),
         }
+        return nll, metrics, alpha, pair_mask
 
     def type_regularization(self, alpha, target_type_ids, history_type_ids, pair_mask):
         selected_alpha = alpha.gather(

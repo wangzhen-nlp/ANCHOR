@@ -240,7 +240,9 @@ def _build_target_windows(sequence, event_dts, topology_index, config):
     target_windows = []
     for target_index in range(1, len(sequence)):
         history_indexes = _history_indexes(sequence.times, target_index, config)
-        query_index = history_indexes[-1] if history_indexes else target_index - 1
+        # Query 始终用 target_index - 1 与 interval_dt 的积分区间对齐；
+        # 即便它被 history_window_sec 截断在 history 外，也比窗口里更早的事件更能代表 target 前一刻状态。
+        query_index = target_index - 1
         target_windows.append(
             AlarmTargetWindow(
                 sequence_id=sequence.sequence_id,

@@ -41,6 +41,10 @@ class AlarmDHPConfig:
     max_candidate_cascades: int = 1024
     max_support_events: int = 256
     max_kernel_updates_per_event: int = 32
+    # EMA decay applied to kernel_alpha before each event's accumulation. Keeps
+    # long-lived cascades' temporal kernels responsive to recent dynamics; the
+    # default is small enough to be invisible on short streams.
+    kernel_decay_per_event: float = 0.001
     topology_strength: float = 1.0
     topology_prior_mass: float = 3.0
     topology_max_hops: int = 2
@@ -72,6 +76,8 @@ class AlarmDHPConfig:
             raise ValueError("max_candidate_cascades must be non-negative")
         if self.topology_max_hops < 0:
             raise ValueError("topology_max_hops must be non-negative")
+        if not 0.0 <= self.kernel_decay_per_event < 1.0:
+            raise ValueError("kernel_decay_per_event must be in [0.0, 1.0)")
 
 
 @dataclass

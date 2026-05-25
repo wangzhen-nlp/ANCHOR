@@ -48,13 +48,14 @@ alarm types: `link`, `power`, and `offline`.
    regularizer currently uses several such tensors. This path is not usable
    with device-level event types.
 
-4. The Monte Carlo integral still sums dense intensity over all event types.
+4. The interval integral still sums dense intensity over all event types.
 
-   Every target window only attends to bounded local history, but the loss still
-   evaluates total intensity over the full output type vocabulary. With
-   `batch_size=16`, `num_mc_samples=20`, and `n_types=1,050,000`, an FP32 tensor
-   shaped like sampled intensity over all types is already about 1.25 GiB before
-   the larger `alpha` and `gamma` tensors are considered.
+   The integral is now evaluated in closed form for the neural exponential
+   kernel, so the Monte Carlo sample axis is gone. But the loss still evaluates
+   total intensity over the full output type vocabulary: with `batch_size=16`,
+   `max_history_events=128`, and `n_types=1,050,000`, the `alpha` / `gamma` /
+   `decay_integral` tensors are still on the order of 8 GiB each before
+   gradients.
 
 ## Modeling Risks
 

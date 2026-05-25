@@ -98,7 +98,6 @@ def _run_epoch(
     optimizer=None,
     l1_reg=0.0,
     variance_reg=0.0,
-    num_mc_samples=20,
     torch,
 ):
     is_training = optimizer is not None
@@ -116,23 +115,10 @@ def _run_epoch(
     with grad_context:
         for batch in dataloader:
             batch = move_batch_to_device(batch, device)
-            nll, nll_metrics = model.negative_log_likelihood(
+            nll, nll_metrics, alpha, pair_mask = model.negative_log_likelihood(
                 batch["target_type_ids"],
                 batch["target_times"],
                 batch["interval_dts"],
-                batch["query_dts"],
-                batch["query_alarm_source_ids"],
-                batch["query_alarm_type_ids"],
-                batch["history_times"],
-                batch["history_dts"],
-                batch["history_alarm_source_ids"],
-                batch["history_alarm_type_ids"],
-                batch["history_mask"],
-                topology_pair_features=batch["topology_pair_features"],
-                num_mc_samples=num_mc_samples,
-            )
-            _intensities, _mu, alpha, _gamma, pair_mask = model.intensity_at_events(
-                batch["target_times"],
                 batch["query_dts"],
                 batch["query_alarm_source_ids"],
                 batch["query_alarm_type_ids"],
@@ -255,7 +241,6 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Adam learning rate.")
     parser.add_argument("--l1-reg", type=float, default=0.025, help="Type-level mean alpha sparsity weight.")
     parser.add_argument("--variance-reg", type=float, default=0.25, help="Within type-pair alpha variance weight.")
-    parser.add_argument("--num-mc-samples", type=int, default=20, help="Monte Carlo samples for interval integral.")
     parser.add_argument(
         "--valid-fraction",
         type=float,
@@ -350,7 +335,6 @@ def main():
             optimizer=optimizer,
             l1_reg=args.l1_reg,
             variance_reg=args.variance_reg,
-            num_mc_samples=args.num_mc_samples,
             torch=torch,
         )
         valid_metrics = (
@@ -360,7 +344,6 @@ def main():
                 device,
                 l1_reg=args.l1_reg,
                 variance_reg=args.variance_reg,
-                num_mc_samples=args.num_mc_samples,
                 torch=torch,
             )
             if valid_loader else None

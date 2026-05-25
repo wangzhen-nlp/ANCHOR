@@ -14,6 +14,7 @@ if __package__ in (None, ""):
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
+# 用于在 JSON 记录中匹配区域字段的可能的键名列表
 REGION_KEYS = (
     "region_id",
     "regionId",
@@ -28,6 +29,10 @@ UNKNOWN_REGION = "未填区域"
 
 
 def load_json(path):
+    """
+    从指定路径加载 JSON 文件并返回解析后的数据。
+    如果文件不存在，则抛出 FileNotFoundError 异常。
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {path}")
     with open(path, "r", encoding="utf-8") as stream:
@@ -35,6 +40,10 @@ def load_json(path):
 
 
 def count_top_level_entries(data, entity_label, path):
+    """
+    统计顶层数据的条目数量。
+    支持 dict（统计键值对数量）和 list（统计元素个数）。
+    """
     if isinstance(data, dict):
         return len(data)
     if isinstance(data, list):
@@ -46,6 +55,10 @@ def count_top_level_entries(data, entity_label, path):
 
 
 def iter_top_level_records(data, entity_label, path):
+    """
+    获取一个用于遍历顶层数据记录的迭代器。
+    如果 data 是 dict，则遍历其 values；如果是 list，则直接遍历其元素。
+    """
     if isinstance(data, dict):
         return data.values()
     if isinstance(data, list):
@@ -57,6 +70,10 @@ def iter_top_level_records(data, entity_label, path):
 
 
 def get_region(record, unknown_label=UNKNOWN_REGION):
+    """
+    从单条记录 (dict) 中提取区域 (Region) 信息。
+    通过遍历 REGION_KEYS 来匹配可能的键名，若未找到或值为空，则返回 unknown_label。
+    """
     if not isinstance(record, dict):
         return unknown_label
     for key in REGION_KEYS:
@@ -70,6 +87,10 @@ def get_region(record, unknown_label=UNKNOWN_REGION):
 
 
 def count_entries_by_region(data, entity_label, path):
+    """
+    按区域统计实体数量。
+    遍历所有记录，提取区域字段并使用 Counter 进行分类计数。
+    """
     counts = Counter()
     for record in iter_top_level_records(data, entity_label, path):
         counts[get_region(record)] += 1
@@ -77,6 +98,10 @@ def count_entries_by_region(data, entity_label, path):
 
 
 def sorted_regions(*counters):
+    """
+    合并多个 Counter 中的所有区域名称并进行排序。
+    排序规则：普通区域按字典序排列，未知区域 (UNKNOWN_REGION) 放在最后。
+    """
     regions = set()
     for counter in counters:
         regions.update(counter)
@@ -84,6 +109,10 @@ def sorted_regions(*counters):
 
 
 def print_region_counts(site_counts, device_counts):
+    """
+    以表格形式格式化并打印按区域统计的站点数和设备数。
+    自动计算对齐宽度，保证中英文混合时的输出美观性。
+    """
     regions = sorted_regions(site_counts, device_counts)
     if not regions:
         print("\n按区域统计: 无数据")
@@ -124,19 +153,33 @@ def main():
         default=SITE_GRAPH_JSON,
         help=f"site_graph.json 文件路径，默认: {resource_display('site_graph.json')}",
     )
+    parser.add_argument(
+        "--details",
+        action="store_true",
+        help="额外按区域统计站点数和设备数",
+    )
+    # 解析命令行参数
     args = parser.parse_args()
 
+    # 1. 加载设备与站点拓扑数据
     ne_graph = load_json(args.ne_graph)
     site_graph = load_json(args.site_graph)
 
+    # 2. 统计全局数量
     device_count = count_top_level_entries(ne_graph, "设备", args.ne_graph)
     site_count = count_top_level_entries(site_graph, "站点", args.site_graph)
+    
+    # 3. 统计各区域的设备与站点数量
     device_counts_by_region = count_entries_by_region(ne_graph, "设备", args.ne_graph)
     site_counts_by_region = count_entries_by_region(site_graph, "站点", args.site_graph)
 
+    # 4. 打印全局统计结果
     print(f"ne_graph.json 设备数: {device_count}")
     print(f"site_graph.json 站点数: {site_count}")
-    print_region_counts(site_counts_by_region, device_counts_by_region)
+    
+    # 5. 如果启用了 --details 参数，则打印按区域的详细统计
+    if args.details:
+        print_region_counts(site_counts_by_region, device_counts_by_region)
 
 
 if __name__ == "__main__":

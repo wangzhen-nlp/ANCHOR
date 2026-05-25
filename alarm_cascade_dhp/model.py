@@ -1,4 +1,3 @@
-import copy
 import math
 import random
 
@@ -213,6 +212,12 @@ class _Cluster:
         }
 
     def _update_time_kernel(self, event, old_supports, config):
+        decay = config.kernel_decay_per_event
+        if decay > 0.0:
+            # EMA-age the kernel so long-lived cascades stay responsive to
+            # recent dynamics instead of ossifying around early observations.
+            retain = 1.0 - decay
+            self.kernel_alpha = [value * retain for value in self.kernel_alpha]
         weights = self.kernel_weights()
         updates = 0
         for support in reversed(old_supports):
@@ -245,6 +250,30 @@ class _Cluster:
             self.topology_relation_counts[relation] += 1
             updates += 1
 
+    def clone(self):
+        """Cheap copy used during SMC resampling.
+
+        Counters/lists/dicts are duplicated so particles diverge independently
+        after resampling, but immutable leaves (supports, event ids, visual
+        symptom dicts that are never mutated in place) are shared by reference.
+        """
+        twin = _Cluster.__new__(_Cluster)
+        twin.cascade_id = self.cascade_id
+        twin.created_ts = self.created_ts
+        twin.last_ts = self.last_ts
+        twin.kernel_alpha = list(self.kernel_alpha)
+        twin.feature_counts = self.feature_counts.copy()
+        twin.total_feature_count = self.total_feature_count
+        twin.supports = list(self.supports)
+        twin.event_ids = list(self.event_ids)
+        twin.visual_symptoms = list(self.visual_symptoms)
+        twin.alarm_titles = self.alarm_titles.copy()
+        twin.sites = self.sites.copy()
+        twin.alarm_sources = self.alarm_sources.copy()
+        twin.active_event_keys = self.active_event_keys.copy()
+        twin.topology_relation_counts = self.topology_relation_counts.copy()
+        return twin
+
 
 @dataclass
 class _Particle:
@@ -258,6 +287,22 @@ class _Particle:
         cascade_id = f"cascade-{self.next_cluster_number}"
         self.next_cluster_number += 1
         return cascade_id
+
+    def clone(self):
+        twin = _Particle(
+            log_weight=self.log_weight,
+            clusters=OrderedDict(
+                (cascade_id, cluster.clone())
+                for cascade_id, cluster in self.clusters.items()
+            ),
+            next_cluster_number=self.next_cluster_number,
+            # last_proposal references are intentionally not carried over: they
+            # belong to the previous step and would alias across resampled
+            # particles, the next observe_raise rewrites them anyway.
+            last_proposal=None,
+            last_candidate_count=0,
+        )
+        return twin
 
 
 class TopologyPoweredDHP:
@@ -384,24 +429,31 @@ class TopologyPoweredDHP:
         particle.last_candidate_count = len(proposals)
 
     def _candidate_clusters(self, particle, event_ts):
-        """Yield the most recently updated active candidates first."""
+        """Return the most recently updated active candidates.
+
+        OrderedDict insertion order tracks the last cluster touched by
+        move_to_end, not last_ts, so late or out-of-order events can perturb
+        the recency order. When max_candidate_cascades binds we re-sort by
+        last_ts so the cap honors true recency rather than touch order.
+        """
         max_candidates = self.config.max_candidate_cascades
-        yielded = 0
+        active_window = self.config.active_window_sec
+        close_after = self.config.close_after_sec
+        candidates = []
+        # Reverse iteration matches the legacy "most-recently-touched first"
+        # contract that downstream MAP tie-breaking relies on.
         for cascade_id in reversed(particle.clusters):
             cluster = particle.clusters[cascade_id]
             age = event_ts - cluster.last_ts
-            if age < 0:
-                continue
-            if age > self.config.active_window_sec or age >= self.config.close_after_sec:
-                # Bounded late events can perturb the recency order slightly.
-                # Skip stale clusters without assuming every older slot is stale.
+            if age < 0 or age > active_window or age >= close_after:
                 continue
             if not cluster.is_candidate(event_ts, self.config):
                 continue
-            yield cluster
-            yielded += 1
-            if max_candidates and yielded >= max_candidates:
-                break
+            candidates.append(cluster)
+        if max_candidates and len(candidates) > max_candidates:
+            candidates.sort(key=lambda cluster: cluster.last_ts, reverse=True)
+            del candidates[max_candidates:]
+        return candidates
 
     def _new_cluster_proposal(self, event):
         empty = _Cluster(
@@ -491,7 +543,7 @@ class TopologyPoweredDHP:
             draw = self.rng.random()
             for index, upper_bound in enumerate(cumulative):
                 if draw <= upper_bound:
-                    new_particles.append(copy.deepcopy(self.particles[index]))
+                    new_particles.append(self.particles[index].clone())
                     break
         uniform_log_weight = -math.log(len(new_particles))
         for particle in new_particles:
