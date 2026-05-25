@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Count data rows in CSV/Excel files under a directory, including ZIP members.
+"""Count data rows in CSV/JSONL/Excel files under a directory, including ZIP members.
 
 By default one header row is subtracted from every non-empty CSV file and every
-non-empty Excel sheet.
+non-empty Excel sheet. JSONL/NDJSON files are counted as headerless records.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from alarm_tools.progress_utils import ProgressBar
 
 
 CSV_EXTS = {".csv"}
+JSONL_EXTS = {".jsonl", ".ndjson"}
 EXCEL_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
 ZIP_EXTS = {".zip"}
 DEFAULT_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
@@ -67,7 +68,7 @@ def _suffix(path):
 
 
 def _is_supported_table(path):
-    return _suffix(path) in CSV_EXTS | EXCEL_EXTS
+    return _suffix(path) in CSV_EXTS | JSONL_EXTS | EXCEL_EXTS
 
 
 def _is_zip(path):
@@ -134,6 +135,64 @@ def _count_csv_bytes(data, logical_path, *, header_rows, encodings=DEFAULT_ENCOD
             continue
     raise UnicodeDecodeError(
         "csv",
+        b"",
+        0,
+        1,
+        f"cannot decode with encodings: {', '.join(encodings)}; last={last_error}",
+    )
+
+
+def _count_jsonl_stream(text_stream):
+    physical_rows = 0
+    for line in text_stream:
+        if line.strip():
+            physical_rows += 1
+    return physical_rows
+
+
+def _count_jsonl_file(path, *, encodings=DEFAULT_ENCODINGS):
+    last_error = None
+    for encoding in encodings:
+        try:
+            with open(path, "r", encoding=encoding) as handle:
+                physical_rows = _count_jsonl_stream(handle)
+            return CountRecord(
+                path=str(path),
+                kind="jsonl",
+                physical_rows=physical_rows,
+                data_rows=physical_rows,
+                header_rows=0,
+            )
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+    raise UnicodeDecodeError(
+        "jsonl",
+        b"",
+        0,
+        1,
+        f"cannot decode with encodings: {', '.join(encodings)}; last={last_error}",
+    )
+
+
+def _count_jsonl_bytes(data, logical_path, *, encodings=DEFAULT_ENCODINGS):
+    last_error = None
+    for encoding in encodings:
+        try:
+            with TextIOWrapper(BytesIO(data), encoding=encoding) as handle:
+                physical_rows = _count_jsonl_stream(handle)
+            return CountRecord(
+                path=logical_path,
+                kind="jsonl",
+                physical_rows=physical_rows,
+                data_rows=physical_rows,
+                header_rows=0,
+            )
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+    raise UnicodeDecodeError(
+        "jsonl",
         b"",
         0,
         1,
@@ -344,6 +403,8 @@ def _count_table_file(path, *, header_rows, first_sheet=False):
     try:
         if ext in CSV_EXTS:
             return [_count_csv_file(path, header_rows=header_rows)]
+        if ext in JSONL_EXTS:
+            return [_count_jsonl_file(path)]
         if ext == ".xls":
             return _count_xls_file_with_pandas(path, header_rows=header_rows, first_sheet=first_sheet)
         if ext in EXCEL_EXTS:
@@ -358,6 +419,8 @@ def _count_table_bytes(data, logical_path, *, header_rows, first_sheet=False):
     try:
         if ext in CSV_EXTS:
             return [_count_csv_bytes(data, logical_path, header_rows=header_rows)]
+        if ext in JSONL_EXTS:
+            return [_count_jsonl_bytes(data, logical_path)]
         if ext == ".xls":
             return _count_xls_bytes_with_pandas(
                 data,
@@ -390,7 +453,7 @@ def _iter_zip_records(zip_bytes_or_path, logical_path, *, header_rows, first_she
             member_name = info.filename
             member_path = f"{logical_path}!/{member_name}"
             ext = PurePosixPath(member_name).suffix.lower()
-            if ext not in (CSV_EXTS | EXCEL_EXTS | ZIP_EXTS):
+            if ext not in (CSV_EXTS | JSONL_EXTS | EXCEL_EXTS | ZIP_EXTS):
                 continue
             try:
                 data = zf.read(info)
@@ -526,13 +589,13 @@ def collect_count_records(root, *, header_rows=1, first_sheet=False, show_progre
 
 
 def main():
-    parser = ArgumentParser(description="递归统计目录/ZIP 内 CSV 和 Excel 的数据行数，默认扣除表头")
+    parser = ArgumentParser(description="递归统计目录/ZIP 内 CSV、JSONL 和 Excel 的数据行数，CSV/Excel 默认扣除表头")
     parser.add_argument("input", help="输入目录、文件或 zip")
     parser.add_argument(
         "--header-rows",
         type=int,
         default=1,
-        help="每个 CSV 文件/Excel sheet 扣除的表头行数，默认 1；传 0 表示不扣表头",
+        help="每个 CSV 文件/Excel sheet 扣除的表头行数，默认 1；JSONL 始终不扣表头",
     )
     parser.add_argument(
         "--first-sheet",
