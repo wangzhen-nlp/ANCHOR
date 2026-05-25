@@ -31,6 +31,7 @@ class BRUNCHConfig:
     log_every: int = 10
     progress_every: int = 50000
     parent_selection: str = "sample"
+    sweep_callback: object = None
 
     def __post_init__(self):
         if self.M < 1:
@@ -114,6 +115,7 @@ class BRUNCH:
             log_every=cfg.log_every,
             progress_every=cfg.progress_every,
             parent_selection=cfg.parent_selection,
+            sweep_callback=cfg.sweep_callback,
         )
         # Reconstruct the BEST state to materialize derived structures.
         best_state = BranchingState(events)

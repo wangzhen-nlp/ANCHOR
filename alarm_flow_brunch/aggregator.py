@@ -423,6 +423,7 @@ def _fit_sequence_with_progress(
     verbose=False,
     log_every=10,
     progress_every=50000,
+    sweep_callback=None,
 ):
     M = len(vocabs.type_vocab)
     events = _build_event_collection(sequence, M)
@@ -445,6 +446,7 @@ def _fit_sequence_with_progress(
         log_every=log_every,
         progress_every=progress_every,
         parent_selection=config.parent_selection,
+        sweep_callback=sweep_callback,
     )
     return BRUNCH(brunch_config).fit(events, init_params=init_params)
 
@@ -617,6 +619,7 @@ def train_alarm_brunch(
     log_every=10,
     region_filter_stats=None,
     progress_every=50000,
+    checkpoint_callback=None,
 ) -> AlarmBRUNCHArtifact:
     """Fit reusable BRUNCH type-level parameters from an ordered alarm stream."""
     config = config or AlarmBRUNCHConfig()
@@ -654,6 +657,42 @@ def train_alarm_brunch(
         n_sweeps=config.n_sweeps,
         burn_in=config.burn_in,
     )
+
+    def on_sweep_checkpoint(payload):
+        if checkpoint_callback is None:
+            return
+        params = payload["checkpoint_params"]
+        training_metadata = {
+            "considered_event_count": considered_event_count,
+            "region_filter": region_filter_stats,
+            "sequence_stats": sequence_stats,
+            "modeled_event_count": len(sequence.events),
+            "type_count": len(vocabs.type_vocab),
+            "active_edge_count": len(params.active_edges()[0]),
+            "topology_edge_policy": config.topology_edge_policy,
+            "topology_max_hops": getattr(topology_index, "max_hops", None),
+            "best_log_likelihood": payload["best_log_likelihood"],
+            "event_type_counts": _event_type_counts(sequence),
+            "type_labels": list(vocabs.type_vocab.labels),
+            "checkpoint": {
+                "sweep": payload["sweep"],
+                "sweep1": payload["sweep"] + 1,
+                "log_likelihood": payload["log_likelihood"],
+                "num_clusters": payload["num_clusters"],
+                "num_cascades": payload["num_cascades"],
+                "is_best": payload["is_best"],
+                "post_burn_in_best": payload["checkpoint_is_post_burn_in"],
+            },
+        }
+        artifact = AlarmBRUNCHArtifact(
+            params=params,
+            vocabs=vocabs,
+            config=config,
+            training_metadata=training_metadata,
+            trace=payload.get("trace") or [],
+        )
+        checkpoint_callback(artifact, payload)
+
     result = _fit_sequence_with_progress(
         sequence,
         vocabs,
@@ -662,6 +701,7 @@ def train_alarm_brunch(
         verbose=verbose,
         log_every=log_every,
         progress_every=progress_every,
+        sweep_callback=on_sweep_checkpoint if checkpoint_callback is not None else None,
     )
     _emit_progress(
         progress_callback,

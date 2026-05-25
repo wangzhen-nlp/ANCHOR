@@ -33,6 +33,22 @@ def _print_progress(message, args):
         print(message, flush=True)
 
 
+def _format_checkpoint_path(template, payload):
+    return template.format(
+        sweep=payload["sweep"],
+        sweep1=payload["sweep"] + 1,
+    )
+
+
+def _save_checkpoint_atomic(path, artifact):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    save_alarm_brunch_artifact(tmp_path, artifact)
+    os.replace(tmp_path, path)
+
+
 def _training_progress(stage, payload):
     if stage == "region_filter":
         if payload.get("enabled"):
@@ -217,6 +233,20 @@ def main():
             "Use 0 to show only phase start/end. Default: 50000."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-output",
+        default="",
+        help=(
+            "Optional checkpoint artifact path. Use {sweep} or {sweep1} in the path "
+            "to keep per-sweep files; otherwise the same file is overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=0,
+        help="Save a checkpoint every N sweeps when --checkpoint-output is set. Default: 0.",
+    )
     parser.add_argument("--quiet", action="store_true", help="Only print the final training summary.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -225,6 +255,10 @@ def main():
         parser.error("--log-every must be >= 1")
     if args.progress_every < 0:
         parser.error("--progress-every must be >= 0")
+    if args.checkpoint_output and args.checkpoint_every < 1:
+        parser.error("--checkpoint-every must be >= 1 when --checkpoint-output is set")
+    if args.checkpoint_every > 0 and not args.checkpoint_output:
+        parser.error("--checkpoint-output is required when --checkpoint-every is set")
 
     config = _build_config(args)
     _print_progress("[train] loading alarms...", args)
@@ -267,6 +301,25 @@ def main():
             args,
         )
         topology_index = NETopologyIndex.from_graph(topology_graph, max_hops=args.topology_max_hops)
+
+    def checkpoint_callback(checkpoint_artifact, payload):
+        if not args.checkpoint_output:
+            return
+        if (payload["sweep"] + 1) % args.checkpoint_every != 0:
+            return
+        checkpoint_artifact.training_metadata["input"] = os.path.abspath(args.alarms)
+        checkpoint_artifact.training_metadata["alarm_metadata"] = alarm_metadata
+        if topology_region_stats is not None:
+            checkpoint_artifact.training_metadata["topology_region_filter"] = topology_region_stats
+        path = _format_checkpoint_path(args.checkpoint_output, payload)
+        _save_checkpoint_atomic(path, checkpoint_artifact)
+        _print_progress(
+            "[train] checkpoint saved: "
+            f"{path}; sweep={payload['sweep']}, "
+            f"best_log_likelihood={payload['best_log_likelihood']:.4f}",
+            args,
+        )
+
     _print_progress("[train] fitting model...", args)
     artifact = train_alarm_brunch(
         alarm_events,
@@ -278,6 +331,7 @@ def main():
         verbose=_progress_enabled(args),
         log_every=args.log_every,
         progress_every=args.progress_every,
+        checkpoint_callback=checkpoint_callback if args.checkpoint_output else None,
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata

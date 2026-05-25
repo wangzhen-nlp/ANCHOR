@@ -335,6 +335,7 @@ def run_media(
     log_every: int = 10,
     progress_every: int = 50000,
     parent_selection: str = "sample",
+    sweep_callback=None,
 ) -> dict:
     """Drive MEDIA for n_sweeps. Returns a dict with best params, final state,
     and a likelihood trace.
@@ -369,19 +370,38 @@ def run_media(
                 f"elapsed={_elapsed_text(ll_start)}",
                 flush=True,
             )
-        trace.append({"sweep": sweep, "log_likelihood": ll, "num_cascades": state.num_cascades})
+        trace_record = {"sweep": sweep, "log_likelihood": ll, "num_cascades": state.num_cascades}
+        trace.append(trace_record)
         if verbose and (sweep % log_every == 0 or sweep == n_sweeps - 1):
             print(
                 f"sweep={sweep:4d} log_lik={ll:.4f} "
                 f"clusters={state.num_clusters} cascades={state.num_cascades} "
                 f"rho={params.spectral_radius():.3f}"
             )
+        is_best = False
         if sweep >= burn_in and ll > best_ll:
             best_ll = ll
             best_params = params.copy()
             best_event_parent = state.event_parent.copy()
             state._ensure_clusters()
             best_cluster_parent = state._cluster_parent.copy()
+            is_best = True
+        if sweep_callback is not None:
+            has_post_burn_in_best = np.isfinite(best_ll)
+            checkpoint_params = best_params.copy() if has_post_burn_in_best else params.copy()
+            sweep_callback(
+                {
+                    "sweep": sweep,
+                    "log_likelihood": ll,
+                    "num_clusters": state.num_clusters,
+                    "num_cascades": state.num_cascades,
+                    "is_best": is_best,
+                    "best_log_likelihood": best_ll if has_post_burn_in_best else ll,
+                    "checkpoint_is_post_burn_in": bool(has_post_burn_in_best),
+                    "checkpoint_params": checkpoint_params,
+                    "trace": list(trace),
+                }
+            )
 
     return {
         "params": best_params,
