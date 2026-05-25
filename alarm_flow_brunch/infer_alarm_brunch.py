@@ -14,7 +14,7 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_flow_brunch.aggregator import infer_alarm_flow, load_alarm_brunch_artifact
-from alarm_flow_brunch.region_filter import load_ne_graph, parse_regions
+from alarm_flow_brunch.region_filter import parse_regions
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, resource_display
 
@@ -91,13 +91,13 @@ def main():
         start_time=args.start_time or None,
         end_time=args.end_time or None,
         clear_delay_sec=args.clear_delay_sec,
+        regions=infer_config.regions,
     )
-    ne_graph_data = load_ne_graph(args.ne_graph) if infer_config.regions else None
     output = infer_alarm_flow(
         alarm_events,
         artifact,
         config=infer_config,
-        ne_graph_data=ne_graph_data,
+        region_filter_stats=(alarm_metadata or {}).get("region_filter"),
     )
     payload = output.to_json_payload()
     payload["metadata"]["input"] = os.path.abspath(args.alarms)

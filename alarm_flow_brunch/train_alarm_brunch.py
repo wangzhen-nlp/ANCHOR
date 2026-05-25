@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from argparse import ArgumentParser
 
@@ -35,12 +36,20 @@ def _print_progress(message, args):
 def _training_progress(stage, payload):
     if stage == "region_filter":
         if payload.get("enabled"):
+            raw_checked = payload.get("raw_checked_alarm_count")
+            raw_kept = payload.get("raw_kept_alarm_count")
+            raw_dropped = payload.get("raw_dropped_alarm_count")
+            raw_summary = (
+                f"raw_kept={raw_kept}/{raw_checked}, raw_dropped={raw_dropped}, "
+                if raw_checked is not None
+                else ""
+            )
             print(
                 "[train] region filter: "
                 f"regions={payload.get('regions', [])}, "
-                f"kept={payload.get('kept_event_count', 0)}/"
+                f"{raw_summary}"
+                f"events={payload.get('kept_event_count', 0)}/"
                 f"{payload.get('input_event_count', 0)}, "
-                f"dropped={payload.get('dropped_event_count', 0)}, "
                 f"allowed_devices={payload.get('allowed_device_count', 0)}",
                 flush=True,
             )
@@ -111,6 +120,14 @@ def _build_config(args):
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
         regions=parse_regions(args.regions),
     )
+
+
+def _adopt_loaded_regions(config, alarm_metadata):
+    region_filter = (alarm_metadata or {}).get("region_filter") or {}
+    if config.regions or not region_filter.get("enabled"):
+        return config
+    regions = parse_regions(region_filter.get("regions"))
+    return replace(config, regions=regions) if regions else config
 
 
 def main():
@@ -197,12 +214,14 @@ def main():
         start_time=args.start_time or None,
         end_time=args.end_time or None,
         clear_delay_sec=args.clear_delay_sec,
+        regions=config.regions,
     )
+    config = _adopt_loaded_regions(config, alarm_metadata)
     _print_progress(f"[train] loaded alarm events: {len(alarm_events)}", args)
     ne_graph_data = None
     topology_graph = None
     topology_region_stats = None
-    if config.regions or config.topology_edge_policy != "off":
+    if config.topology_edge_policy != "off":
         _print_progress(f"[train] loading NE graph: {args.ne_graph}", args)
         ne_graph_data = load_ne_graph(args.ne_graph)
         topology_graph = ne_graph_data
@@ -233,6 +252,7 @@ def main():
         config,
         topology_index=topology_index,
         ne_graph_data=ne_graph_data,
+        region_filter_stats=(alarm_metadata or {}).get("region_filter"),
         progress_callback=_training_progress if _progress_enabled(args) else None,
         verbose=_progress_enabled(args),
         log_every=args.log_every,

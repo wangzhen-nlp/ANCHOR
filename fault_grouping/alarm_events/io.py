@@ -66,6 +66,8 @@ def load_valid_alarms(
     start_ts=None,
     end_ts=None,
     clear_delay_sec=0.0,
+    allowed_alarm_sources=None,
+    region_filter_stats=None,
 ):
     processed_count = 0
     valid_alarms = []
@@ -79,9 +81,25 @@ def load_valid_alarms(
         if alarm_title not in valid_alarm_titles:
             continue
 
+        alarm_source = str(alarm.get('告警源', '') or '').strip()
+        if allowed_alarm_sources is not None:
+            if region_filter_stats is not None:
+                region_filter_stats["raw_checked_alarm_count"] = (
+                    region_filter_stats.get("raw_checked_alarm_count", 0) + 1
+                )
+            if alarm_source not in allowed_alarm_sources:
+                if region_filter_stats is not None:
+                    region_filter_stats["raw_dropped_alarm_count"] = (
+                        region_filter_stats.get("raw_dropped_alarm_count", 0) + 1
+                    )
+                continue
+            if region_filter_stats is not None:
+                region_filter_stats["raw_kept_alarm_count"] = (
+                    region_filter_stats.get("raw_kept_alarm_count", 0) + 1
+                )
+
         site_id = alarm.get('站点ID', '')
         if not site_id or site_id not in valid_sites:
-            alarm_source = alarm.get('告警源', '')
             site_id = ne_to_site.get(alarm_source, '')
 
         if not site_id or site_id not in valid_sites:

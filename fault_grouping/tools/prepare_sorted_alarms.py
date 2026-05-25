@@ -25,10 +25,11 @@ from topology_resources import (
     SITE_GRAPH_BY_NE_JSON,
     resource_display,
 )
+from topology_tools.region_utils import allowed_devices_for_regions, load_ne_graph, parse_regions
 
 
 def _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path):
-    ne_graph_data = json.load(open(ne_graph_path, "r", encoding="utf-8"))
+    ne_graph_data = load_ne_graph(ne_graph_path)
     if topo_path:
         topo_downstream_map = json.load(open(topo_path, "r", encoding="utf-8"))
         valid_sites = set(topo_downstream_map.keys())
@@ -45,7 +46,7 @@ def _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path):
         for ne_id, ne_info in ne_graph_data.items()
         if str(ne_info.get("site_id", "")).strip()
     }
-    return valid_sites, ne_to_site
+    return valid_sites, ne_to_site, ne_graph_data
 
 
 def build_sorted_alarms(
@@ -56,13 +57,29 @@ def build_sorted_alarms(
     start_time=None,
     end_time=None,
     clear_delay_sec=0.0,
+    regions=None,
 ):
     start_ts = parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
     end_ts = parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
     if start_ts is not None and end_ts is not None and start_ts > end_ts:
         raise ValueError("start_time 不能晚于 end_time")
 
-    valid_sites, ne_to_site = _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path)
+    selected_regions = parse_regions(regions)
+    valid_sites, ne_to_site, ne_graph_data = _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path)
+    allowed_alarm_sources = None
+    region_filter_stats = {
+        "stage": "raw_input",
+        "enabled": bool(selected_regions),
+        "regions": sorted(selected_regions),
+        "ne_graph_device_count": len(ne_graph_data) if isinstance(ne_graph_data, dict) else 0,
+        "allowed_device_count": 0,
+        "raw_checked_alarm_count": 0,
+        "raw_kept_alarm_count": 0,
+        "raw_dropped_alarm_count": 0,
+    }
+    if selected_regions:
+        allowed_alarm_sources = allowed_devices_for_regions(ne_graph_data, selected_regions)
+        region_filter_stats["allowed_device_count"] = len(allowed_alarm_sources)
     processed_count, valid_alarms, normal_alarm_count, clear_alarm_count = load_valid_alarms(
         alarm_input,
         CRITICAL_ALARMS,
@@ -71,7 +88,10 @@ def build_sorted_alarms(
         start_ts=start_ts,
         end_ts=end_ts,
         clear_delay_sec=clear_delay_sec,
+        allowed_alarm_sources=allowed_alarm_sources,
+        region_filter_stats=region_filter_stats,
     )
+    region_filter_stats["pre_sort_event_count"] = len(valid_alarms)
     valid_alarms.sort(key=lambda item: item["ts"])
     valid_alarms = trim_trailing_clear_alarms(valid_alarms)
 
@@ -95,6 +115,19 @@ def build_sorted_alarms(
         "ne_to_site_count": len(ne_to_site),
         "valid_alarm_title_count": len(CRITICAL_ALARMS),
     }
+    if selected_regions:
+        region_filter_stats.update(
+            {
+                "input_event_count": region_filter_stats["pre_sort_event_count"],
+                "kept_event_count": len(valid_alarms),
+                "dropped_event_count": (
+                    region_filter_stats["pre_sort_event_count"] - len(valid_alarms)
+                ),
+                "cached_normal_alarm_count": cached_normal_alarm_count,
+                "cached_clear_alarm_count": cached_clear_alarm_count,
+            }
+        )
+        metadata["region_filter"] = region_filter_stats
     return valid_alarms, metadata
 
 
@@ -125,6 +158,14 @@ def main():
         default=0.0,
         help="清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间",
     )
+    parser.add_argument(
+        "--regions",
+        "--region",
+        dest="regions",
+        action="append",
+        default=None,
+        help="仅保留这些 region 下设备的告警；可重复传入或用逗号分隔",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -135,6 +176,7 @@ def main():
         start_time=args.start_time,
         end_time=args.end_time,
         clear_delay_sec=args.clear_delay_sec,
+        regions=args.regions,
     )
     header = write_sorted_alarm_cache(args.output, valid_alarms, metadata)
     elapsed = time.time() - start_time

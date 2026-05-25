@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from argparse import ArgumentParser
@@ -56,6 +57,14 @@ def _build_config(args):
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
         regions=parse_regions(args.regions),
     )
+
+
+def _adopt_loaded_regions(config, alarm_metadata):
+    region_filter = (alarm_metadata or {}).get("region_filter") or {}
+    if config.regions or not region_filter.get("enabled"):
+        return config
+    regions = parse_regions(region_filter.get("regions"))
+    return replace(config, regions=regions) if regions else config
 
 
 def main():
@@ -179,11 +188,13 @@ def main():
         start_time=args.start_time or None,
         end_time=args.end_time or None,
         clear_delay_sec=args.clear_delay_sec,
+        regions=config.regions,
     )
+    config = _adopt_loaded_regions(config, alarm_metadata)
     ne_graph_data = None
     topology_graph = None
     topology_region_stats = None
-    if config.regions or config.topology_edge_policy != "off":
+    if config.topology_edge_policy != "off":
         ne_graph_data = load_ne_graph(args.ne_graph)
         topology_graph = ne_graph_data
         if config.regions:
@@ -199,6 +210,7 @@ def main():
         config,
         topology_index=topology_index,
         ne_graph_data=ne_graph_data,
+        region_filter_stats=(alarm_metadata or {}).get("region_filter"),
     )
     payload = output.to_json_payload()
     payload["metadata"]["input"] = os.path.abspath(args.alarms)

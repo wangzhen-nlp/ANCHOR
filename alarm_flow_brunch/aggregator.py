@@ -442,9 +442,9 @@ def _fit_sequence_with_progress(
     return BRUNCH(brunch_config).fit(events, init_params=init_params)
 
 
-def _emit_progress(progress_callback, stage, **payload):
+def _emit_progress(progress_callback, progress_stage, **payload):
     if progress_callback is not None:
-        progress_callback(stage, payload)
+        progress_callback(progress_stage, payload)
 
 
 def _event_type_counts(sequence):
@@ -543,7 +543,16 @@ def _edge_records(sequence, result):
     return edges
 
 
-def _region_filter_events(sorted_alarm_events, config: AlarmBRUNCHConfig, ne_graph_data=None):
+def _region_filter_events(
+    sorted_alarm_events,
+    config: AlarmBRUNCHConfig,
+    ne_graph_data=None,
+    region_filter_stats=None,
+):
+    if region_filter_stats is not None:
+        stats = dict(region_filter_stats)
+        stats["already_applied"] = True
+        return list(sorted_alarm_events), stats
     return filter_alarm_events_by_regions(
         sorted_alarm_events,
         config.regions,
@@ -599,6 +608,7 @@ def train_alarm_brunch(
     progress_callback=None,
     verbose=False,
     log_every=10,
+    region_filter_stats=None,
 ) -> AlarmBRUNCHArtifact:
     """Fit reusable BRUNCH type-level parameters from an ordered alarm stream."""
     config = config or AlarmBRUNCHConfig()
@@ -608,6 +618,7 @@ def train_alarm_brunch(
         sorted_alarm_events,
         config,
         ne_graph_data,
+        region_filter_stats=region_filter_stats,
     )
     _emit_progress(progress_callback, "region_filter", **region_filter_stats)
     vocabs, considered_event_count = build_alarm_vocabs(sorted_alarm_events, sequence_config)
@@ -678,6 +689,7 @@ def infer_alarm_flow(
     config: AlarmBRUNCHConfig | None = None,
     topology_index=None,
     ne_graph_data=None,
+    region_filter_stats=None,
 ) -> AlarmBRUNCHOutput:
     """Infer fault groups with a trained BRUNCH artifact."""
     config = config or replace(artifact.config, refit_params=False)
@@ -687,6 +699,7 @@ def infer_alarm_flow(
         sorted_alarm_events,
         config,
         ne_graph_data,
+        region_filter_stats=region_filter_stats,
     )
     sequences, sequence_stats = _build_sequences(
         sorted_alarm_events,
@@ -720,6 +733,7 @@ def aggregate_alarm_flow(
     config: AlarmBRUNCHConfig | None = None,
     topology_index=None,
     ne_graph_data=None,
+    region_filter_stats=None,
 ) -> AlarmBRUNCHOutput:
     """Infer fault groups from an ordered alarm stream via BRUNCH branching."""
     config = config or AlarmBRUNCHConfig()
@@ -729,6 +743,7 @@ def aggregate_alarm_flow(
         sorted_alarm_events,
         config,
         ne_graph_data,
+        region_filter_stats=region_filter_stats,
     )
     vocabs, considered_event_count = build_alarm_vocabs(sorted_alarm_events, sequence_config)
     sequences, sequence_stats = _build_sequences(

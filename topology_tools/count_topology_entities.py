@@ -12,19 +12,9 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
+from topology_tools.region_utils import REGION_KEYS, get_region as _get_region
 
 
-# 用于在 JSON 记录中匹配区域字段的可能的键名列表
-REGION_KEYS = (
-    "region_id",
-    "regionId",
-    "regionId1",
-    "region",
-    "area_id",
-    "area",
-    "区域",
-    "地市",
-)
 UNKNOWN_REGION = "未填区域"
 
 
@@ -74,16 +64,7 @@ def get_region(record, unknown_label=UNKNOWN_REGION):
     从单条记录 (dict) 中提取区域 (Region) 信息。
     通过遍历 REGION_KEYS 来匹配可能的键名，若未找到或值为空，则返回 unknown_label。
     """
-    if not isinstance(record, dict):
-        return unknown_label
-    for key in REGION_KEYS:
-        value = record.get(key)
-        if value is None:
-            continue
-        value = str(value).strip()
-        if value:
-            return value
-    return unknown_label
+    return _get_region(record, default=unknown_label)
 
 
 def count_entries_by_region(data, entity_label, path):
