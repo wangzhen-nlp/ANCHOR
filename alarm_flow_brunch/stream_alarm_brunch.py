@@ -15,6 +15,7 @@ import heapq
 import json
 import math
 import os
+import time
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from alarm_flow_brunch.visual_output import AlarmBRUNCHVisualOutputSession
 from alarm_flow_isahp.sequences import alarm_type_label, event_type_label
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from alarm_tools.alarm_types import CRITICAL_ALARMS
+from alarm_tools.progress_utils import ProgressBar
 from brunch.kernels import exp_kernel
 from fault_grouping.alarm_events.io import (
     apply_clear_delay,
@@ -50,6 +52,8 @@ from topology_tools.region_utils import allowed_devices_for_regions, load_ne_gra
 
 
 EPS = 1e-12
+_OFFLINE_REORDER_LAG_SEC = 0.0
+_LIVE_REORDER_LAG_SEC = 300.0
 
 
 @dataclass
@@ -141,6 +145,10 @@ class ReorderBuffer:
     def flush(self):
         while self._heap:
             yield heapq.heappop(self._heap)[2]
+
+    @property
+    def pending_count(self):
+        return len(self._heap)
 
 
 class OnlineBRUNCHAssigner:
@@ -537,6 +545,10 @@ def _count_decision(counts, decision):
     counts[status] = counts.get(status, 0) + 1
 
 
+def _status_count(counts, status):
+    return counts.get(status, 0)
+
+
 def _emit_closed_visual_groups(visual_output, assigner, now_ts, close_after_sec, min_group_events):
     groups = assigner.close_inactive(
         now_ts,
@@ -553,6 +565,199 @@ def _emit_remaining_visual_groups(visual_output, assigner, min_group_events):
     if visual_output is None:
         return 0, groups
     return visual_output.emit_groups(groups, finalization_reason="stream_end"), groups
+
+
+def _progress_extra_text(assigner, counts, reorder_buffer, visual_output=None):
+    visual_count = visual_output.emitted_count if visual_output is not None else 0
+    return (
+        f"聚类 {_status_count(counts, 'clustered')}，"
+        f"跳过 {_status_count(counts, 'skipped')}，"
+        f"cascade {len(assigner.cascades)}，"
+        f"closed {len(assigner.closed_cascade_ids)}，"
+        f"visual {visual_count}，"
+        f"乱序缓冲 {reorder_buffer.pending_count}"
+    )
+
+
+class _StreamProcessProgress:
+    """Throttle processing progress for sorted files or a live stream."""
+
+    def __init__(self, total=0, interval_sec=0.2):
+        self.bar = ProgressBar(total, "处理告警流")
+        self.interval_sec = interval_sec
+        self.last_refresh = 0.0
+
+    def refresh(self, processed_count, assigner, counts, reorder_buffer, visual_output=None, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_refresh < self.interval_sec:
+            return
+        self.bar.set(processed_count)
+        self.bar.set_extra_text(
+            _progress_extra_text(assigner, counts, reorder_buffer, visual_output),
+            force=force,
+        )
+        self.last_refresh = now
+
+    def close(self):
+        self.bar.close()
+
+
+def _print_run_configuration(args, artifact, config, groups_output):
+    active_window = (
+        args.active_window_sec
+        if args.active_window_sec is not None
+        else config.history_window_sec
+    )
+    print("正在初始化 alarm-flow BRUNCH 在线推理器...")
+    print(
+        "模型配置: "
+        f"types={len(artifact.vocabs.type_vocab)}, "
+        f"active_edges={len(artifact.params.active_edges(include_self=True)[0])}, "
+        f"parent_selection={config.parent_selection}, "
+        f"type_fields={','.join(config.type_fields)}"
+    )
+    print(
+        "候选窗口: "
+        f"active={active_window:g}s, "
+        f"max_history_events={config.max_history_events}, "
+        f"close={args.close_after_sec:g}s, "
+        f"reorder_lag={args.reorder_lag_sec:g}s"
+    )
+    print(
+        "输入顺序: "
+        + (
+            "保留源顺序，按实时流入口处理"
+            if args.preserve_input_order
+            else "离线文件默认先过滤并按事件时间排序后推理"
+        )
+    )
+    print("region 过滤: " + (",".join(sorted(config.regions)) if config.regions else "未启用"))
+    print(f"决策输出: {args.output}")
+    if groups_output:
+        print(f"cascade 快照输出: {groups_output}")
+    if args.visual_output:
+        print("可视化输出: cascade 关闭时追加写入，输入结束时补写仍未关闭的 cascade")
+        print(f"可视化文件: {args.visual_output}")
+
+
+def _apply_input_mode_defaults(args):
+    if args.reorder_lag_sec is None:
+        args.reorder_lag_sec = (
+            _LIVE_REORDER_LAG_SEC
+            if args.preserve_input_order
+            else _OFFLINE_REORDER_LAG_SEC
+        )
+    return args
+
+
+def _load_sorted_events(args, config):
+    print("正在加载告警并应用时间/region/拓扑过滤...")
+    start_time = time.time()
+    events = list(
+        _iter_stream_events(
+            args.alarms,
+            topo_path=args.topo,
+            ne_graph_path=args.ne_graph,
+            regions=config.regions,
+            start_time=args.start_time or None,
+            end_time=args.end_time or None,
+            include_clear=config.include_clear,
+            clear_delay_sec=args.clear_delay_sec,
+            show_progress=True,
+        )
+    )
+    load_elapsed = time.time() - start_time
+    print(f"过滤后保留 {len(events)} 条告警事件，加载耗时 {load_elapsed:.2f} 秒")
+    print("正在按事件时间排序告警...")
+    sort_start = time.time()
+    events.sort(key=lambda event: float(event.get("ts", 0.0)))
+    sort_elapsed = time.time() - sort_start
+    print(f"已准备 {len(events)} 条按事件时间排序的告警事件，排序耗时 {sort_elapsed:.2f} 秒")
+    return events
+
+
+def _iter_live_events(args, config):
+    return _iter_stream_events(
+        args.alarms,
+        topo_path=args.topo,
+        ne_graph_path=args.ne_graph,
+        regions=config.regions,
+        start_time=args.start_time or None,
+        end_time=args.end_time or None,
+        include_clear=config.include_clear,
+        clear_delay_sec=args.clear_delay_sec,
+        show_progress=args.show_progress,
+    )
+
+
+def _process_ready_event(
+    assigner,
+    decision_stream,
+    counts,
+    visual_output,
+    ready_event,
+    *,
+    close_after_sec,
+    min_group_events,
+):
+    decision = _process_event(assigner, decision_stream, ready_event)
+    _count_decision(counts, decision)
+    _emit_closed_visual_groups(
+        visual_output,
+        assigner,
+        decision["ts"],
+        close_after_sec,
+        min_group_events,
+    )
+    return decision
+
+
+def _process_event_iterable(
+    events,
+    *,
+    assigner,
+    decision_stream,
+    counts,
+    visual_output,
+    reorder_buffer,
+    close_after_sec,
+    min_group_events,
+    total=0,
+):
+    processed = 0
+    progress = _StreamProcessProgress(total=total)
+    progress.refresh(processed, assigner, counts, reorder_buffer, visual_output, force=True)
+    try:
+        for event in events:
+            reorder_buffer.push(event)
+            for ready_event in reorder_buffer.ready():
+                _process_ready_event(
+                    assigner,
+                    decision_stream,
+                    counts,
+                    visual_output,
+                    ready_event,
+                    close_after_sec=close_after_sec,
+                    min_group_events=min_group_events,
+                )
+            processed += 1
+            progress.refresh(processed, assigner, counts, reorder_buffer, visual_output)
+        print("\n数据流读取完毕，正在清空乱序缓冲并输出剩余决策...")
+        for ready_event in reorder_buffer.flush():
+            _process_ready_event(
+                assigner,
+                decision_stream,
+                counts,
+                visual_output,
+                ready_event,
+                close_after_sec=close_after_sec,
+                min_group_events=min_group_events,
+            )
+            progress.refresh(processed, assigner, counts, reorder_buffer, visual_output)
+    finally:
+        progress.refresh(processed, assigner, counts, reorder_buffer, visual_output, force=True)
+        progress.close()
+    return processed
 
 
 def main():
@@ -605,8 +810,8 @@ def main():
     parser.add_argument(
         "--reorder-lag-sec",
         type=float,
-        default=60.0,
-        help="Maximum event-time wait before emitting a decision. Default: 60 seconds.",
+        default=None,
+        help="Event-time reorder buffer lag. Default: 0 after offline sorting, 300 with --preserve-input-order.",
     )
     parser.add_argument(
         "--active-window-sec",
@@ -645,9 +850,16 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for sample mode.")
     parser.add_argument("--show-progress", action="store_true", help="Show input read progress.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--preserve-input-order",
+        action="store_true",
+        help="Skip the default offline event-time sort and consume source order as a live stream.",
+    )
+    args = _apply_input_mode_defaults(parser.parse_args())
     groups_output = _resolve_groups_output(args)
 
+    start_time = time.time()
+    print("正在加载 BRUNCH 模型 artifact...")
     artifact = load_alarm_brunch_artifact(args.model)
     regions = parse_regions(args.regions) if args.regions is not None else artifact.config.regions
     parent_selection = args.parent_selection or artifact.config.parent_selection
@@ -657,6 +869,7 @@ def main():
         include_clear=bool(args.include_clear or artifact.config.include_clear),
         parent_selection=parent_selection,
     )
+    _print_run_configuration(args, artifact, config, groups_output)
     assigner = OnlineBRUNCHAssigner(
         artifact,
         config=config,
@@ -677,39 +890,29 @@ def main():
     counts = {}
 
     try:
+        sorted_events = None
+        if not args.preserve_input_order:
+            sorted_events = _load_sorted_events(args, config)
+
+        print("正在处理告警流并写出在线 cascade 决策...")
         with open(args.output, "w", encoding="utf-8") as decision_stream:
-            for event in _iter_stream_events(
-                args.alarms,
-                topo_path=args.topo,
-                ne_graph_path=args.ne_graph,
-                regions=config.regions,
-                start_time=args.start_time or None,
-                end_time=args.end_time or None,
-                include_clear=config.include_clear,
-                clear_delay_sec=args.clear_delay_sec,
-                show_progress=args.show_progress,
-            ):
-                reorder_buffer.push(event)
-                for ready_event in reorder_buffer.ready():
-                    decision = _process_event(assigner, decision_stream, ready_event)
-                    _count_decision(counts, decision)
-                    _emit_closed_visual_groups(
-                        visual_output,
-                        assigner,
-                        decision["ts"],
-                        args.close_after_sec,
-                        args.min_group_events,
-                    )
-            for ready_event in reorder_buffer.flush():
-                decision = _process_event(assigner, decision_stream, ready_event)
-                _count_decision(counts, decision)
-                _emit_closed_visual_groups(
-                    visual_output,
-                    assigner,
-                    decision["ts"],
-                    args.close_after_sec,
-                    args.min_group_events,
-                )
+            input_events = (
+                _iter_live_events(args, config)
+                if sorted_events is None
+                else sorted_events
+            )
+            processed_count = _process_event_iterable(
+                input_events,
+                assigner=assigner,
+                decision_stream=decision_stream,
+                counts=counts,
+                visual_output=visual_output,
+                reorder_buffer=reorder_buffer,
+                close_after_sec=args.close_after_sec,
+                min_group_events=args.min_group_events,
+                total=len(sorted_events) if sorted_events is not None else 0,
+            )
+            print("正在补写仍未关闭的 cascade...")
             remaining_emitted, remaining_groups = _emit_remaining_visual_groups(
                 visual_output,
                 assigner,
@@ -729,6 +932,7 @@ def main():
     metadata["regions"] = sorted(config.regions)
 
     if groups_output:
+        print("正在写 cascade 快照 JSON...")
         _write_json(
             groups_output,
             {
@@ -738,13 +942,16 @@ def main():
             },
         )
     visual_count = visual_output.emitted_count if visual_output is not None else 0
+    elapsed = time.time() - start_time
 
     print(
         f"online BRUNCH decisions written to: {args.output}; "
+        f"read={processed_count}, "
         f"events={metadata['modeled_event_count']}, "
         f"skipped={metadata['skipped_event_count']}, "
         f"groups={metadata['group_count']}, "
-        f"edges={metadata['branching_edge_count']}"
+        f"edges={metadata['branching_edge_count']}, "
+        f"elapsed={elapsed:.2f}s"
     )
     if groups_output:
         print(f"final groups written to: {groups_output}")
