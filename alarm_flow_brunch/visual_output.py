@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 from pathlib import Path
 
@@ -29,12 +30,129 @@ def _symptom_to_visual_record(symptom):
     }
 
 
-def group_to_visual_match(group):
+def _link_neighbors(ne_graph_data, ne_id):
+    entry = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+    links = entry.get("link", {}) if isinstance(entry, dict) else {}
+    if not isinstance(links, dict):
+        return set()
+    return set(str(neighbor_id) for neighbor_id in links.keys() if str(neighbor_id))
+
+
+def _has_direct_ne_link(ne_graph_data, source_ne, target_ne):
+    if not source_ne or not target_ne or source_ne == target_ne:
+        return source_ne == target_ne
+    return (
+        target_ne in _link_neighbors(ne_graph_data, source_ne)
+        or source_ne in _link_neighbors(ne_graph_data, target_ne)
+    )
+
+
+def _shortest_ne_hops(ne_graph_data, source_ne, target_ne, max_hops=3):
+    if not source_ne or not target_ne or source_ne == target_ne:
+        return 0 if source_ne == target_ne else None
+    seen = {source_ne}
+    queue = deque([(source_ne, 0)])
+    while queue:
+        node, hops = queue.popleft()
+        if hops >= max_hops:
+            continue
+        for neighbor in _link_neighbors(ne_graph_data, node):
+            if neighbor == target_ne:
+                return hops + 1
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            queue.append((neighbor, hops + 1))
+    return None
+
+
+def _classify_missing_propagation_edge(ne_graph_data, source_symptom, target_symptom):
+    source_ne = str(source_symptom.get("alarm_source", "") or "")
+    target_ne = str(target_symptom.get("alarm_source", "") or "")
+    source_site = str(source_symptom.get("site_id", "") or "")
+    target_site = str(target_symptom.get("site_id", "") or "")
+    if source_ne == target_ne:
+        return "same_device", 0
+    hops = _shortest_ne_hops(ne_graph_data, source_ne, target_ne, max_hops=3)
+    if hops is not None and hops > 1:
+        return "indirect_topology", hops
+    if source_site and source_site == target_site:
+        return "same_site", None
+    if source_site and target_site and source_site != target_site:
+        return "cross_site", None
+    return "unknown", None
+
+
+def _brunch_missing_topology_edges(group, ne_graph_data):
+    if not ne_graph_data:
+        return []
+    symptoms_by_event_id = {
+        str(symptom.get("event_id", "") or ""): symptom
+        for symptom in group.get("symptoms") or []
+        if symptom.get("event_id")
+    }
+    missing_edges = []
+    seen = set()
+    for edge in group.get("edges") or []:
+        source_event_id = str(edge.get("source_event_id", "") or "")
+        target_event_id = str(edge.get("target_event_id", "") or "")
+        source_symptom = symptoms_by_event_id.get(source_event_id)
+        target_symptom = symptoms_by_event_id.get(target_event_id)
+        if not source_symptom or not target_symptom:
+            continue
+        source_ne = str(source_symptom.get("alarm_source", "") or "")
+        target_ne = str(target_symptom.get("alarm_source", "") or "")
+        if not source_ne or not target_ne:
+            continue
+        if _has_direct_ne_link(ne_graph_data, source_ne, target_ne):
+            continue
+
+        relation, hops = _classify_missing_propagation_edge(
+            ne_graph_data,
+            source_symptom,
+            target_symptom,
+        )
+        key = (source_event_id, target_event_id, source_ne, target_ne, relation)
+        if key in seen:
+            continue
+        seen.add(key)
+        source_ts = source_symptom.get("ts")
+        target_ts = target_symptom.get("ts")
+        missing_edges.append(
+            {
+                "source": source_symptom.get("site_id", ""),
+                "target": target_symptom.get("site_id", ""),
+                "source_site": source_symptom.get("site_id", ""),
+                "target_site": target_symptom.get("site_id", ""),
+                "source_ne": source_ne,
+                "target_ne": target_ne,
+                "source_event_id": source_event_id,
+                "target_event_id": target_event_id,
+                "source_alarm": source_symptom.get("alarm_title", ""),
+                "target_alarm": target_symptom.get("alarm_title", ""),
+                "relation": relation,
+                "predicted_relation": relation,
+                "score": "",
+                "inferred_hops": hops or 0,
+                "dt_sec": (
+                    float(target_ts) - float(source_ts)
+                    if source_ts is not None and target_ts is not None
+                    else None
+                ),
+                "edge_source": "alarm_flow_brunch",
+                "description": "BRUNCH inferred propagation edge without direct NE topology link",
+            }
+        )
+    return missing_edges
+
+
+def group_to_visual_match(group, ne_graph_data=None):
     root_event = dict(group.get("root_event") or {})
     root_event_id = root_event.get("event_id", "")
     inferred_roots = {}
     if root_event_id:
         inferred_roots["cascade"] = root_event_id
+    missing_topology_edges = _brunch_missing_topology_edges(group, ne_graph_data)
     return {
         "uuid": group.get("group_id", ""),
         "rule": "alarm_flow_brunch",
@@ -42,6 +160,8 @@ def group_to_visual_match(group):
         "related_group_uuids": [],
         "inferred_roots": inferred_roots,
         "role_mapping": {"cascade": list(group.get("site_list") or [])},
+        "uses_missing_topology": bool(missing_topology_edges),
+        "missing_topology_edges": missing_topology_edges,
         "symptoms": [
             _symptom_to_visual_record(symptom)
             for symptom in group.get("symptoms") or []
@@ -85,7 +205,7 @@ def write_visual_groups(
     count = 0
     with path.open("w", encoding="utf-8") as handle:
         for group in groups:
-            match = group_to_visual_match(group)
+            match = group_to_visual_match(group, ne_graph_data=ne_graph_data)
             if not match.get("uuid"):
                 continue
             record = build_jsonl_match_output(
@@ -154,7 +274,7 @@ class AlarmBRUNCHVisualOutputSession:
 
         emitted = 0
         for group in writable_groups:
-            match = group_to_visual_match(group)
+            match = group_to_visual_match(group, ne_graph_data=self.ne_graph_data)
             cascade_info = dict(match.get("cascade_info") or {})
             cascade_info["finalization_reason"] = finalization_reason
             match["cascade_info"] = cascade_info
