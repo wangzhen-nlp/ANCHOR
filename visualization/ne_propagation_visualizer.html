@@ -625,6 +625,72 @@
             color: #8c959f;
         }
 
+        .alarm-group-partition {
+            margin-top: 10px;
+        }
+
+        .alarm-group-partition-list {
+            display: grid;
+            gap: 6px;
+        }
+
+        .alarm-group-card {
+            border: 1px solid #d0d7de;
+            border-left: 5px solid var(--alarm-group-color, #0969da);
+            border-radius: 8px;
+            background: #ffffff;
+            padding: 8px 10px;
+            box-shadow: 0 1px 2px rgba(27, 31, 36, 0.04);
+        }
+
+        .alarm-group-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 12px;
+            font-weight: 700;
+            color: #24292f;
+        }
+
+        .alarm-group-card-id {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
+
+        .alarm-group-color-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--alarm-group-color, #0969da);
+            flex-shrink: 0;
+        }
+
+        .alarm-group-card-count {
+            color: #57606a;
+            font-size: 11px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .alarm-group-card-meta {
+            margin-top: 4px;
+            color: #57606a;
+            font-size: 11px;
+            line-height: 1.45;
+            word-break: break-word;
+        }
+
+        .alarm-group-card-alarms {
+            margin-top: 5px;
+            color: #8c959f;
+            font-size: 10px;
+            line-height: 1.45;
+            word-break: break-word;
+        }
+
         .node-list {
             background: #f6f8fa;
             padding: 12px;
@@ -994,6 +1060,36 @@
 
         .marker-pin.highlighted svg {
             filter: drop-shadow(0 0 8px #ffd700);
+        }
+
+        .marker-alarm-groups {
+            position: absolute;
+            left: 22px;
+            top: -9px;
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            max-width: 72px;
+            pointer-events: none;
+            z-index: 1200;
+        }
+
+        .marker-alarm-group-dot {
+            min-width: 14px;
+            height: 14px;
+            padding: 0 3px;
+            border-radius: 999px;
+            background: var(--alarm-group-color, #0969da);
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.32);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 8px;
+            line-height: 1;
+            font-weight: 800;
+            white-space: nowrap;
         }
 
         /* 移除固定显示的NE ID标签 */
@@ -1909,6 +2005,12 @@
                 <div class="alarm-meta-row">
                     <div class="alarm-meta-label">告警故障组ID</div>
                     <div class="alarm-meta-values" id="alarmFaultGroupValues">
+                        <div class="alarm-meta-value alarm-meta-empty">无</div>
+                    </div>
+                </div>
+                <div class="alarm-meta-row alarm-group-partition">
+                    <div class="alarm-meta-label">当前渲染告警按故障组划分</div>
+                    <div class="alarm-meta-values alarm-group-partition-list" id="alarmGroupPartitionValues">
                         <div class="alarm-meta-value alarm-meta-empty">无</div>
                     </div>
                 </div>
@@ -3015,7 +3117,12 @@
 
         function renderAlarmMetaSummary() {
             renderAlarmMetaValues('relatedTicketValues', getGraphAlarmFieldValues(graphData, ['工单号']));
-            renderAlarmMetaValues('alarmFaultGroupValues', getGraphAlarmFieldValues(graphData, ['故障组ID']));
+            renderAlarmMetaValues('alarmFaultGroupValues', getGraphAlarmFieldValues(graphData, [
+                '故障组ID',
+                'fault_group_id',
+                'alarm_group_id',
+                'group_id'
+            ]));
         }
 
         // 高亮站点集合
@@ -3296,6 +3403,7 @@
             if (activeGroups.size === 0) {
                 currentNodes = [];
                 currentLinks = [];
+                renderAlarmGroupPartitionSummary();
                 renderMap();
                 renderNodeList();
                 document.getElementById('detailPanel').classList.remove('show');
@@ -3311,6 +3419,7 @@
                 updateActiveGroupsUI();
                 currentNodes = [];
                 currentLinks = [];
+                renderAlarmGroupPartitionSummary();
                 renderMap();
                 renderNodeList();
                 document.getElementById('detailPanel').classList.remove('show');
@@ -3648,6 +3757,7 @@
         // 渲染当前所有激活的 Group
         function renderCurrentGroups() {
             if (activeGroups.size === 0) {
+                renderAlarmGroupPartitionSummary();
                 showLoading(false);
                 return;
             }
@@ -3704,6 +3814,7 @@
             filteredLinks = currentLinks.slice();
             setBaseCurrentGraph(currentNodes, currentLinks);
             document.getElementById('currentNodes').textContent = currentNodes.length;
+            renderAlarmGroupPartitionSummary();
 
             renderMap();
             renderNodeList();
@@ -3892,6 +4003,139 @@
             return alarm.time || alarm.alarm_time || alarm.time_str || formatTimestampSeconds(alarm.ts) || '-';
         }
 
+        function getAlarmFaultGroupId(alarm) {
+            if (!alarm || typeof alarm !== 'object') return '';
+            const candidates = [
+                alarm['故障组ID'],
+                alarm.fault_group_id,
+                alarm.faultGroupId,
+                alarm.alarm_group_id,
+                alarm.alarmGroupId,
+                alarm.group_id,
+                alarm.groupId
+            ];
+            for (let i = 0; i < candidates.length; i++) {
+                const text = String(candidates[i] ?? '').trim();
+                if (text && text !== '0' && text !== '-' && text !== 'null' && text !== 'undefined') {
+                    return text;
+                }
+            }
+            return '';
+        }
+
+        const ALARM_GROUP_COLORS = [
+            '#0969da', '#cf222e', '#1f883d', '#9a6700', '#8250df',
+            '#bf3989', '#0891b2', '#bc4c00', '#57606a', '#0f766e'
+        ];
+
+        function getAlarmGroupColor(groupId) {
+            const text = String(groupId || '未分组');
+            let hash = 0;
+            for (let i = 0; i < text.length; i++) {
+                hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+            }
+            return ALARM_GROUP_COLORS[Math.abs(hash) % ALARM_GROUP_COLORS.length];
+        }
+
+        function getAlarmGroupShortLabel(groupId) {
+            const text = String(groupId || '未分组');
+            if (text === '未分组') return '?';
+            const compact = text.replace(/^group[_:-]*/i, '').replace(/^fault[_:-]*/i, '');
+            return compact.length <= 3 ? compact : compact.slice(-3);
+        }
+
+        function getNodeAlarmGroupIds(node) {
+            const groups = [];
+            const seen = new Set();
+            (node && Array.isArray(node.alarm) ? node.alarm : []).forEach(function(alarm) {
+                const groupId = getAlarmFaultGroupId(alarm) || '未分组';
+                if (!seen.has(groupId)) {
+                    seen.add(groupId);
+                    groups.push(groupId);
+                }
+            });
+            return groups;
+        }
+
+        function buildAlarmGroupPartition(nodes) {
+            const groupMap = new Map();
+            (nodes || []).forEach(function(node) {
+                const alarms = Array.isArray(node.alarm) ? node.alarm : [];
+                alarms.forEach(function(alarm) {
+                    const groupId = getAlarmFaultGroupId(alarm) || '未分组';
+                    if (!groupMap.has(groupId)) {
+                        groupMap.set(groupId, {
+                            groupId: groupId,
+                            alarmCount: 0,
+                            neIds: new Set(),
+                            siteIds: new Set(),
+                            alarmTypes: new Set()
+                        });
+                    }
+                    const entry = groupMap.get(groupId);
+                    entry.alarmCount += 1;
+                    entry.neIds.add(getRawNodeId(node));
+                    if (node.site_id) entry.siteIds.add(String(node.site_id));
+                    const alarmType = alarm.alarm_type || alarm.alarm || alarm.title || '';
+                    if (alarmType) entry.alarmTypes.add(String(alarmType));
+                });
+            });
+            return Array.from(groupMap.values()).sort(function(a, b) {
+                if (b.alarmCount !== a.alarmCount) return b.alarmCount - a.alarmCount;
+                return String(a.groupId).localeCompare(String(b.groupId), 'zh-CN', { numeric: true, sensitivity: 'base' });
+            });
+        }
+
+        function renderAlarmGroupPartitionSummary() {
+            const container = document.getElementById('alarmGroupPartitionValues');
+            if (!container) return;
+            const groups = buildAlarmGroupPartition(currentNodes);
+            if (!groups.length) {
+                container.innerHTML = '<div class="alarm-meta-value alarm-meta-empty">当前渲染范围内无告警</div>';
+                return;
+            }
+            container.innerHTML = groups.map(function(group) {
+                const color = getAlarmGroupColor(group.groupId);
+                const sites = Array.from(group.siteIds).slice(0, 4);
+                const nes = Array.from(group.neIds).slice(0, 4);
+                const alarmTypes = Array.from(group.alarmTypes).slice(0, 3);
+                const siteSuffix = group.siteIds.size > sites.length ? ' 等' + group.siteIds.size + '站点' : '';
+                const neSuffix = group.neIds.size > nes.length ? ' 等' + group.neIds.size + '设备' : '';
+                return '<div class="alarm-group-card" style="--alarm-group-color: ' + color + ';">' +
+                    '<div class="alarm-group-card-header">' +
+                        '<div class="alarm-group-card-id"><span class="alarm-group-color-dot"></span><span>' + escapeHtml(group.groupId) + '</span></div>' +
+                        '<div class="alarm-group-card-count">' + group.alarmCount + ' 告警</div>' +
+                    '</div>' +
+                    '<div class="alarm-group-card-meta">设备: ' + escapeHtml(nes.join(', ') + neSuffix) + '</div>' +
+                    '<div class="alarm-group-card-meta">站点: ' + escapeHtml(sites.join(', ') + siteSuffix) + '</div>' +
+                    (alarmTypes.length ? '<div class="alarm-group-card-alarms">类型: ' + escapeHtml(alarmTypes.join(' / ')) + '</div>' : '') +
+                '</div>';
+            }).join('');
+        }
+
+        function renderMarkerAlarmGroupBadges(node) {
+            const groups = getNodeAlarmGroupIds(node);
+            if (!groups.length) return '';
+            const visibleGroups = groups.slice(0, 3);
+            const badgeHtml = visibleGroups.map(function(groupId) {
+                return '<span class="marker-alarm-group-dot" style="--alarm-group-color: ' + getAlarmGroupColor(groupId) + ';" title="故障组 ' + escapeHtml(groupId) + '">' +
+                    escapeHtml(getAlarmGroupShortLabel(groupId)) +
+                '</span>';
+            }).join('');
+            const moreHtml = groups.length > visibleGroups.length
+                ? '<span class="marker-alarm-group-dot" style="--alarm-group-color: #57606a;">+' + (groups.length - visibleGroups.length) + '</span>'
+                : '';
+            return '<div class="marker-alarm-groups">' + badgeHtml + moreHtml + '</div>';
+        }
+
+        function buildMarkerHtml(node, svgHtml, isSelected, isHighlighted) {
+            return '<div class="marker-pin ' +
+                (node.isNeighborExpanded ? 'neighbor-expanded ' : '') +
+                (isSelected ? 'selected ' : '') +
+                (isHighlighted ? 'highlighted' : '') +
+                '">' + svgHtml + renderMarkerAlarmGroupBadges(node) + '</div>';
+        }
+
         function getSymptomAlarmSource(symptom) {
             if (!symptom || typeof symptom !== 'object') return '';
             return symptom.alarm_source || symptom.alarmSource || symptom.ne_id || symptom.neId || symptom.source || '';
@@ -3911,7 +4155,7 @@
                 site_id: symptom.node || symptom.site_id || '',
                 matched_role: symptom.matched_role || '',
                 '工单号': symptom['工单号'] || '',
-                '故障组ID': symptom['故障组ID'] || '',
+                '故障组ID': symptom['故障组ID'] || symptom.fault_group_id || symptom.alarm_group_id || symptom.group_id || '',
                 ts: symptom.ts
             };
         }
@@ -4181,7 +4425,7 @@
                     '</svg>';
                 
                 // 移除NE ID标签 - 只保留图标
-                const markerHtml = '<div class="marker-pin ' + (node.isNeighborExpanded ? 'neighbor-expanded ' : '') + (isSelected ? 'selected ' : '') + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
+                const markerHtml = buildMarkerHtml(node, svgHtml, isSelected, isHighlighted);
                 
                 const customIcon = L.divIcon({
                     className: 'custom-marker',
@@ -4204,12 +4448,21 @@
                     '<div class="popup-row">坐标: ' + lat.toFixed(6) + ', ' + lng.toFixed(6) + '</div>';
 
                 if (node.alarm && node.alarm.length > 0) {
+                    const alarmGroups = getNodeAlarmGroupIds(node);
+                    if (alarmGroups.length > 0) {
+                        popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">涉及故障组</div>' +
+                            '<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">' +
+                            alarmGroups.map(function(groupId) {
+                                return '<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 6px; border-radius:999px; background:' + getAlarmGroupColor(groupId) + '; color:#fff; font-size:10px; font-weight:700;">' + escapeHtml(groupId) + '</span>';
+                            }).join('') +
+                            '</div>';
+                    }
                     const alarmRows = node.alarm.map(function(alarm) {
                         const alarmTime = getAlarmDisplayTime(alarm);
                         const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
                         const ticketId = alarm['工单号'] || '-';
-                        const faultGroup = alarm['故障组ID'] || '-';
+                        const faultGroup = getAlarmFaultGroupId(alarm) || '-';
                         return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
                             '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
                             '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4;">' + alarmTitle + '</div>' +
@@ -4330,7 +4583,7 @@
                     '<path d="' + getShapePath(style.shape, svgSize) + '" fill="' + style.color + '" stroke="' + strokeColor + '" stroke-width="' + strokeWidth + '"/>' +
                     '</svg>';
                 
-                const markerHtml = '<div class="marker-pin ' + (node.isNeighborExpanded ? 'neighbor-expanded ' : '') + (isSelected ? 'selected ' : '') + (isHighlighted ? 'highlighted' : '') + '">' + svgHtml + '</div>';
+                const markerHtml = buildMarkerHtml(node, svgHtml, isSelected, isHighlighted);
                 
                 marker.setIcon(L.divIcon({
                     className: 'custom-marker',
@@ -4467,14 +4720,30 @@
             
             const domain = node.domain || '';
             const style = getDomainStyle(domain);
+            const alarmGroupPartition = buildAlarmGroupPartition([node]);
             
             let alarmHtml = '<div style="margin-bottom: 15px; padding: 10px; background: #f6f8fa; border-radius: 6px;">' +
                 '<div style="font-weight: bold; color: #0969da; margin-bottom: 5px;">' + getRawNodeId(node) + '</div>' +
                 '<div style="font-size: 12px; color: #57606a;">站点: ' + getNodeSiteTitle(node) + '</div>' +
                 '<div style="font-size: 12px; color: #57606a; margin-top: 4px;">NE: ' + getRawNodeId(node) + ' | Domain: <span style="color:' + style.color + '">' + style.label + '</span></div>' +
                 '<div style="font-size: 12px; color: #57606a; margin-top: 4px;">Group: ' + (node.group || '-') + '</div>' +
-                '</div>' +
-                '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + node.alarm.length + ' 个):</div>' +
+                '</div>';
+
+            if (alarmGroupPartition.length > 0) {
+                alarmHtml += '<div style="font-weight: bold; margin-bottom: 8px; color: #24292f;">按故障组划分</div>' +
+                    '<div style="display:grid; gap:6px; margin-bottom:12px;">' +
+                    alarmGroupPartition.map(function(group) {
+                        return '<div class="alarm-group-card" style="--alarm-group-color: ' + getAlarmGroupColor(group.groupId) + ';">' +
+                            '<div class="alarm-group-card-header">' +
+                                '<div class="alarm-group-card-id"><span class="alarm-group-color-dot"></span><span>' + escapeHtml(group.groupId) + '</span></div>' +
+                                '<div class="alarm-group-card-count">' + group.alarmCount + ' 告警</div>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('') +
+                    '</div>';
+            }
+
+            alarmHtml += '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + node.alarm.length + ' 个):</div>' +
                 '<div class="alarm-list">';
             
             node.alarm.forEach(function(alarm, index) {
@@ -4484,7 +4753,8 @@
                 const time = getAlarmDisplayTime(alarm);
                 const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                 const ticketId = alarm['工单号'] || '-';
-                const faultGroup = alarm['故障组ID'] || '-';
+                const faultGroup = getAlarmFaultGroupId(alarm) || '-';
+                const faultGroupColor = getAlarmGroupColor(faultGroup);
                 
                 // 根据严重级别设置样式
                 let severityClass = 'warning';
@@ -4512,7 +4782,7 @@
                     '</div>' +
                     '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
-                    '<div style="color: #57606a; font-size: 11px;">故障组ID: ' + faultGroup + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px;">故障组ID: <span style="display:inline-block; padding:1px 6px; border-radius:999px; background:' + faultGroupColor + '; color:#fff; font-weight:700;">' + escapeHtml(faultGroup) + '</span></div>' +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
                     '</div>';
             });
@@ -5455,6 +5725,7 @@
             currentLinks = baseCurrentLinks.map(function(l) { return Object.assign({}, l); });
             filteredLinks = currentLinks.slice();
             document.getElementById('currentNodes').textContent = currentNodes.length;
+            renderAlarmGroupPartitionSummary();
         }
 
         function buildSiteGraphFromNeGraph() {
@@ -5644,6 +5915,7 @@
             currentLinks = mergedLinks;
             filteredLinks = currentLinks.slice();
             document.getElementById('currentNodes').textContent = currentNodes.length;
+            renderAlarmGroupPartitionSummary();
             return true;
         }
 
@@ -5693,6 +5965,7 @@
             filteredLinks = allGroupLinks.slice();
             setBaseCurrentGraph(currentNodes, currentLinks);
             document.getElementById('currentNodes').textContent = currentNodes.length;
+            renderAlarmGroupPartitionSummary();
 
             renderMap();
             renderNodeList(nodeIds[0]);
@@ -5718,12 +5991,22 @@
                 const siteIdHtml = isFaultPatternSite
                     ? '<span class="fault-pattern-site-id">' + escapeHtml(n.site_id || '-') + '</span>'
                     : escapeHtml(n.site_id || '-');
+                const alarmGroupIds = getNodeAlarmGroupIds(n);
+                const alarmGroupBadges = alarmGroupIds.length
+                    ? '<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">' +
+                        alarmGroupIds.slice(0, 4).map(function(groupId) {
+                            return '<span style="display:inline-flex; align-items:center; padding:1px 6px; border-radius:999px; background:' + getAlarmGroupColor(groupId) + '; color:#fff; font-size:10px; font-weight:700;">' + escapeHtml(groupId) + '</span>';
+                        }).join('') +
+                        (alarmGroupIds.length > 4 ? '<span style="font-size:10px; color:#57606a;">+' + (alarmGroupIds.length - 4) + '</span>' : '') +
+                    '</div>'
+                    : '';
                 return '<div class="node-item ' + (isSelected ? 'selected' : '') + ' ' + (multiSelectedNodes.has(n.id) ? 'multi-selected' : '') + ' ' + (isHighlighted ? 'highlighted' : '') + ' ' + hasAlarmClass + ' ' + (n.isNeighborExpanded ? 'neighbor-expanded' : '') + ' ' + (isFaultPatternSite ? 'fault-pattern-site' : '') + ' ' + (isSupplementalContext ? 'supplemental-context' : '') + '" onclick="handleNodeListClick(\'' + n.id + '\')">' +
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
                         '<div class="ne-id">' + escapeHtml(getRawNodeId(n)) + '</div>' +
                         '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (isSupplementalContext ? ' | 补全上下文' : '') + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
+                        alarmGroupBadges +
                     '</div>' +
                     '</div>';
             }).join('');
