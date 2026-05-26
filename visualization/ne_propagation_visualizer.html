@@ -2106,13 +2106,13 @@
                                 </defs>
                                 <line x1="0" y1="2" x2="30" y2="2" stroke="url(#missingDirectedLegendGradient)" stroke-width="3"/>
                             </svg>
-                            <span>弱拓扑有向边（深→浅）</span>
+                            <span>模型推断有向边（深→浅）</span>
                         </div>
                         <div class="legend-item">
                             <svg width="30" height="4" style="margin-right: 8px;">
                                 <line x1="0" y1="2" x2="30" y2="2" stroke="#7c3aed" stroke-width="3" stroke-dasharray="9,4,2,4"/>
                             </svg>
-                            <span>弱拓扑无向边</span>
+                            <span>模型推断传播边</span>
                         </div>
                         <div class="legend-item">
                             <div style="width: 16px; height: 16px; border: 3px solid #cf222e; border-radius: 50%;"></div>
@@ -2378,6 +2378,11 @@
             downstream: { color: MISSING_TOPOLOGY_DIRECTED_START_COLOR, label: 'directed' },
             upstream: { color: MISSING_TOPOLOGY_DIRECTED_START_COLOR, label: 'directed' },
             bidirection: { color: '#7c3aed', label: 'bidirection' },
+            brunch_same_device: { color: '#059669', label: 'BRUNCH same device' },
+            brunch_same_site: { color: '#d97706', label: 'BRUNCH same site' },
+            brunch_indirect_topology: { color: '#2563eb', label: 'BRUNCH indirect topology' },
+            brunch_hawkes_cross_site: { color: '#dc2626', label: 'BRUNCH cross-site Hawkes' },
+            brunch_hawkes_unknown_context: { color: '#6b7280', label: 'BRUNCH Hawkes' },
             same_site: { color: '#d97706', label: 'same site' },
             indirect_topology: { color: '#2563eb', label: 'indirect topology' },
             cross_site: { color: '#dc2626', label: 'cross site' },
@@ -2393,11 +2398,22 @@
             if (relation === 'downstream' || relation === '->') return 'downstream';
             if (relation === 'upstream' || relation === '<-') return 'upstream';
             if (relation === 'bidirection' || relation === 'bidirectional' || relation === '<->') return 'bidirection';
+            if (relation === 'brunch_same_device' || relation === 'brunch-same-device' || relation === 'brunch same device') return 'brunch_same_device';
+            if (relation === 'brunch_same_site' || relation === 'brunch-same-site' || relation === 'brunch same site') return 'brunch_same_site';
+            if (relation === 'brunch_indirect_topology' || relation === 'brunch-indirect-topology' || relation === 'brunch indirect topology') return 'brunch_indirect_topology';
+            if (relation === 'brunch_hawkes_cross_site' || relation === 'brunch-hawkes-cross-site' || relation === 'brunch hawkes cross site' || relation === 'brunch cross-site hawkes') return 'brunch_hawkes_cross_site';
+            if (relation === 'brunch_hawkes_unknown_context' || relation === 'brunch-hawkes-unknown-context' || relation === 'brunch hawkes unknown context') return 'brunch_hawkes_unknown_context';
             if (relation === 'same_site' || relation === 'same-site' || relation === 'same site') return 'same_site';
             if (relation === 'indirect_topology' || relation === 'indirect-topology' || relation === 'indirect topology') return 'indirect_topology';
             if (relation === 'cross_site' || relation === 'cross-site' || relation === 'cross site') return 'cross_site';
             if (relation === 'same_device' || relation === 'same-device' || relation === 'same device') return 'same_device';
             return 'default';
+        }
+
+        function isBrunchPropagationLink(link) {
+            const relationKey = normalizeMissingTopologyRelation(link);
+            return String(link && link.edge_source || '').toLowerCase() === 'alarm_flow_brunch' ||
+                relationKey.indexOf('brunch_') === 0;
         }
 
         function getMissingTopologyRelationStyle(linkOrRelation) {
@@ -2533,7 +2549,7 @@
             let addedCount = 0;
 
             missingEdges.forEach(function(edge) {
-                // 传播图只画模型直接预测的一跳弱拓扑边；传递补齐边仍保留在数据里用于筛选/标识。
+                // 传播图只画模型直接推断的一跳传播边；传递补齐边仍保留在数据里用于筛选/标识。
                 if (edge.inferred_from_missing_topology) return;
                 const sourceSite = String(edge.source_site || edge.source || '').trim();
                 const targetSite = String(edge.target_site || edge.target || '').trim();
@@ -2579,6 +2595,8 @@
                     target_event_id: edge.target_event_id || '',
                     source_alarm: edge.source_alarm || '',
                     target_alarm: edge.target_alarm || '',
+                    source_type: edge.source_type || '',
+                    target_type: edge.target_type || '',
                     dt_sec: edge.dt_sec,
                     edge_source: edge.edge_source || '',
                     sample_id: edge.sample_id || '',
@@ -2595,12 +2613,13 @@
         function getMissingTopologyTooltip(link, sourceId, targetId) {
             const relation = link.predicted_relation || link.topology || '-';
             const relationStyle = getMissingTopologyRelationStyle(link);
+            const title = isBrunchPropagationLink(link) ? 'BRUNCH 推断传播边' : '弱拓扑预测边';
             let score = '';
             if (link.predicted_score !== undefined && link.predicted_score !== null && link.predicted_score !== '') {
                 const scoreValue = Number(link.predicted_score);
                 score = '，score=' + (Number.isFinite(scoreValue) ? scoreValue.toFixed(4) : escapeHtml(link.predicted_score));
             }
-            return '<div style="font-weight: bold; color: ' + relationStyle.color + ';">弱拓扑预测边 / ' + escapeHtml(relationStyle.label) + '</div>' +
+            return '<div style="font-weight: bold; color: ' + relationStyle.color + ';">' + title + ' / ' + escapeHtml(relationStyle.label) + '</div>' +
                 '<div>' + escapeHtml(link.source_ne || link.source_site || sourceId) + ' → ' + escapeHtml(link.target_ne || link.target_site || targetId) + '</div>' +
                 '<div>类型: ' + escapeHtml(relation) + score + '</div>';
         }
@@ -4816,6 +4835,7 @@
             
             const isDistance = isDistanceLink(link);
             const isMissingTopology = isMissingTopologyLink(link);
+            const isBrunchPropagation = isMissingTopology && isBrunchPropagationLink(link);
             const connectionType = link.connection_type || '未知';
             const distance = link.distance || 0;
             const topology = link.topology || '-';
@@ -4830,20 +4850,23 @@
             // 边类型标识
             html += '<div style="margin-bottom: 10px;">';
             html += '<span class="edge-type-badge ' + (isDistance ? 'distance' : 'normal') + '">' + 
-                    (isMissingTopology ? '🧩 弱拓扑预测' : (isDistance ? '📏 Distance' : '🔗 普通连接')) + '</span>';
+                    (isBrunchPropagation ? 'BRUNCH 传播推断' : (isMissingTopology ? '🧩 弱拓扑预测' : (isDistance ? '📏 Distance' : '🔗 普通连接'))) + '</span>';
             html += '</div>';
             
             // 连接信息
             html += '<div class="edge-link-info">';
             html += '<div class="link-row"><span class="link-label">连接类型:</span><span class="link-value">' + connectionType + '</span></div>';
             if (isMissingTopology) {
-                html += '<div class="link-row"><span class="link-label">预测关系:</span><span class="link-value">' + escapeHtml(link.predicted_relation || topology) + '</span></div>';
+                html += '<div class="link-row"><span class="link-label">' + (isBrunchPropagation ? '推断分类:' : '预测关系:') + '</span><span class="link-value">' + escapeHtml(link.predicted_relation || topology) + '</span></div>';
                 if (link.predicted_score !== undefined && link.predicted_score !== null && link.predicted_score !== '') {
                     const scoreValue = Number(link.predicted_score);
                     html += '<div class="link-row"><span class="link-label">预测分数:</span><span class="link-value">' + (Number.isFinite(scoreValue) ? scoreValue.toFixed(4) : escapeHtml(link.predicted_score)) + '</span></div>';
                 }
                 if (link.source_ne || link.target_ne) {
                     html += '<div class="link-row"><span class="link-label">设备传播:</span><span class="link-value">' + escapeHtml(link.source_ne || sourceId) + ' → ' + escapeHtml(link.target_ne || targetId) + '</span></div>';
+                }
+                if (link.source_type || link.target_type) {
+                    html += '<div class="link-row"><span class="link-label">事件类型:</span><span class="link-value">' + escapeHtml(link.source_type || '-') + ' → ' + escapeHtml(link.target_type || '-') + '</span></div>';
                 }
                 html += '<div class="link-row"><span class="link-label">站点关系:</span><span class="link-value">' + escapeHtml(link.source_site || '-') + ' → ' + escapeHtml(link.target_site || '-') + '</span></div>';
                 if (link.source_event_id || link.target_event_id) {

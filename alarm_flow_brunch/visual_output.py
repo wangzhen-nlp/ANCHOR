@@ -38,6 +38,24 @@ def _link_neighbors(ne_graph_data, ne_id):
     return set(str(neighbor_id) for neighbor_id in links.keys() if str(neighbor_id))
 
 
+def _ne_site_id(ne_graph_data, ne_id):
+    entry = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+    if not isinstance(entry, dict):
+        return ""
+    for key in ("site_id", "siteId", "site", "site_name", "siteName"):
+        value = str(entry.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _symptom_site_id(ne_graph_data, symptom):
+    site_id = str(symptom.get("site_id", "") or "").strip()
+    if site_id:
+        return site_id
+    return _ne_site_id(ne_graph_data, str(symptom.get("alarm_source", "") or ""))
+
+
 def _has_direct_ne_link(ne_graph_data, source_ne, target_ne):
     if not source_ne or not target_ne or source_ne == target_ne:
         return source_ne == target_ne
@@ -66,21 +84,21 @@ def _shortest_ne_hops(ne_graph_data, source_ne, target_ne, max_hops=3):
     return None
 
 
-def _classify_missing_propagation_edge(ne_graph_data, source_symptom, target_symptom):
+def _classify_brunch_propagation_edge(ne_graph_data, source_symptom, target_symptom):
     source_ne = str(source_symptom.get("alarm_source", "") or "")
     target_ne = str(target_symptom.get("alarm_source", "") or "")
-    source_site = str(source_symptom.get("site_id", "") or "")
-    target_site = str(target_symptom.get("site_id", "") or "")
+    source_site = _symptom_site_id(ne_graph_data, source_symptom)
+    target_site = _symptom_site_id(ne_graph_data, target_symptom)
     if source_ne == target_ne:
-        return "same_device", 0
+        return "brunch_same_device", 0
+    if source_site and source_site == target_site:
+        return "brunch_same_site", None
     hops = _shortest_ne_hops(ne_graph_data, source_ne, target_ne, max_hops=3)
     if hops is not None and hops > 1:
-        return "indirect_topology", hops
-    if source_site and source_site == target_site:
-        return "same_site", None
+        return "brunch_indirect_topology", hops
     if source_site and target_site and source_site != target_site:
-        return "cross_site", None
-    return "unknown", None
+        return "brunch_hawkes_cross_site", None
+    return "brunch_hawkes_unknown_context", None
 
 
 def _brunch_missing_topology_edges(group, ne_graph_data):
@@ -107,7 +125,7 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
         if _has_direct_ne_link(ne_graph_data, source_ne, target_ne):
             continue
 
-        relation, hops = _classify_missing_propagation_edge(
+        relation, hops = _classify_brunch_propagation_edge(
             ne_graph_data,
             source_symptom,
             target_symptom,
@@ -118,18 +136,22 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
         seen.add(key)
         source_ts = source_symptom.get("ts")
         target_ts = target_symptom.get("ts")
+        source_site = _symptom_site_id(ne_graph_data, source_symptom)
+        target_site = _symptom_site_id(ne_graph_data, target_symptom)
         missing_edges.append(
             {
-                "source": source_symptom.get("site_id", ""),
-                "target": target_symptom.get("site_id", ""),
-                "source_site": source_symptom.get("site_id", ""),
-                "target_site": target_symptom.get("site_id", ""),
+                "source": source_site,
+                "target": target_site,
+                "source_site": source_site,
+                "target_site": target_site,
                 "source_ne": source_ne,
                 "target_ne": target_ne,
                 "source_event_id": source_event_id,
                 "target_event_id": target_event_id,
                 "source_alarm": source_symptom.get("alarm_title", ""),
                 "target_alarm": target_symptom.get("alarm_title", ""),
+                "source_type": edge.get("source_type", ""),
+                "target_type": edge.get("target_type", ""),
                 "relation": relation,
                 "predicted_relation": relation,
                 "score": "",
@@ -140,7 +162,7 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
                     else None
                 ),
                 "edge_source": "alarm_flow_brunch",
-                "description": "BRUNCH inferred propagation edge without direct NE topology link",
+                "description": "BRUNCH inferred parent-child propagation edge without direct NE topology link",
             }
         )
     return missing_edges
