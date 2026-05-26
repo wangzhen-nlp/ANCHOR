@@ -4117,6 +4117,7 @@
         }
 
         function renderAlarmGroupMarker(groupId, options) {
+            if (!String(groupId || '').trim()) return '';
             const opts = options || {};
             const spec = getAlarmGroupMarkerSpec(groupId);
             const size = opts.size || 22;
@@ -4135,7 +4136,8 @@
             const groups = [];
             const seen = new Set();
             (node && Array.isArray(node.alarm) ? node.alarm : []).forEach(function(alarm) {
-                const groupId = getAlarmFaultGroupId(alarm) || '未分组';
+                const groupId = getAlarmFaultGroupId(alarm);
+                if (!groupId) return;
                 if (!seen.has(groupId)) {
                     seen.add(groupId);
                     groups.push(groupId);
@@ -4149,7 +4151,8 @@
             (nodes || []).forEach(function(node) {
                 const alarms = Array.isArray(node.alarm) ? node.alarm : [];
                 alarms.forEach(function(alarm) {
-                    const groupId = getAlarmFaultGroupId(alarm) || '未分组';
+                    const groupId = getAlarmFaultGroupId(alarm);
+                    if (!groupId) return;
                     if (!groupMap.has(groupId)) {
                         groupMap.set(groupId, {
                             groupId: groupId,
@@ -4178,7 +4181,7 @@
             if (!container) return;
             const groups = buildAlarmGroupPartition(currentNodes);
             if (!groups.length) {
-                container.innerHTML = '<div class="alarm-meta-value alarm-meta-empty">当前渲染范围内无告警</div>';
+                container.innerHTML = '<div class="alarm-meta-value alarm-meta-empty">当前渲染范围内无带故障组ID的告警</div>';
                 return;
             }
             container.innerHTML = groups.map(function(group) {
@@ -4549,12 +4552,15 @@
                         const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
                         const ticketId = alarm['工单号'] || '-';
-                        const faultGroup = getAlarmFaultGroupId(alarm) || '-';
+                        const faultGroup = getAlarmFaultGroupId(alarm);
+                        const faultGroupHtml = faultGroup
+                            ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
+                            : '<span>-</span>';
                         return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
                             '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
                             '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4;">' + alarmTitle + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
-                            '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span></div>' +
+                            '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                             '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
                             '</div>';
                     }).join('');
@@ -4840,7 +4846,10 @@
                 const time = getAlarmDisplayTime(alarm);
                 const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                 const ticketId = alarm['工单号'] || '-';
-                const faultGroup = getAlarmFaultGroupId(alarm) || '-';
+                const faultGroup = getAlarmFaultGroupId(alarm);
+                const faultGroupHtml = faultGroup
+                    ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
+                    : '<span>-</span>';
                 
                 // 根据严重级别设置样式
                 let severityClass = 'warning';
@@ -4868,7 +4877,7 @@
                     '</div>' +
                     '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
-                    '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span></div>' +
+                    '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
                     '</div>';
             });
