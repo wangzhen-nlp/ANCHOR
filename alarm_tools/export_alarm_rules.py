@@ -19,7 +19,7 @@ def generate_rule_string() -> str:
     
     conditions = [f'"alarmname" = "{alarm}"' for alarm in sorted_alarms]
     rule_body = " or ".join(conditions)
-    return f"'({rule_body})'"
+    return f"({rule_body})"
 
 def main():
     parser = argparse.ArgumentParser(description="导出关键告警规则字符串")
