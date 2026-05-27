@@ -4334,10 +4334,33 @@
         }
 
         function getNeAlarmsFromInfo(neId, neInfo, symptomAlarmIndex) {
-            if (Array.isArray(neInfo && neInfo.alarm)) {
+            const symptomAlarms = symptomAlarmIndex.get(neId) || [];
+            if (!Array.isArray(neInfo && neInfo.alarm)) {
+                return symptomAlarms;
+            }
+            if (symptomAlarms.length === 0) {
                 return neInfo.alarm;
             }
-            return symptomAlarmIndex.get(neId) || [];
+            const symptomByAlarmId = new Map();
+            symptomAlarms.forEach(function(alarm) {
+                const alarmId = String(alarm.alarm_id || '');
+                if (alarmId) {
+                    symptomByAlarmId.set(alarmId, alarm);
+                }
+            });
+            return neInfo.alarm.map(function(alarm) {
+                const alarmId = String(alarm && alarm.alarm_id || '');
+                const symptomAlarm = symptomByAlarmId.get(alarmId);
+                if (!symptomAlarm) return alarm;
+                return Object.assign({}, alarm, {
+                    virtual: !!(alarm.virtual || symptomAlarm.virtual),
+                    __virtual__: !!(alarm.__virtual__ || symptomAlarm.virtual),
+                    inferred_virtual: !!(alarm.inferred_virtual || symptomAlarm.virtual),
+                    latent: !!(alarm.latent || symptomAlarm.latent),
+                    confidence: alarm.confidence !== undefined ? alarm.confidence : symptomAlarm.confidence,
+                    virtual_source: alarm.virtual_source || symptomAlarm.virtual_source || ''
+                });
+            });
         }
 
         function handleSiteNeighborModeToggle(enabled) {

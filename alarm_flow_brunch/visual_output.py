@@ -36,6 +36,49 @@ def _symptom_to_visual_record(symptom):
     }
 
 
+def _attach_virtual_alarm_flags(record):
+    """Copy BRUNCH virtual markers from symptoms into ne_info alarm entries.
+
+    The shared visualization builder keeps arbitrary symptom fields at the
+    top level, but its per-NE alarm records only copy the standard alarm
+    fields. The propagation page renders node markers from ne_info[].alarm
+    first, so we explicitly mirror the virtual metadata there.
+    """
+    symptoms = record.get("symptoms") or []
+    by_key = {}
+    for symptom in symptoms:
+        if not isinstance(symptom, dict) or not symptom.get("virtual"):
+            continue
+        ne_id = str(symptom.get("alarm_source", "") or "")
+        alarm_id = str(symptom.get("eid", "") or "")
+        if not ne_id or not alarm_id:
+            continue
+        by_key[(ne_id, alarm_id)] = {
+            "virtual": True,
+            "__virtual__": True,
+            "inferred_virtual": True,
+            "latent": bool(symptom.get("latent", False)),
+            "confidence": symptom.get("confidence", 1.0),
+            "virtual_source": symptom.get("virtual_source", ""),
+        }
+
+    if not by_key:
+        return record
+
+    ne_info = record.get("ne_info") or {}
+    for ne_id, info in ne_info.items():
+        alarms = info.get("alarm") if isinstance(info, dict) else None
+        if not isinstance(alarms, list):
+            continue
+        for alarm in alarms:
+            if not isinstance(alarm, dict):
+                continue
+            flags = by_key.get((str(ne_id), str(alarm.get("alarm_id", "") or "")))
+            if flags:
+                alarm.update(flags)
+    return record
+
+
 def _link_neighbors(ne_graph_data, ne_id):
     entry = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
     links = entry.get("link", {}) if isinstance(entry, dict) else {}
@@ -247,6 +290,7 @@ def write_visual_groups(
                 site_to_ne_ids=site_to_ne_ids,
                 ne_link_info_cache=ne_link_info_cache,
             )
+            _attach_virtual_alarm_flags(record)
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
     return count
@@ -317,6 +361,7 @@ class AlarmBRUNCHVisualOutputSession:
                 site_to_ne_ids=self.site_to_ne_ids,
                 ne_link_info_cache=self.ne_link_info_cache,
             )
+            _attach_virtual_alarm_flags(record)
             self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.emitted_group_ids.add(group["group_id"])
             emitted += 1
