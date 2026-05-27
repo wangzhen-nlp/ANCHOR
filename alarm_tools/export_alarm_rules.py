@@ -17,7 +17,7 @@ def generate_rule_string() -> str:
     sorted_alarms = sorted(CRITICAL_ALARMS)
     
     conditions = [f'"alarmname" = "{alarm}"' for alarm in sorted_alarms]
-    rule_body = " 或 ".join(conditions)
+    rule_body = " or ".join(conditions)
     return f"'({rule_body})'"
 
 if __name__ == "__main__":
