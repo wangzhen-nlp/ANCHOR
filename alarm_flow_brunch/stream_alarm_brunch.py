@@ -59,6 +59,8 @@ from topology_tools.region_utils import allowed_devices_for_regions, load_ne_gra
 EPS = 1e-12
 _OFFLINE_REORDER_LAG_SEC = 0.0
 _LIVE_REORDER_LAG_SEC = 300.0
+BRUNCH_RULE = "alarm_flow_brunch"
+BRUNCH_VIRTUAL_RULE = "alarm_flow_brunch_virtual_event"
 
 
 _VIRTUAL_ALARM_TITLE_BY_TYPE = {
@@ -220,9 +222,14 @@ class OnlineCascade:
                 summary["confidence"] = 1.0
             summaries.append(summary)
         timestamps = [summary["ts"] for summary in summaries]
+        merged_rules = []
+        if self.virtual_event_count() > 0:
+            merged_rules.extend([BRUNCH_RULE, BRUNCH_VIRTUAL_RULE])
         return {
             "group_id": self.cascade_id,
             "cascade_id": self.cascade_id,
+            "rule": BRUNCH_RULE,
+            "merged_rules": merged_rules,
             "event_count": len(self.events),
             "real_event_count": self.real_event_count(),
             "virtual_event_count": self.virtual_event_count(),

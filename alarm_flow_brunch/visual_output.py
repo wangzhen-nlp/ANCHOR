@@ -9,6 +9,8 @@ from fault_grouping.site_topology import build_site_to_ne_ids
 
 
 VISUAL_NE_SCOPES = frozenset({"alarm-only", "site-context"})
+BRUNCH_RULE = "alarm_flow_brunch"
+BRUNCH_VIRTUAL_RULE = "alarm_flow_brunch_virtual_event"
 
 
 def load_json_object(path):
@@ -179,10 +181,13 @@ def group_to_visual_match(group, ne_graph_data=None):
     if root_event_id:
         inferred_roots["cascade"] = root_event_id
     missing_topology_edges = _brunch_missing_topology_edges(group, ne_graph_data)
+    merged_rules = list(group.get("merged_rules") or [])
+    if not merged_rules and int(group.get("virtual_event_count", 0) or 0) > 0:
+        merged_rules = [BRUNCH_RULE, BRUNCH_VIRTUAL_RULE]
     return {
         "uuid": group.get("group_id", ""),
-        "rule": "alarm_flow_brunch",
-        "merged_rules": [],
+        "rule": group.get("rule") or BRUNCH_RULE,
+        "merged_rules": merged_rules,
         "related_group_uuids": [],
         "inferred_roots": inferred_roots,
         "role_mapping": {"cascade": list(group.get("site_list") or [])},
