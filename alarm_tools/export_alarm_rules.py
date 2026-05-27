@@ -4,6 +4,7 @@
 导出为形如 '("告警标题" 等于 "xxx" 或 "告警标题" 等于 "yyy")' 的规则字符串。
 """
 
+import argparse
 import os
 import sys
 
@@ -20,5 +21,19 @@ def generate_rule_string() -> str:
     rule_body = " or ".join(conditions)
     return f"'({rule_body})'"
 
+def main():
+    parser = argparse.ArgumentParser(description="导出关键告警规则字符串")
+    parser.add_argument("-o", "--output", help="输出文件路径。如果不指定，则直接打印到控制台。")
+    args = parser.parse_args()
+
+    rule_string = generate_rule_string()
+    
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(rule_string + "\n")
+        print(f"规则已成功导出到: {args.output}")
+    else:
+        print(rule_string)
+
 if __name__ == "__main__":
-    print(generate_rule_string())
+    main()
