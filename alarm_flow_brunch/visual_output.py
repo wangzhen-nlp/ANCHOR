@@ -25,6 +25,7 @@ def _symptom_to_visual_record(symptom):
         "ts": symptom.get("ts"),
         "eid": symptom.get("event_id", ""),
         "virtual": bool(symptom.get("virtual", False)),
+        "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),
         "virtual_source": symptom.get("virtual_source", ""),
         "matched_rule": "alarm_flow_brunch",

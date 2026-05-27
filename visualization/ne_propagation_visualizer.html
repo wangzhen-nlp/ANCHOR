@@ -4264,12 +4264,13 @@
 
         function renderVirtualAlarmBadge(alarm) {
             if (!isVirtualAlarm(alarm)) return '';
+            const label = alarm.latent ? 'latent' : 'virtual';
             const confidence = Number(alarm.confidence);
             const confidenceText = Number.isFinite(confidence)
                 ? ' conf=' + confidence.toFixed(2)
                 : '';
             const sourceText = alarm.virtual_source ? ' / ' + escapeHtml(alarm.virtual_source) : '';
-            return '<span class="virtual-alarm-badge" title="插补事件' + confidenceText + sourceText + '">virtual</span>';
+            return '<span class="virtual-alarm-badge" title="插补事件' + confidenceText + sourceText + '">' + label + '</span>';
         }
 
         function renderMarkerVirtualBadge(node) {
@@ -4307,6 +4308,7 @@
                 '工单号': symptom['工单号'] || '',
                 '故障组ID': symptom['故障组ID'] || symptom.fault_group_id || symptom.alarm_group_id || symptom.group_id || '',
                 virtual: !!symptom.virtual,
+                latent: !!symptom.latent,
                 confidence: symptom.confidence,
                 virtual_source: symptom.virtual_source || '',
                 ts: symptom.ts

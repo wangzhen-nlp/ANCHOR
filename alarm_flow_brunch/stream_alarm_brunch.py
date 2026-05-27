@@ -143,6 +143,11 @@ class OnlineEvent:
     # and they are filtered out of cascade output unless they actually attached
     # to a downstream real event.
     virtual: bool = False
+    # `latent` distinguishes "experimental latent-missing mode" virtuals from
+    # known-interval virtuals. Both have virtual=True; latent additionally
+    # carries this flag so audit counters and downstream UI can separate the
+    # low-confidence latent path from known missing-interval imputations.
+    latent: bool = False
     confidence: float = 1.0
     virtual_source: str = ""   # MissingInterval key that produced this event, if any
 
@@ -206,10 +211,12 @@ class OnlineCascade:
                 # summary so downstream UIs can render them as low-confidence
                 # "inferred" symptoms.
                 summary["virtual"] = True
+                summary["latent"] = bool(item.latent)
                 summary["confidence"] = float(item.confidence)
                 summary["virtual_source"] = item.virtual_source
             else:
                 summary["virtual"] = False
+                summary["latent"] = False
                 summary["confidence"] = 1.0
             summaries.append(summary)
         timestamps = [summary["ts"] for summary in summaries]
@@ -284,6 +291,17 @@ class OnlineBRUNCHAssigner:
         max_virtual_per_dim: int = 100,
         virtual_drop_warning_ratio: float = 0.25,
         close_check_min_interval_sec: float = 1.0,
+        # ---- experimental latent-missing mode -----------------------------
+        # When enabled, every dim is treated as having an implicit "data
+        # could be missing at any moment" interval. Sampling rate is scaled
+        # down by latent_rate_multiplier and dampened by latent_confidence so
+        # the chain stays close to the observed-data interpretation; the
+        # active-virtual cap and audit counters are the safety net.
+        latent_missing_mode: bool = False,
+        latent_rate_multiplier: float = 0.05,
+        latent_confidence: float = 0.05,
+        latent_max_virtual_per_call: int = 10,
+        latent_max_active_virtual: int = 200,
     ):
         self.artifact = artifact
         self.config = config
@@ -305,6 +323,12 @@ class OnlineBRUNCHAssigner:
             raise ValueError("virtual_drop_warning_ratio must be in [0, 1]")
         if close_check_min_interval_sec < 0:
             raise ValueError("close_check_min_interval_sec must be non-negative")
+        if not 0.0 <= latent_rate_multiplier <= 1.0:
+            raise ValueError("latent_rate_multiplier must be in [0, 1]")
+        if not 0.0 < latent_confidence <= 1.0:
+            raise ValueError("latent_confidence must be in (0, 1]")
+        if latent_max_virtual_per_call < 0 or latent_max_active_virtual < 0:
+            raise ValueError("latent_max_virtual_per_call / latent_max_active_virtual must be non-negative")
         self.rng = np.random.default_rng(seed)
         self.recent: deque[OnlineEvent] = deque()
         self._active_sources_cache: dict[int, set[int]] = {}
@@ -333,6 +357,77 @@ class OnlineBRUNCHAssigner:
         self.virtual_drop_warning_count = 0
         self.virtual_unresolved_interval_tick_count = 0
         self.virtual_picked_as_parent_count = 0
+        # ---- latent missing mode state + audit counters --------------------
+        self.latent_missing_mode = bool(latent_missing_mode)
+        self.latent_rate_multiplier = float(latent_rate_multiplier)
+        self.latent_confidence = float(latent_confidence)
+        self.latent_max_virtual_per_call = int(latent_max_virtual_per_call)
+        self.latent_max_active_virtual = int(latent_max_active_virtual)
+        # latent_virtual_generated:        total latent virtuals successfully injected
+        # latent_virtual_picked_as_parent: latent virtuals picked as a parent
+        # latent_virtual_dropped_by_cap:   latent virtuals pruned by per-call or active cap
+        # real_events_with_latent_parent:  real events whose chosen parent was a latent virtual
+        self.latent_virtual_generated = 0
+        self.latent_virtual_picked_as_parent = 0
+        self.latent_virtual_dropped_by_cap = 0
+        self.real_events_with_latent_parent = 0
+        self._latent_type_ids = np.asarray([], dtype=np.int64)
+        self._latent_mu_values = np.asarray([], dtype=np.float64)
+        self._latent_mu_cumsum = np.asarray([], dtype=np.float64)
+        self._latent_mu_total = 0.0
+        self._latent_type_metadata: dict[int, dict] = {}
+        if self.latent_missing_mode and self.latent_rate_multiplier > 0.0:
+            # Snapshot params.mu and the outgoing-edge structure for the
+            # latent sampler. This can be O(active_edges) / O(M^2) depending
+            # on parameter storage, so only pay it when latent mode is
+            # actually enabled. We filter to dims that BOTH have μ > 0 AND
+            # are an active source for some target (∃ target_id with
+            # α[target_id, dim] > 0). A dim with no outgoing edges can never
+            # be selected as a parent by _candidate_scores.
+            #
+            # IMPORTANT: these caches snapshot params at init time. If anyone
+            # ever hot-reloads artifact.params at runtime (e.g.
+            # --watch-artifact), the caches MUST be rebuilt — otherwise
+            # latent sampling uses stale rates and stale edge structure.
+            active_source_dims: set[int] = set()
+            for target_id in range(self.params.M):
+                for src in self.params.active_sources_for_target(target_id, include_self=True):
+                    active_source_dims.add(int(src))
+            latent_type_ids = []
+            latent_mu_values = []
+            for type_id in range(self.params.M):
+                if type_id not in active_source_dims:
+                    continue
+                mu = float(self.params.mu[type_id])
+                if mu > 0.0:
+                    latent_type_ids.append(int(type_id))
+                    latent_mu_values.append(mu)
+            self._latent_type_ids = np.asarray(latent_type_ids, dtype=np.int64)
+            self._latent_mu_values = np.asarray(latent_mu_values, dtype=np.float64)
+            self._latent_mu_cumsum = np.cumsum(self._latent_mu_values)
+            self._latent_mu_total = (
+                float(self._latent_mu_cumsum[-1]) if len(self._latent_mu_cumsum) else 0.0
+            )
+            # Pre-compute the per-type fields a virtual event needs in
+            # to_group() output. All inputs are immutable post-init, so
+            # caching avoids string partitioning and topology lookups once
+            # per generated virtual.
+            for type_id in latent_type_ids:
+                type_label = self.vocabs.type_vocab.labels[int(type_id)]
+                field_values = _type_label_field_values(type_label, self.config.type_fields)
+                source_name = field_values.get("alarm_source", "")
+                type_part = field_values.get("alarm_type", "")
+                self._latent_type_metadata[int(type_id)] = {
+                    "type_label": type_label,
+                    "alarm_source": source_name,
+                    "alarm_type": type_part or "",
+                    "alarm_title": _virtual_alarm_title(type_part, field_values.get("alarm_title", "")),
+                    "site_id": field_values.get("site_id", "") or self.ne_to_site.get(source_name, ""),
+                    "interval_key": f"latent:{type_label}",
+                }
+        # Bookkeeping for latent mode: sample-time cursor (max ts up to which
+        # latent virtuals have already been considered).
+        self._last_latent_sample_ts = float("-inf")
         # close_inactive throttle (event-time, not wall-clock). 0 disables.
         self._close_check_min_interval = float(close_check_min_interval_sec)
         self._last_close_check_ts = float("-inf")
@@ -360,11 +455,11 @@ class OnlineBRUNCHAssigner:
         # Inject Shelton-style virtual events for any open MissingIntervals up
         # to this event's timestamp BEFORE deciding whether to skip this real
         # event, so the missing-data completion proceeds even when the current
-        # real event is itself a clear/unknown that we wouldn't process.
-        if (
-            self.missing_tracker is not None
-            and self.missing_tracker.has_intervals_needing_sampling(target_ts)
-        ):
+        # real event is itself a clear/unknown that we wouldn't process. The
+        # latent-missing mode (if enabled) also gets a sampling tick here so
+        # its low-rate "any-time-might-be-missing" virtuals are interleaved
+        # in event-time order with the known-interval virtuals.
+        if self._should_sample_virtuals(target_ts):
             self._sample_virtual_events_until(target_ts)
 
         if not self.config.include_clear and is_clear_alarm(event.get("alarm", {})):
@@ -393,6 +488,7 @@ class OnlineBRUNCHAssigner:
         candidates = self._candidate_scores(online_event)
         chosen_parent, chosen_score, total_score = self._choose_candidate(candidates)
         parent_is_virtual = False
+        parent_is_latent = False
         if chosen_parent is None:
             cascade = self._create_cascade(online_event)
             reason = "new_cascade"
@@ -408,6 +504,10 @@ class OnlineBRUNCHAssigner:
             parent_is_virtual = bool(chosen_parent.virtual)
             if parent_is_virtual:
                 self.virtual_picked_as_parent_count += 1
+                if chosen_parent.latent:
+                    parent_is_latent = True
+                    self.latent_virtual_picked_as_parent += 1
+                    self.real_events_with_latent_parent += 1
 
         self._push_recent_ordered(online_event)
         self.modeled_count += 1
@@ -428,6 +528,7 @@ class OnlineBRUNCHAssigner:
             "details": {
                 "parent_event_id": parent_event_id,
                 "parent_virtual": parent_is_virtual,
+                "parent_latent": parent_is_latent,
                 "target_type": type_label,
                 "parent_type": chosen_parent.type_label if chosen_parent is not None else "",
                 "dt_sec": dt_sec,
@@ -561,6 +662,26 @@ class OnlineBRUNCHAssigner:
                 "max_virtual_per_call": int(self.max_virtual_per_call),
                 "max_virtual_per_dim": int(self.max_virtual_per_dim),
             }
+        if self.latent_missing_mode:
+            # latent_parent_rate is the headline safety gauge: of all real
+            # modeled events, what fraction chose a latent virtual parent.
+            latent_parent_rate = (
+                float(self.real_events_with_latent_parent) / float(self.modeled_count)
+                if self.modeled_count > 0
+                else 0.0
+            )
+            meta["latent_missing"] = {
+                "enabled": True,
+                "rate_multiplier": float(self.latent_rate_multiplier),
+                "confidence": float(self.latent_confidence),
+                "max_virtual_per_call": int(self.latent_max_virtual_per_call),
+                "max_active_virtual": int(self.latent_max_active_virtual),
+                "virtual_events_generated": int(self.latent_virtual_generated),
+                "virtual_events_picked_as_parent": int(self.latent_virtual_picked_as_parent),
+                "virtual_events_dropped_by_cap": int(self.latent_virtual_dropped_by_cap),
+                "real_events_with_latent_parent": int(self.real_events_with_latent_parent),
+                "latent_parent_rate": float(latent_parent_rate),
+            }
         return meta
 
     def _skip(self, event, reason, *, details=None):
@@ -584,7 +705,20 @@ class OnlineBRUNCHAssigner:
         while self.recent and self.recent[0].ts < cutoff:
             self.recent.popleft()
 
-    def _candidate_scores(self, target: OnlineEvent):
+    def _candidate_scores(self, target: OnlineEvent, *, exclude_latent_parents: bool = False):
+        """Score candidate parents for `target` from self.recent.
+
+        Parameters
+        ----------
+        exclude_latent_parents
+            When True, skip any latent virtual events in self.recent. Used
+            when `target` is itself a virtual event being injected: latent
+            virtuals are purely speculative, so "virtual triggered by latent"
+            chains amount to compounded speculation and just inflate
+            audit/edge counters without affecting reportable output. By
+            blocking them at scoring time we keep the latent-mode invariant
+            "latent virtuals only become parents of real events".
+        """
         candidates: list[tuple[OnlineEvent | None, float]] = []
         immigrant_score = max(float(self.params.mu[target.type_id]), EPS)
         candidates.append((None, immigrant_score))
@@ -595,6 +729,8 @@ class OnlineBRUNCHAssigner:
             # Defensive: an event from a since-deleted cascade should never be
             # in self.recent (close_inactive drops them), but skip just in case.
             if source.cascade_id not in self.cascades:
+                continue
+            if exclude_latent_parents and source.virtual and source.latent:
                 continue
             dt_sec = target.ts - source.ts
             if dt_sec <= 0.0:
@@ -681,6 +817,21 @@ class OnlineBRUNCHAssigner:
             raise RuntimeError("OnlineBRUNCHAssigner has no missing_tracker")
         return self.missing_tracker.declare_recovered(key_kind, key_value, end_ts)
 
+    def _should_sample_virtuals(self, target_ts: float) -> bool:
+        """True iff we should run virtual-event sampling at this tick.
+
+        Either:
+        - a MissingInterval has un-sampled time before target_ts (known mode), OR
+        - latent-missing mode is on (sampling is always considered, but the
+          latent path will still cap itself + skip dims covered by an active
+          known interval).
+        """
+        if self.latent_missing_mode and self.latent_rate_multiplier > 0.0:
+            return True
+        if self.missing_tracker is None:
+            return False
+        return self.missing_tracker.has_intervals_needing_sampling(target_ts)
+
     def _sample_virtual_events_until(self, target_ts: float) -> None:
         """For every MissingInterval that still has un-sampled time before
         ``target_ts``, sample background-rate virtual events and feed them
@@ -703,23 +854,31 @@ class OnlineBRUNCHAssigner:
         (λ = μ_d + Σ kernel) is a strict superset and can replace this if
         downstream demand justifies the extra cost.
         """
-        if not self.missing_tracker:
-            return
-        active_intervals = self.missing_tracker.intervals_needing_sampling(target_ts)
-        if not active_intervals:
-            # Nothing to sample, but periodically compact stale entries so the
-            # tracker doesn't grow unbounded under a long outage history.
-            self.missing_tracker.compact()
-            return
         cutoff = float(target_ts) - self.active_window_sec
         scale = float(self.config.time_scale_sec) if self.config.time_scale_sec > 0 else 1.0
         budget = int(self.max_virtual_per_call)
 
-        # Stage 1: enumerate all candidate virtual events into a flat list.
-        # Stage 2 will sort that list by timestamp and inject in order.
+        # Two separate pending lists: known-interval virtuals run through the
+        # legacy per-call/per-dim caps; latent virtuals get their own caps and
+        # the active-virtual ceiling. They merge before injection so the
+        # combined timeline stays monotone.
         pending: list[dict] = []
+        latent_pending: list[dict] = []
+        covered_type_ids: set[int] = set()
         call_candidate_count = 0
         call_dropped_by_dim_cap = 0
+
+        active_intervals = (
+            self.missing_tracker.intervals_needing_sampling(target_ts)
+            if self.missing_tracker is not None
+            else []
+        )
+        if self.missing_tracker is not None and not active_intervals:
+            # Nothing in the known path for this tick — still compact stale
+            # entries so the tracker doesn't grow unbounded under a long
+            # outage history. Continue down to the latent path.
+            self.missing_tracker.compact()
+
         for interval in active_intervals:
             upper = min(float(target_ts), interval.effective_end())
             last = float(interval.last_sample_ts if interval.last_sample_ts is not None else interval.start_ts)
@@ -738,6 +897,9 @@ class OnlineBRUNCHAssigner:
             if not type_ids:
                 self.virtual_unresolved_interval_tick_count += 1
                 continue
+            # Remember dims under an active known interval at this tick — the
+            # latent path skips them so we never double-sample.
+            covered_type_ids.update(int(t) for t in type_ids)
             for type_id in type_ids:
                 mu = float(self.params.mu[type_id])
                 if mu <= 0.0:
@@ -779,26 +941,71 @@ class OnlineBRUNCHAssigner:
                         }
                     )
 
-        # Stage 2: enforce the per-call budget, then sort by ts and inject.
+        # ---- Latent-missing path (experimental) -----------------------------
+        # Implicit "always-open" interval for every dim NOT under an active
+        # known interval. Rate is μ × latent_rate_multiplier, confidence is
+        # latent_confidence (typically << known mode), and the global active-
+        # virtual cap (`latent_max_active_virtual`) bounds how much of
+        # self.recent these can occupy. See _sample_latent_pending docstring.
+        if self.latent_missing_mode and self.latent_rate_multiplier > 0.0:
+            self._sample_latent_pending(
+                target_ts=target_ts,
+                cutoff=cutoff,
+                scale=scale,
+                covered_type_ids=covered_type_ids,
+                out=latent_pending,
+            )
+            self._last_latent_sample_ts = float(target_ts)
+
+        # Stage 2: enforce per-call budgets, apply the latent active-virtual
+        # cap, merge known + latent, sort by ts, inject.
         #
-        # When |pending| exceeds the budget we **uniformly subsample** rather
-        # than truncate by timestamp. Truncating by ts would always drop the
-        # tail — exactly the virtuals nearest to the current real event,
-        # which are the most likely candidate parents under the exp kernel.
-        # That biases the chain toward "no parent found" exactly when the
-        # outage is busiest. Uniform thinning of a Poisson process is itself a
+        # When a single pending list exceeds its budget we **uniformly
+        # subsample** rather than truncate by ts. Truncating by ts would
+        # always drop the tail — exactly the virtuals nearest to the current
+        # real event, which are the most likely candidate parents under the
+        # exp kernel. Uniform thinning of a Poisson process is itself a
         # Poisson process with rate λ · (kept/total), so this is a valid
         # load-shedding policy: it lowers the effective μ uniformly across
         # the whole sampled window instead of starving the tail.
         call_dropped_by_call_budget = 0
-        if pending:
-            if len(pending) > budget:
-                call_dropped_by_call_budget = len(pending) - budget
-                self.virtual_dropped_by_call_budget_count += call_dropped_by_call_budget
-                kept_idx = self.rng.choice(len(pending), size=budget, replace=False)
-                pending = [pending[int(i)] for i in kept_idx]
-            pending.sort(key=lambda spec: spec["ts"])
-            for spec in pending:
+        if pending and len(pending) > budget:
+            call_dropped_by_call_budget = len(pending) - budget
+            self.virtual_dropped_by_call_budget_count += call_dropped_by_call_budget
+            kept_idx = self.rng.choice(len(pending), size=budget, replace=False)
+            pending = [pending[int(i)] for i in kept_idx]
+
+        if latent_pending and len(latent_pending) > self.latent_max_virtual_per_call:
+            dropped = len(latent_pending) - self.latent_max_virtual_per_call
+            self.latent_virtual_dropped_by_cap += dropped
+            kept_idx = self.rng.choice(
+                len(latent_pending), size=self.latent_max_virtual_per_call, replace=False
+            )
+            latent_pending = [latent_pending[int(i)] for i in kept_idx]
+
+        # Active-LATENT-virtual ceiling: only counts latent virtuals already in
+        # self.recent. Known virtuals (from declared missing intervals) do NOT
+        # consume this budget — they have their own per-dim / per-call caps and
+        # are considered "the user knows what they're doing". Mixing the two
+        # would let known mode silently starve latent (e.g. a few permanent
+        # known intervals could fill self.recent with known virtuals and leave
+        # zero room for latent), which contradicts the flag's name and intent.
+        if latent_pending:
+            current_active_latent = sum(1 for e in self.recent if e.virtual and e.latent)
+            room = max(0, self.latent_max_active_virtual - current_active_latent)
+            if room < len(latent_pending):
+                dropped = len(latent_pending) - room
+                self.latent_virtual_dropped_by_cap += dropped
+                if room > 0:
+                    kept_idx = self.rng.choice(len(latent_pending), size=room, replace=False)
+                    latent_pending = [latent_pending[int(i)] for i in kept_idx]
+                else:
+                    latent_pending = []
+
+        all_pending = pending + latent_pending
+        if all_pending:
+            all_pending.sort(key=lambda spec: spec["ts"])
+            for spec in all_pending:
                 self._inject_virtual_event(**spec)
 
         self._maybe_warn_virtual_drop(
@@ -810,9 +1017,91 @@ class OnlineBRUNCHAssigner:
             interval_count=len(active_intervals),
         )
 
-        # Evict closed-and-fully-sampled intervals so subsequent ticks don't
-        # scan them. Runs every call but is cheap: it's a single list filter.
-        self.missing_tracker.compact()
+        # Evict closed-and-fully-sampled known intervals so subsequent ticks
+        # don't scan them. Runs every call but is cheap: it's a single list filter.
+        if self.missing_tracker is not None:
+            self.missing_tracker.compact()
+
+    def _sample_latent_pending(
+        self,
+        *,
+        target_ts: float,
+        cutoff: float,
+        scale: float,
+        covered_type_ids: set,
+        out: list,
+    ) -> None:
+        """Sample latent-missing virtuals into ``out`` for every dim NOT under
+        an active known interval at this tick.
+
+        The total rate is aggregated over eligible dims as
+        ``sum(μ_d) × latent_rate_multiplier``; sampled events are then assigned
+        to dims by μ-proportional categorical sampling. The window is the
+        elapsed event-time since the previous latent tick clipped to the
+        assigner's active window. This is the load-shedded "any moment could
+        be missing" interpretation — strong damping + global caps + audit
+        counters make it tolerable, but it is still a heuristic. Use known
+        intervals when you actually know data is missing.
+        """
+        last_latent = float(self._last_latent_sample_ts)
+        if not math.isfinite(last_latent):
+            return
+        start = max(last_latent, cutoff)
+        if start >= target_ts:
+            return
+        dt_scaled = (target_ts - start) / scale
+        if dt_scaled <= 0.0:
+            return
+        rate_scale = float(self.latent_rate_multiplier)
+        if self._latent_mu_total <= 0.0:
+            return
+        if covered_type_ids:
+            allowed_mask = ~np.isin(self._latent_type_ids, list(covered_type_ids))
+            type_ids = self._latent_type_ids[allowed_mask]
+            mu_values = self._latent_mu_values[allowed_mask]
+            if len(type_ids) == 0:
+                return
+            mu_cumsum = np.cumsum(mu_values)
+            mu_total = float(mu_cumsum[-1])
+        else:
+            type_ids = self._latent_type_ids
+            mu_cumsum = self._latent_mu_cumsum
+            mu_total = self._latent_mu_total
+        expected_total = mu_total * rate_scale * dt_scaled
+        if expected_total <= 0.0:
+            return
+        count = int(self.rng.poisson(expected_total))
+        if count <= 0:
+            return
+        # Cap before the per-virtual allocation loop. This is an engineering
+        # hard cap, not an exact Poisson thinning step: it changes the count
+        # distribution when the cap is hit. That tradeoff is intentional for
+        # latent mode because the alternative is allocating K - budget dicts
+        # only to drop them immediately under overload.
+        budget = int(self.latent_max_virtual_per_call)
+        if budget >= 0 and count > budget:
+            self.latent_virtual_dropped_by_cap += count - budget
+            count = budget
+        if count <= 0:
+            return
+        thresholds = self.rng.uniform(0.0, mu_total, size=count)
+        chosen_positions = np.searchsorted(mu_cumsum, thresholds, side="right")
+        times = self.rng.uniform(start, target_ts, size=count)
+        for type_id, vt in zip(type_ids[chosen_positions], times):
+            meta = self._latent_type_metadata[int(type_id)]
+            out.append(
+                {
+                    "ts": float(vt),
+                    "type_id": int(type_id),
+                    "type_label": meta["type_label"],
+                    "alarm_source": meta["alarm_source"],
+                    "site_id": meta["site_id"],
+                    "alarm_title": meta["alarm_title"],
+                    "alarm_type": meta["alarm_type"],
+                    "interval_key": meta["interval_key"],
+                    "latent": True,
+                }
+            )
 
     def _maybe_warn_virtual_drop(
         self,
@@ -850,6 +1139,7 @@ class OnlineBRUNCHAssigner:
         alarm_title: str,
         alarm_type: str,
         interval_key: str,
+        latent: bool = False,
     ) -> None:
         index = self._next_index
         self._next_index += 1
@@ -859,13 +1149,22 @@ class OnlineBRUNCHAssigner:
             # so summarize_alarm_event() in to_group()/decision output will
             # surface our virtual id rather than falling back to the generic
             # alarm-NNN scheme.
-            "alarm": {"__virtual__": True, "missing_interval": interval_key, "event_id": synthetic_event_id},
+            "alarm": {
+                "__virtual__": True,
+                "missing_interval": interval_key,
+                "event_id": synthetic_event_id,
+                "latent": bool(latent),
+            },
             "ts": ts,
             "site_id": site_id,
             "alarm_source": alarm_source,
             "alarm_title": alarm_title,
             "alarm_type": alarm_type,
         }
+        # Latent virtuals get the much-lower latent_confidence so the
+        # candidate score is heavily dampened relative to known virtuals;
+        # known virtuals keep the user-configured virtual_confidence.
+        effective_confidence = self.latent_confidence if latent else self.virtual_confidence
         online_event = OnlineEvent(
             index=index,
             event=synthetic_alarm_dict,
@@ -873,10 +1172,17 @@ class OnlineBRUNCHAssigner:
             type_label=type_label,
             event_id=synthetic_event_id,
             virtual=True,
-            confidence=self.virtual_confidence,
+            latent=bool(latent),
+            confidence=effective_confidence,
             virtual_source=interval_key,
         )
-        candidates = self._candidate_scores(online_event)
+        # Latent virtuals are speculative. We forbid latent virtuals from
+        # being picked as parent of any virtual (whether known or latent) —
+        # chains of speculation just inflate audit counters and edges without
+        # affecting downstream output (pure-virtual cascades are filtered out
+        # of groups anyway). Latent virtuals can still be picked as parent of
+        # REAL events, which is their actual purpose.
+        candidates = self._candidate_scores(online_event, exclude_latent_parents=True)
         chosen_parent, _, _ = self._choose_candidate(candidates)
         if chosen_parent is None:
             cascade = self._create_cascade(online_event)
@@ -885,10 +1191,14 @@ class OnlineBRUNCHAssigner:
             cascade.add(online_event, parent=chosen_parent)
             self.branching_edge_count += 1
             if chosen_parent.virtual:
-                # virtual event picking a virtual parent — purely synthetic chain.
+                # virtual event picking a (known-only, by the filter above)
+                # virtual parent — still synthetic but at least anchored to
+                # a known-missing window.
                 self.virtual_picked_as_parent_count += 1
         self._push_recent_ordered(online_event)
         self.virtual_event_count += 1
+        if latent:
+            self.latent_virtual_generated += 1
 
 
 def _write_json(path, payload):
@@ -1184,6 +1494,7 @@ def _print_virtual_events_state(args):
         name for name, default in knob_defaults.items()
         if getattr(args, name, default) != default
     ]
+    latent_on = bool(getattr(args, "latent_missing_mode", False))
 
     if args.disable_virtual_events:
         print("virtual events: 已禁用（--disable-virtual-events）")
@@ -1192,23 +1503,41 @@ def _print_virtual_events_state(args):
                 "以下虚拟事件参数将被忽略（virtual events 已禁用）："
                 f" {', '.join('--' + n.replace('_', '-') for n in customized_knobs)}"
             )
+        if latent_on:
+            _warn(
+                "--latent-missing-mode 在 --disable-virtual-events 下也会被忽略；"
+                "去掉 --disable-virtual-events 才能启用 latent 路径"
+            )
         return
-    if not args.missing_intervals:
-        print("virtual events: 未启用（未传 --missing-intervals）")
+    # --- known mode block ---
+    if args.missing_intervals:
+        print(
+            f"virtual events (known): 启用 "
+            f"(missing_intervals={args.missing_intervals}, "
+            f"confidence={args.virtual_confidence:g}, "
+            f"max_per_call={args.max_virtual_per_call}, "
+            f"max_per_dim={args.max_virtual_per_dim}, "
+            f"drop_warning_ratio={args.virtual_drop_warning_ratio:g})"
+        )
+    else:
+        print("virtual events (known): 未启用（未传 --missing-intervals）")
         if customized_knobs:
             _warn(
                 "以下虚拟事件参数将被忽略（未传 --missing-intervals）："
                 f" {', '.join('--' + n.replace('_', '-') for n in customized_knobs)}"
             )
-        return
-    print(
-        f"virtual events: 启用 "
-        f"(missing_intervals={args.missing_intervals}, "
-        f"confidence={args.virtual_confidence:g}, "
-        f"max_per_call={args.max_virtual_per_call}, "
-        f"max_per_dim={args.max_virtual_per_dim}, "
-        f"drop_warning_ratio={args.virtual_drop_warning_ratio:g})"
-    )
+    # --- latent mode block (always shown so users can confirm at a glance) ---
+    if latent_on:
+        print(
+            f"virtual events (latent, EXPERIMENTAL): 启用 "
+            f"(rate_multiplier={args.latent_rate_multiplier:g}, "
+            f"confidence={args.latent_confidence:g}, "
+            f"max_per_call={args.latent_max_virtual_per_call}, "
+            f"max_active={args.latent_max_active_virtual}) — "
+            f"运维上线后请观察 metadata.latent_missing.latent_parent_rate"
+        )
+    else:
+        print("virtual events (latent): 未启用（如需启用请传 --latent-missing-mode）")
 
 
 def _apply_input_mode_defaults(args):
@@ -1486,6 +1815,59 @@ def main():
             "by caps reaches this ratio. Set 0 to disable. Default: 0.25."
         ),
     )
+    # ---- experimental latent-missing mode ----------------------------------
+    parser.add_argument(
+        "--latent-missing-mode",
+        action="store_true",
+        help=(
+            "[EXPERIMENTAL] Assume any dim may have a small chance of missing data at any "
+            "moment. Samples virtual events for every dim NOT covered by an active "
+            "known interval, at a heavily-discounted rate. Useful when missing intervals "
+            "are operationally hard to maintain, but trades cascade noise for coverage. "
+            "Inspect metadata.latent_missing.latent_parent_rate to decide whether the "
+            "mode is over-firing. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--latent-rate-multiplier",
+        type=float,
+        default=0.05,
+        help=(
+            "Per-dim background-rate discount for latent virtuals (in [0, 1]). The "
+            "effective sampling rate is μ_d × multiplier; the default 0.05 means "
+            "'at most ~5%% of events could plausibly have been missed'. Set to 0 to "
+            "disable latent sampling without disabling the mode (no-op)."
+        ),
+    )
+    parser.add_argument(
+        "--latent-confidence",
+        type=float,
+        default=0.05,
+        help=(
+            "Score multiplier for latent virtual parent candidates (in (0, 1]). Much "
+            "lower than --virtual-confidence so latent virtuals only win when the "
+            "real candidate field is exceptionally thin. Default: 0.05."
+        ),
+    )
+    parser.add_argument(
+        "--latent-max-virtual-per-call",
+        type=int,
+        default=10,
+        help="Cap on latent virtuals generated per real-event tick. Default: 10.",
+    )
+    parser.add_argument(
+        "--latent-max-active-virtual",
+        type=int,
+        default=200,
+        help=(
+            "Hard ceiling on LATENT virtuals currently living in self.recent. "
+            "Known-interval virtuals are counted independently and do NOT consume "
+            "this budget (they have their own per-dim / per-call caps). When "
+            "reached, new latent samples this tick are dropped (audited as "
+            "latent_virtual_dropped_by_cap). Bounds self.recent bloat from latent "
+            "noise specifically. Default: 200."
+        ),
+    )
     parser.add_argument(
         "--close-check-interval-sec",
         type=float,
@@ -1540,7 +1922,11 @@ def main():
             f"max_per_dim={args.max_virtual_per_dim}, "
             f"drop_warning_ratio={args.virtual_drop_warning_ratio:g}"
         )
-    virtual_ne_to_site = _load_ne_to_site_map(args.ne_graph) if missing_tracker is not None else {}
+    # Latent mode also wants NE→site mapping for synthetic events, even when
+    # the user hasn't supplied missing-intervals.
+    latent_mode_on = bool(getattr(args, "latent_missing_mode", False)) and not args.disable_virtual_events
+    needs_ne_site_map = missing_tracker is not None or latent_mode_on
+    virtual_ne_to_site = _load_ne_to_site_map(args.ne_graph) if needs_ne_site_map else {}
     assigner = OnlineBRUNCHAssigner(
         artifact,
         config=config,
@@ -1554,6 +1940,11 @@ def main():
         max_virtual_per_dim=args.max_virtual_per_dim,
         virtual_drop_warning_ratio=args.virtual_drop_warning_ratio,
         close_check_min_interval_sec=args.close_check_interval_sec,
+        latent_missing_mode=latent_mode_on,
+        latent_rate_multiplier=args.latent_rate_multiplier,
+        latent_confidence=args.latent_confidence,
+        latent_max_virtual_per_call=args.latent_max_virtual_per_call,
+        latent_max_active_virtual=args.latent_max_active_virtual,
     )
     reorder_buffer = ReorderBuffer(args.reorder_lag_sec)
     visual_output = None
