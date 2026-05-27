@@ -333,15 +333,16 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
             if config.topology_edge_policy == "prefer":
                 fallback_limit = max(0, config.topology_fallback_sources_per_dim)
                 fallback_limit = min(fallback_limit, config.max_active_sources_per_dim)
-                for source, _count in by_target_sources[target_dim].most_common(
-                    config.max_active_sources_per_dim
-                ):
-                    if source in ranked_sources:
-                        continue
-                    ranked_sources.append(source)
-                    fallback_limit -= 1
-                    if fallback_limit <= 0:
-                        break
+                if fallback_limit > 0:
+                    for source, _count in by_target_sources[target_dim].most_common(
+                        config.max_active_sources_per_dim
+                    ):
+                        if source in ranked_sources:
+                            continue
+                        ranked_sources.append(source)
+                        fallback_limit -= 1
+                        if fallback_limit <= 0:
+                            break
             ranked_sources = ranked_sources[: config.max_active_sources_per_dim]
         source_candidates.update(ranked_sources)
         for source_dim in sorted(source_candidates):
