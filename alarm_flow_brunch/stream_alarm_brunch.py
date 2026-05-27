@@ -15,6 +15,7 @@ import heapq
 import json
 import math
 import os
+import sys
 import time
 from argparse import ArgumentParser
 from pathlib import Path
@@ -58,6 +59,74 @@ from topology_tools.region_utils import allowed_devices_for_regions, load_ne_gra
 EPS = 1e-12
 _OFFLINE_REORDER_LAG_SEC = 0.0
 _LIVE_REORDER_LAG_SEC = 300.0
+
+
+_VIRTUAL_ALARM_TITLE_BY_TYPE = {
+    "link": "Link Down",
+    "power": "Power Supply",
+    "offline": "NE is Disconnected",
+}
+
+
+def _warn(message: str) -> None:
+    """Emit a structured warning to stderr.
+
+    Goes to stderr (not stdout) so it survives stdout redirection / piping,
+    and uses a ``[WARN]`` prefix so log-aggregators that scan severity tokens
+    can route or filter it correctly.
+    """
+    print(f"[WARN] {message}", file=sys.stderr, flush=True)
+
+
+def _clean_type_label_part(value) -> str:
+    value = str(value or "").strip()
+    return "" if value == "<empty>" else value
+
+
+def _type_label_field_values(type_label, type_fields) -> dict:
+    fields = tuple(type_fields or ())
+    if not fields:
+        return {}
+    label = str(type_label or "")
+    if len(fields) == 1:
+        return {fields[0]: _clean_type_label_part(label)}
+    parts = label.split(" | ", maxsplit=len(fields) - 1)
+    if len(parts) < len(fields):
+        parts.extend([""] * (len(fields) - len(parts)))
+    return {
+        field: _clean_type_label_part(part)
+        for field, part in zip(fields, parts)
+    }
+
+
+def _virtual_alarm_title(alarm_type: str, alarm_title: str = "") -> str:
+    alarm_title = str(alarm_title or "").strip()
+    if alarm_title:
+        return alarm_title
+    return _VIRTUAL_ALARM_TITLE_BY_TYPE.get(str(alarm_type or "").strip(), "")
+
+
+def _load_ne_to_site_map(ne_graph_path) -> dict[str, str]:
+    try:
+        ne_graph = load_ne_graph(ne_graph_path)
+    except Exception as exc:
+        _warn(f"无法为虚拟事件加载 NE 站点映射: {ne_graph_path} ({exc})")
+        return {}
+    ne_to_site: dict[str, str] = {}
+    for ne_id, record in (ne_graph or {}).items():
+        if not isinstance(record, dict):
+            continue
+        site_id = str(
+            record.get("site_id")
+            or record.get("siteId")
+            or record.get("site")
+            or record.get("site_name")
+            or record.get("siteName")
+            or ""
+        ).strip()
+        if site_id:
+            ne_to_site[str(ne_id)] = site_id
+    return ne_to_site
 
 
 @dataclass
@@ -209,9 +278,11 @@ class OnlineBRUNCHAssigner:
         parent_selection: str | None = None,
         seed: int = 0,
         missing_tracker=None,
+        ne_to_site=None,
         virtual_confidence: float = 0.5,
         max_virtual_per_call: int = 50,
         max_virtual_per_dim: int = 100,
+        virtual_drop_warning_ratio: float = 0.25,
         close_check_min_interval_sec: float = 1.0,
     ):
         self.artifact = artifact
@@ -230,6 +301,8 @@ class OnlineBRUNCHAssigner:
             raise ValueError("virtual_confidence must be in (0, 1]")
         if max_virtual_per_call < 0 or max_virtual_per_dim < 0:
             raise ValueError("virtual sampling caps must be non-negative")
+        if virtual_drop_warning_ratio < 0.0 or virtual_drop_warning_ratio > 1.0:
+            raise ValueError("virtual_drop_warning_ratio must be in [0, 1]")
         if close_check_min_interval_sec < 0:
             raise ValueError("close_check_min_interval_sec must be non-negative")
         self.rng = np.random.default_rng(seed)
@@ -248,10 +321,17 @@ class OnlineBRUNCHAssigner:
         self._next_cascade_ordinal = 1
         # Missing-data support
         self.missing_tracker = missing_tracker
+        self.ne_to_site = dict(ne_to_site or {})
         self.virtual_confidence = float(virtual_confidence)
         self.max_virtual_per_call = int(max_virtual_per_call)
         self.max_virtual_per_dim = int(max_virtual_per_dim)
+        self.virtual_drop_warning_ratio = float(virtual_drop_warning_ratio)
         self.virtual_event_count = 0
+        self.virtual_candidate_event_count = 0
+        self.virtual_dropped_by_dim_cap_count = 0
+        self.virtual_dropped_by_call_budget_count = 0
+        self.virtual_drop_warning_count = 0
+        self.virtual_unresolved_interval_tick_count = 0
         self.virtual_picked_as_parent_count = 0
         # close_inactive throttle (event-time, not wall-clock). 0 disables.
         self._close_check_min_interval = float(close_check_min_interval_sec)
@@ -470,6 +550,12 @@ class OnlineBRUNCHAssigner:
             meta["missing_data"] = {
                 **self.missing_tracker.stats(),
                 "virtual_event_count": int(self.virtual_event_count),
+                "virtual_candidate_event_count": int(self.virtual_candidate_event_count),
+                "virtual_dropped_by_dim_cap_count": int(self.virtual_dropped_by_dim_cap_count),
+                "virtual_dropped_by_call_budget_count": int(self.virtual_dropped_by_call_budget_count),
+                "virtual_drop_warning_count": int(self.virtual_drop_warning_count),
+                "virtual_drop_warning_ratio": float(self.virtual_drop_warning_ratio),
+                "virtual_unresolved_interval_tick_count": int(self.virtual_unresolved_interval_tick_count),
                 "virtual_picked_as_parent_count": int(self.virtual_picked_as_parent_count),
                 "virtual_confidence": float(self.virtual_confidence),
                 "max_virtual_per_call": int(self.max_virtual_per_call),
@@ -632,6 +718,8 @@ class OnlineBRUNCHAssigner:
         # Stage 1: enumerate all candidate virtual events into a flat list.
         # Stage 2 will sort that list by timestamp and inject in order.
         pending: list[dict] = []
+        call_candidate_count = 0
+        call_dropped_by_dim_cap = 0
         for interval in active_intervals:
             upper = min(float(target_ts), interval.effective_end())
             last = float(interval.last_sample_ts if interval.last_sample_ts is not None else interval.start_ts)
@@ -646,7 +734,11 @@ class OnlineBRUNCHAssigner:
             if start >= upper:
                 continue
             dt_scaled = (upper - start) / scale
-            for type_id in self.missing_tracker.type_ids_for(interval):
+            type_ids = self.missing_tracker.type_ids_for(interval)
+            if not type_ids:
+                self.virtual_unresolved_interval_tick_count += 1
+                continue
+            for type_id in type_ids:
                 mu = float(self.params.mu[type_id])
                 if mu <= 0.0:
                     continue
@@ -654,12 +746,24 @@ class OnlineBRUNCHAssigner:
                 if expected <= 0.0:
                     continue
                 count = int(self.rng.poisson(expected))
+                call_candidate_count += count
+                self.virtual_candidate_event_count += count
                 if count <= 0:
                     continue
-                count = min(count, self.max_virtual_per_dim)
+                capped_count = min(count, self.max_virtual_per_dim)
+                dim_dropped = max(0, count - capped_count)
+                call_dropped_by_dim_cap += dim_dropped
+                self.virtual_dropped_by_dim_cap_count += dim_dropped
+                count = capped_count
+                if count <= 0:
+                    continue
                 times = self.rng.uniform(start, upper, size=count)
                 type_label = self.vocabs.type_vocab.labels[type_id]
-                source_name, _, type_part = type_label.partition(" | ")
+                field_values = _type_label_field_values(type_label, self.config.type_fields)
+                source_name = field_values.get("alarm_source", "")
+                type_part = field_values.get("alarm_type", "")
+                alarm_title = _virtual_alarm_title(type_part, field_values.get("alarm_title", ""))
+                site_id = field_values.get("site_id", "") or self.ne_to_site.get(source_name, "")
                 interval_key = f"{interval.key_kind}:{interval.key_value}"
                 for vt in times:
                     pending.append(
@@ -668,6 +772,8 @@ class OnlineBRUNCHAssigner:
                             "type_id": int(type_id),
                             "type_label": type_label,
                             "alarm_source": source_name,
+                            "site_id": site_id,
+                            "alarm_title": alarm_title,
                             "alarm_type": type_part or "",
                             "interval_key": interval_key,
                         }
@@ -684,17 +790,54 @@ class OnlineBRUNCHAssigner:
         # Poisson process with rate λ · (kept/total), so this is a valid
         # load-shedding policy: it lowers the effective μ uniformly across
         # the whole sampled window instead of starving the tail.
+        call_dropped_by_call_budget = 0
         if pending:
             if len(pending) > budget:
+                call_dropped_by_call_budget = len(pending) - budget
+                self.virtual_dropped_by_call_budget_count += call_dropped_by_call_budget
                 kept_idx = self.rng.choice(len(pending), size=budget, replace=False)
                 pending = [pending[int(i)] for i in kept_idx]
             pending.sort(key=lambda spec: spec["ts"])
             for spec in pending:
                 self._inject_virtual_event(**spec)
 
+        self._maybe_warn_virtual_drop(
+            target_ts=target_ts,
+            candidate_count=call_candidate_count,
+            dropped_by_dim_cap=call_dropped_by_dim_cap,
+            dropped_by_call_budget=call_dropped_by_call_budget,
+            kept_count=len(pending),
+            interval_count=len(active_intervals),
+        )
+
         # Evict closed-and-fully-sampled intervals so subsequent ticks don't
         # scan them. Runs every call but is cheap: it's a single list filter.
         self.missing_tracker.compact()
+
+    def _maybe_warn_virtual_drop(
+        self,
+        *,
+        target_ts: float,
+        candidate_count: int,
+        dropped_by_dim_cap: int,
+        dropped_by_call_budget: int,
+        kept_count: int,
+        interval_count: int,
+    ) -> None:
+        dropped = int(dropped_by_dim_cap) + int(dropped_by_call_budget)
+        if candidate_count <= 0 or dropped <= 0 or self.virtual_drop_warning_ratio <= 0.0:
+            return
+        drop_ratio = dropped / float(candidate_count)
+        if drop_ratio < self.virtual_drop_warning_ratio:
+            return
+        self.virtual_drop_warning_count += 1
+        _warn(
+            "virtual events 被 cap 丢弃比例过高: "
+            f"drop_ratio={drop_ratio:.2%}, dropped={dropped}, kept={kept_count}, "
+            f"candidate={candidate_count}, by_dim_cap={dropped_by_dim_cap}, "
+            f"by_call_budget={dropped_by_call_budget}, intervals={interval_count}, "
+            f"ts={float(target_ts):.3f}, threshold={self.virtual_drop_warning_ratio:.2%}"
+        )
 
     def _inject_virtual_event(
         self,
@@ -703,6 +846,8 @@ class OnlineBRUNCHAssigner:
         type_id: int,
         type_label: str,
         alarm_source: str,
+        site_id: str,
+        alarm_title: str,
         alarm_type: str,
         interval_key: str,
     ) -> None:
@@ -716,9 +861,9 @@ class OnlineBRUNCHAssigner:
             # alarm-NNN scheme.
             "alarm": {"__virtual__": True, "missing_interval": interval_key, "event_id": synthetic_event_id},
             "ts": ts,
-            "site_id": "",
+            "site_id": site_id,
             "alarm_source": alarm_source,
-            "alarm_title": "",
+            "alarm_title": alarm_title,
             "alarm_type": alarm_type,
         }
         online_event = OnlineEvent(
@@ -1019,6 +1164,51 @@ def _print_run_configuration(args, artifact, config, groups_output):
     if args.visual_output:
         print("可视化输出: cascade 关闭时追加写入，输入结束时补写仍未关闭的 cascade")
         print(f"可视化文件: {args.visual_output}")
+    _print_virtual_events_state(args)
+
+
+def _print_virtual_events_state(args):
+    """Surface the virtual-events (Shelton missing-data) state so the user
+    can confirm at a glance whether it is on, off, or unconfigured. Also
+    flags sampling-knob arguments that will be ignored.
+    """
+    # Detect sampling-knob args that were customized despite virtual events
+    # being disabled / not configured — these become silent no-ops otherwise.
+    knob_defaults = {
+        "virtual_confidence": 0.5,
+        "max_virtual_per_call": 50,
+        "max_virtual_per_dim": 100,
+        "virtual_drop_warning_ratio": 0.25,
+    }
+    customized_knobs = [
+        name for name, default in knob_defaults.items()
+        if getattr(args, name, default) != default
+    ]
+
+    if args.disable_virtual_events:
+        print("virtual events: 已禁用（--disable-virtual-events）")
+        if customized_knobs:
+            _warn(
+                "以下虚拟事件参数将被忽略（virtual events 已禁用）："
+                f" {', '.join('--' + n.replace('_', '-') for n in customized_knobs)}"
+            )
+        return
+    if not args.missing_intervals:
+        print("virtual events: 未启用（未传 --missing-intervals）")
+        if customized_knobs:
+            _warn(
+                "以下虚拟事件参数将被忽略（未传 --missing-intervals）："
+                f" {', '.join('--' + n.replace('_', '-') for n in customized_knobs)}"
+            )
+        return
+    print(
+        f"virtual events: 启用 "
+        f"(missing_intervals={args.missing_intervals}, "
+        f"confidence={args.virtual_confidence:g}, "
+        f"max_per_call={args.max_virtual_per_call}, "
+        f"max_per_dim={args.max_virtual_per_dim}, "
+        f"drop_warning_ratio={args.virtual_drop_warning_ratio:g})"
+    )
 
 
 def _apply_input_mode_defaults(args):
@@ -1265,6 +1455,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--disable-virtual-events",
+        action="store_true",
+        help="全局降级开关：强制关闭缺失数据插补（Virtual Events）功能，即使提供了缺失数据也会被忽略。",
+    )
+    parser.add_argument(
         "--virtual-confidence",
         type=float,
         default=0.5,
@@ -1281,6 +1476,15 @@ def main():
         type=int,
         default=100,
         help="Cap on virtual events sampled per dimension per tick. Default: 100.",
+    )
+    parser.add_argument(
+        "--virtual-drop-warning-ratio",
+        type=float,
+        default=0.25,
+        help=(
+            "Warn when the per-tick fraction of sampled virtual events dropped "
+            "by caps reaches this ratio. Set 0 to disable. Default: 0.25."
+        ),
     )
     parser.add_argument(
         "--close-check-interval-sec",
@@ -1316,8 +1520,14 @@ def main():
     )
     _print_run_configuration(args, artifact, config, groups_output)
     missing_tracker = None
-    if args.missing_intervals:
-        missing_tracker = MissingIntervalTracker(artifact.vocabs)
+    if args.disable_virtual_events:
+        if args.missing_intervals:
+            _warn(
+                "缺失数据插补已被 --disable-virtual-events 强制关闭，"
+                f"传入的 --missing-intervals {args.missing_intervals} 将被忽略。"
+            )
+    elif args.missing_intervals:
+        missing_tracker = MissingIntervalTracker(artifact.vocabs, type_fields=config.type_fields)
         loaded = load_missing_from_json(args.missing_intervals)
         for interval in loaded:
             missing_tracker.add(interval)
@@ -1327,8 +1537,10 @@ def main():
             f"closed={missing_tracker.stats()['closed_count']})，"
             f"virtual_confidence={args.virtual_confidence:g}, "
             f"max_per_call={args.max_virtual_per_call}, "
-            f"max_per_dim={args.max_virtual_per_dim}"
+            f"max_per_dim={args.max_virtual_per_dim}, "
+            f"drop_warning_ratio={args.virtual_drop_warning_ratio:g}"
         )
+    virtual_ne_to_site = _load_ne_to_site_map(args.ne_graph) if missing_tracker is not None else {}
     assigner = OnlineBRUNCHAssigner(
         artifact,
         config=config,
@@ -1336,9 +1548,11 @@ def main():
         parent_selection=parent_selection,
         seed=args.seed,
         missing_tracker=missing_tracker,
+        ne_to_site=virtual_ne_to_site,
         virtual_confidence=args.virtual_confidence,
         max_virtual_per_call=args.max_virtual_per_call,
         max_virtual_per_dim=args.max_virtual_per_dim,
+        virtual_drop_warning_ratio=args.virtual_drop_warning_ratio,
         close_check_min_interval_sec=args.close_check_interval_sec,
     )
     reorder_buffer = ReorderBuffer(args.reorder_lag_sec)

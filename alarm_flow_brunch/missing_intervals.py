@@ -25,6 +25,27 @@ from typing import Dict, List, Optional, Tuple
 KEY_KINDS = frozenset({"alarm_source", "alarm_type", "type_label", "type_id"})
 
 
+def _clean_type_label_part(value) -> str:
+    value = str(value or "").strip()
+    return "" if value == "<empty>" else value
+
+
+def _type_label_field_values(type_label, type_fields) -> dict:
+    fields = tuple(type_fields or ())
+    if not fields:
+        return {}
+    label = str(type_label or "")
+    if len(fields) == 1:
+        return {fields[0]: _clean_type_label_part(label)}
+    parts = label.split(" | ", maxsplit=len(fields) - 1)
+    if len(parts) < len(fields):
+        parts.extend([""] * (len(fields) - len(parts)))
+    return {
+        field: _clean_type_label_part(part)
+        for field, part in zip(fields, parts)
+    }
+
+
 @dataclass
 class MissingInterval:
     """A declared unobserved (key → time window) range.
@@ -113,8 +134,9 @@ class MissingIntervalTracker:
     matching is duck-typed so it also works when only one field is present.
     """
 
-    def __init__(self, vocabs):
+    def __init__(self, vocabs, type_fields=("alarm_source", "alarm_type")):
         self.vocabs = vocabs
+        self.type_fields = tuple(type_fields or ("alarm_source", "alarm_type"))
         self.intervals: List[MissingInterval] = []
         self._key_to_type_ids: Dict[Tuple[str, str], List[int]] = {}
 
@@ -203,12 +225,22 @@ class MissingIntervalTracker:
         elif interval.key_kind == "alarm_source":
             prefix = f"{interval.key_value} | "
             for idx, label in enumerate(labels):
-                if label == interval.key_value or label.startswith(prefix):
+                values = _type_label_field_values(label, self.type_fields)
+                if (
+                    values.get("alarm_source") == interval.key_value
+                    or label == interval.key_value
+                    or label.startswith(prefix)
+                ):
                     result.append(idx)
         elif interval.key_kind == "alarm_type":
             suffix = f" | {interval.key_value}"
             for idx, label in enumerate(labels):
-                if label == interval.key_value or label.endswith(suffix):
+                values = _type_label_field_values(label, self.type_fields)
+                if (
+                    values.get("alarm_type") == interval.key_value
+                    or label == interval.key_value
+                    or label.endswith(suffix)
+                ):
                     result.append(idx)
         self._key_to_type_ids[cache_key] = result
         return result

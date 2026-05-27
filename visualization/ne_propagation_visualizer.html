@@ -1165,6 +1165,38 @@
             pointer-events: none;
         }
 
+        .marker-virtual-badge {
+            position: absolute;
+            right: -8px;
+            bottom: -8px;
+            min-width: 16px;
+            height: 16px;
+            padding: 0 4px;
+            border-radius: 999px;
+            border: 1px solid #7c3aed;
+            background: #faf5ff;
+            color: #6f42c1;
+            font-size: 9px;
+            line-height: 14px;
+            font-weight: 800;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(31, 35, 40, 0.25);
+            pointer-events: none;
+        }
+
+        .virtual-alarm-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 1px 6px;
+            border-radius: 999px;
+            border: 1px solid #d8b4fe;
+            background: #faf5ff;
+            color: #6f42c1;
+            font-size: 10px;
+            font-weight: 700;
+            line-height: 1.4;
+        }
+
         .site-label-map.expanded-site {
             background: rgba(255, 247, 237, 0.92);
             border-color: rgba(245, 158, 11, 0.35);
@@ -1678,6 +1710,12 @@
             background: rgba(128, 128, 128, 0.1);
             border-left-color: #808080;
             color: #57606a;
+        }
+
+        .alarm-item.virtual {
+            background: rgba(124, 58, 237, 0.08);
+            border-left-color: #7c3aed;
+            color: #4c1d95;
         }
 
         .loading-overlay {
@@ -4216,12 +4254,36 @@
             return '<div class="marker-alarm-groups">' + badgeHtml + moreHtml + '</div>';
         }
 
+        function isVirtualAlarm(alarm) {
+            return !!(alarm && (alarm.virtual || alarm.__virtual__ || alarm.inferred_virtual));
+        }
+
+        function nodeHasVirtualAlarm(node) {
+            return Array.isArray(node && node.alarm) && node.alarm.some(isVirtualAlarm);
+        }
+
+        function renderVirtualAlarmBadge(alarm) {
+            if (!isVirtualAlarm(alarm)) return '';
+            const confidence = Number(alarm.confidence);
+            const confidenceText = Number.isFinite(confidence)
+                ? ' conf=' + confidence.toFixed(2)
+                : '';
+            const sourceText = alarm.virtual_source ? ' / ' + escapeHtml(alarm.virtual_source) : '';
+            return '<span class="virtual-alarm-badge" title="插补事件' + confidenceText + sourceText + '">virtual</span>';
+        }
+
+        function renderMarkerVirtualBadge(node) {
+            if (!nodeHasVirtualAlarm(node)) return '';
+            const virtualCount = (node.alarm || []).filter(isVirtualAlarm).length;
+            return '<span class="marker-virtual-badge" title="插补事件 ' + virtualCount + ' 条">V</span>';
+        }
+
         function buildMarkerHtml(node, svgHtml, isSelected, isHighlighted) {
             return '<div class="marker-pin ' +
                 (node.isNeighborExpanded ? 'neighbor-expanded ' : '') +
                 (isSelected ? 'selected ' : '') +
                 (isHighlighted ? 'highlighted' : '') +
-                '">' + svgHtml + renderMarkerAlarmGroupBadges(node) + '</div>';
+                '">' + svgHtml + renderMarkerAlarmGroupBadges(node) + renderMarkerVirtualBadge(node) + '</div>';
         }
 
         function getSymptomAlarmSource(symptom) {
@@ -4244,6 +4306,9 @@
                 matched_role: symptom.matched_role || '',
                 '工单号': symptom['工单号'] || '',
                 '故障组ID': symptom['故障组ID'] || symptom.fault_group_id || symptom.alarm_group_id || symptom.group_id || '',
+                virtual: !!symptom.virtual,
+                confidence: symptom.confidence,
+                virtual_source: symptom.virtual_source || '',
                 ts: symptom.ts
             };
         }
@@ -4556,9 +4621,12 @@
                         const faultGroupHtml = faultGroup
                             ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
                             : '<span>-</span>';
+                        const virtualBadge = renderVirtualAlarmBadge(alarm);
                         return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
                             '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
-                            '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4;">' + alarmTitle + '</div>' +
+                            '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+                                '<span>' + alarmTitle + '</span>' + virtualBadge +
+                            '</div>' +
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                             '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
@@ -4850,6 +4918,12 @@
                 const faultGroupHtml = faultGroup
                     ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
                     : '<span>-</span>';
+                const virtualBadge = renderVirtualAlarmBadge(alarm);
+                const virtualMeta = isVirtualAlarm(alarm)
+                    ? '<div style="color: #6f42c1; font-size: 11px; margin-top: 3px;">插补来源: ' + escapeHtml(alarm.virtual_source || '-') +
+                        (alarm.confidence !== undefined && alarm.confidence !== null && alarm.confidence !== '' ? '，confidence=' + escapeHtml(alarm.confidence) : '') +
+                        '</div>'
+                    : '';
                 
                 // 根据严重级别设置样式
                 let severityClass = 'warning';
@@ -4870,14 +4944,17 @@
                     severityColor = '#1f883d';
                 }
                 
-                alarmHtml += '<div class="alarm-item ' + severityClass + '">' +
+                alarmHtml += '<div class="alarm-item ' + severityClass + (isVirtualAlarm(alarm) ? ' virtual' : '') + '">' +
                     '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">' +
-                        '<span style="font-weight: bold; color: ' + severityColor + ';">' + alarmType + '</span>' +
+                        '<span style="font-weight: bold; color: ' + severityColor + '; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+                            '<span>' + alarmType + '</span>' + virtualBadge +
+                        '</span>' +
                         '<span style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: ' + severityColor + '; color: white;">' + severityText + '</span>' +
                     '</div>' +
                     '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
+                    virtualMeta +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
                     '</div>';
             });
