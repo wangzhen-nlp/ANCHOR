@@ -16,7 +16,7 @@ def generate_rule_string() -> str:
     # 排序以保证每次生成的字符串顺序一致
     sorted_alarms = sorted(CRITICAL_ALARMS)
     
-    conditions = [f'"告警标题" 等于 "{alarm}"' for alarm in sorted_alarms]
+    conditions = [f'"alarmname" = "{alarm}"' for alarm in sorted_alarms]
     rule_body = " 或 ".join(conditions)
     return f"'({rule_body})'"
 
