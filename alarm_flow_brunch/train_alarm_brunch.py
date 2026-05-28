@@ -135,6 +135,7 @@ def _build_config(args):
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
         non_topology_alpha_multiplier=args.non_topology_alpha_multiplier,
+        stability_radius=args.stability_radius,
         regions=parse_regions(args.regions),
         parent_selection=args.parent_selection,
     )
@@ -207,6 +208,12 @@ def main():
             "Alpha multiplier for non-topology fallback edges in prefer mode. "
             "Default: 0.5, matching the previous hard-coded behavior."
         ),
+    )
+    parser.add_argument(
+        "--stability-radius",
+        type=float,
+        default=0.95,
+        help="Stationarity cap for the initial alpha matrix spectral radius. Default: 0.95. Set to 0 or negative to disable.",
     )
     parser.add_argument(
         "--parent-selection",

@@ -53,6 +53,7 @@ class AlarmBRUNCHConfig:
     topology_prefer_multiplier: float = 2.0
     topology_fallback_sources_per_dim: int = 2
     non_topology_alpha_multiplier: float = 0.5
+    stability_radius: float = 0.95
     regions: tuple = ()
     parent_selection: str = "sample"
 
@@ -77,6 +78,8 @@ class AlarmBRUNCHConfig:
             raise ValueError("topology_fallback_sources_per_dim must be >= 0")
         if self.non_topology_alpha_multiplier < 0.0:
             raise ValueError("non_topology_alpha_multiplier must be non-negative")
+        if self.stability_radius >= 1.0:
+            raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable the cap entirely)")
         if self.parent_selection not in PARENT_SELECTION_MODES:
             raise ValueError(f"parent_selection must be one of {sorted(PARENT_SELECTION_MODES)}")
         del sequence_config  # consumed for its validation side effects above
@@ -386,7 +389,6 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
     # of 0.95 to leave a safety margin. We rescale α uniformly — preserves the
     # relative ranking of edges (so topology-preferred edges remain dominant)
     # while restoring stationarity.
-    STABILITY_RADIUS = 0.95
     tmp_params = HawkesParams.from_edges(
         M=M,
         mu=mu,
@@ -399,13 +401,13 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
         max_active_sources_per_dim=config.max_active_sources_per_dim,
     )
     rho = tmp_params.spectral_radius()
-    if rho > STABILITY_RADIUS and rho > 0.0:
-        scale = STABILITY_RADIUS / rho
+    if config.stability_radius > 0.0 and rho > config.stability_radius:
+        scale = config.stability_radius / rho
         edge_alpha_arr = edge_alpha_arr * scale
         print(
             f"[_build_initial_params] α 矩阵 spectral radius ρ={rho:.2f} 超出 "
-            f"stationarity 阈值 {STABILITY_RADIUS}，统一缩放 α × {scale:.4f} "
-            f"使 ρ≈{STABILITY_RADIUS}（保持边之间的相对权重）"
+            f"stationarity 阈值 {config.stability_radius}，统一缩放 α × {scale:.4f} "
+            f"使 ρ≈{config.stability_radius}（保持边之间的相对权重）"
         )
         return HawkesParams.from_edges(
             M=M,
