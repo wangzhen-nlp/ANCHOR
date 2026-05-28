@@ -276,7 +276,16 @@ def _build_target_windows(sequence, event_dts, topology_index, config):
     return target_windows
 
 
-def _emit_sequence(sequence_id, raw_events, vocabs, config, add_missing_types, topology_index):
+def _emit_sequence(
+    sequence_id,
+    raw_events,
+    vocabs,
+    config,
+    add_missing_types,
+    topology_index,
+    *,
+    build_target_windows: bool = True,
+):
     type_ids = []
     type_labels = []
     alarm_source_ids = []
@@ -321,12 +330,17 @@ def _emit_sequence(sequence_id, raw_events, vocabs, config, add_missing_types, t
         events=events,
         target_windows=[],
     )
-    sequence.target_windows = _build_target_windows(
-        sequence,
-        event_dts,
-        topology_index,
-        config,
-    )
+    # target_windows are an isahp-specific structure (each window pre-materializes
+    # the per-event candidate history) and can occupy several GB for million-
+    # event streams. Callers that don't need them (brunch training only needs
+    # the flat event list) can opt out via build_target_windows=False.
+    if build_target_windows:
+        sequence.target_windows = _build_target_windows(
+            sequence,
+            event_dts,
+            topology_index,
+            config,
+        )
     return sequence
 
 
@@ -337,6 +351,7 @@ def build_alarm_sequences(
     *,
     add_missing_types=False,
     topology_index=None,
+    build_target_windows: bool = True,
 ):
     model_events = list(_iter_model_events(sorted_alarm_events, config))
     sequence = _emit_sequence(
@@ -346,6 +361,7 @@ def build_alarm_sequences(
         config,
         add_missing_types,
         topology_index,
+        build_target_windows=build_target_windows,
     )
     sequences = [sequence] if sequence is not None else []
     stats = {

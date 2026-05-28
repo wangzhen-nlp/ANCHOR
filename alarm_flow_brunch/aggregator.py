@@ -429,12 +429,19 @@ def _build_event_collection(sequence, M):
 
 
 def _build_sequences(sorted_alarm_events, vocabs, sequence_config, *, topology_index=None):
+    # brunch training operates on the flat event list (ts, type_id, alarm_source,
+    # site_id) and never reads sequence.target_windows. Each window pre-
+    # materializes per-event candidate history + topology pair features and
+    # costs ~5 KB; at 1M events that is several GB of pure dead weight. Skip
+    # building them — isahp callers still get them via the default
+    # build_target_windows=True path.
     sequences, sequence_stats = build_alarm_sequences(
         sorted_alarm_events,
         vocabs,
         sequence_config,
         add_missing_types=False,
         topology_index=topology_index,
+        build_target_windows=False,
     )
     if not sequences:
         raise ValueError("no global alarm flow survived preprocessing; relax min-events or inspect input alarms")
