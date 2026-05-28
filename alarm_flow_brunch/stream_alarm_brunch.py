@@ -1093,6 +1093,7 @@ class OnlineBRUNCHAssigner:
             return
         thresholds = self.rng.uniform(0.0, mu_total, size=count)
         chosen_positions = np.searchsorted(mu_cumsum, thresholds, side="right")
+        chosen_positions = np.clip(chosen_positions, 0, len(type_ids) - 1)
         times = self.rng.uniform(start, target_ts, size=count)
         for type_id, vt in zip(type_ids[chosen_positions], times):
             meta = self._latent_type_metadata[int(type_id)]
