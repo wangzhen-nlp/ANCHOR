@@ -197,10 +197,12 @@ def main():
     parser.add_argument(
         "--alpha-prior-mean",
         type=float,
-        default=0.05,
+        default=0.1,
         help=(
             "Prior mean alpha that low-evidence (target, source) pairs shrink "
-            "toward. Should be near the global average per-edge alpha. Default: 0.05."
+            "toward. Should be near the global average per-edge alpha. Default: 0.1. "
+            "Increase if candidate parent scores routinely lose to μ (immigrant "
+            "wins → too many small cascades); decrease if cascade count is too low."
         ),
     )
     parser.add_argument(

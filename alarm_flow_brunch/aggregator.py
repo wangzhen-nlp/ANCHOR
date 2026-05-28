@@ -54,7 +54,7 @@ class AlarmBRUNCHConfig:
     topology_fallback_sources_per_dim: int = 2
     non_topology_alpha_multiplier: float = 0.5
     alpha_prior_strength: float = 10.0
-    alpha_prior_mean: float = 0.05
+    alpha_prior_mean: float = 0.1
     branching_cap: float = 0.9
     stability_radius: float = 0.95
     regions: tuple = ()
@@ -431,6 +431,33 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
                 f"{n_over}/{n_with_edges} 个源 dim 超限 (最大 column sum={max_col_sum:.2f}); "
                 f"按列缩放，最小缩放系数={min_scale:.4f}（其余源 dim 不动）"
             )
+
+    # Diagnostic: per-event parent selection compares one candidate edge's
+    # score (≈ α × β × exp(-β·dt)) against the target's immigrant rate μ.
+    # If μ.median >> α.median × β.median, immigrants win deterministically →
+    # cascade count stays high regardless of spectral radius. Print both so we
+    # can tell whether the bottleneck is μ scale, α scale, or kernel decay.
+    if edge_alpha_arr.size:
+        # candidate score upper bound (dt=0): α × β
+        cand_peak = edge_alpha_arr * edge_beta_arr
+        print(
+            f"[_build_initial_params] μ stats:  min={mu.min():.4f}, "
+            f"median={float(np.median(mu)):.4f}, max={mu.max():.4f}"
+        )
+        print(
+            f"[_build_initial_params] α stats:  min={edge_alpha_arr.min():.4f}, "
+            f"median={float(np.median(edge_alpha_arr)):.4f}, max={edge_alpha_arr.max():.4f}"
+        )
+        print(
+            f"[_build_initial_params] β stats:  min={edge_beta_arr.min():.4f}, "
+            f"median={float(np.median(edge_beta_arr)):.4f}, max={edge_beta_arr.max():.4f}"
+        )
+        print(
+            f"[_build_initial_params] α·β peak (candidate score at dt=0): "
+            f"min={cand_peak.min():.4f}, median={float(np.median(cand_peak)):.4f}, "
+            f"max={cand_peak.max():.4f}  ← compare against μ.median to estimate "
+            f"who wins parent selection"
+        )
 
     tmp_params = HawkesParams.from_edges(
         M=M,
