@@ -371,17 +371,51 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
             edge_alpha.append(alpha)
             edge_beta.append(beta)
 
-    return HawkesParams.from_edges(
+    edge_targets_arr = np.asarray(edge_targets, dtype=np.int64)
+    edge_sources_arr = np.asarray(edge_sources, dtype=np.int64)
+    edge_alpha_arr = np.asarray(edge_alpha, dtype=np.float64)
+    edge_beta_arr = np.asarray(edge_beta, dtype=np.float64)
+
+    # Stationarity cap: Hawkes processes require ρ(α) < 1; otherwise the cluster
+    # Poisson interpretation diverges and the candidate scores blow up so much
+    # that real events deterministically pick the highest-α candidate as parent
+    # (no real competition with μ or the kernel decay). Match brunch's MLE cap
+    # of 0.95 to leave a safety margin. We rescale α uniformly — preserves the
+    # relative ranking of edges (so topology-preferred edges remain dominant)
+    # while restoring stationarity.
+    STABILITY_RADIUS = 0.95
+    tmp_params = HawkesParams.from_edges(
         M=M,
         mu=mu,
-        edge_targets=np.asarray(edge_targets, dtype=np.int64),
-        edge_sources=np.asarray(edge_sources, dtype=np.int64),
-        edge_alpha=np.asarray(edge_alpha, dtype=np.float64),
-        edge_beta=np.asarray(edge_beta, dtype=np.float64),
+        edge_targets=edge_targets_arr,
+        edge_sources=edge_sources_arr,
+        edge_alpha=edge_alpha_arr,
+        edge_beta=edge_beta_arr,
         links=["linear"] * M,
         edge_threshold=config.sparse_alpha_threshold,
         max_active_sources_per_dim=config.max_active_sources_per_dim,
     )
+    rho = tmp_params.spectral_radius()
+    if rho > STABILITY_RADIUS and rho > 0.0:
+        scale = STABILITY_RADIUS / rho
+        edge_alpha_arr = edge_alpha_arr * scale
+        print(
+            f"[_build_initial_params] α 矩阵 spectral radius ρ={rho:.2f} 超出 "
+            f"stationarity 阈值 {STABILITY_RADIUS}，统一缩放 α × {scale:.4f} "
+            f"使 ρ≈{STABILITY_RADIUS}（保持边之间的相对权重）"
+        )
+        return HawkesParams.from_edges(
+            M=M,
+            mu=mu,
+            edge_targets=edge_targets_arr,
+            edge_sources=edge_sources_arr,
+            edge_alpha=edge_alpha_arr,
+            edge_beta=edge_beta_arr,
+            links=["linear"] * M,
+            edge_threshold=config.sparse_alpha_threshold,
+            max_active_sources_per_dim=config.max_active_sources_per_dim,
+        )
+    return tmp_params
 
 
 def _build_event_collection(sequence, M):
