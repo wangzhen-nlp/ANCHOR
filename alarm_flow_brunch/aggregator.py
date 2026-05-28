@@ -53,6 +53,8 @@ class AlarmBRUNCHConfig:
     topology_prefer_multiplier: float = 2.0
     topology_fallback_sources_per_dim: int = 2
     non_topology_alpha_multiplier: float = 0.5
+    alpha_prior_strength: float = 10.0
+    alpha_prior_mean: float = 0.05
     branching_cap: float = 0.9
     stability_radius: float = 0.95
     regions: tuple = ()
@@ -79,6 +81,10 @@ class AlarmBRUNCHConfig:
             raise ValueError("topology_fallback_sources_per_dim must be >= 0")
         if self.non_topology_alpha_multiplier < 0.0:
             raise ValueError("non_topology_alpha_multiplier must be non-negative")
+        if self.alpha_prior_strength <= 0.0:
+            raise ValueError("alpha_prior_strength must be > 0")
+        if self.alpha_prior_mean < 0.0:
+            raise ValueError("alpha_prior_mean must be non-negative")
         if self.branching_cap >= 1.0:
             raise ValueError(
                 "branching_cap must be < 1.0 (set to <= 0 to disable per-source cap and fall back to spectral_radius only)"
@@ -367,7 +373,17 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
             ):
                 continue
             source_count = max(float(dim_counts[source_dim]), 1.0)
-            alpha = (count + 0.25) / (source_count + 2.0)
+            # Bayesian shrinkage prior: alpha = (count + K·m) / (source_count + K)
+            #   K  (alpha_prior_strength) — effective pseudo-count of prior obs
+            #   m  (alpha_prior_mean)     — value to shrink toward
+            # Large K + small m → rare/explosive (target, source) pairs (small
+            # source_count, opportunistically large count) get pulled toward m
+            # instead of producing outlier α values that blow up the spectral
+            # radius. High-frequency sources are barely affected (count and
+            # source_count both >> K).
+            alpha = (
+                count + config.alpha_prior_strength * config.alpha_prior_mean
+            ) / (source_count + config.alpha_prior_strength)
             if topology_index is not None and config.topology_edge_policy != "off":
                 topo_count = float(topo_pair_counts.get(key, 0.0))
                 if topo_count > 0.0:

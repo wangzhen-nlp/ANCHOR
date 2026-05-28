@@ -56,6 +56,8 @@ def _build_config(args):
         topology_edge_policy=args.topology_edge_policy,
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
+        alpha_prior_strength=args.alpha_prior_strength,
+        alpha_prior_mean=args.alpha_prior_mean,
         branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
         regions=parse_regions(args.regions),
@@ -179,6 +181,27 @@ def main():
         type=int,
         default=2,
         help="Non-topology fallback source dimensions kept per target in prefer mode. Default: 2.",
+    )
+    parser.add_argument(
+        "--alpha-prior-strength",
+        type=float,
+        default=10.0,
+        help=(
+            "Bayesian shrinkage strength K for initial alpha estimation: "
+            "alpha = (count + K * alpha_prior_mean) / (source_count + K). "
+            "Larger K shrinks rare (target, source) pairs more aggressively "
+            "toward alpha_prior_mean, preventing outlier alpha values from "
+            "blowing up the spectral radius. Default: 10.0."
+        ),
+    )
+    parser.add_argument(
+        "--alpha-prior-mean",
+        type=float,
+        default=0.05,
+        help=(
+            "Prior mean alpha that low-evidence (target, source) pairs shrink "
+            "toward. Should be near the global average per-edge alpha. Default: 0.05."
+        ),
     )
     parser.add_argument(
         "--branching-cap",
