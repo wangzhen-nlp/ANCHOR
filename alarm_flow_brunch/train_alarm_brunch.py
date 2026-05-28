@@ -134,6 +134,7 @@ def _build_config(args):
         topology_edge_policy=args.topology_edge_policy,
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
+        non_topology_alpha_multiplier=args.non_topology_alpha_multiplier,
         regions=parse_regions(args.regions),
         parent_selection=args.parent_selection,
     )
@@ -198,6 +199,15 @@ def main():
     parser.add_argument("--topology-max-hops", type=int, default=2)
     parser.add_argument("--topology-prefer-multiplier", type=float, default=2.0)
     parser.add_argument("--topology-fallback-sources-per-dim", type=int, default=2)
+    parser.add_argument(
+        "--non-topology-alpha-multiplier",
+        type=float,
+        default=0.5,
+        help=(
+            "Alpha multiplier for non-topology fallback edges in prefer mode. "
+            "Default: 0.5, matching the previous hard-coded behavior."
+        ),
+    )
     parser.add_argument(
         "--parent-selection",
         choices=("sample", "argmax"),

@@ -52,6 +52,7 @@ class AlarmBRUNCHConfig:
     topology_edge_policy: str = "prefer"
     topology_prefer_multiplier: float = 2.0
     topology_fallback_sources_per_dim: int = 2
+    non_topology_alpha_multiplier: float = 0.5
     regions: tuple = ()
     parent_selection: str = "sample"
 
@@ -74,6 +75,8 @@ class AlarmBRUNCHConfig:
             raise ValueError("topology_prefer_multiplier must be >= 1")
         if self.topology_fallback_sources_per_dim < 0:
             raise ValueError("topology_fallback_sources_per_dim must be >= 0")
+        if self.non_topology_alpha_multiplier < 0.0:
+            raise ValueError("non_topology_alpha_multiplier must be non-negative")
         if self.parent_selection not in PARENT_SELECTION_MODES:
             raise ValueError(f"parent_selection must be one of {sorted(PARENT_SELECTION_MODES)}")
         del sequence_config  # consumed for its validation side effects above
@@ -363,7 +366,7 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
                     avg_topo_score = topo_pair_scores[key] / topo_count
                     alpha *= 1.0 + (config.topology_prefer_multiplier - 1.0) * avg_topo_score
                 elif source_dim != target_dim and config.topology_edge_policy == "prefer":
-                    alpha *= 0.5
+                    alpha *= config.non_topology_alpha_multiplier
             alpha = max(alpha, config.sparse_alpha_threshold * 10.0)
             beta = (count + 1.0) / (pair_dt_sums.get(key, 0.0) + 1.0)
             edge_targets.append(target_dim)
