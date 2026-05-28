@@ -53,6 +53,7 @@ class AlarmBRUNCHConfig:
     topology_prefer_multiplier: float = 2.0
     topology_fallback_sources_per_dim: int = 2
     non_topology_alpha_multiplier: float = 0.5
+    branching_cap: float = 0.9
     stability_radius: float = 0.95
     regions: tuple = ()
     parent_selection: str = "sample"
@@ -78,6 +79,10 @@ class AlarmBRUNCHConfig:
             raise ValueError("topology_fallback_sources_per_dim must be >= 0")
         if self.non_topology_alpha_multiplier < 0.0:
             raise ValueError("non_topology_alpha_multiplier must be non-negative")
+        if self.branching_cap >= 1.0:
+            raise ValueError(
+                "branching_cap must be < 1.0 (set to <= 0 to disable per-source cap and fall back to spectral_radius only)"
+            )
         if self.stability_radius >= 1.0:
             raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable the cap entirely)")
         if self.parent_selection not in PARENT_SELECTION_MODES:
@@ -382,13 +387,35 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
     edge_alpha_arr = np.asarray(edge_alpha, dtype=np.float64)
     edge_beta_arr = np.asarray(edge_beta, dtype=np.float64)
 
-    # Stationarity cap: Hawkes processes require ρ(α) < 1; otherwise the cluster
-    # Poisson interpretation diverges and the candidate scores blow up so much
-    # that real events deterministically pick the highest-α candidate as parent
-    # (no real competition with μ or the kernel decay). Match brunch's MLE cap
-    # of 0.95 to leave a safety margin. We rescale α uniformly — preserves the
-    # relative ranking of edges (so topology-preferred edges remain dominant)
-    # while restoring stationarity.
+    # Primary regularization: per-source branching ratio cap.
+    # For non-negative α, ρ(α) ≤ ‖α‖₁ = max_i Σ_j α[j, i] (max column sum).
+    # Capping each source dim's column sum to branching_cap < 1 both:
+    #   (a) guarantees stationarity, AND
+    #   (b) only touches the *individual* explosive source dims — the previous
+    #       global spectral cap uniformly shrank every edge whenever a single
+    #       source blew up (e.g. one "万能爹" dim → ρ=143 → α × 0.0066, killing
+    #       every healthy cascade signal).
+    # The branching ratio also has a clean interpretation: "expected number of
+    # children spawned by one event of type i". A cap of 0.9 means no parent
+    # type is expected to spawn more than 0.9 children on average.
+    if config.branching_cap > 0.0 and edge_alpha_arr.size:
+        col_sums = np.zeros(M, dtype=np.float64)
+        np.add.at(col_sums, edge_sources_arr, edge_alpha_arr)
+        over_mask = col_sums > config.branching_cap
+        if over_mask.any():
+            col_scale = np.ones(M, dtype=np.float64)
+            col_scale[over_mask] = config.branching_cap / col_sums[over_mask]
+            edge_alpha_arr = edge_alpha_arr * col_scale[edge_sources_arr]
+            n_over = int(over_mask.sum())
+            n_with_edges = int((col_sums > 0).sum())
+            min_scale = float(col_scale[over_mask].min())
+            max_col_sum = float(col_sums.max())
+            print(
+                f"[_build_initial_params] per-source 分支比上限 {config.branching_cap}: "
+                f"{n_over}/{n_with_edges} 个源 dim 超限 (最大 column sum={max_col_sum:.2f}); "
+                f"按列缩放，最小缩放系数={min_scale:.4f}（其余源 dim 不动）"
+            )
+
     tmp_params = HawkesParams.from_edges(
         M=M,
         mu=mu,
@@ -400,26 +427,30 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
         edge_threshold=config.sparse_alpha_threshold,
         max_active_sources_per_dim=config.max_active_sources_per_dim,
     )
-    rho = tmp_params.spectral_radius()
-    if config.stability_radius > 0.0 and rho > config.stability_radius:
-        scale = config.stability_radius / rho
-        edge_alpha_arr = edge_alpha_arr * scale
-        print(
-            f"[_build_initial_params] α 矩阵 spectral radius ρ={rho:.2f} 超出 "
-            f"stationarity 阈值 {config.stability_radius}，统一缩放 α × {scale:.4f} "
-            f"使 ρ≈{config.stability_radius}（保持边之间的相对权重）"
-        )
-        return HawkesParams.from_edges(
-            M=M,
-            mu=mu,
-            edge_targets=edge_targets_arr,
-            edge_sources=edge_sources_arr,
-            edge_alpha=edge_alpha_arr,
-            edge_beta=edge_beta_arr,
-            links=["linear"] * M,
-            edge_threshold=config.sparse_alpha_threshold,
-            max_active_sources_per_dim=config.max_active_sources_per_dim,
-        )
+
+    # Safety net: global spectral-radius cap. The per-source cap above already
+    # implies ρ ≤ branching_cap, so this only fires when branching_cap is
+    # disabled (≤ 0) or as a paranoid backstop against numerical drift.
+    if config.stability_radius > 0.0:
+        rho = tmp_params.spectral_radius()
+        if rho > config.stability_radius:
+            scale = config.stability_radius / rho
+            edge_alpha_arr = edge_alpha_arr * scale
+            print(
+                f"[_build_initial_params] α 矩阵 spectral radius ρ={rho:.2f} 仍超出 "
+                f"stationarity 阈值 {config.stability_radius}（安全网），统一缩放 α × {scale:.4f}"
+            )
+            return HawkesParams.from_edges(
+                M=M,
+                mu=mu,
+                edge_targets=edge_targets_arr,
+                edge_sources=edge_sources_arr,
+                edge_alpha=edge_alpha_arr,
+                edge_beta=edge_beta_arr,
+                links=["linear"] * M,
+                edge_threshold=config.sparse_alpha_threshold,
+                max_active_sources_per_dim=config.max_active_sources_per_dim,
+            )
     return tmp_params
 
 

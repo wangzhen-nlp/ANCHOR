@@ -56,6 +56,7 @@ def _build_config(args):
         topology_edge_policy=args.topology_edge_policy,
         topology_prefer_multiplier=args.topology_prefer_multiplier,
         topology_fallback_sources_per_dim=args.topology_fallback_sources_per_dim,
+        branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
         regions=parse_regions(args.regions),
         parent_selection=args.parent_selection,
@@ -180,10 +181,27 @@ def main():
         help="Non-topology fallback source dimensions kept per target in prefer mode. Default: 2.",
     )
     parser.add_argument(
+        "--branching-cap",
+        type=float,
+        default=0.9,
+        help=(
+            "Per-source branching ratio cap on the initial alpha matrix: "
+            "max_i sum_j alpha[j,i] <= branching_cap. Primary stationarity "
+            "regularizer; only individual explosive source dims are shrunk, "
+            "healthy ones are untouched. Default: 0.9. "
+            "Set to 0 or negative to fall back to global spectral-radius cap."
+        ),
+    )
+    parser.add_argument(
         "--stability-radius",
         type=float,
         default=0.95,
-        help="Stationarity cap for the initial alpha matrix spectral radius. Default: 0.95. Set to 0 or negative to disable.",
+        help=(
+            "Safety-net global spectral-radius cap on the initial alpha matrix. "
+            "Per-source branching_cap already implies rho <= branching_cap, so "
+            "this rarely fires unless --branching-cap is disabled. Default: 0.95. "
+            "Set to 0 or negative to disable."
+        ),
     )
     parser.add_argument(
         "--parent-selection",
