@@ -395,6 +395,7 @@ def run_media(
                     "log_likelihood": ll,
                     "num_clusters": state.num_clusters,
                     "num_cascades": state.num_cascades,
+                    "cascade_of": state.cascade_of.copy(),
                     "is_best": is_best,
                     "best_log_likelihood": best_ll if has_post_burn_in_best else ll,
                     "checkpoint_is_post_burn_in": bool(has_post_burn_in_best),

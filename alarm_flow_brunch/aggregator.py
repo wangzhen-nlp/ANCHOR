@@ -577,6 +577,60 @@ def _emit_progress(progress_callback, progress_stage, **payload):
         progress_callback(progress_stage, payload)
 
 
+def _cascade_size_stats(cascade_of):
+    """Return cascade size distribution for observability.
+
+    Pure-observability helper: groups events by cascade id, counts how many
+    cascades have >=2 events (the "meaningful" cascades vs singletons), and
+    bins the distribution. Used by the sweep callback and the final training
+    summary so the user can see whether tuning helps the multi-event share
+    rather than just the raw cascade count.
+    """
+    if cascade_of is None or len(cascade_of) == 0:
+        return None
+    arr = np.asarray(cascade_of, dtype=np.int64)
+    raw_sizes = np.bincount(arr)
+    sizes = raw_sizes[raw_sizes > 0]
+    if sizes.size == 0:
+        return None
+    n_cascades = int(sizes.size)
+    n_events = int(sizes.sum())
+    multi_mask = sizes >= 2
+    n_multi = int(multi_mask.sum())
+    n_multi_events = int(sizes[multi_mask].sum())
+    bucket_edges = [(1, 1), (2, 3), (4, 9), (10, 49), (50, None)]
+    histogram = []
+    for lo, hi in bucket_edges:
+        if hi is None:
+            mask = sizes >= lo
+            label = f">={lo}"
+        elif lo == hi:
+            mask = sizes == lo
+            label = f"{lo}"
+        else:
+            mask = (sizes >= lo) & (sizes <= hi)
+            label = f"{lo}-{hi}"
+        histogram.append(
+            {
+                "label": label,
+                "cascade_count": int(mask.sum()),
+                "event_count": int(sizes[mask].sum()),
+            }
+        )
+    return {
+        "n_cascades": n_cascades,
+        "n_events": n_events,
+        "multi_event_cascade_count": n_multi,
+        "multi_event_cascade_share": float(n_multi / n_cascades),
+        "multi_event_event_count": n_multi_events,
+        "multi_event_event_share": float(n_multi_events / n_events),
+        "max_size": int(sizes.max()),
+        "median_size": float(np.median(sizes)),
+        "mean_size": float(sizes.mean()),
+        "histogram": histogram,
+    }
+
+
 def _event_type_counts(sequence):
     return {
         label: count
@@ -779,7 +833,22 @@ def train_alarm_brunch(
         burn_in=config.burn_in,
     )
 
-    def on_sweep_checkpoint(payload):
+    def on_sweep(payload):
+        # Observability: per-sweep multi-event cascade share. Singleton cascades
+        # ("immigrant + no children") are usually noise for downstream alarm
+        # consumers, so the user often cares more about the >=2-event subset.
+        if verbose:
+            stats = _cascade_size_stats(payload.get("cascade_of"))
+            if stats is not None:
+                print(
+                    f"[train] sweep={payload['sweep']} "
+                    f"multi(>=2)={stats['multi_event_cascade_count']}/"
+                    f"{stats['n_cascades']} "
+                    f"({stats['multi_event_cascade_share'] * 100:.1f}% of cascades, "
+                    f"{stats['multi_event_event_share'] * 100:.1f}% of events); "
+                    f"size median={stats['median_size']:.1f}, max={stats['max_size']}",
+                    flush=True,
+                )
         if checkpoint_callback is None:
             return
         params = payload["checkpoint_params"]
@@ -822,7 +891,7 @@ def train_alarm_brunch(
         verbose=verbose,
         log_every=log_every,
         progress_every=progress_every,
-        sweep_callback=on_sweep_checkpoint if checkpoint_callback is not None else None,
+        sweep_callback=on_sweep,
     )
     _emit_progress(
         progress_callback,
@@ -842,6 +911,7 @@ def train_alarm_brunch(
         "best_log_likelihood": result.best_log_likelihood,
         "event_type_counts": _event_type_counts(sequence),
         "type_labels": list(vocabs.type_vocab.labels),
+        "cascade_size_stats": _cascade_size_stats(result.cascade_of),
     }
     return AlarmBRUNCHArtifact(
         params=result.params,

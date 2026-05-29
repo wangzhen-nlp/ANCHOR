@@ -397,6 +397,25 @@ def main():
     artifact.training_metadata["alarm_metadata"] = alarm_metadata
     if topology_region_stats is not None:
         artifact.training_metadata["topology_region_filter"] = topology_region_stats
+    cascade_stats = artifact.training_metadata.get("cascade_size_stats")
+    if cascade_stats and _progress_enabled(args):
+        print("[train] cascade size distribution:")
+        for bucket in cascade_stats["histogram"]:
+            print(
+                f"  size={bucket['label']:>5s} : "
+                f"{bucket['cascade_count']:>7d} cascades, "
+                f"{bucket['event_count']:>7d} events"
+            )
+        print(
+            f"[train] multi(>=2) cascades: "
+            f"{cascade_stats['multi_event_cascade_count']}/"
+            f"{cascade_stats['n_cascades']} "
+            f"({cascade_stats['multi_event_cascade_share'] * 100:.1f}% of cascades, "
+            f"{cascade_stats['multi_event_event_share'] * 100:.1f}% of events); "
+            f"size mean={cascade_stats['mean_size']:.2f}, "
+            f"median={cascade_stats['median_size']:.1f}, "
+            f"max={cascade_stats['max_size']}"
+        )
     _print_progress(f"[train] saving model artifact: {args.output}", args)
     save_alarm_brunch_artifact(args.output, artifact)
     print(
