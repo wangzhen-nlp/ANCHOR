@@ -60,6 +60,7 @@ def _build_config(args):
         alpha_prior_mean=args.alpha_prior_mean,
         branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
+        mu_count_smoothing=args.mu_count_smoothing,
         regions=parse_regions(args.regions),
         parent_selection=args.parent_selection,
     )
@@ -226,6 +227,19 @@ def main():
             "Per-source branching_cap already implies rho <= branching_cap, so "
             "this rarely fires unless --branching-cap is disabled. Default: 0.95. "
             "Set to 0 or negative to disable."
+        ),
+    )
+    parser.add_argument(
+        "--mu-count-smoothing",
+        choices=("linear", "log"),
+        default="linear",
+        help=(
+            "Smoothing applied to per-type event counts when computing the "
+            "immigrant baseline mu. 'linear' is the standard MLE estimate "
+            "(mu proportional to count). 'log' uses mu proportional to "
+            "log(1 + count), which compresses heavy-tail high-frequency types "
+            "so they stop monopolizing the immigrant prior and cascade "
+            "candidates can win more often. Default: linear."
         ),
     )
     parser.add_argument(

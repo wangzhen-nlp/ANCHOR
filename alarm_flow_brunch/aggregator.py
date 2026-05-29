@@ -23,6 +23,7 @@ from alarm_flow_brunch.region_filter import filter_alarm_events_by_regions, pars
 
 TOPOLOGY_EDGE_POLICIES = frozenset({"off", "prefer", "require"})
 PARENT_SELECTION_MODES = frozenset({"sample", "argmax"})
+MU_COUNT_SMOOTHINGS = frozenset({"linear", "log"})
 ARTIFACT_TYPE = "alarm_flow_brunch.v1"
 
 
@@ -57,6 +58,7 @@ class AlarmBRUNCHConfig:
     alpha_prior_mean: float = 0.1
     branching_cap: float = 0.9
     stability_radius: float = 0.95
+    mu_count_smoothing: str = "linear"
     regions: tuple = ()
     parent_selection: str = "sample"
 
@@ -91,6 +93,8 @@ class AlarmBRUNCHConfig:
             )
         if self.stability_radius >= 1.0:
             raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable the cap entirely)")
+        if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
+            raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.parent_selection not in PARENT_SELECTION_MODES:
             raise ValueError(f"parent_selection must be one of {sorted(PARENT_SELECTION_MODES)}")
         del sequence_config  # consumed for its validation side effects above
@@ -292,7 +296,19 @@ def _build_initial_params(sequence, vocabs, config: AlarmBRUNCHConfig, topology_
     dims = np.asarray(sequence.type_ids, dtype=np.int64)
     horizon = max(float(times[-1] - times[0]) if len(times) else 0.0, 1.0)
     dim_counts = np.bincount(dims, minlength=M).astype(np.float64)
-    mu = np.maximum(0.05 / horizon, 0.1 * dim_counts / horizon)
+    # μ_d controls the immigrant baseline intensity for type d. The "linear"
+    # mode μ ∝ count is the standard MLE under a Poisson model, but for very
+    # heavy-tail type frequencies (a few high-frequency types dwarfing the
+    # rest) it lets μ.max blow up to where it deterministically beats any
+    # candidate kernel score → every high-frequency event becomes immigrant
+    # → cascade fragmentation. The "log" mode μ ∝ log(1 + count) compresses
+    # this tail so high-frequency types stop monopolizing the immigrant prior
+    # while leaving low/medium-frequency types essentially unchanged.
+    if config.mu_count_smoothing == "log":
+        mu_signal = 0.1 * np.log1p(dim_counts) / horizon
+    else:
+        mu_signal = 0.1 * dim_counts / horizon
+    mu = np.maximum(0.05 / horizon, mu_signal)
 
     pair_counts = Counter()
     pair_dt_sums = defaultdict(float)
