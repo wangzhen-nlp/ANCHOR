@@ -323,9 +323,9 @@ def _events_to_collection(view, M: int) -> EventCollection:
     return EventCollection(times=times, dims=dims, M=M, T=T)
 
 
-def _emit_progress(progress_callback, stage, **payload):
+def _emit_progress(progress_callback, progress_stage, **payload):
     if progress_callback is not None:
-        progress_callback(stage, payload)
+        progress_callback(progress_stage, payload)
 
 
 def train_alarm_mhp(
