@@ -64,6 +64,7 @@ class AlarmMHPConfig:
     max_active_sources_per_dim: int = 16
     branching_cap: float = 0.9
     stability_radius: float = 0.95
+    chunk_size: int = 20_000
     # Held-out validation (the bit that lets training be meaningful instead
     # of just heuristic init): if > 0, the last `val_split` fraction of the
     # event sequence by time is held out. Per-iteration val LL is tracked,
@@ -104,6 +105,8 @@ class AlarmMHPConfig:
             raise ValueError("branching_cap must be < 1.0 (set to <= 0 to disable)")
         if self.stability_radius >= 1.0:
             raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable)")
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")
         if not (0.0 <= self.val_split < 1.0):
             raise ValueError("val_split must be in [0, 1)")
         if self.early_stop_patience < 1:
@@ -148,6 +151,7 @@ class AlarmMHPConfig:
             max_active_sources_per_dim=self.max_active_sources_per_dim,
             branching_cap=self.branching_cap,
             stability_radius=self.stability_radius,
+            chunk_size=self.chunk_size,
             seed=self.seed,
         )
 

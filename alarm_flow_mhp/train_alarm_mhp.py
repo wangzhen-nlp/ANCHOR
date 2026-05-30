@@ -110,6 +110,7 @@ def _build_config(args):
         max_active_sources_per_dim=args.max_active_sources_per_dim,
         branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
+        chunk_size=args.chunk_size,
         val_split=args.val_split,
         early_stop_patience=args.early_stop_patience,
         regions=parse_regions(args.regions),
@@ -189,6 +190,16 @@ def main():
     parser.add_argument("--max-active-sources-per-dim", type=int, default=16)
     parser.add_argument("--branching-cap", type=float, default=0.9)
     parser.add_argument("--stability-radius", type=float, default=0.95)
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=20_000,
+        help=(
+            "Events processed per chunk in E-step. Peak pair memory per chunk "
+            "is chunk_size * max_history_events * ~16 bytes. Default 20000 "
+            "(~40 MB at K=128). Bump to 50000 for 2M+ events if you have headroom."
+        ),
+    )
     # Held-out validation (the thing that makes training meaningful):
     parser.add_argument(
         "--val-split",
