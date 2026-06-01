@@ -489,6 +489,17 @@ def fit_mhp(
         iter_total = t_iter_end - t_iter_start
         iter_estep = t_estep_end - t_iter_start
         iter_mstep = t_iter_end - t_estep_end
+        # β stats — only meaningful on active edges (β=0 where α=0)
+        active_mask = alpha_new > 0
+        if active_mask.any():
+            beta_active = beta_new[active_mask]
+            beta_median_active = float(np.median(beta_active))
+            beta_max_active = float(beta_active.max())
+            beta_min_active = float(beta_active.min())
+        else:
+            beta_median_active = 0.0
+            beta_max_active = 0.0
+            beta_min_active = 0.0
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
@@ -499,6 +510,9 @@ def fit_mhp(
             "mu_median": float(np.median(mu_new)),
             "alpha_max": float(alpha_new.max()),
             "alpha_median_active": float(np.median(alpha_new[alpha_new > 0])) if active_edges else 0.0,
+            "beta_min_active": beta_min_active,
+            "beta_median_active": beta_median_active,
+            "beta_max_active": beta_max_active,
             "p_self_mean": float(p_self.mean()),
             "iter_seconds": float(iter_total),
             "estep_seconds": float(iter_estep),
@@ -513,6 +527,7 @@ def fit_mhp(
                 f"active_edges={active_edges} "
                 f"μ.max={trace_entry['mu_max']:.4f} "
                 f"α.max={trace_entry['alpha_max']:.4f} "
+                f"β.median={beta_median_active:.3f} β.max={beta_max_active:.3f} "
                 f"p_self.mean={trace_entry['p_self_mean']:.3f} "
                 f"rescaled_cols={n_rescaled} "
                 f"t={_fmt_secs(iter_total)} (E={_fmt_secs(iter_estep)} M={_fmt_secs(iter_mstep)})",
