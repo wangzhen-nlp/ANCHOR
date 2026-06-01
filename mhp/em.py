@@ -27,6 +27,7 @@ and at most `max_active_sources_per_dim` sources are kept per target.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -36,6 +37,17 @@ from .params import MHPParams
 
 
 _EPS = 1e-12
+
+
+def _fmt_secs(seconds: float) -> str:
+    """Compact human-readable elapsed time."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - 60 * minutes
+    return f"{minutes}m{rem:04.1f}s"
 
 
 @dataclass
@@ -382,6 +394,7 @@ def fit_mhp(
     N = events.n
     horizon = events.T
 
+    t_total_start = time.monotonic()
     if config.verbose:
         print(
             f"[mhp] events={N}, types={M}, chunk_size={config.chunk_size}, "
@@ -393,14 +406,17 @@ def fit_mhp(
     if init_alpha is None or init_beta is None:
         if config.verbose:
             print("[mhp] pass 1: accumulating initial pair statistics ...", flush=True)
+        t_init_start = time.monotonic()
         n_pair, sum_dt = _accumulate_initial_pair_stats(events, config)
         alpha_data, beta_data = _compute_initial_alpha_beta(events, n_pair, sum_dt, config)
         alpha = alpha_data if init_alpha is None else init_alpha.astype(np.float32)
         beta = beta_data if init_beta is None else init_beta.astype(np.float32)
         del n_pair, sum_dt
+        init_pass_seconds = time.monotonic() - t_init_start
     else:
         alpha = init_alpha.astype(np.float32)
         beta = init_beta.astype(np.float32)
+        init_pass_seconds = 0.0
     if init_mu is None:
         mu = _compute_mu_initial(events, horizon, config)
     else:
@@ -413,7 +429,8 @@ def fit_mhp(
         active = int((alpha > 0).sum())
         print(
             f"[mhp] init: active_edges={active} rescaled_cols={n_rescaled_init} "
-            f"α.max={alpha.max():.4f} μ.max={mu.max():.4f}",
+            f"α.max={alpha.max():.4f} μ.max={mu.max():.4f} "
+            f"init_pass={_fmt_secs(init_pass_seconds)}",
             flush=True,
         )
 
@@ -427,10 +444,12 @@ def fit_mhp(
     prev_ll = -np.inf
 
     for it in range(config.max_iters):
+        t_iter_start = time.monotonic()
         # E-step (chunked) returns sufficient statistics for M-step
         p_self, alpha_num, beta_num_dt, mu_num, ll_term1 = _run_estep_iteration(
             events, alpha, beta, mu, config
         )
+        t_estep_end = time.monotonic()
 
         # M-step
         mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
@@ -466,6 +485,10 @@ def fit_mhp(
             best_p_self = p_self
 
         active_edges = int((alpha_new > 0).sum())
+        t_iter_end = time.monotonic()
+        iter_total = t_iter_end - t_iter_start
+        iter_estep = t_estep_end - t_iter_start
+        iter_mstep = t_iter_end - t_estep_end
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
@@ -477,6 +500,9 @@ def fit_mhp(
             "alpha_max": float(alpha_new.max()),
             "alpha_median_active": float(np.median(alpha_new[alpha_new > 0])) if active_edges else 0.0,
             "p_self_mean": float(p_self.mean()),
+            "iter_seconds": float(iter_total),
+            "estep_seconds": float(iter_estep),
+            "mstep_seconds": float(iter_mstep),
         }
         trace.append(trace_entry)
         if iter_callback is not None:
@@ -488,7 +514,8 @@ def fit_mhp(
                 f"μ.max={trace_entry['mu_max']:.4f} "
                 f"α.max={trace_entry['alpha_max']:.4f} "
                 f"p_self.mean={trace_entry['p_self_mean']:.3f} "
-                f"rescaled_cols={n_rescaled}",
+                f"rescaled_cols={n_rescaled} "
+                f"t={_fmt_secs(iter_total)} (E={_fmt_secs(iter_estep)} M={_fmt_secs(iter_mstep)})",
                 flush=True,
             )
 
@@ -551,6 +578,14 @@ def fit_mhp(
         beta_shared=(config.beta_mode == "shared"),
     )
 
+    if config.verbose:
+        total_fit = time.monotonic() - t_total_start
+        avg_iter = sum(e["iter_seconds"] for e in trace) / max(len(trace), 1)
+        print(
+            f"[mhp] fit complete: iters={len(trace)} converged={converged} "
+            f"total={_fmt_secs(total_fit)} avg_iter={_fmt_secs(avg_iter)}",
+            flush=True,
+        )
     return MHPResult(
         params=final_params,
         log_likelihood=best_ll,

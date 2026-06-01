@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import os
+import time
 from argparse import ArgumentParser
 
 if __package__ in (None, ""):
@@ -251,6 +252,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    t_total_start = time.monotonic()
     config = _build_config(args)
     _print_progress("[train] loading alarms...", args)
     alarm_events, alarm_metadata = load_ordered_alarm_events(
@@ -312,6 +314,18 @@ def main():
     if _progress_enabled(args):
         _print_cascade_size_distribution(md.get("cascade_size_stats"))
         _print_topology_consistency(md.get("topology_consistency"))
+        total_elapsed = time.monotonic() - t_total_start
+        print(f"[train] total wall-clock: {_format_seconds(total_elapsed)}")
+
+
+def _format_seconds(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - 60 * minutes
+    return f"{minutes}m{rem:04.1f}s"
 
 
 def _print_cascade_size_distribution(stats):

@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 import json
+import time
 from typing import Iterable, Optional
 
 import numpy as np
@@ -240,6 +241,20 @@ def mhp_params_from_dict(payload) -> MHPParams:
     )
 
 
+@dataclass
+class AlarmMHPOutput:
+    groups: list
+    edges: list
+    metadata: dict
+
+    def to_json_payload(self):
+        return {
+            "metadata": self.metadata,
+            "groups": self.groups,
+            "edges": self.edges,
+        }
+
+
 def save_alarm_mhp_artifact(path, artifact: AlarmMHPArtifact):
     with open(path, "w", encoding="utf-8") as stream:
         json.dump(artifact.to_dict(), stream, ensure_ascii=False, indent=2)
@@ -280,6 +295,127 @@ def _region_filter_events(
         config.regions,
         ne_graph_data=ne_graph_data,
     )
+
+
+def _event_id(event, fallback_index):
+    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
+    for key in ("告警编码ID", "alarm_id", "event_id", "id"):
+        value = alarm.get(key) if key in alarm else event.get(key, "")
+        value = str(value or "").strip()
+        if value:
+            return value
+    return f"alarm-{fallback_index:06d}"
+
+
+def summarize_alarm_event(event, index):
+    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
+    return {
+        "index": int(index),
+        "event_id": _event_id(event, index),
+        "ts": float(event.get("ts", 0.0)),
+        "site_id": str(event.get("site_id", "") or ""),
+        "alarm_source": str(event.get("alarm_source", "") or ""),
+        "alarm_title": str(event.get("alarm_title", "") or ""),
+        "alarm_type": alarm_type_from_title(event.get("alarm_title", "")),
+        "is_clear": is_clear_alarm(alarm),
+    }
+
+
+def _group_records_from_parents(
+    sequence,
+    parent_of: np.ndarray,
+    cascade_of: np.ndarray,
+    *,
+    min_group_events: int = 1,
+    id_prefix: str = "mhp",
+):
+    """Build group records from MHP's hard parent/cascade assignments.
+
+    Output schema matches alarm_flow_brunch._group_records so downstream
+    consumers (visualizers, ground-truth comparison) don't need adaptation.
+    """
+    by_cascade = defaultdict(list)
+    for index, cid in enumerate(cascade_of):
+        by_cascade[int(cid)].append(index)
+    groups = []
+    for ordinal, (cascade_id, indices) in enumerate(
+        sorted(by_cascade.items(), key=lambda item: min(item[1])),
+        start=1,
+    ):
+        if len(indices) < min_group_events:
+            continue
+        events = [sequence.events[i] for i in indices]
+        summaries = [summarize_alarm_event(e, i) for i, e in zip(indices, events)]
+        parent_indices = [int(parent_of[i]) for i in indices]
+        root_index = min(
+            indices,
+            key=lambda i: (
+                parent_of[i] != i,
+                float(sequence.events[i].get("ts", 0.0)),
+                i,
+            ),
+        )
+        group_edges = []
+        idx_set = set(indices)
+        for child_index, parent_index in zip(indices, parent_indices):
+            if parent_index == child_index or parent_index not in idx_set:
+                continue
+            group_edges.append(
+                {
+                    "source_index": parent_index,
+                    "target_index": child_index,
+                    "source_event_id": _event_id(sequence.events[parent_index], parent_index),
+                    "target_event_id": _event_id(sequence.events[child_index], child_index),
+                    "source_type": sequence.type_labels[parent_index],
+                    "target_type": sequence.type_labels[child_index],
+                }
+            )
+        timestamps = [s["ts"] for s in summaries]
+        groups.append(
+            {
+                "group_id": f"{id_prefix}-{ordinal:06d}",
+                "cascade_id": cascade_id,
+                "event_count": len(indices),
+                "start_ts": min(timestamps),
+                "end_ts": max(timestamps),
+                "duration_sec": max(timestamps) - min(timestamps),
+                "root_event": summarize_alarm_event(sequence.events[root_index], root_index),
+                "site_list": sorted({s["site_id"] for s in summaries if s["site_id"]}),
+                "alarm_source_list": sorted({s["alarm_source"] for s in summaries if s["alarm_source"]}),
+                "alarm_title_counts": dict(
+                    Counter(s["alarm_title"] for s in summaries if s["alarm_title"])
+                ),
+                "alarm_type_counts": dict(
+                    Counter(s["alarm_type"] for s in summaries if s["alarm_type"])
+                ),
+                "symptoms": summaries,
+                "edges": group_edges,
+            }
+        )
+    return groups
+
+
+def _edge_records_from_parents(sequence, parent_of: np.ndarray):
+    """Branching edges across all cascades (one record per (parent, child) link).
+    """
+    edges = []
+    for child_index in range(len(parent_of)):
+        parent_index = int(parent_of[child_index])
+        if parent_index == child_index:
+            continue
+        edges.append(
+            {
+                "source_index": parent_index,
+                "target_index": child_index,
+                "source_event_id": _event_id(sequence.events[parent_index], parent_index),
+                "target_event_id": _event_id(sequence.events[child_index], child_index),
+                "source_type": sequence.type_labels[parent_index],
+                "target_type": sequence.type_labels[child_index],
+                "source_event": summarize_alarm_event(sequence.events[parent_index], parent_index),
+                "target_event": summarize_alarm_event(sequence.events[child_index], child_index),
+            }
+        )
+    return edges
 
 
 def _event_type_counts(sequence):
@@ -444,17 +580,25 @@ def train_alarm_mhp(
     # Metric 1: Hard cascade size distribution (BRUNCH-comparable)
     if verbose:
         print("[train] computing hard cascade assignments ...", flush=True)
+    t0 = time.monotonic()
     parent_of = compute_hard_parents(train_events, result.params, config=mhp_config)
     cascade_of = compute_cascade_of(parent_of)
     cascade_stats_hard = _cascade_size_stats_from_hard(cascade_of)
+    hard_cascade_seconds = time.monotonic() - t0
+    if verbose:
+        print(f"[train] hard cascade assignments done in {hard_cascade_seconds:.1f}s", flush=True)
 
     # Metric 2: Topology consistency of learned edges
+    t0 = time.monotonic()
     topology_report = _topology_consistency_report(
         result.params,
         vocabs,
         config.type_fields,
         topology_index,
     )
+    topology_report_seconds = time.monotonic() - t0
+    if topology_report is not None and verbose:
+        print(f"[train] topology consistency report done in {topology_report_seconds:.1f}s", flush=True)
 
     training_metadata = {
         "considered_event_count": considered_event_count,
@@ -475,6 +619,8 @@ def train_alarm_mhp(
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,
         "val_trace": val_trace,
+        "hard_cascade_seconds": float(hard_cascade_seconds),
+        "topology_report_seconds": float(topology_report_seconds),
     }
     return AlarmMHPArtifact(
         params=result.params,
@@ -483,6 +629,80 @@ def train_alarm_mhp(
         training_metadata=training_metadata,
         trace=result.trace,
     )
+
+
+def infer_alarm_mhp(
+    sorted_alarm_events: Iterable[dict],
+    artifact: AlarmMHPArtifact,
+    *,
+    config: AlarmMHPConfig | None = None,
+    region_filter_stats=None,
+    verbose: bool = True,
+    min_group_events: Optional[int] = None,
+) -> AlarmMHPOutput:
+    """Apply a trained MHP artifact to a new alarm stream offline.
+
+    Inference is a single chunked E-step over the input events using the
+    trained Θ, followed by hard parent argmax and union-find for cascades.
+    Returns groups in the same JSON shape as alarm_flow_brunch.
+    """
+    cfg = config or artifact.config
+    seq_cfg = cfg.sequence_config()
+    sorted_alarm_events = list(sorted_alarm_events)
+    sorted_alarm_events, region_filter_stats = _region_filter_events(
+        sorted_alarm_events,
+        cfg,
+        ne_graph_data=None,
+        region_filter_stats=region_filter_stats,
+    )
+    # Reuse vocabs from training — events of unknown type are dropped
+    # silently by build_alarm_sequences(add_missing_types=False).
+    sequences, sequence_stats = _build_sequences(sorted_alarm_events, artifact.vocabs, seq_cfg)
+    sequence = sequences[0]
+    M = len(artifact.vocabs.type_vocab)
+    view = _EventColumnsView(times=sequence.times, type_ids=sequence.type_ids)
+    events = _events_to_collection(view, M)
+
+    if verbose:
+        print(
+            f"[infer] events={events.n}, types={M}, "
+            f"max_history_events={cfg.max_history_events}",
+            flush=True,
+        )
+    t0 = time.monotonic()
+    mhp_cfg = cfg.mhp_config()
+    mhp_cfg.verbose = False
+    parent_of = compute_hard_parents(events, artifact.params, config=mhp_cfg)
+    cascade_of = compute_cascade_of(parent_of)
+    infer_seconds = time.monotonic() - t0
+    if verbose:
+        print(f"[infer] hard parent + cascade assignment done in {infer_seconds:.1f}s", flush=True)
+
+    min_grp = cfg.min_group_events if min_group_events is None else int(min_group_events)
+    groups = _group_records_from_parents(
+        sequence, parent_of, cascade_of, min_group_events=min_grp
+    )
+    edges = _edge_records_from_parents(sequence, parent_of)
+    cascade_stats_hard = _cascade_size_stats_from_hard(cascade_of)
+
+    metadata = {
+        "algorithm": "alarm_flow_mhp",
+        "config": cfg.to_dict(),
+        "sequence_config": seq_cfg.to_dict(),
+        "considered_event_count": sequence_stats.get("input_event_count", events.n),
+        "region_filter": region_filter_stats or {},
+        "sequence_stats": sequence_stats,
+        "modeled_event_count": events.n,
+        "type_count": M,
+        "active_edge_count": len(artifact.params.edge_alpha),
+        "group_count": len(groups),
+        "branching_edge_count": len(edges),
+        "event_type_counts": _event_type_counts(sequence),
+        "type_labels": list(artifact.vocabs.type_vocab.labels),
+        "cascade_size_stats": cascade_stats_hard,
+        "infer_seconds": float(infer_seconds),
+    }
+    return AlarmMHPOutput(groups=groups, edges=edges, metadata=metadata)
 
 
 def _cascade_size_stats_from_p_self(p_self: np.ndarray, dims: np.ndarray):
