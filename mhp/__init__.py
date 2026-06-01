@@ -23,7 +23,14 @@ The package contains:
 
 from .events import EventCollection
 from .params import MHPParams
-from .em import MHPConfig, MHPResult, fit_mhp, log_likelihood
+from .em import (
+    MHPConfig,
+    MHPResult,
+    compute_cascade_of,
+    compute_hard_parents,
+    fit_mhp,
+    log_likelihood,
+)
 
 __all__ = [
     "EventCollection",
@@ -32,4 +39,6 @@ __all__ = [
     "MHPResult",
     "fit_mhp",
     "log_likelihood",
+    "compute_hard_parents",
+    "compute_cascade_of",
 ]

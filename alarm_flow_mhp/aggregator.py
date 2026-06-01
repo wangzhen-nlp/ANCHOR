@@ -29,8 +29,17 @@ from alarm_flow_isahp.sequences import (
     parse_type_fields,
 )
 from alarm_flow_brunch.region_filter import filter_alarm_events_by_regions, parse_regions
+from alarm_flow_isahp.ne_topology import NETopologyIndex
 from fault_grouping.alarm_events.io import is_clear_alarm
-from mhp import EventCollection, MHPConfig, MHPParams, MHPResult, fit_mhp
+from mhp import (
+    EventCollection,
+    MHPConfig,
+    MHPParams,
+    MHPResult,
+    compute_cascade_of,
+    compute_hard_parents,
+    fit_mhp,
+)
 
 
 MU_COUNT_SMOOTHINGS = frozenset({"linear", "log"})
@@ -334,6 +343,7 @@ def train_alarm_mhp(
     progress_callback=None,
     verbose: bool = True,
     region_filter_stats=None,
+    topology_index: Optional[NETopologyIndex] = None,
 ) -> AlarmMHPArtifact:
     """Fit alarm-flow MHP parameters via windowed sparse MAP EM."""
     config = config or AlarmMHPConfig()
@@ -429,7 +439,23 @@ def train_alarm_mhp(
         converged=result.converged,
     )
 
-    cascade_stats = _cascade_size_stats_from_p_self(result.p_self, train_events.dims)
+    cascade_stats_soft = _cascade_size_stats_from_p_self(result.p_self, train_events.dims)
+
+    # Metric 1: Hard cascade size distribution (BRUNCH-comparable)
+    if verbose:
+        print("[train] computing hard cascade assignments ...", flush=True)
+    parent_of = compute_hard_parents(train_events, result.params, config=mhp_config)
+    cascade_of = compute_cascade_of(parent_of)
+    cascade_stats_hard = _cascade_size_stats_from_hard(cascade_of)
+
+    # Metric 2: Topology consistency of learned edges
+    topology_report = _topology_consistency_report(
+        result.params,
+        vocabs,
+        config.type_fields,
+        topology_index,
+    )
+
     training_metadata = {
         "considered_event_count": considered_event_count,
         "region_filter": region_filter_stats,
@@ -445,7 +471,9 @@ def train_alarm_mhp(
         "converged": result.converged,
         "event_type_counts": _event_type_counts(sequence),
         "type_labels": list(vocabs.type_vocab.labels),
-        "cascade_size_stats": cascade_stats,
+        "cascade_size_stats_soft": cascade_stats_soft,
+        "cascade_size_stats": cascade_stats_hard,
+        "topology_consistency": topology_report,
         "val_trace": val_trace,
     }
     return AlarmMHPArtifact(
@@ -458,12 +486,10 @@ def train_alarm_mhp(
 
 
 def _cascade_size_stats_from_p_self(p_self: np.ndarray, dims: np.ndarray):
-    """Rough proxy for cascade size distribution under the MHP soft assignments.
+    """Rough proxy: only uses the soft immigrant probability per event.
 
-    Without a hard parent assignment (we have probabilities, not assignments),
-    we estimate the expected immigrant count as Σ p_self. Each event's
-    "expected children" comes from p_ij sums, but we don't keep those around.
-    So we report immigrant_share + mean rate as a proxy, not a true histogram.
+    Kept for backwards compatibility. The hard-assignment stats (see
+    `_cascade_size_stats_from_hard`) are the canonical metric.
     """
     if len(p_self) == 0:
         return None
@@ -474,4 +500,143 @@ def _cascade_size_stats_from_p_self(p_self: np.ndarray, dims: np.ndarray):
         "p_self_min": float(p_self.min()),
         "p_self_median": float(np.median(p_self)),
         "p_self_max": float(p_self.max()),
+    }
+
+
+def _cascade_size_stats_from_hard(cascade_of: np.ndarray):
+    """Cascade size histogram on hard parent assignments — same format as the
+    BRUNCH training summary so the two pipelines are directly comparable.
+    """
+    if cascade_of is None or len(cascade_of) == 0:
+        return None
+    arr = np.asarray(cascade_of, dtype=np.int64)
+    raw_sizes = np.bincount(arr)
+    sizes = raw_sizes[raw_sizes > 0]
+    if sizes.size == 0:
+        return None
+    n_cascades = int(sizes.size)
+    n_events = int(sizes.sum())
+    multi_mask = sizes >= 2
+    n_multi = int(multi_mask.sum())
+    n_multi_events = int(sizes[multi_mask].sum())
+    bucket_edges = [(1, 1), (2, 3), (4, 9), (10, 49), (50, None)]
+    histogram = []
+    for lo, hi in bucket_edges:
+        if hi is None:
+            mask = sizes >= lo
+            label = f">={lo}"
+        elif lo == hi:
+            mask = sizes == lo
+            label = f"{lo}"
+        else:
+            mask = (sizes >= lo) & (sizes <= hi)
+            label = f"{lo}-{hi}"
+        histogram.append(
+            {
+                "label": label,
+                "cascade_count": int(mask.sum()),
+                "event_count": int(sizes[mask].sum()),
+            }
+        )
+    return {
+        "n_cascades": n_cascades,
+        "n_events": n_events,
+        "multi_event_cascade_count": n_multi,
+        "multi_event_cascade_share": float(n_multi / n_cascades),
+        "multi_event_event_count": n_multi_events,
+        "multi_event_event_share": float(n_multi_events / n_events),
+        "max_size": int(sizes.max()),
+        "median_size": float(np.median(sizes)),
+        "mean_size": float(sizes.mean()),
+        "histogram": histogram,
+    }
+
+
+def _topology_consistency_report(
+    params: MHPParams,
+    vocabs: AlarmVocabs,
+    type_fields: tuple,
+    topology_index,
+    *,
+    top_k: int = 20,
+):
+    """Classify each learned edge by its topological relationship.
+
+    For each active edge (target_type_id, source_type_id), parse the type
+    labels back into (alarm_source, alarm_type) pairs and look up the
+    topological relation between the two NEs in the NE graph. Reports the
+    histogram of relation buckets and the top-K edges by α.
+    """
+    if len(params.edge_targets) == 0:
+        return None
+    # Type field positions
+    try:
+        src_field_idx = type_fields.index("alarm_source")
+    except ValueError:
+        src_field_idx = None
+    labels = vocabs.type_vocab.labels
+
+    def _parse(label):
+        parts = str(label).split(" | ")
+        return parts[src_field_idx] if src_field_idx is not None and len(parts) > src_field_idx else None
+
+    buckets = {
+        "same_ne": 0,
+        "direct_link": 0,
+        "indirect_link": 0,
+        "no_topology": 0,
+        "unknown": 0,
+    }
+    edge_records = []
+    for k in range(len(params.edge_targets)):
+        t = int(params.edge_targets[k])
+        s = int(params.edge_sources[k])
+        a = float(params.edge_alpha[k])
+        b = float(params.edge_beta[k])
+        t_label = labels[t] if t < len(labels) else f"<type {t}>"
+        s_label = labels[s] if s < len(labels) else f"<type {s}>"
+        t_ne = _parse(t_label)
+        s_ne = _parse(s_label)
+        if t == s:
+            relation = "same_ne"
+        elif t_ne is None or s_ne is None or t_ne == "<empty>" or s_ne == "<empty>":
+            relation = "unknown"
+        elif t_ne == s_ne:
+            relation = "same_ne"
+        elif topology_index is None:
+            relation = "unknown"
+        else:
+            features = topology_index.pair_features(s_ne, t_ne)
+            # features layout (PAIR_FEATURE_NAMES order):
+            # 0:same_alarm_source, 1:direct_fwd, 2:direct_rev, 3:direct_bi,
+            # 4:reachable_fwd, 5:reachable_rev, 6:undirected_reachable, ...
+            if features and (features[1] > 0 or features[2] > 0 or features[3] > 0):
+                relation = "direct_link"
+            elif features and (features[4] > 0 or features[5] > 0 or features[6] > 0):
+                relation = "indirect_link"
+            else:
+                relation = "no_topology"
+        buckets[relation] = buckets.get(relation, 0) + 1
+        edge_records.append(
+            {
+                "target_type": t_label,
+                "source_type": s_label,
+                "target_ne": t_ne,
+                "source_ne": s_ne,
+                "alpha": a,
+                "beta": b,
+                "relation": relation,
+            }
+        )
+    edge_records.sort(key=lambda r: -r["alpha"])
+    topology_related = (
+        buckets.get("same_ne", 0) + buckets.get("direct_link", 0) + buckets.get("indirect_link", 0)
+    )
+    total = sum(buckets.values())
+    return {
+        "buckets": buckets,
+        "topology_related_count": topology_related,
+        "topology_related_share": float(topology_related / total) if total else 0.0,
+        "top_edges": edge_records[:top_k],
+        "total_active_edges": total,
     }

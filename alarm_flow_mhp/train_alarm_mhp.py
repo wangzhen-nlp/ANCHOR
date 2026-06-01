@@ -17,8 +17,13 @@ from alarm_flow_mhp.aggregator import (
     save_alarm_mhp_artifact,
     train_alarm_mhp,
 )
-from alarm_flow_brunch.region_filter import parse_regions
+from alarm_flow_brunch.region_filter import (
+    filter_ne_graph_by_regions,
+    load_ne_graph,
+    parse_regions,
+)
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
+from alarm_flow_isahp.ne_topology import NETopologyIndex
 from alarm_flow_isahp.sequences import parse_type_fields
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, resource_display
 
@@ -224,6 +229,24 @@ def main():
         default=None,
     )
     parser.add_argument("--min-group-events", type=int, default=1)
+    parser.add_argument(
+        "--load-topology",
+        action="store_true",
+        default=True,
+        help="Load NE topology graph and report learned-edge consistency. Default: on.",
+    )
+    parser.add_argument(
+        "--no-load-topology",
+        action="store_false",
+        dest="load_topology",
+        help="Skip topology graph loading (faster startup; no topology report).",
+    )
+    parser.add_argument(
+        "--topology-max-hops",
+        type=int,
+        default=2,
+        help="Maximum NE graph hops considered when classifying learned edges. Default: 2.",
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -242,6 +265,21 @@ def main():
     config = _adopt_loaded_regions(config, alarm_metadata)
     _print_progress(f"[train] loaded alarm events: {len(alarm_events)}", args)
 
+    topology_index = None
+    if args.load_topology:
+        _print_progress(f"[train] loading NE graph: {args.ne_graph}", args)
+        ne_graph_data = load_ne_graph(args.ne_graph)
+        if config.regions:
+            ne_graph_data, _stats = filter_ne_graph_by_regions(ne_graph_data, config.regions)
+        _print_progress(
+            f"[train] building topology index (max_hops={args.topology_max_hops}) ...",
+            args,
+        )
+        topology_index = NETopologyIndex.from_graph(
+            ne_graph_data,
+            max_hops=args.topology_max_hops,
+        )
+
     _print_progress("[train] fitting model (MAP EM)...", args)
     artifact = train_alarm_mhp(
         alarm_events,
@@ -249,6 +287,7 @@ def main():
         region_filter_stats=(alarm_metadata or {}).get("region_filter"),
         progress_callback=_training_progress if _progress_enabled(args) else None,
         verbose=_progress_enabled(args),
+        topology_index=topology_index,
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata
@@ -269,6 +308,62 @@ def main():
         f"converged={md['converged']}, "
         f"ll={md['best_log_likelihood']:.4f}{val_str}"
     )
+
+    if _progress_enabled(args):
+        _print_cascade_size_distribution(md.get("cascade_size_stats"))
+        _print_topology_consistency(md.get("topology_consistency"))
+
+
+def _print_cascade_size_distribution(stats):
+    """Metric 1: BRUNCH-comparable cascade size histogram."""
+    if not stats:
+        return
+    print("[train] cascade size distribution (hard parent assignments):")
+    for bucket in stats["histogram"]:
+        print(
+            f"  size={bucket['label']:>5s} : "
+            f"{bucket['cascade_count']:>7d} cascades, "
+            f"{bucket['event_count']:>7d} events"
+        )
+    print(
+        f"[train] multi(>=2) cascades: "
+        f"{stats['multi_event_cascade_count']}/{stats['n_cascades']} "
+        f"({stats['multi_event_cascade_share'] * 100:.1f}% of cascades, "
+        f"{stats['multi_event_event_share'] * 100:.1f}% of events); "
+        f"size mean={stats['mean_size']:.2f}, "
+        f"median={stats['median_size']:.1f}, "
+        f"max={stats['max_size']}"
+    )
+
+
+def _print_topology_consistency(report):
+    """Metric 2: Learned-edge ↔ NE topology alignment."""
+    if not report:
+        return
+    buckets = report["buckets"]
+    total = report["total_active_edges"]
+    if total == 0:
+        return
+    print("[train] topology consistency of learned edges:")
+    for key in ("same_ne", "direct_link", "indirect_link", "no_topology", "unknown"):
+        count = buckets.get(key, 0)
+        share = count / total * 100
+        print(f"  {key:<14s} : {count:>6d} ({share:5.1f}%)")
+    print(
+        f"[train] topology-related (same_ne + direct + indirect): "
+        f"{report['topology_related_count']}/{total} "
+        f"({report['topology_related_share'] * 100:.1f}%)"
+    )
+    top_edges = report.get("top_edges", [])
+    if top_edges:
+        print(f"[train] top-{min(len(top_edges), 10)} edges by α:")
+        for i, edge in enumerate(top_edges[:10], 1):
+            t = edge["target_type"]
+            s = edge["source_type"]
+            print(
+                f"  #{i:2d} α={edge['alpha']:.4f} β={edge['beta']:.3f} "
+                f"[{edge['relation']:<14s}]  {s}  →  {t}"
+            )
 
 
 if __name__ == "__main__":

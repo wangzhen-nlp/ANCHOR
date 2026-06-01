@@ -561,6 +561,123 @@ def fit_mhp(
     )
 
 
+def compute_hard_parents(
+    events: EventCollection,
+    params: MHPParams,
+    *,
+    config: Optional[MHPConfig] = None,
+) -> np.ndarray:
+    """Decode soft p_ij assignments into a hard per-event parent decision.
+
+    For each event i, we choose the parent that maximizes the unnormalized
+    score among (immigrant μ_{u_i}, score(i, j) over candidates j). If the
+    immigrant score wins, parent[i] = i (event is its own root); otherwise
+    parent[i] = j*, the chosen candidate.
+
+    Returns
+    -------
+    parent : (N,) int64
+        parent[i] is the global event index of the chosen parent (or i if
+        i is an immigrant).
+    """
+    cfg = config or MHPConfig()
+    M = events.M
+    N = events.n
+    times = events.times
+    dims = events.dims
+    history_window = cfg.history_window
+    max_history_events = max(int(cfg.max_history_events), 1)
+    chunk_size = max(int(cfg.chunk_size), 1)
+    # Build dense α/β for fast lookup
+    alpha_dense = np.zeros((M, M), dtype=np.float32)
+    beta_dense = np.zeros((M, M), dtype=np.float32)
+    if len(params.edge_targets):
+        alpha_dense[params.edge_targets, params.edge_sources] = params.edge_alpha.astype(np.float32)
+        beta_dense[params.edge_targets, params.edge_sources] = params.edge_beta.astype(np.float32)
+    parent = np.arange(N, dtype=np.int64)  # default: each event is its own parent
+
+    for chunk_start in range(0, N, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N)
+        chunk_size_local = chunk_end - chunk_start
+        target_dims_chunk = dims[chunk_start:chunk_end]
+        mu_chunk = params.mu[target_dims_chunk]
+        (
+            pair_target,
+            pair_source,
+            pair_dt,
+            pair_target_dim,
+            pair_source_dim,
+            pair_target_local,
+            _,
+        ) = _build_chunk_pair_arrays(
+            times,
+            dims,
+            chunk_start,
+            chunk_end,
+            history_window,
+            max_history_events,
+        )
+        if pair_dt.size == 0:
+            # All events in chunk are immigrants (no candidates in window)
+            continue
+        alpha_pair = alpha_dense[pair_target_dim, pair_source_dim]
+        beta_pair = beta_dense[pair_target_dim, pair_source_dim]
+        score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt)
+        # For each event in chunk, find the max candidate score and which parent
+        # wins it. Use np.maximum.reduceat by sorted (pair_target_local, score).
+        # Faster: sort pairs by (target_local, -score), take first per group.
+        # Even simpler: scan with np.add.at on -inf accumulators.
+        best_score = np.full(chunk_size_local, -np.inf, dtype=np.float64)
+        best_parent = np.full(chunk_size_local, -1, dtype=np.int64)
+        # We need argmax per segment; np.maximum.at handles the max, but to get
+        # the parent index we need a second pass. Cheaper: sort within groups.
+        order = np.lexsort((-score_pair.astype(np.float64), pair_target_local))
+        sorted_target_local = pair_target_local[order]
+        sorted_parent = pair_source[order]
+        sorted_score = score_pair[order]
+        # First occurrence of each target_local in sorted order = its best score
+        _, first_idx = np.unique(sorted_target_local, return_index=True)
+        idxs = sorted_target_local[first_idx]
+        best_score[idxs] = sorted_score[first_idx].astype(np.float64)
+        best_parent[idxs] = sorted_parent[first_idx]
+        # Decide: immigrant if mu > best_score, else best_parent
+        immigrant_wins = mu_chunk > best_score
+        chunk_event_ids = np.arange(chunk_start, chunk_end, dtype=np.int64)
+        parent[chunk_event_ids] = np.where(immigrant_wins, chunk_event_ids, best_parent)
+    return parent
+
+
+def compute_cascade_of(parent: np.ndarray) -> np.ndarray:
+    """Union-find on the parent pointers → cascade id per event.
+
+    Returns cascade_of[i] ∈ [0, C) for some C ≤ N.
+    """
+    N = len(parent)
+    cascade = -np.ones(N, dtype=np.int64)
+    next_id = 0
+    # Iterative path compression
+    for i in range(N):
+        if cascade[i] != -1:
+            continue
+        # Walk up parents until we find a known cascade or a root
+        path = []
+        cur = i
+        while cascade[cur] == -1:
+            path.append(cur)
+            if parent[cur] == cur:
+                break
+            cur = int(parent[cur])
+        if cascade[cur] != -1:
+            cid = int(cascade[cur])
+        else:
+            cid = next_id
+            next_id += 1
+            cascade[cur] = cid
+        for node in path:
+            cascade[node] = cid
+    return cascade
+
+
 def log_likelihood(
     events: EventCollection,
     params: MHPParams,
