@@ -38,6 +38,7 @@ if __package__ in (None, ""):
 import numpy as np
 
 from alarm_flow_brunch.region_filter import parse_regions
+from alarm_flow_brunch.visual_output import write_visual_groups
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
 from alarm_flow_isahp.sequences import alarm_type_from_title, event_type_label
 from alarm_flow_mhp.aggregator import (
@@ -46,7 +47,7 @@ from alarm_flow_mhp.aggregator import (
     summarize_alarm_event,
 )
 from fault_grouping.alarm_events.io import is_clear_alarm
-from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, resource_display
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON, resource_display
 
 
 EPS = 1e-12
@@ -451,6 +452,22 @@ def main():
         help="Optional JSONL output for branching edges across all cascades.",
     )
     parser.add_argument(
+        "--visual-output",
+        default="",
+        help="Optional visualization JSONL compatible with the fault group browser and propagation visualizer.",
+    )
+    parser.add_argument(
+        "--site-graph",
+        default=SITE_GRAPH_JSON,
+        help=f"Site metadata for --visual-output. Default: {resource_display('site_graph.json')}.",
+    )
+    parser.add_argument(
+        "--visual-ne-scope",
+        choices=("alarm-only", "site-context"),
+        default="alarm-only",
+        help="NEs in --visual-output: grouped alarm devices only, or all devices at group sites.",
+    )
+    parser.add_argument(
         "--topo",
         default=SITE_GRAPH_BY_NE_JSON,
         help=f"Site topology for raw alarm inputs. Default: {resource_display('site_graph_by_ne.json')}.",
@@ -639,6 +656,16 @@ def main():
             edges.extend(group["edges"])
         n = _write_jsonl(args.edges_output, edges)
         print(f"branching edges written to: {args.edges_output}; edges={n}")
+
+    if args.visual_output:
+        visual_count = write_visual_groups(
+            args.visual_output,
+            groups,
+            ne_graph_path=args.ne_graph,
+            site_graph_path=args.site_graph,
+            ne_scope=args.visual_ne_scope,
+        )
+        print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
 
     if cascade_stats and not args.quiet:
         print("[stream] cascade size distribution:")
