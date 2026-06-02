@@ -33,7 +33,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .events import EventCollection
-from .params import MHPParams
+from .params import MHPParams, bucket_index_vec, bucket_widths
 
 
 _EPS = 1e-12
@@ -79,6 +79,12 @@ class MHPConfig:
     # peak pair memory is chunk_size · max_history_events · ~16 bytes. With
     # defaults: 20k · 128 · 16 = 40 MB.
     chunk_size: int = 20_000
+    # Piecewise (box-basis) kernel. When kernel_type == "piecewise", training
+    # runs two stages: (1) exp-kernel fit selects the sparse active edge set,
+    # (2) a box-basis EM learns per-edge per-bucket weights θ on those edges.
+    # bucket_edges are right edges in MODEL TIME (ascending, last == window).
+    kernel_type: str = "exp"                 # "exp" | "piecewise"
+    bucket_edges: tuple = ()                  # set by aggregator from real-sec config
     seed: int = 0
     verbose: bool = True
 
@@ -611,6 +617,276 @@ def fit_mhp(
     )
 
 
+def _make_pair_scorer(params: MHPParams):
+    """Return a vectorized score_fn(pair_target_dim, pair_source_dim, pair_dt)
+    that dispatches on params.kernel_type. Precomputes dense lookup tables once.
+
+    Used by compute_hard_parents and log_likelihood so both kernels share one
+    inference path.
+    """
+    M = params.M
+    if params.kernel_type == "piecewise":
+        bucket_edges = np.asarray(params.bucket_edges, dtype=np.float64)
+        edge_index_map = np.full((M, M), -1, dtype=np.int32)
+        if len(params.edge_targets):
+            edge_index_map[params.edge_targets, params.edge_sources] = np.arange(
+                len(params.edge_targets), dtype=np.int32
+            )
+        theta = np.asarray(params.edge_theta, dtype=np.float64)
+
+        def score_fn(pair_tdim, pair_sdim, pair_dt):
+            pe = edge_index_map[pair_tdim, pair_sdim]
+            valid = pe >= 0
+            out = np.zeros(pair_dt.shape, dtype=np.float64)
+            if valid.any():
+                pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
+                out[valid] = theta[pe[valid], pb]
+            return out
+
+        return score_fn
+
+    # exp kernel
+    alpha_dense = np.zeros((M, M), dtype=np.float32)
+    beta_dense = np.zeros((M, M), dtype=np.float32)
+    if len(params.edge_targets):
+        alpha_dense[params.edge_targets, params.edge_sources] = params.edge_alpha.astype(np.float32)
+        beta_dense[params.edge_targets, params.edge_sources] = params.edge_beta.astype(np.float32)
+
+    def score_fn(pair_tdim, pair_sdim, pair_dt):
+        alpha_pair = alpha_dense[pair_tdim, pair_sdim]
+        beta_pair = beta_dense[pair_tdim, pair_sdim]
+        safe_beta = np.where(beta_pair > 0, beta_pair, 1.0)
+        out = alpha_pair * safe_beta * np.exp(-safe_beta * pair_dt)
+        return np.where(alpha_pair > 0, out, 0.0).astype(np.float64)
+
+    return score_fn
+
+
+def _build_edge_index_map(M: int, edge_targets: np.ndarray, edge_sources: np.ndarray) -> np.ndarray:
+    """Dense (M, M) int32 map: (target, source) → edge index, -1 if no edge.
+
+    316 MB at M=8898 — same order as the dense α matrix, acceptable. Lets the
+    piecewise E-step vectorize the per-pair edge lookup.
+    """
+    edge_index_map = np.full((M, M), -1, dtype=np.int32)
+    edge_index_map[edge_targets, edge_sources] = np.arange(len(edge_targets), dtype=np.int32)
+    return edge_index_map
+
+
+def fit_mhp_piecewise(
+    events: EventCollection,
+    config: MHPConfig,
+    *,
+    edge_targets: np.ndarray,
+    edge_sources: np.ndarray,
+    init_mu: np.ndarray,
+    iter_callback: Optional[Callable[[dict], None]] = None,
+) -> MHPResult:
+    """Stage-2 box-basis kernel learning on a FIXED active edge set.
+
+    Given the sparse edges selected by stage 1, learn per-edge per-bucket
+    weights θ[e, k] ≥ 0 such that the kernel is the step function
+        g_e(Δt) = θ[e, bucket(Δt)].
+    μ is also refined. The branching ratio of edge e is Σ_k θ[e,k]·width_k,
+    which is what the stationarity cap constrains.
+
+    M-step (closed form, MAP with Gamma prior):
+        θ[e,k] = (Σ responsibility_{e,k} + K·m) / (n_v[e]·width_k + K)
+    where the width_k in the denominator is the exposure of bucket k — this
+    is what makes wide and narrow buckets comparable.
+    """
+    M = events.M
+    N = events.n
+    horizon = events.T
+    bucket_edges = np.asarray(config.bucket_edges, dtype=np.float64)
+    B = len(bucket_edges)
+    if B == 0:
+        raise ValueError("piecewise kernel requires non-empty bucket_edges")
+    widths = bucket_widths(bucket_edges)                      # (B,)
+    E = len(edge_targets)
+    edge_targets = np.asarray(edge_targets, dtype=np.int64)
+    edge_sources = np.asarray(edge_sources, dtype=np.int64)
+    edge_index_map = _build_edge_index_map(M, edge_targets, edge_sources)
+    n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
+    # n_v per edge (source-type event count) — the exposure base
+    n_v_per_edge = n_source[edge_sources]                     # (E,)
+    K = config.alpha_prior_strength
+    m = config.alpha_prior_mean
+
+    t_total_start = time.monotonic()
+    if config.verbose:
+        print(
+            f"[mhp-pw] stage 2 box-basis: edges={E}, buckets={B}, "
+            f"bucket_edges(model-time)={list(np.round(bucket_edges, 3))}",
+            flush=True,
+        )
+
+    # Initialize θ from windowed co-occurrence per bucket (shape-agnostic).
+    resp_init = np.zeros((E, B), dtype=np.float64)
+    chunk_size = max(int(config.chunk_size), 1)
+    for chunk_start in range(0, N, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N)
+        (_, _, pair_dt, pair_tdim, pair_sdim, _, _) = _build_chunk_pair_arrays(
+            events.times, events.dims, chunk_start, chunk_end,
+            config.history_window, max(int(config.max_history_events), 1),
+        )
+        if pair_dt.size == 0:
+            continue
+        pe = edge_index_map[pair_tdim, pair_sdim]
+        valid = pe >= 0
+        if not valid.any():
+            continue
+        pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
+        flat = pe[valid].astype(np.int64) * B + pb
+        np.add.at(resp_init.ravel(), flat, 1.0)
+    theta = (resp_init + K * m) / (n_v_per_edge[:, None] * widths[None, :] + K)
+    mu = np.asarray(init_mu, dtype=np.float64).reshape(-1).copy()
+
+    trace: list[dict] = []
+    best_ll = -np.inf
+    best_theta = theta.copy()
+    best_mu = mu.copy()
+    best_p_self = np.zeros(N, dtype=np.float64)
+    converged = False
+    prev_ll = -np.inf
+
+    for it in range(config.max_iters):
+        t_iter = time.monotonic()
+        p_self = np.zeros(N, dtype=np.float64)
+        resp = np.zeros((E, B), dtype=np.float64)
+        mu_num = np.zeros(M, dtype=np.float64)
+        ll_term1 = 0.0
+
+        for chunk_start in range(0, N, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, N)
+            csize = chunk_end - chunk_start
+            tdims_chunk = events.dims[chunk_start:chunk_end]
+            mu_chunk = mu[tdims_chunk]
+            (_, _, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+                events.times, events.dims, chunk_start, chunk_end,
+                config.history_window, max(int(config.max_history_events), 1),
+            )
+            if pair_dt.size == 0:
+                rate = np.maximum(mu_chunk, _EPS)
+                p_self[chunk_start:chunk_end] = 1.0
+                mu_num += _segment_sum(np.ones(csize), tdims_chunk, M)
+                ll_term1 += float(np.log(rate).sum())
+                continue
+            pe = edge_index_map[pair_tdim, pair_sdim]
+            valid = pe >= 0
+            pb = np.zeros(pair_dt.shape, dtype=np.int64)
+            score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
+            if valid.any():
+                pb_valid = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
+                pb[valid] = pb_valid
+                score_pair[valid] = theta[pe[valid], pb_valid]
+            sum_score = _segment_sum(score_pair, pair_tlocal, csize)
+            rate = np.maximum(mu_chunk + sum_score, _EPS)
+            p_self_chunk = mu_chunk / rate
+            p_self[chunk_start:chunk_end] = p_self_chunk
+            p_ij = score_pair / rate[pair_tlocal]
+            if valid.any():
+                flat = pe[valid].astype(np.int64) * B + pb[valid]
+                np.add.at(resp.ravel(), flat, p_ij[valid])
+            mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
+            ll_term1 += float(np.log(rate).sum())
+
+        # M-step
+        mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
+        theta_new = (resp + K * m) / (n_v_per_edge[:, None] * widths[None, :] + K)
+
+        # Branching cap on Σ_k θ·w, grouped per source type.
+        if config.branching_cap > 0:
+            branching_per_edge = (theta_new * widths[None, :]).sum(axis=1)   # (E,)
+            col_sums = np.zeros(M, dtype=np.float64)
+            np.add.at(col_sums, edge_sources, branching_per_edge)
+            over = col_sums > config.branching_cap
+            n_rescaled = int(over.sum())
+            if n_rescaled:
+                scale = np.ones(M, dtype=np.float64)
+                scale[over] = config.branching_cap / col_sums[over]
+                theta_new *= scale[edge_sources][:, None]
+        else:
+            n_rescaled = 0
+
+        branching_per_edge = (theta_new * widths[None, :]).sum(axis=1)
+        ll = ll_term1 - horizon * float(mu_new.sum()) - float(branching_per_edge.sum())
+        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
+
+        if ll > best_ll:
+            best_ll = ll
+            best_theta = theta_new.copy()
+            best_mu = mu_new.copy()
+            best_p_self = p_self
+
+        trace_entry = {
+            "iter": it,
+            "log_likelihood": float(ll),
+            "delta_rel": float(delta_rel),
+            "branching_rescaled": n_rescaled,
+            "active_edges": E,
+            "mu_max": float(mu_new.max()),
+            "branching_max": float(branching_per_edge.max()),
+            "branching_median": float(np.median(branching_per_edge)),
+            "p_self_mean": float(p_self.mean()),
+            "iter_seconds": float(time.monotonic() - t_iter),
+        }
+        trace.append(trace_entry)
+        if iter_callback is not None:
+            iter_callback(trace_entry)
+        if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
+            print(
+                f"[mhp-pw] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
+                f"branch.median={trace_entry['branching_median']:.4f} "
+                f"branch.max={trace_entry['branching_max']:.4f} "
+                f"μ.max={trace_entry['mu_max']:.4f} "
+                f"p_self.mean={trace_entry['p_self_mean']:.3f} "
+                f"rescaled_cols={n_rescaled} "
+                f"t={_fmt_secs(trace_entry['iter_seconds'])}",
+                flush=True,
+            )
+
+        theta = theta_new
+        mu = mu_new
+        if it > 0 and delta_rel < config.tol:
+            converged = True
+            if config.verbose:
+                print(f"[mhp-pw] converged at iter {it} (Δrel={delta_rel:.2e})", flush=True)
+            break
+        prev_ll = ll
+
+    if config.verbose:
+        print(
+            f"[mhp-pw] fit complete: iters={len(trace)} converged={converged} "
+            f"total={_fmt_secs(time.monotonic() - t_total_start)}",
+            flush=True,
+        )
+
+    # edge_alpha summary = branching ratio per edge; edge_beta = 0 placeholder
+    branching_per_edge = (best_theta * widths[None, :]).sum(axis=1)
+    final_params = MHPParams.from_edges(
+        M=M,
+        mu=best_mu,
+        edge_targets=edge_targets,
+        edge_sources=edge_sources,
+        edge_alpha=branching_per_edge,
+        edge_beta=np.zeros(E, dtype=np.float64),
+        edge_threshold=0.0,                       # edges already selected in stage 1
+        max_active_sources_per_dim=config.max_active_sources_per_dim,
+        kernel_type="piecewise",
+        edge_theta=best_theta,
+        bucket_edges=tuple(config.bucket_edges),
+    )
+    return MHPResult(
+        params=final_params,
+        log_likelihood=best_ll,
+        iterations_run=len(trace),
+        converged=converged,
+        trace=trace,
+        p_self=best_p_self,
+    )
+
+
 def compute_hard_parents(
     events: EventCollection,
     params: MHPParams,
@@ -638,12 +914,7 @@ def compute_hard_parents(
     history_window = cfg.history_window
     max_history_events = max(int(cfg.max_history_events), 1)
     chunk_size = max(int(cfg.chunk_size), 1)
-    # Build dense α/β for fast lookup
-    alpha_dense = np.zeros((M, M), dtype=np.float32)
-    beta_dense = np.zeros((M, M), dtype=np.float32)
-    if len(params.edge_targets):
-        alpha_dense[params.edge_targets, params.edge_sources] = params.edge_alpha.astype(np.float32)
-        beta_dense[params.edge_targets, params.edge_sources] = params.edge_beta.astype(np.float32)
+    score_fn = _make_pair_scorer(params)
     parent = np.arange(N, dtype=np.int64)  # default: each event is its own parent
 
     for chunk_start in range(0, N, chunk_size):
@@ -670,9 +941,7 @@ def compute_hard_parents(
         if pair_dt.size == 0:
             # All events in chunk are immigrants (no candidates in window)
             continue
-        alpha_pair = alpha_dense[pair_target_dim, pair_source_dim]
-        beta_pair = beta_dense[pair_target_dim, pair_source_dim]
-        score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt)
+        score_pair = score_fn(pair_target_dim, pair_source_dim, pair_dt)
         # For each event in chunk, find the max candidate score and which parent
         # wins it. Use np.maximum.reduceat by sorted (pair_target_local, score).
         # Faster: sort pairs by (target_local, -score), take first per group.
@@ -741,20 +1010,13 @@ def log_likelihood(
     config for apples-to-apples val LL comparison.
     """
     cfg = config or MHPConfig()
-    M = events.M
     N = events.n
     times = events.times
     dims = events.dims
     history_window = cfg.history_window
     max_history_events = max(int(cfg.max_history_events), 1)
     chunk_size = max(int(cfg.chunk_size), 1)
-
-    # Build dense α/β for fast lookup (lazy — keep it local to this call).
-    alpha_dense = np.zeros((M, M), dtype=np.float32)
-    beta_dense = np.zeros((M, M), dtype=np.float32)
-    if len(params.edge_targets):
-        alpha_dense[params.edge_targets, params.edge_sources] = params.edge_alpha.astype(np.float32)
-        beta_dense[params.edge_targets, params.edge_sources] = params.edge_beta.astype(np.float32)
+    score_fn = _make_pair_scorer(params)
 
     rate_term = 0.0
     for chunk_start in range(0, N, chunk_size):
@@ -782,13 +1044,13 @@ def log_likelihood(
             rate = np.maximum(mu_chunk, _EPS)
             rate_term += float(np.log(rate).sum())
             continue
-        alpha_pair = alpha_dense[pair_target_dim, pair_source_dim]
-        beta_pair = beta_dense[pair_target_dim, pair_source_dim]
-        safe_beta = np.where(beta_pair > 0, beta_pair, 1.0)
-        score_pair = alpha_pair * safe_beta * np.exp(-safe_beta * pair_dt)
-        score_pair = np.where(alpha_pair > 0, score_pair, 0.0)
+        score_pair = score_fn(pair_target_dim, pair_source_dim, pair_dt)
         sum_score = _segment_sum(score_pair.astype(np.float64), pair_target_local, chunk_size_local)
         rate = np.maximum(mu_chunk + sum_score, _EPS)
         rate_term += float(np.log(rate).sum())
 
-    return _log_likelihood_global(rate_term, params.mu, alpha_dense.astype(np.float64), events.T)
+    # term3: integral proxy = total branching mass (Σ edge_alpha, which for
+    # piecewise is Σ branching ratio per edge).
+    term2 = events.T * float(params.mu.sum())
+    term3 = float(params.edge_alpha.sum()) if len(params.edge_alpha) else 0.0
+    return rate_term - term2 - term3

@@ -40,12 +40,19 @@ from mhp import (
     compute_cascade_of,
     compute_hard_parents,
     fit_mhp,
+    fit_mhp_piecewise,
 )
 
 
 MU_COUNT_SMOOTHINGS = frozenset({"linear", "log"})
 BETA_MODES = frozenset({"shared", "per_edge"})
+KERNEL_TYPES = frozenset({"exp", "piecewise"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
+
+# Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
+# match fast alarm cascades (observed half-life ~10s), with a couple of wider
+# buckets for slower propagation. The last edge should be <= history_window.
+DEFAULT_BUCKET_EDGES_SEC = (15.0, 60.0, 180.0, 600.0, 1800.0)
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,11 @@ class AlarmMHPConfig:
     branching_cap: float = 0.9
     stability_radius: float = 0.95
     chunk_size: int = 20_000
+    # Kernel shape. "exp" = single exponential (α·β·exp(-β·dt)); "piecewise" =
+    # two-stage: exp fit selects edges, then box-basis EM learns per-bucket
+    # weights θ. bucket_edges_sec are right edges in REAL seconds.
+    kernel_type: str = "exp"
+    bucket_edges_sec: tuple = DEFAULT_BUCKET_EDGES_SEC
     # Held-out validation (the bit that lets training be meaningful instead
     # of just heuristic init): if > 0, the last `val_split` fraction of the
     # event sequence by time is held out. Per-iteration val LL is tracked,
@@ -117,6 +129,20 @@ class AlarmMHPConfig:
             raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable)")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be >= 1")
+        if self.kernel_type not in KERNEL_TYPES:
+            raise ValueError(f"kernel_type must be one of {sorted(KERNEL_TYPES)}")
+        if self.kernel_type == "piecewise":
+            edges = tuple(float(e) for e in self.bucket_edges_sec)
+            if not edges:
+                raise ValueError("piecewise kernel requires non-empty bucket_edges_sec")
+            if list(edges) != sorted(edges) or len(set(edges)) != len(edges):
+                raise ValueError("bucket_edges_sec must be strictly ascending")
+            if edges[-1] > self.history_window_sec + 1e-9:
+                raise ValueError(
+                    f"last bucket edge ({edges[-1]}s) must be <= history_window_sec "
+                    f"({self.history_window_sec}s); widen the window or trim buckets"
+                )
+            object.__setattr__(self, "bucket_edges_sec", edges)
         if not (0.0 <= self.val_split < 1.0):
             raise ValueError("val_split must be in [0, 1)")
         if self.early_stop_patience < 1:
@@ -162,6 +188,9 @@ class AlarmMHPConfig:
             branching_cap=self.branching_cap,
             stability_radius=self.stability_radius,
             chunk_size=self.chunk_size,
+            kernel_type=self.kernel_type,
+            # Convert real-second bucket edges to model time (same scale as window)
+            bucket_edges=tuple(e / self.time_scale_sec for e in self.bucket_edges_sec),
             seed=self.seed,
         )
 
@@ -169,6 +198,7 @@ class AlarmMHPConfig:
         payload = asdict(self)
         payload["type_fields"] = list(self.type_fields)
         payload["regions"] = list(self.regions)
+        payload["bucket_edges_sec"] = list(self.bucket_edges_sec)
         return payload
 
     @classmethod
@@ -178,6 +208,8 @@ class AlarmMHPConfig:
             payload["type_fields"] = tuple(payload["type_fields"])
         if "regions" in payload:
             payload["regions"] = parse_regions(payload["regions"])
+        if "bucket_edges_sec" in payload and payload["bucket_edges_sec"] is not None:
+            payload["bucket_edges_sec"] = tuple(payload["bucket_edges_sec"])
         return cls(**payload)
 
 
@@ -213,7 +245,7 @@ class AlarmMHPArtifact:
 
 
 def mhp_params_to_dict(params: MHPParams):
-    return {
+    payload = {
         "M": params.M,
         "mu": params.mu.tolist(),
         "edge_targets": params.edge_targets.astype(int).tolist(),
@@ -223,11 +255,25 @@ def mhp_params_to_dict(params: MHPParams):
         "edge_threshold": float(params.edge_threshold),
         "max_active_sources_per_dim": params.max_active_sources_per_dim,
         "beta_shared": bool(params.beta_shared),
+        "kernel_type": params.kernel_type,
     }
+    if params.kernel_type == "piecewise":
+        payload["edge_theta"] = (
+            params.edge_theta.astype(float).tolist() if params.edge_theta is not None else []
+        )
+        payload["bucket_edges"] = list(params.bucket_edges)
+    return payload
 
 
 def mhp_params_from_dict(payload) -> MHPParams:
     payload = dict(payload or {})
+    kernel_type = payload.get("kernel_type", "exp")
+    edge_theta = None
+    bucket_edges = ()
+    if kernel_type == "piecewise":
+        raw_theta = payload.get("edge_theta") or []
+        edge_theta = np.asarray(raw_theta, dtype=np.float64) if raw_theta else None
+        bucket_edges = tuple(payload.get("bucket_edges", ()))
     return MHPParams.from_edges(
         M=int(payload["M"]),
         mu=np.asarray(payload["mu"], dtype=np.float64),
@@ -238,6 +284,9 @@ def mhp_params_from_dict(payload) -> MHPParams:
         edge_threshold=float(payload.get("edge_threshold", 0.0)),
         max_active_sources_per_dim=payload.get("max_active_sources_per_dim"),
         beta_shared=bool(payload.get("beta_shared", False)),
+        kernel_type=kernel_type,
+        edge_theta=edge_theta,
+        bucket_edges=bucket_edges,
     )
 
 
@@ -548,11 +597,31 @@ def train_alarm_mhp(
             "log_likelihood_train": trace_entry["log_likelihood"],
         })
 
-    result: MHPResult = fit_mhp(
-        train_events,
-        mhp_config,
-        iter_callback=iter_callback,
-    )
+    if config.kernel_type == "piecewise":
+        # Stage 1: exp-kernel fit selects the sparse active edge set + μ.
+        if verbose:
+            print("[train] kernel=piecewise → stage 1: exp-kernel edge selection", flush=True)
+        stage1_config = replace(mhp_config, kernel_type="exp")
+        stage1 = fit_mhp(train_events, stage1_config, iter_callback=iter_callback)
+        # Stage 2: box-basis EM on the fixed edges from stage 1.
+        if verbose:
+            print(
+                f"[train] stage 2: box-basis kernel on {len(stage1.params.edge_targets)} edges",
+                flush=True,
+            )
+        result = fit_mhp_piecewise(
+            train_events,
+            mhp_config,
+            edge_targets=stage1.params.edge_targets,
+            edge_sources=stage1.params.edge_sources,
+            init_mu=stage1.params.mu,
+        )
+    else:
+        result = fit_mhp(
+            train_events,
+            mhp_config,
+            iter_callback=iter_callback,
+        )
 
     final_val_ll: Optional[float] = None
     if val_events is not None and val_events.n > 0:
@@ -600,6 +669,9 @@ def train_alarm_mhp(
     if topology_report is not None and verbose:
         print(f"[train] topology consistency report done in {topology_report_seconds:.1f}s", flush=True)
 
+    # Metric 3 (piecewise only): per-bucket excitation mass distribution
+    bucket_mass = _bucket_mass_distribution(result.params, config.bucket_edges_sec)
+
     training_metadata = {
         "considered_event_count": considered_event_count,
         "region_filter": region_filter_stats,
@@ -618,6 +690,7 @@ def train_alarm_mhp(
         "cascade_size_stats_soft": cascade_stats_soft,
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,
+        "bucket_mass_distribution": bucket_mass,
         "val_trace": val_trace,
         "hard_cascade_seconds": float(hard_cascade_seconds),
         "topology_report_seconds": float(topology_report_seconds),
@@ -770,6 +843,54 @@ def _cascade_size_stats_from_hard(cascade_of: np.ndarray):
         "mean_size": float(sizes.mean()),
         "histogram": histogram,
     }
+
+
+def _bucket_mass_distribution(params: MHPParams, bucket_edges_sec: tuple):
+    """For piecewise kernels: how much total excitation mass sits in each bucket.
+
+    mass_k = Σ_edges θ[e, k] · width_k. The share per bucket tells you whether
+    the chosen window/buckets are well-matched to the data: if 90% of mass is
+    in the first two short buckets, the long-tail buckets (and the wide
+    history window feeding them) are wasted.
+    """
+    if params.kernel_type != "piecewise" or params.edge_theta is None:
+        return None
+    theta = np.asarray(params.edge_theta, dtype=np.float64)        # (E, B)
+    if theta.size == 0:
+        return None
+    bucket_edges_model = np.asarray(params.bucket_edges, dtype=np.float64)
+    widths = np.empty_like(bucket_edges_model)
+    widths[0] = bucket_edges_model[0]
+    widths[1:] = bucket_edges_model[1:] - bucket_edges_model[:-1]
+    mass_per_bucket = (theta * widths[None, :]).sum(axis=0)        # (B,)
+    total = float(mass_per_bucket.sum())
+    # Human-readable bucket labels from real-second edges
+    edges_sec = list(bucket_edges_sec)
+    labels = []
+    prev = 0.0
+    for e in edges_sec:
+        labels.append(_format_bucket_label(prev, e))
+        prev = e
+    buckets = []
+    for k in range(len(mass_per_bucket)):
+        buckets.append(
+            {
+                "label": labels[k] if k < len(labels) else f"bucket{k}",
+                "mass": float(mass_per_bucket[k]),
+                "share": float(mass_per_bucket[k] / total) if total > 0 else 0.0,
+            }
+        )
+    return {"total_mass": total, "buckets": buckets}
+
+
+def _format_bucket_label(lo_sec: float, hi_sec: float) -> str:
+    def fmt(s):
+        if s < 60:
+            return f"{s:.0f}s"
+        if s < 3600:
+            return f"{s / 60:.0f}min"
+        return f"{s / 3600:.0f}h"
+    return f"{fmt(lo_sec)}-{fmt(hi_sec)}"
 
 
 def _topology_consistency_report(

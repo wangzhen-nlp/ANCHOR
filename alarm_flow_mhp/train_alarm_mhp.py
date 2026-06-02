@@ -93,6 +93,16 @@ def _training_progress(stage, payload):
         )
 
 
+def _parse_bucket_edges(text):
+    """Parse comma-separated bucket right-edges (real seconds). Empty → default."""
+    from alarm_flow_mhp.aggregator import DEFAULT_BUCKET_EDGES_SEC
+
+    parts = [p.strip() for p in str(text or "").split(",") if p.strip()]
+    if not parts:
+        return DEFAULT_BUCKET_EDGES_SEC
+    return tuple(float(p) for p in parts)
+
+
 def _build_config(args):
     return AlarmMHPConfig(
         type_fields=parse_type_fields(args.type_fields),
@@ -117,6 +127,8 @@ def _build_config(args):
         branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
         chunk_size=args.chunk_size,
+        kernel_type=args.kernel_type,
+        bucket_edges_sec=_parse_bucket_edges(args.bucket_edges_sec),
         val_split=args.val_split,
         early_stop_patience=args.early_stop_patience,
         regions=parse_regions(args.regions),
@@ -192,6 +204,28 @@ def main():
     parser.add_argument("--beta-prior-mean", type=float, default=1.0)
     parser.add_argument("--beta-min", type=float, default=1e-2)
     parser.add_argument("--beta-max", type=float, default=50.0)
+    parser.add_argument(
+        "--kernel-type",
+        choices=("exp", "piecewise"),
+        default="exp",
+        help=(
+            "Excitation kernel shape. 'exp' = single exponential α·β·exp(-β·dt) "
+            "(default, current behavior). 'piecewise' = two-stage: exp fit selects "
+            "edges, then box-basis EM learns per-edge per-time-bucket weights θ. "
+            "Piecewise is interpretable ('A triggers B in the 3-10min bucket') and "
+            "handles delayed-peak cascades that a single exponential cannot."
+        ),
+    )
+    parser.add_argument(
+        "--bucket-edges-sec",
+        default="",
+        help=(
+            "Comma-separated right edges (real seconds) for piecewise buckets, "
+            "ascending, last <= history-window-sec. Empty uses default "
+            "15,60,180,600,1800 (0-15s, 15-60s, 1-3m, 3-10m, 10-30m). "
+            "Only used when --kernel-type piecewise."
+        ),
+    )
     parser.add_argument("--edge-threshold", type=float, default=1e-3)
     parser.add_argument("--max-active-sources-per-dim", type=int, default=16)
     parser.add_argument("--branching-cap", type=float, default=0.9)
@@ -314,8 +348,20 @@ def main():
     if _progress_enabled(args):
         _print_cascade_size_distribution(md.get("cascade_size_stats"))
         _print_topology_consistency(md.get("topology_consistency"))
+        _print_bucket_mass(md.get("bucket_mass_distribution"))
         total_elapsed = time.monotonic() - t_total_start
         print(f"[train] total wall-clock: {_format_seconds(total_elapsed)}")
+
+
+def _print_bucket_mass(report):
+    """Metric 3 (piecewise): per-bucket excitation mass share."""
+    if not report:
+        return
+    print("[train] piecewise bucket mass distribution (Σθ·width per bucket):")
+    for bucket in report["buckets"]:
+        bar_len = int(round(bucket["share"] * 40))
+        bar = "█" * bar_len
+        print(f"  {bucket['label']:>10s} : {bucket['share'] * 100:5.1f}%  {bar}")
 
 
 def _format_seconds(seconds: float) -> str:

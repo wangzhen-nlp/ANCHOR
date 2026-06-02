@@ -24,7 +24,6 @@ from collections import Counter, deque
 from dataclasses import dataclass, field
 from dataclasses import replace as _replace
 import json
-import math
 import os
 import sys
 import time
@@ -197,17 +196,10 @@ class StreamMHPAssigner:
         for idx in range(n_recent - 1, n_recent - 1 - cap, -1):
             cand = self.recent[idx]
             sources[i] = idx
-            # Δt in model time units (scaled by time_scale_sec)
+            # Δt in model time units (scaled by time_scale_sec). pair_score
+            # dispatches on the artifact's kernel_type (exp or piecewise).
             dt = (target_ts - cand.ts) / self.config.time_scale_sec
-            if dt <= 0:
-                scores[i] = 0.0
-            else:
-                alpha = self.params.alpha_value(target_type_id, cand.type_id)
-                if alpha <= 0:
-                    scores[i] = 0.0
-                else:
-                    beta = self.params.beta_value(target_type_id, cand.type_id)
-                    scores[i] = alpha * beta * math.exp(-beta * dt)
+            scores[i] = self.params.pair_score(target_type_id, cand.type_id, dt)
             i += 1
         return sources, scores
 
