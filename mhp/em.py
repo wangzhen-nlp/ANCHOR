@@ -727,17 +727,6 @@ def _make_pair_scorer(params: MHPParams):
     return score_fn
 
 
-def _build_edge_index_map(M: int, edge_targets: np.ndarray, edge_sources: np.ndarray) -> np.ndarray:
-    """Dense (M, M) int32 map: (target, source) → edge index, -1 if no edge.
-
-    316 MB at M=8898 — same order as the dense α matrix, acceptable. Lets the
-    piecewise E-step vectorize the per-pair edge lookup.
-    """
-    edge_index_map = np.full((M, M), -1, dtype=np.int32)
-    edge_index_map[edge_targets, edge_sources] = np.arange(len(edge_targets), dtype=np.int32)
-    return edge_index_map
-
-
 def fit_mhp_piecewise(
     events: EventCollection,
     config: MHPConfig,
@@ -771,7 +760,27 @@ def fit_mhp_piecewise(
     E = len(edge_targets)
     edge_targets = np.asarray(edge_targets, dtype=np.int64)
     edge_sources = np.asarray(edge_sources, dtype=np.int64)
-    edge_index_map = _build_edge_index_map(M, edge_targets, edge_sources)
+    # Sparse edge lookup via sorted keys (binary search) instead of a dense
+    # (M, M) int32 index map (~2.4 GB at M=24356). Sort defensively so
+    # searchsorted is valid regardless of caller ordering; θ/resp are built
+    # AFTER this so they align with the sorted edge order.
+    if E:
+        _order = np.lexsort((edge_sources, edge_targets))
+        edge_targets = edge_targets[_order]
+        edge_sources = edge_sources[_order]
+        edge_keys = edge_targets * M + edge_sources
+    else:
+        edge_keys = np.zeros(0, dtype=np.int64)
+
+    def _edge_lookup(pair_tdim, pair_sdim):
+        """(edge_idx_clipped, valid_mask) for each pair via binary search."""
+        if E == 0:
+            n = len(pair_tdim)
+            return np.zeros(n, dtype=np.int64), np.zeros(n, dtype=bool)
+        pk = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
+        idx = np.minimum(np.searchsorted(edge_keys, pk), E - 1)
+        return idx, edge_keys[idx] == pk
+
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
     # n_v per edge (source-type event count) — the exposure base
     n_v_per_edge = n_source[edge_sources]                     # (E,)
@@ -797,8 +806,7 @@ def fit_mhp_piecewise(
         )
         if pair_dt.size == 0:
             continue
-        pe = edge_index_map[pair_tdim, pair_sdim]
-        valid = pe >= 0
+        pe, valid = _edge_lookup(pair_tdim, pair_sdim)
         if not valid.any():
             continue
         pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
@@ -837,8 +845,7 @@ def fit_mhp_piecewise(
                 mu_num += _segment_sum(np.ones(csize), tdims_chunk, M)
                 ll_term1 += float(np.log(rate).sum())
                 continue
-            pe = edge_index_map[pair_tdim, pair_sdim]
-            valid = pe >= 0
+            pe, valid = _edge_lookup(pair_tdim, pair_sdim)
             pb = np.zeros(pair_dt.shape, dtype=np.int64)
             score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
             if valid.any():
