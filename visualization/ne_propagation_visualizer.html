@@ -6467,7 +6467,16 @@
                             site_ids: Array.from(group.siteIds),
                             alarm_types: Array.from(group.alarmTypes)
                         };
-                    })
+                    }),
+                edge_details: (window.edgeDetails && typeof window.edgeDetails === 'object') ? window.edgeDetails : {},
+                site_order_data: (siteOrderData && typeof siteOrderData === 'object') ? siteOrderData : null,
+                graph_meta: {
+                    match_info: graphData ? (graphData.match_info || null) : null,
+                    role_mapping: graphData ? (graphData.role_mapping || null) : null,
+                    fault_pattern_managed_sites: graphData ? (graphData.fault_pattern_managed_sites || null) : null,
+                    fault_pattern_analysis: graphData ? (graphData.fault_pattern_analysis || null) : null,
+                    fault_patterns: graphData ? (graphData.fault_patterns || null) : null
+                }
             };
         }
 
@@ -6482,8 +6491,20 @@
                 '  const SNAPSHOT = JSON.parse(decodeURIComponent(' + JSON.stringify(encodeURIComponent(JSON.stringify(payload))) + '));',
                 '  function restoreSnapshot(){',
                 '    try {',
-                '      graphData = { group_info: {} };',
+                '      const meta = SNAPSHOT.graph_meta || {};',
+                '      graphData = {',
+                '        group_info: {},',
+                '        match_info: meta.match_info || null,',
+                '        role_mapping: meta.role_mapping || null,',
+                '        fault_pattern_managed_sites: meta.fault_pattern_managed_sites || null,',
+                '        fault_pattern_analysis: meta.fault_pattern_analysis || null,',
+                '        fault_patterns: meta.fault_patterns || null',
+                '      };',
                 '      (SNAPSHOT.groups || []).forEach(function(group){ graphData.group_info[group.group_id] = group.group_info || {}; });',
+                '      window.edgeDetails = (SNAPSHOT.edge_details && typeof SNAPSHOT.edge_details === "object") ? SNAPSHOT.edge_details : {};',
+                '      if (SNAPSHOT.site_order_data) { siteOrderData = SNAPSHOT.site_order_data; }',
+                '      if (typeof updateRoleSiteSets === "function") updateRoleSiteSets(graphData);',
+                '      if (typeof updateFaultPatternManagedSites === "function") updateFaultPatternManagedSites(graphData);',
                 '      allNodes = (SNAPSHOT.nodes || []).map(function(n){ const style = getDomainStyle(n.domain || ""); return Object.assign({}, n, { domainStyle: style }); });',
                 '      allLinks = (SNAPSHOT.links || []).map(function(l){ return Object.assign({}, l); });',
                 '      currentNodes = allNodes.map(function(n){ return Object.assign({}, n); });',
@@ -6516,8 +6537,8 @@
                 '  }',
                 '  document.addEventListener("DOMContentLoaded", function(){ setTimeout(restoreSnapshot, 0); });',
                 '})();'
-            ].join('\\n');
-            let html = pristineDocumentHtml || ('<!DOCTYPE html>\\n' + document.documentElement.outerHTML);
+            ].join('\n');
+            let html = pristineDocumentHtml || ('<!DOCTYPE html>\n' + document.documentElement.outerHTML);
             html = html.replace(/<\/body>\s*<\/html>\s*$/i, '<scr' + 'ipt>' + snapshotScript + '</scr' + 'ipt></body></html>');
             const nameBase = payload.active_groups.length
                 ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
