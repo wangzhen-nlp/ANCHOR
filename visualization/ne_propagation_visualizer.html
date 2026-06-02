@@ -174,6 +174,23 @@
             background: #a40e26;
         }
 
+        .btn-export-html {
+            background: #8250df;
+            color: #fff;
+            width: 100%;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        .btn-export-html:hover {
+            background: #6639ba;
+        }
+
         .active-groups {
             margin-top: 10px;
         }
@@ -2045,6 +2062,7 @@
                 </div>
                 
                 <button class="btn-clear" onclick="clearAllGroups()" style="margin-top: 10px; width: 100%;">清空所有</button>
+                <button class="btn-export-html" onclick="exportCurrentGroupsHtml()" style="margin-top: 8px;">导出当前故障组 HTML</button>
             </div>
 
             <!-- 站点/NE 搜索添加区域 -->
@@ -6286,6 +6304,320 @@
             const a = document.createElement('a');
             a.href = url;
             a.download = 'current_view.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function sanitizeFileNamePart(value) {
+            const text = String(value || '').trim();
+            if (!text) return 'current';
+            return text
+                .replace(/[\\/:*?"<>|]+/g, '_')
+                .replace(/\s+/g, '_')
+                .slice(0, 80);
+        }
+
+        function formatExportTimestamp(date) {
+            const pad = function(value) { return String(value).padStart(2, '0'); };
+            return date.getFullYear() + '-' +
+                pad(date.getMonth() + 1) + '-' +
+                pad(date.getDate()) + ' ' +
+                pad(date.getHours()) + ':' +
+                pad(date.getMinutes()) + ':' +
+                pad(date.getSeconds());
+        }
+
+        function normalizeLinkEndpoint(endpoint) {
+            if (endpoint && typeof endpoint === 'object') {
+                return endpoint.id || endpoint.ne_id || endpoint.name || '';
+            }
+            return endpoint === null || endpoint === undefined ? '' : String(endpoint);
+        }
+
+        function normalizeLinkForExport(link) {
+            const normalized = {};
+            Object.keys(link || {}).forEach(function(key) {
+                if (key === 'source' || key === 'target') return;
+                const value = link[key];
+                if (typeof value !== 'function') {
+                    normalized[key] = value;
+                }
+            });
+            normalized.source = normalizeLinkEndpoint(link && link.source);
+            normalized.target = normalizeLinkEndpoint(link && link.target);
+            return normalized;
+        }
+
+        function normalizeNodeForExport(node) {
+            const normalized = {};
+            Object.keys(node || {}).forEach(function(key) {
+                if (key === 'domainStyle') return;
+                const value = node[key];
+                if (typeof value !== 'function') {
+                    normalized[key] = value;
+                }
+            });
+            return normalized;
+        }
+
+        function collectCurrentAlarmRowsForExport(nodes) {
+            const rows = [];
+            (nodes || []).forEach(function(node) {
+                const alarms = Array.isArray(node.alarm) ? node.alarm : [];
+                alarms.forEach(function(alarm) {
+                    rows.push({
+                        ne_id: getRawNodeId(node),
+                        site_id: node.site_id || '',
+                        domain: node.domain || '',
+                        fault_group_id: getAlarmFaultGroupId(alarm),
+                        alarm_id: alarm.alarm_id || alarm.eid || alarm.id || '',
+                        alarm_id_list: alarm.alarm_id_list || alarm.eid_list || [],
+                        alarm_type: alarm.alarm_type || alarm.alarm || alarm.title || '',
+                        severity: alarm.severity || alarm.alarm_level || '',
+                        time: getAlarmDisplayTime(alarm),
+                        clear_time: alarm['告警清除时间'] || alarm.alarm_clear_time || '',
+                        ticket_id: alarm['工单号'] || alarm.ticket_id || alarm.ticketId || '',
+                        raw_alarm: alarm
+                    });
+                });
+            });
+            return rows;
+        }
+
+        function collectCurrentSiteRowsForExport(nodes) {
+            const siteMap = new Map();
+            (nodes || []).forEach(function(node) {
+                const siteId = String(node.site_id || node.site_name || '未知站点');
+                if (!siteMap.has(siteId)) {
+                    siteMap.set(siteId, {
+                        site_id: siteId,
+                        site_name: node.site_name || '',
+                        ne_count: 0,
+                        alarm_count: 0,
+                        domains: new Set(),
+                        ne_ids: []
+                    });
+                }
+                const entry = siteMap.get(siteId);
+                entry.ne_count += 1;
+                entry.alarm_count += Array.isArray(node.alarm) ? node.alarm.length : 0;
+                if (node.domain) entry.domains.add(String(node.domain));
+                entry.ne_ids.push(getRawNodeId(node));
+            });
+            return Array.from(siteMap.values()).map(function(entry) {
+                return {
+                    site_id: entry.site_id,
+                    site_name: entry.site_name,
+                    ne_count: entry.ne_count,
+                    alarm_count: entry.alarm_count,
+                    domains: Array.from(entry.domains),
+                    ne_ids: entry.ne_ids
+                };
+            }).sort(function(a, b) {
+                return String(a.site_id).localeCompare(String(b.site_id), 'zh-CN', { numeric: true, sensitivity: 'base' });
+            });
+        }
+
+        function buildCurrentGroupsExportPayload() {
+            const exportTime = new Date();
+            const activeGroupIds = Array.from(activeGroups).sort(function(a, b) {
+                return String(a).localeCompare(String(b), 'zh-CN', { numeric: true, sensitivity: 'base' });
+            });
+            const nodes = currentNodes.map(normalizeNodeForExport);
+            const links = currentLinks.map(normalizeLinkForExport);
+            const alarms = collectCurrentAlarmRowsForExport(currentNodes);
+            const sites = collectCurrentSiteRowsForExport(currentNodes);
+            const missingTopologyLinks = links.filter(function(link) {
+                return !!(link && link.missing_topology_prediction);
+            });
+            const groupDetails = activeGroupIds.map(function(groupId) {
+                return {
+                    group_id: groupId,
+                    group_info: graphData && graphData.group_info ? (graphData.group_info[groupId] || null) : null
+                };
+            });
+            const noteTextarea = document.getElementById('noteTextarea');
+            return {
+                exported_at: exportTime.toISOString(),
+                exported_at_local: formatExportTimestamp(exportTime),
+                active_groups: activeGroupIds,
+                summary: {
+                    active_group_count: activeGroupIds.length,
+                    node_count: nodes.length,
+                    site_count: sites.length,
+                    link_count: links.length,
+                    alarm_count: alarms.length,
+                    missing_topology_link_count: missingTopologyLinks.length
+                },
+                note: noteTextarea ? noteTextarea.value : '',
+                groups: groupDetails,
+                sites: sites,
+                nodes: nodes,
+                links: links,
+                alarms: alarms,
+                missing_topology_links: missingTopologyLinks,
+                alarm_group_partition: buildAlarmGroupPartition(currentNodes)
+                    .map(function(group) {
+                        return {
+                            group_id: group.groupId,
+                            alarm_count: group.alarmCount,
+                            ne_ids: Array.from(group.neIds),
+                            site_ids: Array.from(group.siteIds),
+                            alarm_types: Array.from(group.alarmTypes)
+                        };
+                    })
+            };
+        }
+
+        function renderExportTable(headers, rows, emptyText) {
+            if (!rows || rows.length === 0) {
+                return '<div class="empty">' + escapeHtml(emptyText || '无数据') + '</div>';
+            }
+            return '<table><thead><tr>' +
+                headers.map(function(header) { return '<th>' + escapeHtml(header.label) + '</th>'; }).join('') +
+                '</tr></thead><tbody>' +
+                rows.map(function(row) {
+                    return '<tr>' + headers.map(function(header) {
+                        let value = typeof header.value === 'function' ? header.value(row) : row[header.key];
+                        if (Array.isArray(value)) value = value.join(', ');
+                        if (value && typeof value === 'object') value = JSON.stringify(value);
+                        return '<td>' + escapeHtml(value === null || value === undefined || value === '' ? '-' : value) + '</td>';
+                    }).join('') + '</tr>';
+                }).join('') +
+                '</tbody></table>';
+        }
+
+        function buildCurrentGroupsReportHtml(payload) {
+            const jsonText = JSON.stringify(payload, null, 2);
+            const scriptJsonText = jsonText.replace(/<\/script/gi, '<\\/script').replace(/<!--/g, '<\\!--');
+            const activeGroupText = payload.active_groups.length ? payload.active_groups.join(', ') : '无';
+            const title = 'NE传播图故障组导出 - ' + activeGroupText;
+            const summaryCards = [
+                ['激活故障组', payload.summary.active_group_count],
+                ['站点数', payload.summary.site_count],
+                ['设备数', payload.summary.node_count],
+                ['连边数', payload.summary.link_count],
+                ['告警数', payload.summary.alarm_count],
+                ['弱拓扑/补全边', payload.summary.missing_topology_link_count]
+            ].map(function(item) {
+                return '<div class="card"><div class="card-value">' + escapeHtml(item[1]) + '</div><div class="card-label">' + escapeHtml(item[0]) + '</div></div>';
+            }).join('');
+
+            const groupTable = renderExportTable([
+                { label: 'Group ID', key: 'group_id' },
+                { label: '站点数', value: function(row) { return row.group_info && row.group_info.site_list ? row.group_info.site_list.length : 0; } },
+                { label: '设备数', value: function(row) { return row.group_info && row.group_info.ne_list ? row.group_info.ne_list.length : 0; } },
+                { label: '规则', value: function(row) {
+                    const rules = row.group_info && row.group_info.rule ? row.group_info.rule : (row.group_info && row.group_info.rules ? row.group_info.rules : []);
+                    return Array.isArray(rules) ? rules.join(', ') : rules;
+                } }
+            ], payload.groups, '无激活故障组');
+
+            const partitionTable = renderExportTable([
+                { label: '告警故障组ID', key: 'group_id' },
+                { label: '告警数', key: 'alarm_count' },
+                { label: '设备', key: 'ne_ids' },
+                { label: '站点', key: 'site_ids' },
+                { label: '告警类型', key: 'alarm_types' }
+            ], payload.alarm_group_partition, '当前告警无故障组ID');
+
+            const siteTable = renderExportTable([
+                { label: '站点ID', key: 'site_id' },
+                { label: '站点名', key: 'site_name' },
+                { label: '设备数', key: 'ne_count' },
+                { label: '告警数', key: 'alarm_count' },
+                { label: 'Domain', key: 'domains' },
+                { label: '设备', key: 'ne_ids' }
+            ], payload.sites, '无站点');
+
+            const nodeTable = renderExportTable([
+                { label: 'NE', value: function(row) { return getRawNodeId(row); } },
+                { label: '站点', key: 'site_id' },
+                { label: 'Domain', key: 'domain' },
+                { label: 'Group', key: 'group' },
+                { label: '告警数', value: function(row) { return Array.isArray(row.alarm) ? row.alarm.length : 0; } },
+                { label: '角色', value: function(row) { return row.matched_role || row.role || ''; } }
+            ], payload.nodes, '无设备');
+
+            const linkTable = renderExportTable([
+                { label: 'Source', key: 'source' },
+                { label: 'Target', key: 'target' },
+                { label: '类型', value: function(row) { return row.predicted_relation || row.relation || row.topology || row.edge_source || ''; } },
+                { label: 'Score', key: 'score' },
+                { label: '补全拓扑', value: function(row) { return row.missing_topology_prediction ? '是' : '否'; } }
+            ], payload.links, '无连边');
+
+            const alarmTable = renderExportTable([
+                { label: 'NE', key: 'ne_id' },
+                { label: '站点', key: 'site_id' },
+                { label: '告警故障组ID', key: 'fault_group_id' },
+                { label: '告警ID', key: 'alarm_id' },
+                { label: '告警类型', key: 'alarm_type' },
+                { label: '级别', key: 'severity' },
+                { label: '发生时间', key: 'time' },
+                { label: '清除时间', key: 'clear_time' },
+                { label: '工单号', key: 'ticket_id' }
+            ], payload.alarms, '无告警');
+
+            const missingTopologyTable = renderExportTable([
+                { label: 'Source', key: 'source' },
+                { label: 'Target', key: 'target' },
+                { label: '预测关系', value: function(row) { return normalizeMissingTopologyRelation(row); } },
+                { label: 'Score', key: 'score' },
+                { label: '来源', key: 'edge_source' }
+            ], payload.missing_topology_links, '无补全拓扑边');
+
+            return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">' +
+                '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+                '<title>' + escapeHtml(title) + '</title>' +
+                '<style>' +
+                    'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f8fa;color:#24292f;}' +
+                    '.page{max-width:1280px;margin:0 auto;padding:28px;}' +
+                    'h1{font-size:24px;margin:0 0 8px;color:#0969da;} h2{font-size:18px;margin:28px 0 12px;border-left:5px solid #0969da;padding-left:10px;}' +
+                    '.sub{color:#57606a;font-size:13px;margin-bottom:18px;line-height:1.6;}' +
+                    '.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0;}' +
+                    '.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(27,31,36,.04);}' +
+                    '.card-value{font-size:24px;font-weight:800;color:#0969da;}.card-label{font-size:12px;color:#57606a;margin-top:4px;}' +
+                    'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d0d7de;border-radius:8px;overflow:hidden;font-size:12px;}' +
+                    'th,td{border-bottom:1px solid #d8dee4;padding:8px 10px;text-align:left;vertical-align:top;word-break:break-word;} th{background:#f0f6ff;color:#0969da;font-weight:700;}' +
+                    'tr:last-child td{border-bottom:none;}.empty{background:#fff;border:1px dashed #d0d7de;border-radius:8px;padding:14px;color:#8c959f;}' +
+                    'details{background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:12px;margin-top:12px;} summary{cursor:pointer;font-weight:700;color:#0969da;}' +
+                    'pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:14px;max-height:520px;overflow:auto;}' +
+                    '.note{background:#fff8c5;border:1px solid #f0c36d;border-radius:8px;padding:12px;white-space:pre-wrap;}' +
+                '</style></head><body><div class="page">' +
+                '<h1>NE传播图故障组导出</h1>' +
+                '<div class="sub">导出时间: ' + escapeHtml(payload.exported_at_local) + '<br>当前激活 Group: ' + escapeHtml(activeGroupText) + '</div>' +
+                '<div class="cards">' + summaryCards + '</div>' +
+                (payload.note ? '<h2>备注</h2><div class="note">' + escapeHtml(payload.note) + '</div>' : '') +
+                '<h2>当前激活 Group</h2>' + groupTable +
+                '<h2>当前告警按故障组ID划分</h2>' + partitionTable +
+                '<h2>站点汇总</h2>' + siteTable +
+                '<h2>设备明细</h2>' + nodeTable +
+                '<h2>连边明细</h2>' + linkTable +
+                '<h2>补全/弱拓扑边</h2>' + missingTopologyTable +
+                '<h2>告警明细</h2>' + alarmTable +
+                '<h2>完整导出 JSON</h2><details open><summary>展开/收起完整 JSON</summary><pre>' + escapeHtml(jsonText) + '</pre></details>' +
+                '<script type="application/json" id="fault-group-export-data">' + scriptJsonText + '<\/script>' +
+                '</div></body></html>';
+        }
+
+        function exportCurrentGroupsHtml() {
+            if (!currentNodes || currentNodes.length === 0) {
+                showError('当前没有渲染的故障组/设备，无法导出');
+                return;
+            }
+            const payload = buildCurrentGroupsExportPayload();
+            const html = buildCurrentGroupsReportHtml(payload);
+            const nameBase = payload.active_groups.length
+                ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
+                : 'current_view';
+            const timestampPart = payload.exported_at_local.replace(/[-:\s]/g, '');
+            const filename = 'fault_group_report_' + sanitizeFileNamePart(nameBase) + '_' + timestampPart + '.html';
+            const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
             a.click();
             URL.revokeObjectURL(url);
         }
