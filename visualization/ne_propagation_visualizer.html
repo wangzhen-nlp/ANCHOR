@@ -6501,6 +6501,7 @@
                 '        fault_patterns: meta.fault_patterns || null',
                 '      };',
                 '      (SNAPSHOT.groups || []).forEach(function(group){ graphData.group_info[group.group_id] = group.group_info || {}; });',
+                '      graphData.nodes = SNAPSHOT.nodes || [];',
                 '      window.edgeDetails = (SNAPSHOT.edge_details && typeof SNAPSHOT.edge_details === "object") ? SNAPSHOT.edge_details : {};',
                 '      if (SNAPSHOT.site_order_data) { siteOrderData = SNAPSHOT.site_order_data; }',
                 '      if (typeof updateRoleSiteSets === "function") updateRoleSiteSets(graphData);',
