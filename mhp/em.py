@@ -212,20 +212,32 @@ def _compute_initial_alpha_beta(
     sum_dt: Optional[np.ndarray],
     config: MHPConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """MAP point estimate from accumulated pair statistics."""
+    """MAP point estimate from accumulated pair statistics.
+
+    Memory note: for shared β, β is returned as a 0-d scalar (np.float32)
+    rather than a dense (M, M) matrix — at M=24356 that saves ~2.4 GB and is
+    mathematically identical (every entry was the same constant). The α
+    computation reuses the n_pair buffer in place to avoid a transient
+    (M, M) float64 copy (~4.4 GB), which is what triggers OOM at large M.
+    `n_pair` is consumed (mutated) by this call.
+    """
     M = events.M
     K = config.alpha_prior_strength
     m = config.alpha_prior_mean
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
     denom = n_source[np.newaxis, :] + K
-    alpha = ((n_pair + K * m) / denom).astype(np.float32)
     if config.beta_mode == "per_edge":
+        # β must be computed from n_pair BEFORE n_pair is mutated below.
         K_b = config.beta_prior_strength
         m_b = max(config.beta_prior_mean, _EPS)
         beta = ((n_pair + K_b) / ((sum_dt if sum_dt is not None else 0.0) + K_b / m_b)).astype(np.float32)
         np.clip(beta, config.beta_min, config.beta_max, out=beta)
     else:
-        beta = np.full((M, M), config.beta_shared_value, dtype=np.float32)
+        beta = np.float32(config.beta_shared_value)  # 0-d scalar, not (M, M)
+    # In-place: alpha = (n_pair + K*m) / denom. Reuses n_pair's buffer.
+    n_pair += K * m
+    n_pair /= denom
+    alpha = n_pair.astype(np.float32)
     return alpha, beta
 
 
@@ -341,7 +353,9 @@ def _run_estep_iteration(
 
         # E-step on this chunk
         alpha_pair = alpha[pair_target_dim, pair_source_dim]
-        beta_pair = beta[pair_target_dim, pair_source_dim]
+        # β is a 0-d scalar in shared mode (saves a dense (M,M) array) or a
+        # dense matrix in per_edge mode. Both broadcast in the score formula.
+        beta_pair = beta if np.ndim(beta) == 0 else beta[pair_target_dim, pair_source_dim]
         # Score: α · β · exp(-β · Δt)
         score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt)
         # rate_per_event = μ_{u_i} + Σ_j score(i, j)
@@ -442,8 +456,15 @@ def fit_mhp(
 
     trace: list[dict] = []
     best_ll = -np.inf
-    best_alpha = alpha.copy()
-    best_beta = beta.copy()
+    # Best-iteration snapshot stored SPARSELY (edge list), not as a dense
+    # (M, M) copy — after top-k pruning α has <= max_active_sources_per_dim
+    # nonzeros per row, so this is a few hundred KB instead of ~2.4 GB held
+    # across all iterations.
+    best_edge_targets = np.zeros(0, dtype=np.int64)
+    best_edge_sources = np.zeros(0, dtype=np.int64)
+    best_edge_alpha = np.zeros(0, dtype=np.float64)
+    best_edge_beta = None                                   # set in per_edge mode
+    best_beta_scalar = float(beta) if np.ndim(beta) == 0 else None
     best_mu = mu.copy()
     best_p_self = np.zeros(N, dtype=np.float64)
     converged = False
@@ -464,9 +485,9 @@ def fit_mhp(
         K = config.alpha_prior_strength
         m = config.alpha_prior_mean
         denom = n_source[np.newaxis, :] + K
-        alpha_new = ((alpha_num + K * m) / denom).astype(np.float32)
 
         if config.beta_mode == "per_edge":
+            # β must be read from alpha_num BEFORE the in-place α mutation below.
             K_b = config.beta_prior_strength
             m_b = max(config.beta_prior_mean, _EPS)
             beta_new = (
@@ -474,7 +495,14 @@ def fit_mhp(
             ).astype(np.float32)
             np.clip(beta_new, config.beta_min, config.beta_max, out=beta_new)
         else:
-            beta_new = beta
+            beta_new = beta  # scalar
+
+        # In-place: alpha_new = (alpha_num + K*m) / denom, reusing the f64
+        # accumulator buffer to avoid a transient (M,M) copy (~4.4 GB at large M).
+        alpha_num += K * m
+        alpha_num /= denom
+        alpha_new = alpha_num.astype(np.float32)
+        del alpha_num  # release the 4.4 GB f64 buffer immediately
 
         # Sparsity and stability
         n_rescaled = _apply_branching_cap(alpha_new, config.branching_cap)
@@ -483,10 +511,19 @@ def fit_mhp(
         ll = _log_likelihood_global(ll_term1, mu_new, alpha_new, horizon)
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
+        beta_is_scalar = np.ndim(beta_new) == 0
         if ll > best_ll:
             best_ll = ll
-            best_alpha = alpha_new.copy()
-            best_beta = beta_new.copy()
+            nz_t, nz_s = np.nonzero(alpha_new)
+            best_edge_targets = nz_t.copy()
+            best_edge_sources = nz_s.copy()
+            best_edge_alpha = alpha_new[nz_t, nz_s].astype(np.float64)
+            if beta_is_scalar:
+                best_beta_scalar = float(beta_new)
+                best_edge_beta = None
+            else:
+                best_beta_scalar = None
+                best_edge_beta = beta_new[nz_t, nz_s].astype(np.float64)
             best_mu = mu_new.copy()
             best_p_self = p_self
 
@@ -496,16 +533,22 @@ def fit_mhp(
         iter_estep = t_estep_end - t_iter_start
         iter_mstep = t_iter_end - t_estep_end
         # β stats — only meaningful on active edges (β=0 where α=0)
-        active_mask = alpha_new > 0
-        if active_mask.any():
-            beta_active = beta_new[active_mask]
-            beta_median_active = float(np.median(beta_active))
-            beta_max_active = float(beta_active.max())
-            beta_min_active = float(beta_active.min())
+        if beta_is_scalar:
+            bval = float(beta_new)
+            beta_median_active = bval if active_edges else 0.0
+            beta_max_active = bval if active_edges else 0.0
+            beta_min_active = bval if active_edges else 0.0
         else:
-            beta_median_active = 0.0
-            beta_max_active = 0.0
-            beta_min_active = 0.0
+            active_mask = alpha_new > 0
+            if active_mask.any():
+                beta_active = beta_new[active_mask]
+                beta_median_active = float(np.median(beta_active))
+                beta_max_active = float(beta_active.max())
+                beta_min_active = float(beta_active.min())
+            else:
+                beta_median_active = 0.0
+                beta_max_active = 0.0
+                beta_min_active = 0.0
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
@@ -554,46 +597,48 @@ def fit_mhp(
             break
         prev_ll = ll
 
+    # The best snapshot is already a sparse edge list (best_edge_*). Build the
+    # per-edge β array: replicate the scalar for shared mode.
+    if best_beta_scalar is not None:
+        best_edge_beta_arr = np.full(len(best_edge_targets), best_beta_scalar, dtype=np.float64)
+    else:
+        best_edge_beta_arr = (
+            best_edge_beta if best_edge_beta is not None else np.zeros(len(best_edge_targets))
+        )
+
     # Final spectral-radius safety net (the per-source cap above already
     # implies ρ ≤ branching_cap, so this rarely fires).
-    if config.stability_radius > 0:
-        tmp_targets, tmp_sources = np.nonzero(best_alpha)
-        if len(tmp_targets):
-            tmp_params = MHPParams.from_edges(
-                M=M,
-                mu=best_mu,
-                edge_targets=tmp_targets,
-                edge_sources=tmp_sources,
-                edge_alpha=best_alpha[tmp_targets, tmp_sources],
-                edge_beta=best_beta[tmp_targets, tmp_sources],
-                edge_threshold=config.edge_threshold,
-                max_active_sources_per_dim=config.max_active_sources_per_dim,
-                beta_shared=(config.beta_mode == "shared"),
-            )
-            rho = tmp_params.spectral_radius()
-            if rho > config.stability_radius and rho > 0:
-                scale = config.stability_radius / rho
-                best_alpha = best_alpha * scale
-                if config.verbose:
-                    print(
-                        f"[mhp] spectral safety net: ρ={rho:.4f} > {config.stability_radius} "
-                        f"→ α × {scale:.4f}",
-                        flush=True,
-                    )
+    if config.stability_radius > 0 and len(best_edge_targets):
+        tmp_params = MHPParams.from_edges(
+            M=M,
+            mu=best_mu,
+            edge_targets=best_edge_targets,
+            edge_sources=best_edge_sources,
+            edge_alpha=best_edge_alpha,
+            edge_beta=best_edge_beta_arr,
+            edge_threshold=config.edge_threshold,
+            max_active_sources_per_dim=config.max_active_sources_per_dim,
+            beta_shared=(config.beta_mode == "shared"),
+        )
+        rho = tmp_params.spectral_radius()
+        if rho > config.stability_radius and rho > 0:
+            scale = config.stability_radius / rho
+            best_edge_alpha = best_edge_alpha * scale
+            if config.verbose:
+                print(
+                    f"[mhp] spectral safety net: ρ={rho:.4f} > {config.stability_radius} "
+                    f"→ α × {scale:.4f}",
+                    flush=True,
+                )
 
-    # Build final sparse params
-    tgts, srcs = np.nonzero(best_alpha)
-    if config.edge_threshold > 0 and len(tgts):
-        keep = best_alpha[tgts, srcs] > config.edge_threshold
-        tgts = tgts[keep]
-        srcs = srcs[keep]
+    # Build final sparse params (edge_threshold filter applied inside from_edges)
     final_params = MHPParams.from_edges(
         M=M,
         mu=best_mu,
-        edge_targets=tgts,
-        edge_sources=srcs,
-        edge_alpha=best_alpha[tgts, srcs] if len(tgts) else np.zeros(0),
-        edge_beta=best_beta[tgts, srcs] if len(tgts) else np.zeros(0),
+        edge_targets=best_edge_targets,
+        edge_sources=best_edge_sources,
+        edge_alpha=best_edge_alpha,
+        edge_beta=best_edge_beta_arr,
         edge_threshold=config.edge_threshold,
         max_active_sources_per_dim=config.max_active_sources_per_dim,
         beta_shared=(config.beta_mode == "shared"),
@@ -619,45 +664,65 @@ def fit_mhp(
 
 def _make_pair_scorer(params: MHPParams):
     """Return a vectorized score_fn(pair_target_dim, pair_source_dim, pair_dt)
-    that dispatches on params.kernel_type. Precomputes dense lookup tables once.
+    that dispatches on params.kernel_type.
+
+    Uses a SPARSE edge lookup (binary search over sorted edge keys) instead of
+    a dense (M, M) table. At M=24356 the dense tables were ~2.4 GB each; the
+    sparse keys array is only O(active_edges). MHPParams.from_edges stores
+    edges sorted by (target, source), so key = target*M + source is ascending
+    and np.searchsorted gives an O(log E) vectorized lookup.
 
     Used by compute_hard_parents and log_likelihood so both kernels share one
     inference path.
     """
     M = params.M
+    E = len(params.edge_targets)
+    keys = (
+        params.edge_targets.astype(np.int64) * M + params.edge_sources.astype(np.int64)
+        if E
+        else np.zeros(0, dtype=np.int64)
+    )
+
+    def _lookup(pair_tdim, pair_sdim):
+        """Return (edge_idx, valid_mask) for each pair via binary search."""
+        if E == 0:
+            n = len(pair_tdim)
+            return np.zeros(n, dtype=np.int64), np.zeros(n, dtype=bool)
+        pair_key = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
+        idx = np.searchsorted(keys, pair_key)
+        idx_clip = np.minimum(idx, E - 1)
+        valid = keys[idx_clip] == pair_key
+        return idx_clip, valid
+
     if params.kernel_type == "piecewise":
         bucket_edges = np.asarray(params.bucket_edges, dtype=np.float64)
-        edge_index_map = np.full((M, M), -1, dtype=np.int32)
-        if len(params.edge_targets):
-            edge_index_map[params.edge_targets, params.edge_sources] = np.arange(
-                len(params.edge_targets), dtype=np.int32
-            )
         theta = np.asarray(params.edge_theta, dtype=np.float64)
 
         def score_fn(pair_tdim, pair_sdim, pair_dt):
-            pe = edge_index_map[pair_tdim, pair_sdim]
-            valid = pe >= 0
             out = np.zeros(pair_dt.shape, dtype=np.float64)
+            ei, valid = _lookup(pair_tdim, pair_sdim)
             if valid.any():
                 pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
-                out[valid] = theta[pe[valid], pb]
+                out[valid] = theta[ei[valid], pb]
             return out
 
         return score_fn
 
-    # exp kernel
-    alpha_dense = np.zeros((M, M), dtype=np.float32)
-    beta_dense = np.zeros((M, M), dtype=np.float32)
-    if len(params.edge_targets):
-        alpha_dense[params.edge_targets, params.edge_sources] = params.edge_alpha.astype(np.float32)
-        beta_dense[params.edge_targets, params.edge_sources] = params.edge_beta.astype(np.float32)
+    # exp kernel. Keep α/β/Δt in float32 so the score matches the old dense
+    # scorer (and the training E-step) bit-for-bit — both computed in f32 and
+    # only widened to f64 on assignment into `out`.
+    edge_alpha = params.edge_alpha.astype(np.float32)
+    edge_beta = params.edge_beta.astype(np.float32)
 
     def score_fn(pair_tdim, pair_sdim, pair_dt):
-        alpha_pair = alpha_dense[pair_tdim, pair_sdim]
-        beta_pair = beta_dense[pair_tdim, pair_sdim]
-        safe_beta = np.where(beta_pair > 0, beta_pair, 1.0)
-        out = alpha_pair * safe_beta * np.exp(-safe_beta * pair_dt)
-        return np.where(alpha_pair > 0, out, 0.0).astype(np.float64)
+        out = np.zeros(pair_dt.shape, dtype=np.float64)
+        ei, valid = _lookup(pair_tdim, pair_sdim)
+        if valid.any():
+            a = edge_alpha[ei[valid]]                       # f32
+            b = edge_beta[ei[valid]]                        # f32
+            dt = pair_dt[valid]                             # f32 (as passed)
+            out[valid] = a * b * np.exp(-b * dt)            # f32 compute, widened on assign
+        return out
 
     return score_fn
 
