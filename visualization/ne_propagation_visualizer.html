@@ -6469,50 +6469,54 @@
             };
         }
 
-        function buildCurrentGroupsReportHtml(payload) {
-            const jsonText = JSON.stringify(payload, null, 2);
-            const encodedPayload = encodeURIComponent(jsonText);
-            const activeGroupText = payload.active_groups.length ? payload.active_groups.join(', ') : '无';
-            const title = 'NE传播图故障组导出 - ' + activeGroupText;
-            const exportScript =
-                'const DATA = JSON.parse(decodeURIComponent(' + JSON.stringify(encodedPayload) + '));\n' +
-                'const DOMAIN_STYLE = {DATA:{color:"#00BFFF",label:"Data"},IP:{color:"#00BFFF",label:"Data"},Transmission:{color:"#FF8C00",label:"Transmission"},RAN:{color:"#32CD32",label:"RAN"},DEFAULT:{color:"#808080",label:"Other"}};\n' +
-                'function esc(v){return String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/\\x27/g,"&#39;");}\n' +
-                'function domainStyle(d){const s=String(d||"").toLowerCase(); if(s.includes("data")||s.includes("ip")) return DOMAIN_STYLE.DATA; if(s.includes("trans")||s.includes("microwave")) return DOMAIN_STYLE.Transmission; if(s.includes("ran")) return DOMAIN_STYLE.RAN; return DOMAIN_STYLE.DEFAULT;}\n' +
-                'function rawId(n){const id=String((n&&n.id)||""); return id.split("::").pop()||id||"-";}\n' +
-                'function lat(n){return Number(n.lat??n.latitude??n.site_lat??n.y);} function lng(n){return Number(n.lng??n.lon??n.longitude??n.site_lng??n.x);}\n' +
-                'function alarmCount(n){return Array.isArray(n.alarm)?n.alarm.length:0;}\n' +
-                'function groupIdOfAlarm(a){return String((a&&(\n' +
-                'a["故障组ID"]??a.fault_group_id??a.faultGroupId??a.alarm_group_id??a.alarmGroupId??a.group_id??a.groupId))||"").trim();}\n' +
-                'function alarmGroups(n){const seen=new Set(); (Array.isArray(n.alarm)?n.alarm:[]).forEach(a=>{const g=groupIdOfAlarm(a); if(g) seen.add(g);}); return Array.from(seen);}\n' +
-                'function endpoint(e){return e&&typeof e==="object" ? e.id : String(e||"");}\n' +
-                'function relationLabel(l){return l.predicted_relation||l.relation||l.topology||l.edge_source||"";}\n' +
-                'function lineColor(l){if(l.missing_topology_prediction){const r=String(relationLabel(l)).toLowerCase(); return r.includes("bidirection")?"#7c3aed":"#0f5132";} return "#57606a";}\n' +
-                'function nodeHtml(n){const s=domainStyle(n.domain); const groups=alarmGroups(n); return "<div class=\\"node-row\\" data-node-id=\\""+esc(n.id)+"\\"><span class=\\"dot\\" style=\\"background:"+s.color+"\\"></span><div><b>"+esc(rawId(n))+"</b><div class=\\"muted\\">站点 "+esc(n.site_id||"-")+" | "+esc(s.label)+" | 告警 "+alarmCount(n)+"</div>"+(groups.length?"<div class=\\"group-line\\">故障组ID: "+groups.map(esc).join(", ")+"</div>":"")+"</div></div>";}\n' +
-                'function popupHtml(n){const alarms=Array.isArray(n.alarm)?n.alarm:[]; return "<b>"+esc(rawId(n))+"</b><br>站点: "+esc(n.site_id||"-")+"<br>Domain: "+esc(n.domain||"-")+"<br>Group: "+esc(n.group||"-")+"<hr>"+(alarms.length?alarms.map(a=>"<div class=\\"alarm\\"><b>"+esc(a.alarm_type||a.alarm||a.title||"未知告警")+"</b><br>故障组ID: "+esc(groupIdOfAlarm(a)||"-")+"<br>告警ID: "+esc(a.alarm_id||a.eid||a.id||"-")+"<br>时间: "+esc(a.time||a.alarm_time||a.time_str||"-")+"</div>").join(""):"无告警");}\n' +
-                'function build(){document.getElementById("title").textContent="NE传播图故障组导出"; document.getElementById("subtitle").textContent="导出时间: "+DATA.exported_at_local+" | 当前 Group: "+(DATA.active_groups.length?DATA.active_groups.join(", "):"无"); document.getElementById("stats").innerHTML=["激活故障组 "+DATA.summary.active_group_count,"站点 "+DATA.summary.site_count,"设备 "+DATA.summary.node_count,"连边 "+DATA.summary.link_count,"告警 "+DATA.summary.alarm_count,"补全边 "+DATA.summary.missing_topology_link_count].map(x=>"<span>"+esc(x)+"</span>").join(""); document.getElementById("nodeList").innerHTML=DATA.nodes.map(nodeHtml).join(""); const map=L.map("map"); const osm=L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"&copy; OpenStreetMap"}).addTo(map); const markers=new Map(); const bounds=[]; DATA.nodes.forEach(n=>{const la=lat(n),lo=lng(n); if(!Number.isFinite(la)||!Number.isFinite(lo)) return; const st=domainStyle(n.domain); const html="<div class=\\"marker\\" style=\\"--c:"+st.color+"\\"><span>"+alarmCount(n)+"</span></div>"; const m=L.marker([la,lo],{icon:L.divIcon({className:"",html:html,iconSize:[28,28],iconAnchor:[14,14]})}).bindPopup(popupHtml(n)).addTo(map); markers.set(n.id,m); bounds.push([la,lo]);}); DATA.links.forEach(l=>{const s=markers.get(l.source),t=markers.get(l.target); if(!s||!t) return; L.polyline([s.getLatLng(),t.getLatLng()],{color:lineColor(l),weight:l.missing_topology_prediction?4:2,opacity:l.missing_topology_prediction?0.95:0.65,dashArray:l.missing_topology_prediction?"8,5":null}).bindTooltip(esc((l.source||"")+" -> "+(l.target||"")+" "+relationLabel(l))).addTo(map);}); if(bounds.length){map.fitBounds(bounds,{padding:[40,40]});} else {map.setView([30,110],5);} }\n' +
-                'build();';
-
-            return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">' +
-                '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
-                '<title>' + escapeHtml(title) + '</title>' +
-                '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">' +
-                '<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#24292f;background:#f6f8fa}.layout{display:grid;grid-template-columns:360px 1fr;height:100vh}.sidebar{background:#fff;border-right:1px solid #d0d7de;padding:16px;overflow:auto}.sidebar h1{font-size:18px;color:#0969da;margin:0 0 6px}.muted{color:#57606a;font-size:12px;line-height:1.5}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.stats span{background:#f0f6ff;border:1px solid #d0d7de;border-radius:8px;padding:8px;font-size:12px;font-weight:700;color:#0969da}.node-row{display:flex;gap:8px;padding:8px;border:1px solid #d8dee4;border-radius:8px;margin:7px 0;background:#fff}.dot{width:12px;height:12px;border-radius:50%;margin-top:4px;flex-shrink:0}.group-line{margin-top:3px;font-size:11px;color:#8250df}.map-wrap{position:relative}#map{height:100vh;width:100%}.marker{width:28px;height:28px;border-radius:50%;background:var(--c);border:3px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:900}.alarm{border-top:1px solid #d8dee4;margin-top:6px;padding-top:6px;font-size:12px}.legend{position:absolute;right:16px;bottom:20px;z-index:500;background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:10px;font-size:12px;box-shadow:0 2px 10px rgba(0,0,0,.12)}</style>' +
-                '</head><body><div class="layout"><aside class="sidebar"><h1 id="title"></h1><div class="muted" id="subtitle"></div><div class="stats" id="stats"></div>' +
-                (payload.note ? '<h2 style="font-size:14px;">备注</h2><div class="muted" style="white-space:pre-wrap;background:#fff8c5;border:1px solid #f0c36d;border-radius:8px;padding:8px;">' + escapeHtml(payload.note) + '</div>' : '') +
-                '<h2 style="font-size:14px;">设备列表</h2><div id="nodeList"></div></aside><main class="map-wrap"><div id="map"></div><div class="legend">实线: 原始拓扑 / 虚线粗线: 补全或弱拓扑边</div></main></div>' +
-                '<scr' + 'ipt src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></scr' + 'ipt>' +
-                '<scr' + 'ipt>' + exportScript + '</scr' + 'ipt>' +
-                '</body></html>';
-        }
-
         function exportCurrentGroupsHtml() {
             if (!currentNodes || currentNodes.length === 0) {
                 showError('当前没有渲染的故障组/设备，无法导出');
                 return;
             }
             const payload = buildCurrentGroupsExportPayload();
-            const html = buildCurrentGroupsReportHtml(payload);
+            const snapshotScript = [
+                '(function(){',
+                '  const SNAPSHOT = JSON.parse(decodeURIComponent(' + JSON.stringify(encodeURIComponent(JSON.stringify(payload))) + '));',
+                '  function restoreSnapshot(){',
+                '    try {',
+                '      graphData = { group_info: {} };',
+                '      (SNAPSHOT.groups || []).forEach(function(group){ graphData.group_info[group.group_id] = group.group_info || {}; });',
+                '      allNodes = (SNAPSHOT.nodes || []).map(function(n){ const style = getDomainStyle(n.domain || ""); return Object.assign({}, n, { domainStyle: style }); });',
+                '      allLinks = (SNAPSHOT.links || []).map(function(l){ return Object.assign({}, l); });',
+                '      currentNodes = allNodes.map(function(n){ return Object.assign({}, n); });',
+                '      currentLinks = allLinks.map(function(l){ return Object.assign({}, l); });',
+                '      filteredLinks = currentLinks.slice();',
+                '      baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
+                '      baseCurrentLinks = currentLinks.map(function(l){ return Object.assign({}, l); });',
+                '      activeGroups = new Set(SNAPSHOT.active_groups || []);',
+                '      currentNote = SNAPSHOT.note || "";',
+                '      const fileStatus = document.getElementById("fileStatus");',
+                '      if (fileStatus) fileStatus.textContent = "已加载导出的当前传播图快照";',
+                '      document.getElementById("groupInput").disabled = false;',
+                '      document.getElementById("addGroupBtn").disabled = false;',
+                '      document.getElementById("searchInput").disabled = false;',
+                '      document.getElementById("searchAddBtn").disabled = false;',
+                '      updateActiveGroupsUI();',
+                '      renderAlarmMetaSummary();',
+                '      updateStats();',
+                '      document.getElementById("currentNodes").textContent = currentNodes.length;',
+                '      renderAlarmGroupPartitionSummary();',
+                '      renderMap();',
+                '      renderNodeList();',
+                '      enableNotePanel();',
+                '      loadNoteToPanel();',
+                '      showLoading(false);',
+                '    } catch (error) {',
+                '      console.error("恢复导出传播图失败:", error);',
+                '      if (typeof showError === "function") showError("恢复导出传播图失败: " + (error.message || error));',
+                '    }',
+                '  }',
+                '  document.addEventListener("DOMContentLoaded", function(){ setTimeout(restoreSnapshot, 0); });',
+                '})();'
+            ].join('\\n');
+            let html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
+            html = html.replace(/<\/body>\s*<\/html>\s*$/i, '<scr' + 'ipt>' + snapshotScript + '</scr' + 'ipt></body></html>');
             const nameBase = payload.active_groups.length
                 ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
                 : 'current_view';
