@@ -6521,7 +6521,26 @@
                 '  document.addEventListener("DOMContentLoaded", function(){ setTimeout(restoreSnapshot, 0); });',
                 '})();'
             ].join('\\n');
-            let html = '<!DOCTYPE html>\\n' + document.documentElement.outerHTML;
+            const exportRoot = document.documentElement.cloneNode(true);
+            const exportMap = exportRoot.querySelector('#map');
+            if (exportMap) {
+                exportMap.innerHTML = '';
+                exportMap.className = '';
+                exportMap.removeAttribute('style');
+            }
+            const exportLoading = exportRoot.querySelector('#loadingOverlay');
+            if (exportLoading) {
+                exportLoading.classList.remove('show');
+            }
+            const exportAlarmPopup = exportRoot.querySelector('#alarmPopup');
+            if (exportAlarmPopup) {
+                exportAlarmPopup.classList.remove('show');
+            }
+            const exportDetailPanel = exportRoot.querySelector('#detailPanel');
+            if (exportDetailPanel) {
+                exportDetailPanel.classList.remove('show');
+            }
+            let html = '<!DOCTYPE html>\\n' + exportRoot.outerHTML;
             html = html.replace(/<\/body>\s*<\/html>\s*$/i, '<scr' + 'ipt>' + snapshotScript + '</scr' + 'ipt></body></html>');
             const nameBase = payload.active_groups.length
                 ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
