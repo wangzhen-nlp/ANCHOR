@@ -6475,73 +6475,144 @@
                 return;
             }
             const payload = buildCurrentGroupsExportPayload();
-            const snapshotScript = [
-                '(function(){',
-                '  const SNAPSHOT = JSON.parse(decodeURIComponent(' + JSON.stringify(encodeURIComponent(JSON.stringify(payload))) + '));',
-                '  const exportedMapEl = document.getElementById("map");',
-                '  if (exportedMapEl) {',
-                '    exportedMapEl.innerHTML = "";',
-                '    exportedMapEl.className = "";',
-                '    exportedMapEl.removeAttribute("style");',
-                '  }',
-                '  function restoreSnapshot(){',
-                '    try {',
-                '      graphData = { group_info: {} };',
-                '      (SNAPSHOT.groups || []).forEach(function(group){ graphData.group_info[group.group_id] = group.group_info || {}; });',
-                '      allNodes = (SNAPSHOT.nodes || []).map(function(n){ const style = getDomainStyle(n.domain || ""); return Object.assign({}, n, { domainStyle: style }); });',
-                '      allLinks = (SNAPSHOT.links || []).map(function(l){ return Object.assign({}, l); });',
-                '      currentNodes = allNodes.map(function(n){ return Object.assign({}, n); });',
-                '      currentLinks = allLinks.map(function(l){ return Object.assign({}, l); });',
-                '      filteredLinks = currentLinks.slice();',
-                '      baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
-                '      baseCurrentLinks = currentLinks.map(function(l){ return Object.assign({}, l); });',
-                '      activeGroups = new Set(SNAPSHOT.active_groups || []);',
-                '      currentNote = SNAPSHOT.note || "";',
-                '      const fileStatus = document.getElementById("fileStatus");',
-                '      if (fileStatus) fileStatus.textContent = "已加载导出的当前传播图快照";',
-                '      document.getElementById("groupInput").disabled = false;',
-                '      document.getElementById("addGroupBtn").disabled = false;',
-                '      document.getElementById("searchInput").disabled = false;',
-                '      document.getElementById("searchAddBtn").disabled = false;',
-                '      updateActiveGroupsUI();',
-                '      renderAlarmMetaSummary();',
-                '      updateStats();',
-                '      document.getElementById("currentNodes").textContent = currentNodes.length;',
-                '      renderAlarmGroupPartitionSummary();',
-                '      renderMap();',
-                '      renderNodeList();',
-                '      enableNotePanel();',
-                '      loadNoteToPanel();',
-                '      showLoading(false);',
-                '    } catch (error) {',
-                '      console.error("恢复导出传播图失败:", error);',
-                '      if (typeof showError === "function") showError("恢复导出传播图失败: " + (error.message || error));',
-                '    }',
-                '  }',
-                '  document.addEventListener("DOMContentLoaded", function(){ setTimeout(restoreSnapshot, 0); });',
-                '})();'
-            ].join('\\n');
-            const exportRoot = document.documentElement.cloneNode(true);
-            const exportMap = exportRoot.querySelector('#map');
-            if (exportMap) {
-                exportMap.innerHTML = '';
-                exportMap.className = '';
-                exportMap.removeAttribute('style');
+            const width = 1400;
+            const height = 900;
+            const padding = 80;
+            const nodes = payload.nodes || [];
+            const links = payload.links || [];
+            const nodeById = new Map(nodes.map(function(node) { return [node.id, node]; }));
+            const coordNodes = nodes.map(function(node, index) {
+                const latValue = Number(node.latitude ?? node.lat ?? node.site_lat ?? node.y);
+                const lngValue = Number(node.longitude ?? node.lng ?? node.lon ?? node.site_lng ?? node.x);
+                return { node: node, index: index, lat: latValue, lng: lngValue };
+            });
+            const validCoords = coordNodes.filter(function(item) {
+                return Number.isFinite(item.lat) && Number.isFinite(item.lng);
+            });
+            const minLat = validCoords.length ? Math.min.apply(null, validCoords.map(function(item) { return item.lat; })) : 0;
+            const maxLat = validCoords.length ? Math.max.apply(null, validCoords.map(function(item) { return item.lat; })) : 1;
+            const minLng = validCoords.length ? Math.min.apply(null, validCoords.map(function(item) { return item.lng; })) : 0;
+            const maxLng = validCoords.length ? Math.max.apply(null, validCoords.map(function(item) { return item.lng; })) : 1;
+            const latSpan = Math.max(maxLat - minLat, 0.000001);
+            const lngSpan = Math.max(maxLng - minLng, 0.000001);
+            const cols = Math.max(1, Math.ceil(Math.sqrt(Math.max(nodes.length, 1))));
+            const positionById = new Map();
+
+            coordNodes.forEach(function(item) {
+                let x;
+                let y;
+                if (Number.isFinite(item.lat) && Number.isFinite(item.lng)) {
+                    x = padding + ((item.lng - minLng) / lngSpan) * (width - padding * 2);
+                    y = padding + ((maxLat - item.lat) / latSpan) * (height - padding * 2);
+                } else {
+                    x = padding + (item.index % cols) * ((width - padding * 2) / Math.max(cols - 1, 1));
+                    y = padding + Math.floor(item.index / cols) * 90;
+                }
+                positionById.set(item.node.id, { x: x, y: y });
+            });
+
+            function nodeAlarmCount(node) {
+                return Array.isArray(node.alarm) ? node.alarm.length : 0;
             }
-            const exportLoading = exportRoot.querySelector('#loadingOverlay');
-            if (exportLoading) {
-                exportLoading.classList.remove('show');
+
+            function nodeAlarmGroupIds(node) {
+                const seen = new Set();
+                (Array.isArray(node.alarm) ? node.alarm : []).forEach(function(alarm) {
+                    const groupId = getAlarmFaultGroupId(alarm);
+                    if (groupId) seen.add(groupId);
+                });
+                return Array.from(seen);
             }
-            const exportAlarmPopup = exportRoot.querySelector('#alarmPopup');
-            if (exportAlarmPopup) {
-                exportAlarmPopup.classList.remove('show');
+
+            function nodeExportTitle(node) {
+                return [
+                    getRawNodeId(node),
+                    '站点: ' + (node.site_id || '-'),
+                    'Domain: ' + (node.domain || '-'),
+                    'Group: ' + (node.group || '-'),
+                    '告警数: ' + nodeAlarmCount(node),
+                    '故障组ID: ' + (nodeAlarmGroupIds(node).join(', ') || '-')
+                ].join('\n');
             }
-            const exportDetailPanel = exportRoot.querySelector('#detailPanel');
-            if (exportDetailPanel) {
-                exportDetailPanel.classList.remove('show');
+
+            function linkRelation(link) {
+                return link.predicted_relation || link.relation || link.topology || link.edge_source || '';
             }
-            let html = '<!DOCTYPE html>\\n' + exportRoot.outerHTML;
-            html = html.replace(/<\/body>\s*<\/html>\s*$/i, '<scr' + 'ipt>' + snapshotScript + '</scr' + 'ipt></body></html>');
+
+            function linkColor(link) {
+                if (link.missing_topology_prediction) {
+                    return String(linkRelation(link)).toLowerCase().indexOf('bidirection') >= 0 ? '#7c3aed' : '#0f5132';
+                }
+                return '#57606a';
+            }
+
+            const linkSvg = links.map(function(link) {
+                const sourcePos = positionById.get(link.source);
+                const targetPos = positionById.get(link.target);
+                if (!sourcePos || !targetPos) return '';
+                const missingAttrs = link.missing_topology_prediction ? ' stroke-dasharray="10 6" stroke-width="4"' : ' stroke-width="2"';
+                return '<line x1="' + sourcePos.x.toFixed(1) + '" y1="' + sourcePos.y.toFixed(1) +
+                    '" x2="' + targetPos.x.toFixed(1) + '" y2="' + targetPos.y.toFixed(1) +
+                    '" stroke="' + linkColor(link) + '"' + missingAttrs + ' opacity="0.78">' +
+                    '<title>' + escapeHtml((link.source || '') + ' -> ' + (link.target || '') + ' ' + linkRelation(link)) + '</title></line>';
+            }).join('');
+
+            const nodeSvg = nodes.map(function(node) {
+                const pos = positionById.get(node.id);
+                if (!pos) return '';
+                const style = getDomainStyle(node.domain || '');
+                const alarmCount = nodeAlarmCount(node);
+                const groupText = nodeAlarmGroupIds(node).slice(0, 2).join(' / ');
+                return '<g class="node">' +
+                    '<circle cx="' + pos.x.toFixed(1) + '" cy="' + pos.y.toFixed(1) + '" r="' + (alarmCount > 0 ? 18 : 13) +
+                    '" fill="' + style.color + '" stroke="#ffffff" stroke-width="4"></circle>' +
+                    '<text x="' + pos.x.toFixed(1) + '" y="' + (pos.y + 4).toFixed(1) + '" text-anchor="middle" fill="#ffffff" font-size="11" font-weight="800">' + alarmCount + '</text>' +
+                    '<text x="' + pos.x.toFixed(1) + '" y="' + (pos.y + 32).toFixed(1) + '" text-anchor="middle" fill="#24292f" font-size="11" font-weight="700">' + escapeHtml(getRawNodeId(node)) + '</text>' +
+                    (groupText ? '<text x="' + pos.x.toFixed(1) + '" y="' + (pos.y + 47).toFixed(1) + '" text-anchor="middle" fill="#8250df" font-size="10" font-weight="700">' + escapeHtml(groupText) + '</text>' : '') +
+                    '<title>' + escapeHtml(nodeExportTitle(node)) + '</title>' +
+                '</g>';
+            }).join('');
+
+            const alarmRows = payload.alarms.map(function(alarm) {
+                return '<tr><td>' + escapeHtml(alarm.ne_id) + '</td><td>' + escapeHtml(alarm.site_id) + '</td><td>' +
+                    escapeHtml(alarm.fault_group_id || '-') + '</td><td>' + escapeHtml(alarm.alarm_id || '-') + '</td><td>' +
+                    escapeHtml(alarm.alarm_type || '-') + '</td><td>' + escapeHtml(alarm.time || '-') + '</td></tr>';
+            }).join('');
+
+            const nodeRows = nodes.map(function(node) {
+                const style = getDomainStyle(node.domain || '');
+                return '<tr><td><span class="dot" style="background:' + style.color + '"></span>' + escapeHtml(getRawNodeId(node)) + '</td><td>' +
+                    escapeHtml(node.site_id || '-') + '</td><td>' + escapeHtml(style.label) + '</td><td>' +
+                    nodeAlarmCount(node) + '</td><td>' + escapeHtml(nodeAlarmGroupIds(node).join(', ') || '-') + '</td></tr>';
+            }).join('');
+
+            const html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">' +
+                '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+                '<title>NE传播图导出</title>' +
+                '<style>' +
+                    'body{margin:0;background:#f6f8fa;color:#24292f;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}' +
+                    '.page{max-width:1500px;margin:0 auto;padding:24px;}' +
+                    'h1{margin:0 0 8px;color:#0969da;font-size:24px}.sub{color:#57606a;font-size:13px;line-height:1.6;margin-bottom:14px}' +
+                    '.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:14px 0}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:12px}.card b{font-size:22px;color:#0969da}' +
+                    '.graph{background:#fff;border:1px solid #d0d7de;border-radius:12px;overflow:auto;box-shadow:0 2px 10px rgba(0,0,0,.05)}svg{display:block;min-width:100%;height:auto}.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:#57606a;margin:10px 0 18px}.legend span{display:inline-flex;align-items:center;gap:6px}.line{width:26px;height:0;border-top:3px solid #57606a}.line.missing{border-top:4px dashed #0f5132}.line.bi{border-top:4px dashed #7c3aed}' +
+                    'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d0d7de;border-radius:10px;overflow:hidden;margin-top:10px;font-size:12px}th,td{padding:8px 10px;border-bottom:1px solid #d8dee4;text-align:left;vertical-align:top;word-break:break-word}th{background:#f0f6ff;color:#0969da}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.note{white-space:pre-wrap;background:#fff8c5;border:1px solid #f0c36d;border-radius:8px;padding:10px;margin:12px 0}' +
+                '</style></head><body><div class="page">' +
+                '<h1>NE传播图导出</h1>' +
+                '<div class="sub">导出时间: ' + escapeHtml(payload.exported_at_local) + '<br>当前 Group: ' + escapeHtml(payload.active_groups.join(', ') || '无') + '</div>' +
+                '<div class="cards">' +
+                    '<div class="card"><b>' + payload.summary.active_group_count + '</b><div>故障组</div></div>' +
+                    '<div class="card"><b>' + payload.summary.site_count + '</b><div>站点</div></div>' +
+                    '<div class="card"><b>' + payload.summary.node_count + '</b><div>设备</div></div>' +
+                    '<div class="card"><b>' + payload.summary.link_count + '</b><div>连边</div></div>' +
+                    '<div class="card"><b>' + payload.summary.alarm_count + '</b><div>告警</div></div>' +
+                    '<div class="card"><b>' + payload.summary.missing_topology_link_count + '</b><div>补全/弱拓扑边</div></div>' +
+                '</div>' +
+                (payload.note ? '<div class="note">' + escapeHtml(payload.note) + '</div>' : '') +
+                '<div class="legend"><span><i class="line"></i>原始/已有连边</span><span><i class="line missing"></i>有向补全/弱拓扑边</span><span><i class="line bi"></i>双向补全/弱拓扑边</span><span>节点数字表示告警数</span></div>' +
+                '<div class="graph"><svg viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="NE传播图">' + linkSvg + nodeSvg + '</svg></div>' +
+                '<h2>设备明细</h2><table><thead><tr><th>NE</th><th>站点</th><th>Domain</th><th>告警数</th><th>告警故障组ID</th></tr></thead><tbody>' + nodeRows + '</tbody></table>' +
+                '<h2>告警明细</h2><table><thead><tr><th>NE</th><th>站点</th><th>告警故障组ID</th><th>告警ID</th><th>告警类型</th><th>发生时间</th></tr></thead><tbody>' + alarmRows + '</tbody></table>' +
+                '</div></body></html>';
             const nameBase = payload.active_groups.length
                 ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
                 : 'current_view';
