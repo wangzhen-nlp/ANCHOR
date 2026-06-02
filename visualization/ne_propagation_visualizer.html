@@ -6489,7 +6489,6 @@
 
         function buildCurrentGroupsReportHtml(payload) {
             const jsonText = JSON.stringify(payload, null, 2);
-            const scriptJsonText = jsonText.replace(/<\/script/gi, '<\\/script').replace(/<!--/g, '<\\!--');
             const activeGroupText = payload.active_groups.length ? payload.active_groups.join(', ') : '无';
             const title = 'NE传播图故障组导出 - ' + activeGroupText;
             const summaryCards = [
@@ -6597,7 +6596,6 @@
                 '<h2>补全/弱拓扑边</h2>' + missingTopologyTable +
                 '<h2>告警明细</h2>' + alarmTable +
                 '<h2>完整导出 JSON</h2><details open><summary>展开/收起完整 JSON</summary><pre>' + escapeHtml(jsonText) + '</pre></details>' +
-                '<script type="application/json" id="fault-group-export-data">' + scriptJsonText + '<\/script>' +
                 '</div></body></html>';
         }
 
