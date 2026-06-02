@@ -6469,134 +6469,41 @@
             };
         }
 
-        function renderExportTable(headers, rows, emptyText) {
-            if (!rows || rows.length === 0) {
-                return '<div class="empty">' + escapeHtml(emptyText || '无数据') + '</div>';
-            }
-            return '<table><thead><tr>' +
-                headers.map(function(header) { return '<th>' + escapeHtml(header.label) + '</th>'; }).join('') +
-                '</tr></thead><tbody>' +
-                rows.map(function(row) {
-                    return '<tr>' + headers.map(function(header) {
-                        let value = typeof header.value === 'function' ? header.value(row) : row[header.key];
-                        if (Array.isArray(value)) value = value.join(', ');
-                        if (value && typeof value === 'object') value = JSON.stringify(value);
-                        return '<td>' + escapeHtml(value === null || value === undefined || value === '' ? '-' : value) + '</td>';
-                    }).join('') + '</tr>';
-                }).join('') +
-                '</tbody></table>';
-        }
-
         function buildCurrentGroupsReportHtml(payload) {
             const jsonText = JSON.stringify(payload, null, 2);
+            const encodedPayload = encodeURIComponent(jsonText);
             const activeGroupText = payload.active_groups.length ? payload.active_groups.join(', ') : '无';
             const title = 'NE传播图故障组导出 - ' + activeGroupText;
-            const summaryCards = [
-                ['激活故障组', payload.summary.active_group_count],
-                ['站点数', payload.summary.site_count],
-                ['设备数', payload.summary.node_count],
-                ['连边数', payload.summary.link_count],
-                ['告警数', payload.summary.alarm_count],
-                ['弱拓扑/补全边', payload.summary.missing_topology_link_count]
-            ].map(function(item) {
-                return '<div class="card"><div class="card-value">' + escapeHtml(item[1]) + '</div><div class="card-label">' + escapeHtml(item[0]) + '</div></div>';
-            }).join('');
-
-            const groupTable = renderExportTable([
-                { label: 'Group ID', key: 'group_id' },
-                { label: '站点数', value: function(row) { return row.group_info && row.group_info.site_list ? row.group_info.site_list.length : 0; } },
-                { label: '设备数', value: function(row) { return row.group_info && row.group_info.ne_list ? row.group_info.ne_list.length : 0; } },
-                { label: '规则', value: function(row) {
-                    const rules = row.group_info && row.group_info.rule ? row.group_info.rule : (row.group_info && row.group_info.rules ? row.group_info.rules : []);
-                    return Array.isArray(rules) ? rules.join(', ') : rules;
-                } }
-            ], payload.groups, '无激活故障组');
-
-            const partitionTable = renderExportTable([
-                { label: '告警故障组ID', key: 'group_id' },
-                { label: '告警数', key: 'alarm_count' },
-                { label: '设备', key: 'ne_ids' },
-                { label: '站点', key: 'site_ids' },
-                { label: '告警类型', key: 'alarm_types' }
-            ], payload.alarm_group_partition, '当前告警无故障组ID');
-
-            const siteTable = renderExportTable([
-                { label: '站点ID', key: 'site_id' },
-                { label: '站点名', key: 'site_name' },
-                { label: '设备数', key: 'ne_count' },
-                { label: '告警数', key: 'alarm_count' },
-                { label: 'Domain', key: 'domains' },
-                { label: '设备', key: 'ne_ids' }
-            ], payload.sites, '无站点');
-
-            const nodeTable = renderExportTable([
-                { label: 'NE', value: function(row) { return getRawNodeId(row); } },
-                { label: '站点', key: 'site_id' },
-                { label: 'Domain', key: 'domain' },
-                { label: 'Group', key: 'group' },
-                { label: '告警数', value: function(row) { return Array.isArray(row.alarm) ? row.alarm.length : 0; } },
-                { label: '角色', value: function(row) { return row.matched_role || row.role || ''; } }
-            ], payload.nodes, '无设备');
-
-            const linkTable = renderExportTable([
-                { label: 'Source', key: 'source' },
-                { label: 'Target', key: 'target' },
-                { label: '类型', value: function(row) { return row.predicted_relation || row.relation || row.topology || row.edge_source || ''; } },
-                { label: 'Score', key: 'score' },
-                { label: '补全拓扑', value: function(row) { return row.missing_topology_prediction ? '是' : '否'; } }
-            ], payload.links, '无连边');
-
-            const alarmTable = renderExportTable([
-                { label: 'NE', key: 'ne_id' },
-                { label: '站点', key: 'site_id' },
-                { label: '告警故障组ID', key: 'fault_group_id' },
-                { label: '告警ID', key: 'alarm_id' },
-                { label: '告警类型', key: 'alarm_type' },
-                { label: '级别', key: 'severity' },
-                { label: '发生时间', key: 'time' },
-                { label: '清除时间', key: 'clear_time' },
-                { label: '工单号', key: 'ticket_id' }
-            ], payload.alarms, '无告警');
-
-            const missingTopologyTable = renderExportTable([
-                { label: 'Source', key: 'source' },
-                { label: 'Target', key: 'target' },
-                { label: '预测关系', value: function(row) { return normalizeMissingTopologyRelation(row); } },
-                { label: 'Score', key: 'score' },
-                { label: '来源', key: 'edge_source' }
-            ], payload.missing_topology_links, '无补全拓扑边');
+            const exportScript =
+                'const DATA = JSON.parse(decodeURIComponent(' + JSON.stringify(encodedPayload) + '));\n' +
+                'const DOMAIN_STYLE = {DATA:{color:"#00BFFF",label:"Data"},IP:{color:"#00BFFF",label:"Data"},Transmission:{color:"#FF8C00",label:"Transmission"},RAN:{color:"#32CD32",label:"RAN"},DEFAULT:{color:"#808080",label:"Other"}};\n' +
+                'function esc(v){return String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/\\x27/g,"&#39;");}\n' +
+                'function domainStyle(d){const s=String(d||"").toLowerCase(); if(s.includes("data")||s.includes("ip")) return DOMAIN_STYLE.DATA; if(s.includes("trans")||s.includes("microwave")) return DOMAIN_STYLE.Transmission; if(s.includes("ran")) return DOMAIN_STYLE.RAN; return DOMAIN_STYLE.DEFAULT;}\n' +
+                'function rawId(n){const id=String((n&&n.id)||""); return id.split("::").pop()||id||"-";}\n' +
+                'function lat(n){return Number(n.lat??n.latitude??n.site_lat??n.y);} function lng(n){return Number(n.lng??n.lon??n.longitude??n.site_lng??n.x);}\n' +
+                'function alarmCount(n){return Array.isArray(n.alarm)?n.alarm.length:0;}\n' +
+                'function groupIdOfAlarm(a){return String((a&&(\n' +
+                'a["故障组ID"]??a.fault_group_id??a.faultGroupId??a.alarm_group_id??a.alarmGroupId??a.group_id??a.groupId))||"").trim();}\n' +
+                'function alarmGroups(n){const seen=new Set(); (Array.isArray(n.alarm)?n.alarm:[]).forEach(a=>{const g=groupIdOfAlarm(a); if(g) seen.add(g);}); return Array.from(seen);}\n' +
+                'function endpoint(e){return e&&typeof e==="object" ? e.id : String(e||"");}\n' +
+                'function relationLabel(l){return l.predicted_relation||l.relation||l.topology||l.edge_source||"";}\n' +
+                'function lineColor(l){if(l.missing_topology_prediction){const r=String(relationLabel(l)).toLowerCase(); return r.includes("bidirection")?"#7c3aed":"#0f5132";} return "#57606a";}\n' +
+                'function nodeHtml(n){const s=domainStyle(n.domain); const groups=alarmGroups(n); return "<div class=\\"node-row\\" data-node-id=\\""+esc(n.id)+"\\"><span class=\\"dot\\" style=\\"background:"+s.color+"\\"></span><div><b>"+esc(rawId(n))+"</b><div class=\\"muted\\">站点 "+esc(n.site_id||"-")+" | "+esc(s.label)+" | 告警 "+alarmCount(n)+"</div>"+(groups.length?"<div class=\\"group-line\\">故障组ID: "+groups.map(esc).join(", ")+"</div>":"")+"</div></div>";}\n' +
+                'function popupHtml(n){const alarms=Array.isArray(n.alarm)?n.alarm:[]; return "<b>"+esc(rawId(n))+"</b><br>站点: "+esc(n.site_id||"-")+"<br>Domain: "+esc(n.domain||"-")+"<br>Group: "+esc(n.group||"-")+"<hr>"+(alarms.length?alarms.map(a=>"<div class=\\"alarm\\"><b>"+esc(a.alarm_type||a.alarm||a.title||"未知告警")+"</b><br>故障组ID: "+esc(groupIdOfAlarm(a)||"-")+"<br>告警ID: "+esc(a.alarm_id||a.eid||a.id||"-")+"<br>时间: "+esc(a.time||a.alarm_time||a.time_str||"-")+"</div>").join(""):"无告警");}\n' +
+                'function build(){document.getElementById("title").textContent="NE传播图故障组导出"; document.getElementById("subtitle").textContent="导出时间: "+DATA.exported_at_local+" | 当前 Group: "+(DATA.active_groups.length?DATA.active_groups.join(", "):"无"); document.getElementById("stats").innerHTML=["激活故障组 "+DATA.summary.active_group_count,"站点 "+DATA.summary.site_count,"设备 "+DATA.summary.node_count,"连边 "+DATA.summary.link_count,"告警 "+DATA.summary.alarm_count,"补全边 "+DATA.summary.missing_topology_link_count].map(x=>"<span>"+esc(x)+"</span>").join(""); document.getElementById("nodeList").innerHTML=DATA.nodes.map(nodeHtml).join(""); const map=L.map("map"); const osm=L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"&copy; OpenStreetMap"}).addTo(map); const markers=new Map(); const bounds=[]; DATA.nodes.forEach(n=>{const la=lat(n),lo=lng(n); if(!Number.isFinite(la)||!Number.isFinite(lo)) return; const st=domainStyle(n.domain); const html="<div class=\\"marker\\" style=\\"--c:"+st.color+"\\"><span>"+alarmCount(n)+"</span></div>"; const m=L.marker([la,lo],{icon:L.divIcon({className:"",html:html,iconSize:[28,28],iconAnchor:[14,14]})}).bindPopup(popupHtml(n)).addTo(map); markers.set(n.id,m); bounds.push([la,lo]);}); DATA.links.forEach(l=>{const s=markers.get(l.source),t=markers.get(l.target); if(!s||!t) return; L.polyline([s.getLatLng(),t.getLatLng()],{color:lineColor(l),weight:l.missing_topology_prediction?4:2,opacity:l.missing_topology_prediction?0.95:0.65,dashArray:l.missing_topology_prediction?"8,5":null}).bindTooltip(esc((l.source||"")+" -> "+(l.target||"")+" "+relationLabel(l))).addTo(map);}); if(bounds.length){map.fitBounds(bounds,{padding:[40,40]});} else {map.setView([30,110],5);} }\n' +
+                'build();';
 
             return '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">' +
                 '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
                 '<title>' + escapeHtml(title) + '</title>' +
-                '<style>' +
-                    'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f6f8fa;color:#24292f;}' +
-                    '.page{max-width:1280px;margin:0 auto;padding:28px;}' +
-                    'h1{font-size:24px;margin:0 0 8px;color:#0969da;} h2{font-size:18px;margin:28px 0 12px;border-left:5px solid #0969da;padding-left:10px;}' +
-                    '.sub{color:#57606a;font-size:13px;margin-bottom:18px;line-height:1.6;}' +
-                    '.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0;}' +
-                    '.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:14px;box-shadow:0 1px 2px rgba(27,31,36,.04);}' +
-                    '.card-value{font-size:24px;font-weight:800;color:#0969da;}.card-label{font-size:12px;color:#57606a;margin-top:4px;}' +
-                    'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d0d7de;border-radius:8px;overflow:hidden;font-size:12px;}' +
-                    'th,td{border-bottom:1px solid #d8dee4;padding:8px 10px;text-align:left;vertical-align:top;word-break:break-word;} th{background:#f0f6ff;color:#0969da;font-weight:700;}' +
-                    'tr:last-child td{border-bottom:none;}.empty{background:#fff;border:1px dashed #d0d7de;border-radius:8px;padding:14px;color:#8c959f;}' +
-                    'details{background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:12px;margin-top:12px;} summary{cursor:pointer;font-weight:700;color:#0969da;}' +
-                    'pre{white-space:pre-wrap;word-break:break-word;background:#0d1117;color:#c9d1d9;border-radius:8px;padding:14px;max-height:520px;overflow:auto;}' +
-                    '.note{background:#fff8c5;border:1px solid #f0c36d;border-radius:8px;padding:12px;white-space:pre-wrap;}' +
-                '</style></head><body><div class="page">' +
-                '<h1>NE传播图故障组导出</h1>' +
-                '<div class="sub">导出时间: ' + escapeHtml(payload.exported_at_local) + '<br>当前激活 Group: ' + escapeHtml(activeGroupText) + '</div>' +
-                '<div class="cards">' + summaryCards + '</div>' +
-                (payload.note ? '<h2>备注</h2><div class="note">' + escapeHtml(payload.note) + '</div>' : '') +
-                '<h2>当前激活 Group</h2>' + groupTable +
-                '<h2>当前告警按故障组ID划分</h2>' + partitionTable +
-                '<h2>站点汇总</h2>' + siteTable +
-                '<h2>设备明细</h2>' + nodeTable +
-                '<h2>连边明细</h2>' + linkTable +
-                '<h2>补全/弱拓扑边</h2>' + missingTopologyTable +
-                '<h2>告警明细</h2>' + alarmTable +
-                '<h2>完整导出 JSON</h2><details open><summary>展开/收起完整 JSON</summary><pre>' + escapeHtml(jsonText) + '</pre></details>' +
-                '</div></body></html>';
+                '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">' +
+                '<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#24292f;background:#f6f8fa}.layout{display:grid;grid-template-columns:360px 1fr;height:100vh}.sidebar{background:#fff;border-right:1px solid #d0d7de;padding:16px;overflow:auto}.sidebar h1{font-size:18px;color:#0969da;margin:0 0 6px}.muted{color:#57606a;font-size:12px;line-height:1.5}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.stats span{background:#f0f6ff;border:1px solid #d0d7de;border-radius:8px;padding:8px;font-size:12px;font-weight:700;color:#0969da}.node-row{display:flex;gap:8px;padding:8px;border:1px solid #d8dee4;border-radius:8px;margin:7px 0;background:#fff}.dot{width:12px;height:12px;border-radius:50%;margin-top:4px;flex-shrink:0}.group-line{margin-top:3px;font-size:11px;color:#8250df}.map-wrap{position:relative}#map{height:100vh;width:100%}.marker{width:28px;height:28px;border-radius:50%;background:var(--c);border:3px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:900}.alarm{border-top:1px solid #d8dee4;margin-top:6px;padding-top:6px;font-size:12px}.legend{position:absolute;right:16px;bottom:20px;z-index:500;background:#fff;border:1px solid #d0d7de;border-radius:8px;padding:10px;font-size:12px;box-shadow:0 2px 10px rgba(0,0,0,.12)}</style>' +
+                '</head><body><div class="layout"><aside class="sidebar"><h1 id="title"></h1><div class="muted" id="subtitle"></div><div class="stats" id="stats"></div>' +
+                (payload.note ? '<h2 style="font-size:14px;">备注</h2><div class="muted" style="white-space:pre-wrap;background:#fff8c5;border:1px solid #f0c36d;border-radius:8px;padding:8px;">' + escapeHtml(payload.note) + '</div>' : '') +
+                '<h2 style="font-size:14px;">设备列表</h2><div id="nodeList"></div></aside><main class="map-wrap"><div id="map"></div><div class="legend">实线: 原始拓扑 / 虚线粗线: 补全或弱拓扑边</div></main></div>' +
+                '<scr' + 'ipt src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></scr' + 'ipt>' +
+                '<scr' + 'ipt>' + exportScript + '</scr' + 'ipt>' +
+                '</body></html>';
         }
 
         function exportCurrentGroupsHtml() {
@@ -6610,7 +6517,7 @@
                 ? payload.active_groups.slice(0, 3).join('_') + (payload.active_groups.length > 3 ? '_等' + payload.active_groups.length + '组' : '')
                 : 'current_view';
             const timestampPart = payload.exported_at_local.replace(/[-:\s]/g, '');
-            const filename = 'fault_group_report_' + sanitizeFileNamePart(nameBase) + '_' + timestampPart + '.html';
+            const filename = 'fault_group_propagation_' + sanitizeFileNamePart(nameBase) + '_' + timestampPart + '.html';
             const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
