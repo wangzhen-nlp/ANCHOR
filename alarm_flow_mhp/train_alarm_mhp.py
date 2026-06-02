@@ -115,6 +115,9 @@ def _build_config(args):
         tol=args.tol,
         alpha_prior_strength=args.alpha_prior_strength,
         alpha_prior_mean=args.alpha_prior_mean,
+        topology_prior_boost=args.topology_prior_boost,
+        topology_prior_max_hops=args.topology_prior_max_hops,
+        topology_prior_min_score=args.topology_prior_min_score,
         mu_count_smoothing=args.mu_count_smoothing,
         beta_mode=args.beta_mode,
         beta_shared_value=args.beta_shared_value,
@@ -187,6 +190,30 @@ def main():
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)
     parser.add_argument("--alpha-prior-mean", type=float, default=0.1)
+    parser.add_argument(
+        "--topology-prior-boost",
+        type=float,
+        default=0.0,
+        help=(
+            "Inject extra MAP prior mass on topologically-related (target, source) "
+            "type pairs, so rare or zero-co-occurrence but physically connected "
+            "device pairs still form an edge. 0 disables (pure data-driven). "
+            "Try 0.3. Requires the NE graph (loaded by default). The prior is "
+            "auto-weighted toward rare sources, where data-driven edges are missing."
+        ),
+    )
+    parser.add_argument(
+        "--topology-prior-max-hops",
+        type=int,
+        default=1,
+        help="NE-graph hops for the topology prior. 1 = same-NE + direct links only. Default: 1.",
+    )
+    parser.add_argument(
+        "--topology-prior-min-score",
+        type=float,
+        default=0.6,
+        help="Drop topology relations weaker than this (0-1). Default: 0.6 (keeps same-NE/direct).",
+    )
     parser.add_argument(
         "--mu-count-smoothing",
         choices=("linear", "log"),
@@ -307,13 +334,15 @@ def main():
         ne_graph_data = load_ne_graph(args.ne_graph)
         if config.regions:
             ne_graph_data, _stats = filter_ne_graph_by_regions(ne_graph_data, config.regions)
+        # The index must reach at least as far as the topology prior needs.
+        index_hops = max(args.topology_max_hops, args.topology_prior_max_hops)
         _print_progress(
-            f"[train] building topology index (max_hops={args.topology_max_hops}) ...",
+            f"[train] building topology index (max_hops={index_hops}) ...",
             args,
         )
         topology_index = NETopologyIndex.from_graph(
             ne_graph_data,
-            max_hops=args.topology_max_hops,
+            max_hops=index_hops,
         )
 
     _print_progress("[train] fitting model (MAP EM)...", args)

@@ -70,6 +70,13 @@ class AlarmMHPConfig:
     tol: float = 1e-4
     alpha_prior_strength: float = 10.0
     alpha_prior_mean: float = 0.1
+    # Topology prior: inject extra MAP prior mass on topologically-related
+    # (target, source) type pairs so rare/zero-co-occurrence but physically
+    # connected device pairs still form (or strengthen) an edge. boost=0
+    # disables (pure data-driven). Needs the NE graph at train time.
+    topology_prior_boost: float = 0.0
+    topology_prior_max_hops: int = 1         # 1 = same-NE + direct links only
+    topology_prior_min_score: float = 0.6    # drop weak (far multi-hop) relations
     mu_count_smoothing: str = "log"
     beta_mode: str = "shared"
     beta_shared_value: float = 1.0
@@ -109,6 +116,12 @@ class AlarmMHPConfig:
             raise ValueError("alpha_prior_strength must be > 0")
         if self.alpha_prior_mean < 0:
             raise ValueError("alpha_prior_mean must be non-negative")
+        if self.topology_prior_boost < 0:
+            raise ValueError("topology_prior_boost must be non-negative")
+        if self.topology_prior_max_hops < 1:
+            raise ValueError("topology_prior_max_hops must be >= 1")
+        if not (0.0 <= self.topology_prior_min_score <= 1.0):
+            raise ValueError("topology_prior_min_score must be in [0, 1]")
         if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
             raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.beta_mode not in BETA_MODES:
@@ -176,6 +189,7 @@ class AlarmMHPConfig:
             tol=self.tol,
             alpha_prior_strength=self.alpha_prior_strength,
             alpha_prior_mean=self.alpha_prior_mean,
+            topology_prior_boost=self.topology_prior_boost,
             mu_count_smoothing=self.mu_count_smoothing,
             beta_mode=self.beta_mode,
             beta_shared_value=self.beta_shared_value,
@@ -597,12 +611,43 @@ def train_alarm_mhp(
             "log_likelihood_train": trace_entry["log_likelihood"],
         })
 
+    # Topology prior (optional): sparse extra prior mass on topologically
+    # related (target, source) pairs so rare/zero-co-occurrence but connected
+    # device pairs still get an edge. Built once from the NE graph.
+    topo_prior_flat = None
+    topo_prior_score = None
+    if config.topology_prior_boost > 0 and topology_index is not None:
+        topo_prior_flat, topo_prior_score = build_topology_pairs(
+            vocabs,
+            config.type_fields,
+            topology_index,
+            max_hops=config.topology_prior_max_hops,
+            min_score=config.topology_prior_min_score,
+        )
+        if verbose:
+            print(
+                f"[train] topology prior: {len(topo_prior_flat)} related (target,source) "
+                f"pairs (boost={config.topology_prior_boost}, max_hops="
+                f"{config.topology_prior_max_hops}, min_score={config.topology_prior_min_score})",
+                flush=True,
+            )
+    elif config.topology_prior_boost > 0 and topology_index is None and verbose:
+        print("[train] WARN: topology_prior_boost > 0 but no NE graph loaded → prior disabled", flush=True)
+
     if config.kernel_type == "piecewise":
-        # Stage 1: exp-kernel fit selects the sparse active edge set + μ.
+        # Stage 1: exp-kernel fit selects the sparse active edge set + μ. The
+        # topology prior applies HERE (edge selection); stage 2 only learns θ
+        # on the resulting edges.
         if verbose:
             print("[train] kernel=piecewise → stage 1: exp-kernel edge selection", flush=True)
         stage1_config = replace(mhp_config, kernel_type="exp")
-        stage1 = fit_mhp(train_events, stage1_config, iter_callback=iter_callback)
+        stage1 = fit_mhp(
+            train_events,
+            stage1_config,
+            iter_callback=iter_callback,
+            topo_prior_flat=topo_prior_flat,
+            topo_prior_score=topo_prior_score,
+        )
         # Stage 2: box-basis EM on the fixed edges from stage 1.
         if verbose:
             print(
@@ -621,6 +666,8 @@ def train_alarm_mhp(
             train_events,
             mhp_config,
             iter_callback=iter_callback,
+            topo_prior_flat=topo_prior_flat,
+            topo_prior_score=topo_prior_score,
         )
 
     final_val_ll: Optional[float] = None
@@ -891,6 +938,103 @@ def _format_bucket_label(lo_sec: float, hi_sec: float) -> str:
             return f"{s / 60:.0f}min"
         return f"{s / 3600:.0f}h"
     return f"{fmt(lo_sec)}-{fmt(hi_sec)}"
+
+
+def _ne_pair_topo_score(source_ne: str, target_ne: str, topology_index) -> float:
+    """Directed topology relation score (source → target), NE-level.
+
+    Mirrors the cross-NE branch of _topology_relation_score (same buckets), but
+    works on NE strings only (no site_id). Returns 0 if unrelated.
+    """
+    if source_ne == target_ne:
+        return 1.0
+    features = topology_index.pair_features(source_ne, target_ne)
+    if not features:
+        return 0.0
+    # features: [same, direct_fwd, direct_rev, direct_bi, reach_fwd, reach_rev,
+    #            undirected_reach, ...]
+    if features[1] > 0:
+        return 1.0
+    if features[2] > 0 or features[3] > 0:
+        return 0.85
+    if features[4] > 0:
+        return 0.75
+    if features[5] > 0:
+        return 0.6
+    if features[6] > 0:
+        return 0.45
+    return 0.0
+
+
+def build_topology_pairs(vocabs, type_fields, topology_index, *, max_hops, min_score):
+    """Build the sparse topology prior: (flat_index, score) for every
+    topologically-related (target_type, source_type) pair among active types.
+
+    flat_index = target_type_id * M + source_type_id (matches the EM's α
+    flattening). Score in (0, 1] graded by relation strength (same NE / direct /
+    multi-hop). Edges are generated by traversing the NE graph (not M²): types
+    are grouped by NE, then same-NE pairs and graph-reachable NE pairs (within
+    max_hops, score >= min_score) are crossed.
+
+    Returns (flat_idx int64 array, score float64 array), max score kept per pair.
+    """
+    if topology_index is None:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    labels = vocabs.type_vocab.labels
+    M = len(labels)
+    try:
+        src_field_idx = tuple(type_fields).index("alarm_source")
+    except ValueError:
+        # No NE field in the type → topology prior is meaningless
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+
+    def _ne_of(label):
+        parts = str(label).split(" | ")
+        return parts[src_field_idx] if len(parts) > src_field_idx else ""
+
+    # Group active type_ids by their NE
+    ne_to_types: dict[str, list[int]] = defaultdict(list)
+    for tid, label in enumerate(labels):
+        ne = _ne_of(label)
+        if ne and ne != "<empty>":
+            ne_to_types[ne].append(tid)
+
+    undirected_hops = getattr(topology_index, "undirected_hops", {}) or {}
+    pair_score: dict[int, float] = {}
+
+    def _emit(target_tid, source_tid, score):
+        key = target_tid * M + source_tid
+        prev = pair_score.get(key)
+        if prev is None or score > prev:
+            pair_score[key] = score
+
+    # 1) Same-NE pairs (includes self-loops) → score 1.0
+    for ne, tids in ne_to_types.items():
+        for u in tids:
+            for v in tids:
+                _emit(u, v, 1.0)
+
+    # 2) Cross-NE pairs reachable within max_hops (source → target)
+    for source_ne, source_tids in ne_to_types.items():
+        reachable = undirected_hops.get(source_ne, {})
+        for target_ne, hop in reachable.items():
+            if hop > max_hops or target_ne == source_ne:
+                continue
+            target_tids = ne_to_types.get(target_ne)
+            if not target_tids:
+                continue
+            score = _ne_pair_topo_score(source_ne, target_ne, topology_index)
+            if score < min_score:
+                continue
+            for u in target_tids:        # target type
+                for v in source_tids:    # source type (excites target)
+                    _emit(u, v, score)
+
+    if not pair_score:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    flat = np.fromiter(pair_score.keys(), dtype=np.int64, count=len(pair_score))
+    score = np.fromiter(pair_score.values(), dtype=np.float64, count=len(pair_score))
+    return flat, score
 
 
 def _topology_consistency_report(

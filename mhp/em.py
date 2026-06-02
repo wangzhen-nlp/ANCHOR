@@ -85,6 +85,12 @@ class MHPConfig:
     # bucket_edges are right edges in MODEL TIME (ascending, last == window).
     kernel_type: str = "exp"                 # "exp" | "piecewise"
     bucket_edges: tuple = ()                  # set by aggregator from real-sec config
+    # Topology prior: extra MAP prior mass on topologically-related (target,
+    # source) type pairs so they get (or strengthen) an edge even with little/no
+    # co-occurrence. The actual (flat_idx, score) pairs are passed to fit_mhp
+    # by the alarm layer (it knows the NE graph); this scalar is the strength.
+    # α[u,v] gains K · boost · topo_score[u,v] of prior mass in the numerator.
+    topology_prior_boost: float = 0.0        # 0 = disabled
     seed: int = 0
     verbose: bool = True
 
@@ -206,11 +212,39 @@ def _accumulate_initial_pair_stats(
     return n_pair, sum_dt
 
 
+def _add_topology_prior(
+    alpha_num: np.ndarray,
+    config: MHPConfig,
+    topo_prior_flat: Optional[np.ndarray],
+    topo_prior_score: Optional[np.ndarray],
+) -> None:
+    """Scatter-add topology prior mass into the α numerator (in place).
+
+    For each topology-related (target, source) pair, adds K · boost · score to
+    the numerator, so its MAP estimate becomes
+        α = (count + K·m_base + K·boost·score) / (n_v + K).
+    Pairs with no co-occurrence (count=0) get a nonzero α purely from this term
+    — i.e. a zero-shot topology edge. The (n_v + K) denominator (applied by the
+    caller) naturally gives this term MORE weight for rare sources (small n_v),
+    which is exactly where data-driven edges are missing.
+    """
+    if (
+        config.topology_prior_boost <= 0.0
+        or topo_prior_flat is None
+        or len(topo_prior_flat) == 0
+    ):
+        return
+    mass = config.alpha_prior_strength * config.topology_prior_boost * topo_prior_score
+    np.add.at(alpha_num.reshape(-1), topo_prior_flat, mass)
+
+
 def _compute_initial_alpha_beta(
     events: EventCollection,
     n_pair: np.ndarray,
     sum_dt: Optional[np.ndarray],
     config: MHPConfig,
+    topo_prior_flat: Optional[np.ndarray] = None,
+    topo_prior_score: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """MAP point estimate from accumulated pair statistics.
 
@@ -234,8 +268,9 @@ def _compute_initial_alpha_beta(
         np.clip(beta, config.beta_min, config.beta_max, out=beta)
     else:
         beta = np.float32(config.beta_shared_value)  # 0-d scalar, not (M, M)
-    # In-place: alpha = (n_pair + K*m) / denom. Reuses n_pair's buffer.
+    # In-place: alpha = (n_pair + K*m [+ topology prior]) / denom.
     n_pair += K * m
+    _add_topology_prior(n_pair, config, topo_prior_flat, topo_prior_score)
     n_pair /= denom
     alpha = n_pair.astype(np.float32)
     return alpha, beta
@@ -408,8 +443,16 @@ def fit_mhp(
     init_beta: Optional[np.ndarray] = None,
     init_mu: Optional[np.ndarray] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
+    topo_prior_flat: Optional[np.ndarray] = None,
+    topo_prior_score: Optional[np.ndarray] = None,
 ) -> MHPResult:
-    """Run MAP EM on the event sequence."""
+    """Run MAP EM on the event sequence.
+
+    topo_prior_flat / topo_prior_score: optional sparse topology prior. When
+    config.topology_prior_boost > 0, these (flat index = target*M + source,
+    score in [0,1]) inject extra MAP prior mass on topology-related pairs in
+    both the init and every M-step — see _add_topology_prior.
+    """
     M = events.M
     N = events.n
     horizon = events.T
@@ -428,7 +471,9 @@ def fit_mhp(
             print("[mhp] pass 1: accumulating initial pair statistics ...", flush=True)
         t_init_start = time.monotonic()
         n_pair, sum_dt = _accumulate_initial_pair_stats(events, config)
-        alpha_data, beta_data = _compute_initial_alpha_beta(events, n_pair, sum_dt, config)
+        alpha_data, beta_data = _compute_initial_alpha_beta(
+            events, n_pair, sum_dt, config, topo_prior_flat, topo_prior_score
+        )
         alpha = alpha_data if init_alpha is None else init_alpha.astype(np.float32)
         beta = beta_data if init_beta is None else init_beta.astype(np.float32)
         del n_pair, sum_dt
@@ -497,9 +542,11 @@ def fit_mhp(
         else:
             beta_new = beta  # scalar
 
-        # In-place: alpha_new = (alpha_num + K*m) / denom, reusing the f64
-        # accumulator buffer to avoid a transient (M,M) copy (~4.4 GB at large M).
+        # In-place: alpha_new = (alpha_num + K*m [+ topology prior]) / denom,
+        # reusing the f64 accumulator buffer to avoid a transient (M,M) copy
+        # (~4.4 GB at large M).
         alpha_num += K * m
+        _add_topology_prior(alpha_num, config, topo_prior_flat, topo_prior_score)
         alpha_num /= denom
         alpha_new = alpha_num.astype(np.float32)
         del alpha_num  # release the 4.4 GB f64 buffer immediately
