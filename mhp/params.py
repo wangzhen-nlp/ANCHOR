@@ -188,7 +188,11 @@ class MHPParams:
         stream/run inference paths so they don't hard-code the exp form.
         """
         idx = self._lookup.get(int(target) * self.M + int(source))
-        if idx is None or dt <= 0:
+        # Gate only dt < 0 (causally invalid + exp(-β·dt) would blow up). dt == 0
+        # is kept (full peak α·β), matching the training E-step and
+        # compute_hard_parents so the run / stream / training paths agree on
+        # simultaneous (same-timestamp) events.
+        if idx is None or dt < 0:
             return 0.0
         if self.kernel_type == "piecewise":
             b = bucket_index(dt, self.bucket_edges)

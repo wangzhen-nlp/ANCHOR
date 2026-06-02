@@ -20,7 +20,7 @@ Differences from alarm_flow_brunch.stream_alarm_brunch:
 
 from __future__ import annotations
 
-from collections import Counter, deque
+from collections import Counter
 from dataclasses import dataclass, field
 from dataclasses import replace as _replace
 import json
@@ -127,7 +127,8 @@ class StreamMHPAssigner:
     """Stateful online inference engine.
 
     Maintains:
-      - `recent`: deque of real events still within history_window
+      - `_buf_*`: parallel arrays (events/ts/type) + head pointer holding real
+        events still within history_window, for vectorized candidate scoring
       - `cascades`: dict cascade_id → Cascade for cascades still considered active
       - vocabs for label → id resolution
 
@@ -145,11 +146,38 @@ class StreamMHPAssigner:
         self.params = artifact.params
         self.vocabs = artifact.vocabs
         self.config = config
-        # Sliding window: events with ts >= now - window are kept
-        self.recent: deque[OnlineEvent] = deque()
+        # Sliding window of recent events kept as parallel arrays with a head
+        # pointer (amortized O(1) append + eviction, O(cap) tail slice for
+        # vectorized scoring). `_buf_events` holds the OnlineEvent objects;
+        # `_buf_ts` / `_buf_type` are numpy-friendly parallel columns.
+        self._buf_events: list[OnlineEvent] = []
+        self._buf_ts: list[float] = []
+        self._buf_type: list[int] = []
+        self._head: int = 0                      # logical front index into the bufs
         self.cascades: dict[int, Cascade] = {}
         self._next_cascade_id: int = 0
         self._next_event_index: int = 0
+        # Throttle for _close_inactive: only scan open cascades when event time
+        # has advanced at least this far since the last scan (avoids an O(open
+        # cascades) sweep on every single event). Scan cadence = a fraction of
+        # close_inactive_sec so closures stay timely.
+        self._last_close_scan_ts: float = -np.inf
+        self._close_scan_interval: float = max(config.close_inactive_sec * 0.1, 1.0)
+        # Precompute the sparse kernel lookup (sorted edge keys + per-edge
+        # params) once — streaming params are frozen. Mirrors params.pair_score
+        # but vectorized over a batch of candidates (f64, matching pair_score).
+        M = self.params.M
+        self._M = M
+        et = self.params.edge_targets.astype(np.int64)
+        es = self.params.edge_sources.astype(np.int64)
+        self._edge_keys = et * M + es            # ascending (from_edges sorted)
+        self._E = len(et)
+        if self.params.kernel_type == "piecewise":
+            self._theta = np.asarray(self.params.edge_theta, dtype=np.float64)
+            self._bucket_edges = np.asarray(self.params.bucket_edges, dtype=np.float64)
+        else:
+            self._edge_alpha = self.params.edge_alpha.astype(np.float64)
+            self._edge_beta = self.params.edge_beta.astype(np.float64)
         # Stats for reporting
         self.total_events_processed = 0
         self.total_immigrants = 0
@@ -157,8 +185,14 @@ class StreamMHPAssigner:
         self.dropped_unknown_type = 0
         self.dropped_clear = 0
         self.dropped_no_type = 0
-        # Closed cascade output sink — populated as cascades close
+        # Closed cascade output sink — only cascades passing min_group_events.
         self.closed_groups: list = []
+        # Size of EVERY closed cascade (incl. those filtered from output) so the
+        # diagnostic size distribution matches training (computed on all
+        # cascades, not just the emitted ones). Counter keyed by size keeps
+        # this O(distinct sizes) regardless of stream length.
+        self.closed_size_counter: Counter = Counter()
+        self.emitted_group_count = 0
 
     def _resolve_type_id(self, alarm_event) -> tuple[int, str] | None:
         """Translate an alarm event to (type_id, label) using artifact vocabs."""
@@ -169,39 +203,72 @@ class StreamMHPAssigner:
         return type_id, type_label
 
     def _evict_expired(self, now_ts: float):
-        """Drop events from the left of `recent` that fell out of the window.
-
-        We use real-seconds × time_scale_sec for the comparison since `recent`
-        stores real timestamps.
+        """Advance the head pointer past events older than history_window, then
+        compact the buffers periodically so they don't grow unboundedly.
         """
         cutoff = now_ts - self.config.history_window_sec
-        while self.recent and self.recent[0].ts < cutoff:
-            self.recent.popleft()
+        head = self._head
+        ts = self._buf_ts
+        n = len(ts)
+        while head < n and ts[head] < cutoff:
+            head += 1
+        self._head = head
+        # Compact when the dead prefix dominates — amortized O(1) per event.
+        if head > 4096 and head * 2 > n:
+            self._buf_events = self._buf_events[head:]
+            self._buf_ts = self._buf_ts[head:]
+            self._buf_type = self._buf_type[head:]
+            self._head = 0
+
+    def _score_batch(self, target_type_id: int, src_types: np.ndarray, dts: np.ndarray) -> np.ndarray:
+        """Vectorized kernel score for a batch of candidates — sparse binary
+        search over sorted edge keys, dispatching on kernel_type. Bit-for-bit
+        consistent with params.pair_score (f64, Δt>=0 gate; only Δt<0 excluded).
+        """
+        n = len(src_types)
+        out = np.zeros(n, dtype=np.float64)
+        if self._E == 0 or n == 0:
+            return out
+        keys = int(target_type_id) * self._M + src_types
+        idx = np.minimum(np.searchsorted(self._edge_keys, keys), self._E - 1)
+        # Gate only dt < 0 (keep dt == 0 → full peak), matching pair_score /
+        # compute_hard_parents / training so run and stream agree on
+        # simultaneous events.
+        valid = (self._edge_keys[idx] == keys) & (dts >= 0)
+        if not valid.any():
+            return out
+        vi = idx[valid]
+        if self.params.kernel_type == "piecewise":
+            from mhp.params import bucket_index_vec
+
+            pb = bucket_index_vec(dts[valid], self._bucket_edges)
+            out[valid] = self._theta[vi, pb]
+        else:
+            a = self._edge_alpha[vi]
+            b = self._edge_beta[vi]
+            out[valid] = a * b * np.exp(-b * dts[valid])
+        return out
 
     def _candidate_scores(self, target_type_id: int, target_ts: float):
-        """Score each event in `recent` as a candidate parent.
+        """Score the most recent `max_history_events` candidates in one numpy
+        batch.
 
-        Returns a (sources, scores) pair where sources[k] is the recent-list
-        index and scores[k] is the unnormalized score for that candidate.
+        Returns (positions, scores) where positions[k] is the ABSOLUTE buffer
+        index of candidate k (so the caller can fetch the OnlineEvent), and
+        scores[k] is its kernel score against the target.
         """
-        n_recent = len(self.recent)
-        if n_recent == 0:
+        n = len(self._buf_ts)
+        live = n - self._head
+        if live <= 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-        cap = min(n_recent, self.config.max_history_events)
-        # Iterate from newest backwards — only the last `cap` candidates matter
-        # because kernel decay puts older events near zero weight.
-        sources = np.empty(cap, dtype=np.int64)
-        scores = np.empty(cap, dtype=np.float64)
-        i = 0
-        for idx in range(n_recent - 1, n_recent - 1 - cap, -1):
-            cand = self.recent[idx]
-            sources[i] = idx
-            # Δt in model time units (scaled by time_scale_sec). pair_score
-            # dispatches on the artifact's kernel_type (exp or piecewise).
-            dt = (target_ts - cand.ts) / self.config.time_scale_sec
-            scores[i] = self.params.pair_score(target_type_id, cand.type_id, dt)
-            i += 1
-        return sources, scores
+        cap = min(live, self.config.max_history_events)
+        lo = n - cap                                  # tail start (newest `cap`)
+        positions = np.arange(lo, n, dtype=np.int64)
+        ts_tail = np.asarray(self._buf_ts[lo:], dtype=np.float64)
+        type_tail = np.asarray(self._buf_type[lo:], dtype=np.int64)
+        dts = (target_ts - ts_tail) / self.config.time_scale_sec
+        scores = self._score_batch(target_type_id, type_tail, dts)
+        return positions, scores
 
     def process(self, alarm_event: dict):
         """Ingest one alarm event in time order, run inference, update state."""
@@ -219,16 +286,22 @@ class StreamMHPAssigner:
         type_id, type_label = resolved
 
         ts = float(alarm_event.get("ts", 0.0))
-        # Close cascades that have been silent long enough — done before scoring
-        # so a long-quiet cascade can't catch a new event by accident.
+        # Close cascades silent past close_inactive_sec. This only governs
+        # OUTPUT timing — its order relative to scoring is irrelevant: when
+        # close_inactive_sec >= history_window_sec a closable cascade has no
+        # in-window candidate parents anyway, so it can never catch a new event
+        # regardless of when we close it (same reason the close-scan throttle is
+        # result-preserving).
         self._close_inactive(ts)
         self._evict_expired(ts)
 
         # Score candidates
-        sources, scores = self._candidate_scores(type_id, ts)
+        positions, scores = self._candidate_scores(type_id, ts)
         mu = float(self.params.mu[type_id]) * self.config.immigrant_bias
-        # argmax over (μ, top_candidate)
-        if scores.size == 0 or scores.max() <= mu:
+        # argmax over (μ, top_candidate). Use strict `< mu` so a candidate that
+        # ties μ binds to its parent — matching training's compute_hard_parents
+        # (immigrant iff mu > best_score, i.e. candidate wins on a tie).
+        if scores.size == 0 or scores.max() < mu:
             # Immigrant: start a new cascade
             cascade_id = self._next_cascade_id
             self._next_cascade_id += 1
@@ -240,7 +313,7 @@ class StreamMHPAssigner:
         else:
             # Bind to most-likely parent's cascade
             best_local = int(scores.argmax())
-            parent_event = self.recent[int(sources[best_local])]
+            parent_event = self._buf_events[int(positions[best_local])]
             cascade_id = parent_event.cascade_id
             cascade = self.cascades.get(cascade_id)
             if cascade is None:
@@ -270,17 +343,24 @@ class StreamMHPAssigner:
         )
         self._next_event_index += 1
         cascade.add(event)
-        self.recent.append(event)
-        # Cap recent deque so memory stays bounded — old events fall off via
-        # _evict_expired in normal use, but very dense bursts could grow it
-        # unboundedly between evictions.
-        if len(self.recent) > self.config.max_history_events * 4:
-            self.recent.popleft()
+        self._buf_events.append(event)
+        self._buf_ts.append(ts)
+        self._buf_type.append(type_id)
         self.total_events_processed += 1
         return event
 
     def _close_inactive(self, now_ts: float):
-        """Move cascades whose last_ts < now - close_inactive_sec to closed_groups."""
+        """Move cascades whose last_ts < now - close_inactive_sec to closed_groups.
+
+        Throttled: the O(open cascades) sweep runs only when event time has
+        advanced past `_close_scan_interval` since the last scan. Cascades may
+        thus linger slightly past close_inactive_sec before being emitted, but
+        the assignment result is unaffected (closure only gates OUTPUT timing,
+        and scoring already excludes out-of-window candidates via _evict).
+        """
+        if now_ts - self._last_close_scan_ts < self._close_scan_interval:
+            return
+        self._last_close_scan_ts = now_ts
         cutoff = now_ts - self.config.close_inactive_sec
         to_close: list[int] = []
         for cid, cascade in self.cascades.items():
@@ -288,17 +368,24 @@ class StreamMHPAssigner:
                 to_close.append(cid)
         for cid in to_close:
             cascade = self.cascades.pop(cid)
-            if cascade.event_count() >= self.config.min_group_events:
-                self.closed_groups.append(_cascade_to_group(cascade))
-                self.closed_cascade_count += 1
+            self._record_closed(cascade)
 
     def close_remaining(self):
         """Emit any still-active cascades. Call once at end of stream."""
         for cid in list(self.cascades.keys()):
             cascade = self.cascades.pop(cid)
-            if cascade.event_count() >= self.config.min_group_events:
-                self.closed_groups.append(_cascade_to_group(cascade))
-                self.closed_cascade_count += 1
+            self._record_closed(cascade)
+
+    def _record_closed(self, cascade: "Cascade"):
+        """Record a closed cascade: count its size for the diagnostic
+        distribution (ALL cascades), and emit it to output only if it passes
+        the min_group_events filter.
+        """
+        self.closed_cascade_count += 1
+        self.closed_size_counter[cascade.event_count()] += 1
+        if cascade.event_count() >= self.config.min_group_events:
+            self.closed_groups.append(_cascade_to_group(cascade))
+            self.emitted_group_count += 1
 
     def stats(self) -> dict:
         return {
@@ -306,7 +393,7 @@ class StreamMHPAssigner:
             "total_immigrants": self.total_immigrants,
             "closed_cascade_count": self.closed_cascade_count,
             "open_cascade_count": len(self.cascades),
-            "recent_window_size": len(self.recent),
+            "recent_window_size": len(self._buf_ts) - self._head,
             "dropped_clear": self.dropped_clear,
             "dropped_no_type": self.dropped_no_type,
             "dropped_unknown_type": self.dropped_unknown_type,
@@ -382,13 +469,24 @@ def _write_jsonl(path, records):
 # --------------------------------------------------------------------------
 
 
-def _cascade_size_stats(groups: list) -> dict | None:
-    if not groups:
+def _cascade_size_stats(size_counter: Counter) -> dict | None:
+    """Cascade size distribution over ALL closed cascades (pre output-filter).
+
+    Computed from a Counter {size: count} so it reflects every cascade the
+    stream closed — including singletons that are dropped from --groups-output
+    by min_group_events. This makes the distribution directly comparable to the
+    training-time `cascade_size_stats`, and keeps "multi(>=2)" meaningful (it is
+    the genuine non-singleton fraction, not "everything that passed the filter").
+    """
+    if not size_counter:
         return None
-    sizes = np.array([g["event_count"] for g in groups], dtype=np.int64)
-    n_cascades = int(sizes.size)
-    n_events = int(sizes.sum())
+    sizes = np.array(sorted(size_counter), dtype=np.int64)
+    counts = np.array([size_counter[int(s)] for s in sizes], dtype=np.int64)
+    n_cascades = int(counts.sum())
+    n_events = int((sizes * counts).sum())
     multi_mask = sizes >= 2
+    multi_cascades = int(counts[multi_mask].sum())
+    multi_events = int((sizes[multi_mask] * counts[multi_mask]).sum())
     bucket_edges = [(1, 1), (2, 3), (4, 9), (10, 49), (50, None)]
     histogram = []
     for lo, hi in bucket_edges:
@@ -404,20 +502,25 @@ def _cascade_size_stats(groups: list) -> dict | None:
         histogram.append(
             {
                 "label": label,
-                "cascade_count": int(mask.sum()),
-                "event_count": int(sizes[mask].sum()),
+                "cascade_count": int(counts[mask].sum()),
+                "event_count": int((sizes[mask] * counts[mask]).sum()),
             }
         )
+    # Weighted median/mean over the counter
+    cum = np.cumsum(counts)
+    median_idx = int(np.searchsorted(cum, (n_cascades + 1) // 2))
+    median_size = float(sizes[min(median_idx, len(sizes) - 1)])
+    mean_size = float(n_events / n_cascades) if n_cascades else 0.0
     return {
         "n_cascades": n_cascades,
         "n_events": n_events,
-        "multi_event_cascade_count": int(multi_mask.sum()),
-        "multi_event_cascade_share": float(multi_mask.sum() / n_cascades),
-        "multi_event_event_count": int(sizes[multi_mask].sum()),
-        "multi_event_event_share": float(sizes[multi_mask].sum() / n_events),
+        "multi_event_cascade_count": multi_cascades,
+        "multi_event_cascade_share": float(multi_cascades / n_cascades) if n_cascades else 0.0,
+        "multi_event_event_count": multi_events,
+        "multi_event_event_share": float(multi_events / n_events) if n_events else 0.0,
         "max_size": int(sizes.max()),
-        "median_size": float(np.median(sizes)),
-        "mean_size": float(sizes.mean()),
+        "median_size": median_size,
+        "mean_size": mean_size,
         "histogram": histogram,
     }
 
@@ -566,6 +669,14 @@ def main():
             f"immigrant_bias={stream_config.immigrant_bias}",
             flush=True,
         )
+    if stream_config.close_inactive_sec < stream_config.history_window_sec:
+        print(
+            f"[stream] WARN: close_inactive_sec ({stream_config.close_inactive_sec:.0f}s) < "
+            f"history_window_sec ({stream_config.history_window_sec:.0f}s). A cascade can be "
+            f"closed while its events are still candidate parents, turning would-be children "
+            f"into 'orphan' immigrants. Set close_inactive_sec >= history_window_sec to avoid this.",
+            flush=True,
+        )
 
     assigner = StreamMHPAssigner(artifact, stream_config)
 
@@ -600,15 +711,17 @@ def main():
     if not args.quiet:
         print(
             f"[stream] done: events={stats['total_events_processed']}, "
-            f"groups={len(groups)}, "
-            f"immigrants={stats['total_immigrants']}, "
             f"closed_cascades={stats['closed_cascade_count']}, "
+            f"emitted_groups(>= {stream_config.min_group_events})={len(groups)}, "
+            f"immigrants={stats['total_immigrants']}, "
             f"dropped={{clear:{stats['dropped_clear']}, no_type:{stats['dropped_no_type']}, "
             f"unknown_type:{stats['dropped_unknown_type']}}}",
             flush=True,
         )
 
-    cascade_stats = _cascade_size_stats(groups)
+    # Diagnostic distribution over ALL closed cascades (pre min_group_events
+    # filter) — comparable to training. `groups` (emitted) is filtered.
+    cascade_stats = _cascade_size_stats(assigner.closed_size_counter)
     metadata = {
         "algorithm": "alarm_flow_mhp.stream",
         "model": os.path.abspath(args.model),
@@ -624,6 +737,8 @@ def main():
             "time_scale_sec": stream_config.time_scale_sec,
         },
         "group_count": len(groups),
+        "emitted_group_count": len(groups),
+        "closed_cascade_count": stats["closed_cascade_count"],
         "modeled_event_count": stats["total_events_processed"],
         "immigrant_count": stats["total_immigrants"],
         "cascade_size_stats": cascade_stats,
@@ -660,7 +775,7 @@ def main():
         print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
 
     if cascade_stats and not args.quiet:
-        print("[stream] cascade size distribution:")
+        print("[stream] cascade size distribution (ALL closed cascades, pre min_group_events filter):")
         for bucket in cascade_stats["histogram"]:
             print(
                 f"  size={bucket['label']:>5s} : "
