@@ -6478,6 +6478,12 @@
             const snapshotScript = [
                 '(function(){',
                 '  const SNAPSHOT = JSON.parse(decodeURIComponent(' + JSON.stringify(encodeURIComponent(JSON.stringify(payload))) + '));',
+                '  const exportedMapEl = document.getElementById("map");',
+                '  if (exportedMapEl) {',
+                '    exportedMapEl.innerHTML = "";',
+                '    exportedMapEl.className = "";',
+                '    exportedMapEl.removeAttribute("style");',
+                '  }',
                 '  function restoreSnapshot(){',
                 '    try {',
                 '      graphData = { group_info: {} };',
