@@ -39,7 +39,7 @@ import numpy as np
 from alarm_flow_brunch.region_filter import parse_regions
 from alarm_flow_brunch.visual_output import write_visual_groups
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
-from alarm_flow_isahp.sequences import alarm_type_from_title, event_type_label
+from alarm_flow_isahp.sequences import alarm_type_label, event_type_label
 from alarm_flow_mhp.aggregator import (
     AlarmMHPConfig,
     load_alarm_mhp_artifact,
@@ -63,12 +63,14 @@ class OnlineEvent:
 
     index: int                  # global ordinal in the stream
     ts: float                   # event time (epoch seconds)
-    type_id: int                # vocab type ID
+    type_id: int                # vocab type ID (-1 in feature mode if unseen)
     type_label: str             # human-readable type
     alarm: dict                 # original alarm event dict (for output)
     parent_index: int = -1      # -1 for immigrant; otherwise the OnlineEvent.index of parent
     cascade_id: int = -1        # assigned cascade ID
     parent_score: float = 0.0   # score that won (for debugging / output)
+    alarm_type: str = ""        # feature mode: link/power/offline
+    ne: str = ""                # feature mode: alarm_source (device id)
 
 
 @dataclass
@@ -108,6 +110,11 @@ class StreamConfig:
     min_group_events: int = 1               # filter on output
     immigrant_bias: float = 1.0             # multiplier on μ at scoring time
                                             # (>1 → prefer immigrant; <1 → prefer cascade)
+    feature_alpha_floor: float = 0.0        # feature mode: candidate edges with
+                                            # live α below this are treated as
+                                            # non-edges (score 0) — the inference
+                                            # analog of device-mode edge_threshold,
+                                            # guards against soft over-connection.
 
     @classmethod
     def from_artifact_config(cls, cfg: AlarmMHPConfig, **overrides):
@@ -141,11 +148,28 @@ class StreamMHPAssigner:
       6. Append to recent
     """
 
-    def __init__(self, artifact, config: StreamConfig):
+    def __init__(self, artifact, config: StreamConfig, feature_scorer=None, mu_scorer=None):
         self.artifact = artifact
         self.params = artifact.params
         self.vocabs = artifact.vocabs
         self.config = config
+        # Feature mode: live α = softplus(w·φ) per candidate, device-OPEN
+        # (new devices not dropped). feature_scorer / mu_scorer are built by
+        # main() from the artifact + NE graph.
+        self.feature_mode = getattr(artifact.config, "edge_mode", "device") == "feature"
+        self.feature_scorer = feature_scorer
+        self.mu_scorer = mu_scorer            # live parameterized μ (or None → fallback table)
+        if self.feature_mode:
+            rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
+            self._mu_by_at = rt.get("mu_by_alarm_type", {}) or {}
+            self._mu_default = float(rt.get("mu_default", 0.0))
+            self._feat_beta = float(rt.get("beta", 1.0))
+            # α floor: CLI override else fall back to the trained edge_threshold
+            # (so feature inference prunes weak edges like device mode does).
+            floor = getattr(config, "feature_alpha_floor", 0.0)
+            if floor <= 0:
+                floor = float(getattr(artifact.config, "edge_threshold", 0.0))
+            self._feat_alpha_floor = float(floor)
         # Sliding window of recent events kept as parallel arrays with a head
         # pointer (amortized O(1) append + eviction, O(cap) tail slice for
         # vectorized scoring). `_buf_events` holds the OnlineEvent objects;
@@ -270,20 +294,66 @@ class StreamMHPAssigner:
         scores = self._score_batch(target_type_id, type_tail, dts)
         return positions, scores
 
+    def _candidate_scores_feature(self, target_at: str, target_ne: str, target_ts: float):
+        """Feature-mode candidate scoring: live α = softplus(w·φ) per source
+        candidate (device-OPEN), then α·β·exp(-β·Δt). Returns (positions, scores).
+        """
+        n = len(self._buf_ts)
+        live = n - self._head
+        if live <= 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+        cap = min(live, self.config.max_history_events)
+        lo = n - cap
+        positions = np.arange(lo, n, dtype=np.int64)
+        src_events = self._buf_events[lo:]
+        src_ats = [e.alarm_type for e in src_events]
+        src_nes = [e.ne for e in src_events]
+        ts_tail = np.asarray(self._buf_ts[lo:], dtype=np.float64)
+        dts = (target_ts - ts_tail) / self.config.time_scale_sec
+        alpha = self.feature_scorer.alpha_for_target(target_at, target_ne, src_ats, src_nes)
+        # α floor: treat too-weak edges as non-edges (inference analog of
+        # device-mode edge_threshold) — guards the soft model against linking
+        # unrelated pairs whose baseline α is small but positive.
+        if self._feat_alpha_floor > 0:
+            alpha = np.where(alpha >= self._feat_alpha_floor, alpha, 0.0)
+        b = self._feat_beta
+        scores = np.where(dts >= 0, alpha * b * np.exp(-b * dts), 0.0)
+        return positions, scores
+
     def process(self, alarm_event: dict):
         """Ingest one alarm event in time order, run inference, update state."""
         # Filtering: skip events we can't model
         if is_clear_alarm(alarm_event.get("alarm", {}) if isinstance(alarm_event, dict) else {}):
             self.dropped_clear += 1
             return None
-        if alarm_type_from_title(alarm_event.get("alarm_title", "")) is None:
+        atype = alarm_type_label(alarm_event)
+        if atype is None:
             self.dropped_no_type += 1
             return None
-        resolved = self._resolve_type_id(alarm_event)
-        if resolved is None:
-            self.dropped_unknown_type += 1
-            return None
-        type_id, type_label = resolved
+
+        if self.feature_mode:
+            # Device-OPEN: accept any event with a known alarm type; the type_id
+            # may be unseen (-1) — α comes from features, not a vocab edge.
+            # Extract (ne, alarm_type) the SAME way training did — rebuild the
+            # type label via type_fields and parse it — so the device id / alarm
+            # type fed to the scorer match training's keys exactly (stripping,
+            # custom type_fields), not an ad-hoc raw-field read.
+            from alarm_flow_mhp.feature_spec import runtime_ne_at
+
+            type_label = event_type_label(alarm_event, self.artifact.config.type_fields)
+            type_id = self.vocabs.type_vocab.get(type_label)
+            type_id = -1 if type_id is None else int(type_id)
+            ne, atype_feat = runtime_ne_at(alarm_event, self.artifact.config.type_fields)
+            # use the label-parsed alarm type for features/μ (consistent with
+            # training's at_vocab / mu_by_alarm_type keys)
+            atype = atype_feat or atype
+        else:
+            resolved = self._resolve_type_id(alarm_event)
+            if resolved is None:
+                self.dropped_unknown_type += 1
+                return None
+            type_id, type_label = resolved
+            ne = ""
 
         ts = float(alarm_event.get("ts", 0.0))
         # Close cascades silent past close_inactive_sec. This only governs
@@ -295,9 +365,20 @@ class StreamMHPAssigner:
         self._close_inactive(ts)
         self._evict_expired(ts)
 
-        # Score candidates
-        positions, scores = self._candidate_scores(type_id, ts)
-        mu = float(self.params.mu[type_id]) * self.config.immigrant_bias
+        # Score candidates + immigrant baseline μ. Feature mode is INDUCTIVE:
+        # μ = softplus(w_μ·ψ) from the type's own features (parameterized) —
+        # seen and new devices treated identically, no per-device memorization.
+        # Falls back to the per-alarm-type table if no μ scorer / attrs missing.
+        if self.feature_mode:
+            positions, scores = self._candidate_scores_feature(atype, ne, ts)
+            if self.mu_scorer is not None:
+                base_mu = self.mu_scorer.mu_for(atype, ne)
+            else:
+                base_mu = self._mu_by_at.get(atype, self._mu_default)
+            mu = base_mu * self.config.immigrant_bias
+        else:
+            positions, scores = self._candidate_scores(type_id, ts)
+            mu = float(self.params.mu[type_id]) * self.config.immigrant_bias
         # argmax over (μ, top_candidate). Use strict `< mu` so a candidate that
         # ties μ binds to its parent — matching training's compute_hard_parents
         # (immigrant iff mu > best_score, i.e. candidate wins on a tie).
@@ -340,6 +421,8 @@ class StreamMHPAssigner:
             parent_index=parent_index,
             cascade_id=cascade_id,
             parent_score=parent_score,
+            alarm_type=atype if self.feature_mode else "",
+            ne=ne,
         )
         self._next_event_index += 1
         cascade.add(event)
@@ -535,7 +618,7 @@ def main():
         description="Online (streaming) MHP inference: ingest alarms in time order, emit cascade groups."
     )
     parser.add_argument("model", help="Trained MHP artifact JSON (produced by train_alarm_mhp.py).")
-    parser.add_argument("alarms", help="Sorted alarm cache or raw alarms — same format as run_alarm_mhp.")
+    parser.add_argument("alarms", help="Sorted alarm cache or raw alarms — same format as train_alarm_mhp.")
     parser.add_argument(
         "--groups-output",
         default="",
@@ -611,6 +694,17 @@ def main():
         help="Override max candidate parents per event. Default: artifact value.",
     )
     parser.add_argument(
+        "--feature-alpha-floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Feature mode only: candidate edges with live α below this are treated "
+            "as non-edges (the inference analog of device-mode edge_threshold). "
+            "0 (default) falls back to the artifact's edge_threshold. Raise to "
+            "curb soft over-connection of feature-similar but unrelated pairs."
+        ),
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=50_000,
@@ -659,6 +753,7 @@ def main():
         min_group_events=args.min_group_events,
         immigrant_bias=args.immigrant_bias,
         max_history_events=args.max_history_events,
+        feature_alpha_floor=args.feature_alpha_floor,
     )
     if not args.quiet:
         print(
@@ -678,7 +773,71 @@ def main():
             flush=True,
         )
 
-    assigner = StreamMHPAssigner(artifact, stream_config)
+    # Feature mode: build the live-α scorer from the artifact kernel + NE graph
+    # (device attributes + topology). This is what generalizes to new devices.
+    feature_scorer = None
+    mu_scorer = None
+    if getattr(artifact.config, "edge_mode", "device") == "feature":
+        from mhp.feature_kernel import FeatureKernel
+        from alarm_flow_mhp.feature_spec import (
+            MuFeatureSpec,
+            RuntimeFeatureScorer,
+            RuntimeMuScorer,
+        )
+        from alarm_flow_isahp.ne_topology import NETopologyIndex
+        from ne_link_learning.core import build_graph_context
+        from topology_tools.region_utils import load_ne_graph
+
+        md = artifact.training_metadata or {}
+        fk = md.get("feature_kernel")
+        rt = md.get("feature_runtime") or {}
+        if fk is None:
+            raise ValueError("feature-mode artifact missing feature_kernel")
+        if not args.quiet:
+            print("[stream] feature mode: loading NE graph + building live-α scorer ...", flush=True)
+        ne_graph_data = load_ne_graph(args.ne_graph)
+        graph_ctx = build_graph_context(ne_graph_data)
+        # Build the index with the SAME reach training used for feature
+        # candidate generation — otherwise pairs beyond this many hops would get
+        # topo_score=0 at inference, diverging from the trained φ.
+        infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
+        topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
+        if not args.quiet:
+            print(f"[stream] topology index max_hops={infer_hops} (from artifact.config)", flush=True)
+        feature_scorer = RuntimeFeatureScorer(
+            kernel=FeatureKernel.from_dict(fk),
+            at_vocab=rt.get("at_vocab", []),
+            graph_context=graph_ctx,
+            topology_index=topo_idx,
+            beta=float(rt.get("beta", 1.0)),
+        )
+        if not args.quiet:
+            print(
+                f"[stream] feature scorer: {feature_scorer.layout.n_features} features, "
+                f"device-OPEN (new devices accepted)",
+                flush=True,
+            )
+        # Parameterized μ scorer (live μ for any device). Falls back to the
+        # per-alarm-type table inside the assigner if absent.
+        mu_fk = rt.get("mu_kernel")
+        mu_sp = rt.get("mu_spec")
+        if mu_fk is not None and mu_sp is not None:
+            mu_scorer = RuntimeMuScorer(
+                mu_kernel=FeatureKernel.from_dict(mu_fk),
+                mu_spec=MuFeatureSpec.from_dict(mu_sp),
+                graph_context=graph_ctx,
+            )
+            if not args.quiet:
+                print(
+                    f"[stream] μ scorer: {mu_scorer.spec.n_features} features (parameterized μ)",
+                    flush=True,
+                )
+        elif not args.quiet:
+            print("[stream] μ: per-alarm-type table (no parameterized μ in artifact)", flush=True)
+
+    assigner = StreamMHPAssigner(
+        artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
+    )
 
     t_stream_start = time.monotonic()
     last_print = t_stream_start

@@ -29,9 +29,11 @@ from .em import (
     compute_cascade_of,
     compute_hard_parents,
     fit_mhp,
+    fit_mhp_feature,
     fit_mhp_piecewise,
     log_likelihood,
 )
+from .feature_kernel import FeatureKernel
 
 __all__ = [
     "EventCollection",
@@ -39,7 +41,9 @@ __all__ = [
     "MHPConfig",
     "MHPResult",
     "fit_mhp",
+    "fit_mhp_feature",
     "fit_mhp_piecewise",
+    "FeatureKernel",
     "log_likelihood",
     "compute_hard_parents",
     "compute_cascade_of",

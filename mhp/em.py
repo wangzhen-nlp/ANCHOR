@@ -105,6 +105,11 @@ class MHPResult:
     # Per-event posterior of "this event is an immigrant" — useful for cascade
     # output downstream. Length N, in [0, 1].
     p_self: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float64))
+    # Feature-mode only: the learned log-linear amplitude model. None for
+    # device-mode / piecewise. Lets inference compute α for unseen pairs.
+    feature_kernel: object = None
+    # Feature-mode only: the learned log-linear immigrant model μ=softplus(w·ψ).
+    mu_kernel: object = None
 
 
 def _segment_sum(values: np.ndarray, segment_ids: np.ndarray, n_segments: int) -> np.ndarray:
@@ -1003,6 +1008,263 @@ def fit_mhp_piecewise(
         converged=converged,
         trace=trace,
         p_self=best_p_self,
+    )
+
+
+def fit_mhp_feature(
+    events: EventCollection,
+    config: MHPConfig,
+    *,
+    cand_targets: np.ndarray,
+    cand_sources: np.ndarray,
+    cand_phi: np.ndarray,
+    feature_names: list,
+    init_mu: Optional[np.ndarray] = None,
+    w_prior_mean: Optional[np.ndarray] = None,
+    l2: float = 1e-3,
+    mu_phi: Optional[np.ndarray] = None,
+    mu_feature_names: Optional[list] = None,
+    iter_callback: Optional[Callable[[dict], None]] = None,
+) -> MHPResult:
+    """Feature-weighted MAP EM: α on a fixed CANDIDATE pair set is a log-linear
+    function of pair features, α_c = softplus(w · φ_c). EM alternates:
+
+      E-step  (same windowed/chunked machinery as the other fits) — uses the
+              current α_c on candidate pairs to compute parent responsibilities.
+      M-step  — aggregate responsibility N_c and exposure E_c=n_{source} per
+              candidate, then fit w by gradient ascent (fit_weights_mstep);
+              μ closed-form as usual.
+
+    The learned FeatureKernel is returned so inference can compute α for pairs
+    unseen in training (new devices) from their features — the inductive part.
+
+    cand_targets/cand_sources : (C,) int64   the modeled (target,source) type pairs
+    cand_phi                  : (C, F) float64 their feature matrix (row-aligned)
+    """
+    from .feature_kernel import FeatureKernel, softplus
+
+    M = events.M
+    N = events.n
+    horizon = events.T
+    beta_scalar = np.float32(config.beta_shared_value)
+
+    cand_targets = np.asarray(cand_targets, dtype=np.int64)
+    cand_sources = np.asarray(cand_sources, dtype=np.int64)
+    cand_phi = np.asarray(cand_phi, dtype=np.float64)
+    C = len(cand_targets)
+    if C == 0:
+        raise ValueError("feature mode requires a non-empty candidate pair set")
+    # Sort candidates by key so the E-step can binary-search.
+    keys = cand_targets * M + cand_sources
+    order = np.argsort(keys, kind="stable")
+    cand_targets = cand_targets[order]
+    cand_sources = cand_sources[order]
+    cand_phi = cand_phi[order]
+    cand_keys = cand_targets * M + cand_sources
+
+    n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
+    exposure = n_source[cand_sources]                      # E_c
+    F = cand_phi.shape[1]
+    w = np.zeros(F) if w_prior_mean is None else np.asarray(w_prior_mean, dtype=np.float64).copy()
+
+    # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
+    # function of the type's OWN features ψ (alarm_type, ne_type, vendor, domain)
+    # — symmetric to α. Learned by the same gradient M-step. A brand-new device
+    # gets μ from its ψ; seen and new devices are treated identically (no
+    # per-device frequency memorization). Falls back to per-type closed-form μ
+    # if no mu_phi is supplied.
+    use_mu_features = mu_phi is not None
+    if use_mu_features:
+        mu_phi = np.asarray(mu_phi, dtype=np.float64)
+        F_mu = mu_phi.shape[1]
+        w_mu = np.zeros(F_mu)
+        mu_exposure = np.full(M, max(horizon, _EPS), dtype=np.float64)   # ∫ over T per type
+
+    if init_mu is None:
+        mu = _compute_mu_initial(events, horizon, config)
+    else:
+        mu = np.asarray(init_mu, dtype=np.float64).reshape(-1).copy()
+
+    if use_mu_features:
+        # Seed the μ bias so the initial parameterized μ matches the heuristic
+        # median rate (inverse-softplus), avoiding a high-μ first iteration.
+        m0 = float(np.median(mu)) if len(mu) else 0.01
+        m0 = max(m0, 1e-6)
+        w_mu[0] = float(np.log(np.expm1(m0)))   # inverse softplus of m0
+        mu = softplus(mu_phi @ w_mu)
+
+    chunk_size = max(int(config.chunk_size), 1)
+    history_window = config.history_window
+    max_history_events = max(int(config.max_history_events), 1)
+
+    t_total_start = time.monotonic()
+    if config.verbose:
+        print(
+            f"[mhp-feat] events={N}, candidate pairs={C}, features={F}, "
+            f"mu_features={(mu_phi.shape[1] if use_mu_features else 0)}, "
+            f"chunk_size={chunk_size}",
+            flush=True,
+        )
+
+    trace: list[dict] = []
+    best_ll = -np.inf
+    best_w = w.copy()
+    best_w_mu = w_mu.copy() if use_mu_features else None
+    best_mu = mu.copy()
+    best_p_self = np.zeros(N, dtype=np.float64)
+    converged = False
+    prev_ll = -np.inf
+
+    for it in range(config.max_iters):
+        t_iter = time.monotonic()
+        alpha_cand = softplus(cand_phi @ w)                # (C,) current amplitudes
+
+        p_self = np.zeros(N, dtype=np.float64)
+        n_resp = np.zeros(C, dtype=np.float64)             # N_c
+        mu_num = np.zeros(M, dtype=np.float64)
+        ll_term1 = 0.0
+
+        for chunk_start in range(0, N, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, N)
+            csize = chunk_end - chunk_start
+            tdims_chunk = events.dims[chunk_start:chunk_end]
+            mu_chunk = mu[tdims_chunk]
+            (_, _, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+                events.times, events.dims, chunk_start, chunk_end,
+                history_window, max_history_events,
+            )
+            if pair_dt.size == 0:
+                rate = np.maximum(mu_chunk, _EPS)
+                p_self[chunk_start:chunk_end] = 1.0
+                mu_num += _segment_sum(np.ones(csize), tdims_chunk, M)
+                ll_term1 += float(np.log(rate).sum())
+                continue
+            # Map each pair to its candidate index (binary search), gate dt>=0.
+            pk = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
+            idx = np.minimum(np.searchsorted(cand_keys, pk), C - 1)
+            valid = (cand_keys[idx] == pk) & (pair_dt >= 0)
+            score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
+            if valid.any():
+                vi = idx[valid]
+                b = float(beta_scalar)
+                score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt[valid])
+            sum_score = _segment_sum(score_pair, pair_tlocal, csize)
+            rate = np.maximum(mu_chunk + sum_score, _EPS)
+            p_self_chunk = mu_chunk / rate
+            p_self[chunk_start:chunk_end] = p_self_chunk
+            p_ij = score_pair / rate[pair_tlocal]
+            if valid.any():
+                np.add.at(n_resp, idx[valid], p_ij[valid])
+            mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
+            ll_term1 += float(np.log(rate).sum())
+
+        # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
+        # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
+        # parameterized (mu_phi), else per-type closed form.
+        from .feature_kernel import fit_weights_mstep
+
+        w_new = fit_weights_mstep(
+            cand_phi, n_resp, exposure, w, l2=l2, w_prior_mean=w_prior_mean, max_iter=50
+        )
+        alpha_new = softplus(cand_phi @ w_new)
+
+        if use_mu_features:
+            w_mu_new = fit_weights_mstep(
+                mu_phi, mu_num, mu_exposure, w_mu, l2=l2, max_iter=50
+            )
+            mu_new = softplus(mu_phi @ w_mu_new)
+        else:
+            w_mu_new = None
+            mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
+
+        # Proper LL = Σ log rate − T·Σμ − Σ_c E_c·α_c. The integral term is
+        # exposure-weighted (E_c = source-type count), matching the M-step
+        # objective Σ[N_c·log α_c − E_c·α_c] — so best-iteration selection tracks
+        # the actual objective rather than an unweighted Σα that would bias
+        # toward large α on high-frequency sources.
+        ll = ll_term1 - horizon * float(mu_new.sum()) - float((alpha_new * exposure).sum())
+        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
+
+        if ll > best_ll:
+            best_ll = ll
+            best_w = w_new.copy()
+            best_mu = mu_new.copy()
+            best_w_mu = None if w_mu_new is None else w_mu_new.copy()
+            best_p_self = p_self
+
+        active = int((alpha_new > config.edge_threshold).sum())
+        entry = {
+            "iter": it,
+            "log_likelihood": float(ll),
+            "delta_rel": float(delta_rel),
+            "active_edges": active,
+            "candidate_pairs": C,
+            "mu_max": float(mu_new.max()),
+            "alpha_max": float(alpha_new.max()),
+            "alpha_median": float(np.median(alpha_new)),
+            "p_self_mean": float(p_self.mean()),
+            "iter_seconds": float(time.monotonic() - t_iter),
+        }
+        trace.append(entry)
+        if iter_callback is not None:
+            iter_callback(entry)
+        if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
+            print(
+                f"[mhp-feat] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
+                f"active(>thr)={active}/{C} "
+                f"α.median={entry['alpha_median']:.4f} α.max={entry['alpha_max']:.4f} "
+                f"μ.max={entry['mu_max']:.4f} p_self.mean={entry['p_self_mean']:.3f} "
+                f"t={_fmt_secs(entry['iter_seconds'])}",
+                flush=True,
+            )
+
+        w = w_new
+        mu = mu_new
+        if use_mu_features:
+            w_mu = w_mu_new
+        if it > 0 and delta_rel < config.tol:
+            converged = True
+            if config.verbose:
+                print(f"[mhp-feat] converged at iter {it} (Δrel={delta_rel:.2e})", flush=True)
+            break
+        prev_ll = ll
+
+    kernel = FeatureKernel(weights=best_w, feature_names=list(feature_names), l2=l2)
+    mu_kernel = (
+        FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
+        if use_mu_features and best_w_mu is not None
+        else None
+    )
+    # Materialize the final sparse α on candidate pairs (for artifact / device-
+    # style consumers); inference can instead recompute α from the kernel.
+    alpha_final = kernel.alpha(cand_phi)
+    keep = alpha_final > config.edge_threshold
+    final_params = MHPParams.from_edges(
+        M=M,
+        mu=best_mu,
+        edge_targets=cand_targets[keep],
+        edge_sources=cand_sources[keep],
+        edge_alpha=alpha_final[keep],
+        edge_beta=np.full(int(keep.sum()), float(beta_scalar), dtype=np.float64),
+        edge_threshold=config.edge_threshold,
+        max_active_sources_per_dim=config.max_active_sources_per_dim,
+        beta_shared=True,
+    )
+    if config.verbose:
+        print(
+            f"[mhp-feat] fit complete: iters={len(trace)} converged={converged} "
+            f"active_edges={int(keep.sum())}/{C} total={_fmt_secs(time.monotonic()-t_total_start)}",
+            flush=True,
+        )
+    return MHPResult(
+        params=final_params,
+        log_likelihood=best_ll,
+        iterations_run=len(trace),
+        converged=converged,
+        trace=trace,
+        p_self=best_p_self,
+        feature_kernel=kernel,
+        mu_kernel=mu_kernel,
     )
 
 

@@ -118,6 +118,10 @@ def _build_config(args):
         topology_prior_boost=args.topology_prior_boost,
         topology_prior_max_hops=args.topology_prior_max_hops,
         topology_prior_min_score=args.topology_prior_min_score,
+        edge_mode=args.edge_mode,
+        feature_l2=args.feature_l2,
+        feature_topo_max_hops=args.feature_topo_max_hops,
+        feature_topo_min_score=args.feature_topo_min_score,
         mu_count_smoothing=args.mu_count_smoothing,
         beta_mode=args.beta_mode,
         beta_shared_value=args.beta_shared_value,
@@ -187,6 +191,36 @@ def main():
         type=float,
         default=1e-4,
         help="Relative LL change for convergence. Default: 1e-4.",
+    )
+    parser.add_argument(
+        "--edge-mode",
+        choices=("device", "feature"),
+        default="device",
+        help=(
+            "Edge/amplitude model. 'device' (default) learns a free α per "
+            "(device-type) pair — transductive, no new-device generalization. "
+            "'feature' learns α = softplus(w·φ) over device-agnostic pair "
+            "features (alarm-type pair, topology relation, same-site, vendor, "
+            "...) — inductive: generalizes to unseen pairs. Needs the NE graph."
+        ),
+    )
+    parser.add_argument(
+        "--feature-l2",
+        type=float,
+        default=1e-3,
+        help="Ridge penalty on feature weights (feature mode). Default: 1e-3.",
+    )
+    parser.add_argument(
+        "--feature-topo-max-hops",
+        type=int,
+        default=2,
+        help="Topology reach for feature-mode candidate pair generation. Default: 2.",
+    )
+    parser.add_argument(
+        "--feature-topo-min-score",
+        type=float,
+        default=0.0,
+        help="Topology score floor for feature-mode candidates. Default: 0 (keep all reachable).",
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)
     parser.add_argument("--alpha-prior-mean", type=float, default=0.1)
@@ -329,13 +363,17 @@ def main():
     _print_progress(f"[train] loaded alarm events: {len(alarm_events)}", args)
 
     topology_index = None
-    if args.load_topology:
+    ne_graph_data = None
+    # Feature mode needs the NE graph for device attributes — force-load it.
+    need_graph = args.load_topology or config.edge_mode == "feature"
+    if need_graph:
         _print_progress(f"[train] loading NE graph: {args.ne_graph}", args)
         ne_graph_data = load_ne_graph(args.ne_graph)
         if config.regions:
             ne_graph_data, _stats = filter_ne_graph_by_regions(ne_graph_data, config.regions)
-        # The index must reach at least as far as the topology prior needs.
-        index_hops = max(args.topology_max_hops, args.topology_prior_max_hops)
+        # The index must reach at least as far as the topology prior / feature
+        # candidate generation needs.
+        index_hops = max(args.topology_max_hops, args.topology_prior_max_hops, config.feature_topo_max_hops)
         _print_progress(
             f"[train] building topology index (max_hops={index_hops}) ...",
             args,
@@ -353,6 +391,7 @@ def main():
         progress_callback=_training_progress if _progress_enabled(args) else None,
         verbose=_progress_enabled(args),
         topology_index=topology_index,
+        ne_graph_data=ne_graph_data,
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata

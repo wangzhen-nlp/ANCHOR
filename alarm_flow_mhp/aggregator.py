@@ -40,6 +40,7 @@ from mhp import (
     compute_cascade_of,
     compute_hard_parents,
     fit_mhp,
+    fit_mhp_feature,
     fit_mhp_piecewise,
 )
 
@@ -47,6 +48,7 @@ from mhp import (
 MU_COUNT_SMOOTHINGS = frozenset({"linear", "log"})
 BETA_MODES = frozenset({"shared", "per_edge"})
 KERNEL_TYPES = frozenset({"exp", "piecewise"})
+EDGE_MODES = frozenset({"device", "feature"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -77,6 +79,13 @@ class AlarmMHPConfig:
     topology_prior_boost: float = 0.0
     topology_prior_max_hops: int = 1         # 1 = same-NE + direct links only
     topology_prior_min_score: float = 0.6    # drop weak (far multi-hop) relations
+    # Edge model: "device" = free per-(device-type) α (default, transductive);
+    # "feature" = α = softplus(w·φ) learned over device-agnostic pair features
+    # (inductive — generalizes to unseen pairs). feature mode needs the NE graph.
+    edge_mode: str = "device"
+    feature_l2: float = 1e-3                  # ridge on feature weights
+    feature_topo_max_hops: int = 2            # candidate topology reach (feature mode)
+    feature_topo_min_score: float = 0.0       # candidate topology score floor
     mu_count_smoothing: str = "log"
     beta_mode: str = "shared"
     beta_shared_value: float = 1.0
@@ -122,6 +131,10 @@ class AlarmMHPConfig:
             raise ValueError("topology_prior_max_hops must be >= 1")
         if not (0.0 <= self.topology_prior_min_score <= 1.0):
             raise ValueError("topology_prior_min_score must be in [0, 1]")
+        if self.edge_mode not in EDGE_MODES:
+            raise ValueError(f"edge_mode must be one of {sorted(EDGE_MODES)}")
+        if self.feature_l2 < 0:
+            raise ValueError("feature_l2 must be non-negative")
         if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
             raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.beta_mode not in BETA_MODES:
@@ -304,20 +317,6 @@ def mhp_params_from_dict(payload) -> MHPParams:
     )
 
 
-@dataclass
-class AlarmMHPOutput:
-    groups: list
-    edges: list
-    metadata: dict
-
-    def to_json_payload(self):
-        return {
-            "metadata": self.metadata,
-            "groups": self.groups,
-            "edges": self.edges,
-        }
-
-
 def save_alarm_mhp_artifact(path, artifact: AlarmMHPArtifact):
     with open(path, "w", encoding="utf-8") as stream:
         json.dump(artifact.to_dict(), stream, ensure_ascii=False, indent=2)
@@ -384,103 +383,6 @@ def summarize_alarm_event(event, index):
     }
 
 
-def _group_records_from_parents(
-    sequence,
-    parent_of: np.ndarray,
-    cascade_of: np.ndarray,
-    *,
-    min_group_events: int = 1,
-    id_prefix: str = "mhp",
-):
-    """Build group records from MHP's hard parent/cascade assignments.
-
-    Output schema matches alarm_flow_brunch._group_records so downstream
-    consumers (visualizers, ground-truth comparison) don't need adaptation.
-    """
-    by_cascade = defaultdict(list)
-    for index, cid in enumerate(cascade_of):
-        by_cascade[int(cid)].append(index)
-    groups = []
-    for ordinal, (cascade_id, indices) in enumerate(
-        sorted(by_cascade.items(), key=lambda item: min(item[1])),
-        start=1,
-    ):
-        if len(indices) < min_group_events:
-            continue
-        events = [sequence.events[i] for i in indices]
-        summaries = [summarize_alarm_event(e, i) for i, e in zip(indices, events)]
-        parent_indices = [int(parent_of[i]) for i in indices]
-        root_index = min(
-            indices,
-            key=lambda i: (
-                parent_of[i] != i,
-                float(sequence.events[i].get("ts", 0.0)),
-                i,
-            ),
-        )
-        group_edges = []
-        idx_set = set(indices)
-        for child_index, parent_index in zip(indices, parent_indices):
-            if parent_index == child_index or parent_index not in idx_set:
-                continue
-            group_edges.append(
-                {
-                    "source_index": parent_index,
-                    "target_index": child_index,
-                    "source_event_id": _event_id(sequence.events[parent_index], parent_index),
-                    "target_event_id": _event_id(sequence.events[child_index], child_index),
-                    "source_type": sequence.type_labels[parent_index],
-                    "target_type": sequence.type_labels[child_index],
-                }
-            )
-        timestamps = [s["ts"] for s in summaries]
-        groups.append(
-            {
-                "group_id": f"{id_prefix}-{ordinal:06d}",
-                "cascade_id": cascade_id,
-                "event_count": len(indices),
-                "start_ts": min(timestamps),
-                "end_ts": max(timestamps),
-                "duration_sec": max(timestamps) - min(timestamps),
-                "root_event": summarize_alarm_event(sequence.events[root_index], root_index),
-                "site_list": sorted({s["site_id"] for s in summaries if s["site_id"]}),
-                "alarm_source_list": sorted({s["alarm_source"] for s in summaries if s["alarm_source"]}),
-                "alarm_title_counts": dict(
-                    Counter(s["alarm_title"] for s in summaries if s["alarm_title"])
-                ),
-                "alarm_type_counts": dict(
-                    Counter(s["alarm_type"] for s in summaries if s["alarm_type"])
-                ),
-                "symptoms": summaries,
-                "edges": group_edges,
-            }
-        )
-    return groups
-
-
-def _edge_records_from_parents(sequence, parent_of: np.ndarray):
-    """Branching edges across all cascades (one record per (parent, child) link).
-    """
-    edges = []
-    for child_index in range(len(parent_of)):
-        parent_index = int(parent_of[child_index])
-        if parent_index == child_index:
-            continue
-        edges.append(
-            {
-                "source_index": parent_index,
-                "target_index": child_index,
-                "source_event_id": _event_id(sequence.events[parent_index], parent_index),
-                "target_event_id": _event_id(sequence.events[child_index], child_index),
-                "source_type": sequence.type_labels[parent_index],
-                "target_type": sequence.type_labels[child_index],
-                "source_event": summarize_alarm_event(sequence.events[parent_index], parent_index),
-                "target_event": summarize_alarm_event(sequence.events[child_index], child_index),
-            }
-        )
-    return edges
-
-
 def _event_type_counts(sequence):
     return {
         label: count
@@ -543,8 +445,14 @@ def train_alarm_mhp(
     verbose: bool = True,
     region_filter_stats=None,
     topology_index: Optional[NETopologyIndex] = None,
+    ne_graph_data=None,
 ) -> AlarmMHPArtifact:
-    """Fit alarm-flow MHP parameters via windowed sparse MAP EM."""
+    """Fit alarm-flow MHP parameters via windowed sparse MAP EM.
+
+    ne_graph_data: raw NE graph dict — required for edge_mode='feature' (device
+    attributes for pair features). Topology_index is still used for topology
+    relation features / prior.
+    """
     config = config or AlarmMHPConfig()
     sequence_config = config.sequence_config()
     sorted_alarm_events = list(sorted_alarm_events)
@@ -616,6 +524,15 @@ def train_alarm_mhp(
     # device pairs still get an edge. Built once from the NE graph.
     topo_prior_flat = None
     topo_prior_score = None
+    # Feature-mode device attributes (NE graph → manufacturer/ne_type/site/...).
+    feature_graph_context = None
+    if config.edge_mode == "feature":
+        if ne_graph_data is None:
+            raise ValueError("edge_mode='feature' requires ne_graph_data (NE graph) for device attributes")
+        from ne_link_learning.core import build_graph_context
+
+        feature_graph_context = build_graph_context(ne_graph_data)
+
     if config.topology_prior_boost > 0 and topology_index is not None:
         topo_prior_flat, topo_prior_score = build_topology_pairs(
             vocabs,
@@ -634,7 +551,85 @@ def train_alarm_mhp(
     elif config.topology_prior_boost > 0 and topology_index is None and verbose:
         print("[train] WARN: topology_prior_boost > 0 but no NE graph loaded → prior disabled", flush=True)
 
-    if config.kernel_type == "piecewise":
+    feat_at_vocab = None
+    feat_mu_spec = None
+    if config.edge_mode == "feature":
+        # Feature-weighted α = softplus(w·φ) over device-agnostic pair features.
+        from alarm_flow_mhp.feature_spec import build_candidate_features
+
+        # Warn about config that feature mode does NOT honor, so users aren't
+        # misled by flags that silently no-op here.
+        if verbose:
+            ignored = []
+            if config.kernel_type == "piecewise":
+                ignored.append("--kernel-type piecewise (feature mode is exp-only)")
+            if config.beta_mode == "per_edge":
+                ignored.append("--beta-mode per_edge (feature mode uses shared β)")
+            if config.topology_prior_boost > 0:
+                ignored.append(
+                    "--topology-prior-boost (topology enters as a φ feature in feature mode, "
+                    "not as a prior)"
+                )
+            for msg in ignored:
+                print(f"[train] WARN: edge_mode=feature ignores {msg}", flush=True)
+            print(
+                "[train] NOTE: feature mode has no branching-cap/top-k/spectral cap; "
+                "stationarity relies on the L2 ridge (--feature-l2) + data. ρ is checked below.",
+                flush=True,
+            )
+
+        if verbose:
+            print("[train] edge_mode=feature → building candidate pair features ...", flush=True)
+        from alarm_flow_mhp.feature_spec import build_mu_features
+
+        cand_t, cand_s, phi, feat_names, feat_at_vocab, feat_type_group = build_candidate_features(
+            train_events,
+            vocabs,
+            config.type_fields,
+            topology_index=topology_index,
+            graph_context=feature_graph_context,
+            history_window=mhp_config.history_window,
+            max_history_events=mhp_config.max_history_events,
+            chunk_size=mhp_config.chunk_size,
+            topo_max_hops=config.feature_topo_max_hops,
+            topo_min_score=config.feature_topo_min_score,
+        )
+        # Parameterized inductive μ: ψ(u) single-type features (alarm_type +
+        # ne_type/vendor/domain from the NE graph), μ=softplus(w_μ·ψ).
+        mu_phi, mu_spec = build_mu_features(vocabs, config.type_fields, feature_graph_context)
+        feat_mu_spec = mu_spec
+        if verbose:
+            print(
+                f"[train] feature mode: {len(cand_t)} candidate pairs, {phi.shape[1]} features "
+                f"{feat_names}",
+                flush=True,
+            )
+        result = fit_mhp_feature(
+            train_events,
+            mhp_config,
+            cand_targets=cand_t,
+            cand_sources=cand_s,
+            cand_phi=phi,
+            feature_names=feat_names,
+            l2=config.feature_l2,
+            mu_phi=mu_phi,                       # inductive parameterized μ
+            mu_feature_names=mu_spec.feature_names,
+            iter_callback=iter_callback,
+        )
+        # Stationarity check (feature mode has no hard cap): warn if the
+        # materialized α matrix's spectral radius ≥ 1 → cluster-Poisson diverges.
+        if config.stability_radius > 0 and len(result.params.edge_alpha):
+            rho = result.params.spectral_radius()
+            if rho >= config.stability_radius and verbose:
+                print(
+                    f"[train] WARN: feature-mode α spectral radius ρ={rho:.3f} >= "
+                    f"{config.stability_radius}. No hard cap in feature mode — raise "
+                    f"--feature-l2 to shrink weights, or expect over-excitation. ",
+                    flush=True,
+                )
+            elif verbose:
+                print(f"[train] feature-mode α spectral radius ρ={rho:.3f} (< {config.stability_radius}, OK)", flush=True)
+    elif config.kernel_type == "piecewise":
         # Stage 1: exp-kernel fit selects the sparse active edge set + μ. The
         # topology prior applies HERE (edge selection); stage 2 only learns θ
         # on the resulting edges.
@@ -738,6 +733,18 @@ def train_alarm_mhp(
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,
         "bucket_mass_distribution": bucket_mass,
+        # Feature-mode: persist the learned weights (interpretable + enables
+        # live-α inference for unseen devices) and the runtime info needed to
+        # rebuild the scorer (alarm-type vocab + μ aggregated per alarm-type so
+        # new devices have an immigrant baseline).
+        "feature_kernel": (
+            result.feature_kernel.to_dict() if result.feature_kernel is not None else None
+        ),
+        "feature_runtime": (
+            _build_feature_runtime(result, vocabs, config, feat_at_vocab, feat_mu_spec)
+            if config.edge_mode == "feature"
+            else None
+        ),
         "val_trace": val_trace,
         "hard_cascade_seconds": float(hard_cascade_seconds),
         "topology_report_seconds": float(topology_report_seconds),
@@ -749,80 +756,6 @@ def train_alarm_mhp(
         training_metadata=training_metadata,
         trace=result.trace,
     )
-
-
-def infer_alarm_mhp(
-    sorted_alarm_events: Iterable[dict],
-    artifact: AlarmMHPArtifact,
-    *,
-    config: AlarmMHPConfig | None = None,
-    region_filter_stats=None,
-    verbose: bool = True,
-    min_group_events: Optional[int] = None,
-) -> AlarmMHPOutput:
-    """Apply a trained MHP artifact to a new alarm stream offline.
-
-    Inference is a single chunked E-step over the input events using the
-    trained Θ, followed by hard parent argmax and union-find for cascades.
-    Returns groups in the same JSON shape as alarm_flow_brunch.
-    """
-    cfg = config or artifact.config
-    seq_cfg = cfg.sequence_config()
-    sorted_alarm_events = list(sorted_alarm_events)
-    sorted_alarm_events, region_filter_stats = _region_filter_events(
-        sorted_alarm_events,
-        cfg,
-        ne_graph_data=None,
-        region_filter_stats=region_filter_stats,
-    )
-    # Reuse vocabs from training — events of unknown type are dropped
-    # silently by build_alarm_sequences(add_missing_types=False).
-    sequences, sequence_stats = _build_sequences(sorted_alarm_events, artifact.vocabs, seq_cfg)
-    sequence = sequences[0]
-    M = len(artifact.vocabs.type_vocab)
-    view = _EventColumnsView(times=sequence.times, type_ids=sequence.type_ids)
-    events = _events_to_collection(view, M)
-
-    if verbose:
-        print(
-            f"[infer] events={events.n}, types={M}, "
-            f"max_history_events={cfg.max_history_events}",
-            flush=True,
-        )
-    t0 = time.monotonic()
-    mhp_cfg = cfg.mhp_config()
-    mhp_cfg.verbose = False
-    parent_of = compute_hard_parents(events, artifact.params, config=mhp_cfg)
-    cascade_of = compute_cascade_of(parent_of)
-    infer_seconds = time.monotonic() - t0
-    if verbose:
-        print(f"[infer] hard parent + cascade assignment done in {infer_seconds:.1f}s", flush=True)
-
-    min_grp = cfg.min_group_events if min_group_events is None else int(min_group_events)
-    groups = _group_records_from_parents(
-        sequence, parent_of, cascade_of, min_group_events=min_grp
-    )
-    edges = _edge_records_from_parents(sequence, parent_of)
-    cascade_stats_hard = _cascade_size_stats_from_hard(cascade_of)
-
-    metadata = {
-        "algorithm": "alarm_flow_mhp",
-        "config": cfg.to_dict(),
-        "sequence_config": seq_cfg.to_dict(),
-        "considered_event_count": sequence_stats.get("input_event_count", events.n),
-        "region_filter": region_filter_stats or {},
-        "sequence_stats": sequence_stats,
-        "modeled_event_count": events.n,
-        "type_count": M,
-        "active_edge_count": len(artifact.params.edge_alpha),
-        "group_count": len(groups),
-        "branching_edge_count": len(edges),
-        "event_type_counts": _event_type_counts(sequence),
-        "type_labels": list(artifact.vocabs.type_vocab.labels),
-        "cascade_size_stats": cascade_stats_hard,
-        "infer_seconds": float(infer_seconds),
-    }
-    return AlarmMHPOutput(groups=groups, edges=edges, metadata=metadata)
 
 
 def _cascade_size_stats_from_p_self(p_self: np.ndarray, dims: np.ndarray):
@@ -938,6 +871,46 @@ def _format_bucket_label(lo_sec: float, hi_sec: float) -> str:
             return f"{s / 60:.0f}min"
         return f"{s / 3600:.0f}h"
     return f"{fmt(lo_sec)}-{fmt(hi_sec)}"
+
+
+def _build_feature_runtime(result, vocabs, config, at_vocab, mu_spec=None):
+    """Runtime info for feature-mode inference:
+      - α: feature_kernel (stored separately)
+      - μ: the parameterized μ kernel (w_μ) + its MuFeatureSpec (category vocabs)
+           for live μ on any device; plus a per-alarm-type μ table as a fallback
+           when NE attributes are unavailable.
+      - β shared scalar.
+    """
+    labels = vocabs.type_vocab.labels
+    type_fields = tuple(config.type_fields)
+    try:
+        at_idx = type_fields.index("alarm_type")
+    except ValueError:
+        at_idx = None
+
+    def _at_of(label):
+        if at_idx is None:
+            return ""
+        parts = str(label).split(" | ")
+        return parts[at_idx] if len(parts) > at_idx else ""
+
+    mu = result.params.mu
+    at_to_mus = defaultdict(list)
+    for tid, label in enumerate(labels):
+        at = _at_of(label)
+        if at:
+            at_to_mus[at].append(float(mu[tid]) if tid < len(mu) else 0.0)
+    global_med = float(np.median(mu)) if len(mu) else 0.0
+    mu_by_at = {at: (float(np.mean(v)) if v else global_med) for at, v in at_to_mus.items()}
+    return {
+        "at_vocab": list(at_vocab or []),
+        "mu_by_alarm_type": mu_by_at,       # fallback when NE attrs missing
+        "mu_default": global_med,
+        "beta": float(config.beta_shared_value),
+        # Parameterized μ (preferred at inference):
+        "mu_kernel": (result.mu_kernel.to_dict() if result.mu_kernel is not None else None),
+        "mu_spec": (mu_spec.to_dict() if mu_spec is not None else None),
+    }
 
 
 def _ne_pair_topo_score(source_ne: str, target_ne: str, topology_index) -> float:
