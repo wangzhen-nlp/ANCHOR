@@ -135,6 +135,10 @@ class AlarmMHPConfig:
             raise ValueError(f"edge_mode must be one of {sorted(EDGE_MODES)}")
         if self.feature_l2 < 0:
             raise ValueError("feature_l2 must be non-negative")
+        if self.feature_topo_max_hops < 1:
+            raise ValueError("feature_topo_max_hops must be >= 1")
+        if not (0.0 <= self.feature_topo_min_score <= 1.0):
+            raise ValueError("feature_topo_min_score must be in [0, 1]")
         if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
             raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.beta_mode not in BETA_MODES:

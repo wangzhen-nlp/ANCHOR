@@ -127,7 +127,24 @@ class StreamConfig:
         for k, v in overrides.items():
             if v is not None:
                 setattr(base, k, v)
+        base.validate()
         return base
+
+    def validate(self):
+        if self.history_window_sec <= 0:
+            raise ValueError("history_window_sec must be > 0")
+        if self.max_history_events < 1:
+            raise ValueError("max_history_events must be >= 1")
+        if self.time_scale_sec <= 0:
+            raise ValueError("time_scale_sec must be > 0")
+        if self.close_inactive_sec < 0:
+            raise ValueError("close_inactive_sec must be >= 0")
+        if self.min_group_events < 1:
+            raise ValueError("min_group_events must be >= 1")
+        if self.immigrant_bias < 0:
+            raise ValueError("immigrant_bias must be >= 0")
+        if self.feature_alpha_floor < 0:
+            raise ValueError("feature_alpha_floor must be >= 0")
 
 
 class StreamMHPAssigner:
@@ -159,7 +176,10 @@ class StreamMHPAssigner:
         self.feature_mode = getattr(artifact.config, "edge_mode", "device") == "feature"
         self.feature_scorer = feature_scorer
         self.mu_scorer = mu_scorer            # live parameterized μ (or None → fallback table)
+        self.config.validate()
         if self.feature_mode:
+            if self.feature_scorer is None:
+                raise ValueError("feature-mode artifact requires a RuntimeFeatureScorer")
             rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
             self._mu_by_at = rt.get("mu_by_alarm_type", {}) or {}
             self._mu_default = float(rt.get("mu_default", 0.0))
