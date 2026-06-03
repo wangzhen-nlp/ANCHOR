@@ -122,6 +122,7 @@ def _build_config(args):
         feature_l2=args.feature_l2,
         feature_topo_max_hops=args.feature_topo_max_hops,
         feature_topo_min_score=args.feature_topo_min_score,
+        feature_topo_prior_boost=args.feature_topo_prior_boost,
         mu_count_smoothing=args.mu_count_smoothing,
         beta_mode=args.beta_mode,
         beta_shared_value=args.beta_shared_value,
@@ -221,6 +222,18 @@ def main():
         type=float,
         default=0.0,
         help="Topology score floor for feature-mode candidates. Default: 0 (keep all reachable).",
+    )
+    parser.add_argument(
+        "--feature-topo-prior-boost",
+        type=float,
+        default=0.0,
+        help=(
+            "Feature-mode topology PRIOR (device-parity). Injects a pseudo-count "
+            "prior α≈boost·score on topology-related candidate edges: strong where "
+            "data is sparse (rare/zero-co-occurrence but physically connected pairs "
+            "still form an edge), washed out where data is rich. 0 disables (pure "
+            "MLE). Try 0.3. Needs the NE graph (feature mode loads it anyway)."
+        ),
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)
     parser.add_argument("--alpha-prior-mean", type=float, default=0.1)

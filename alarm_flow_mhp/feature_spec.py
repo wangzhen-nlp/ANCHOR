@@ -415,7 +415,7 @@ def build_candidate_features(
 
     if not cand_keys:
         return (np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 0)), [],
-                list(attrs["at_vocab"]), at_id.copy())
+                list(attrs["at_vocab"]), at_id.copy(), np.zeros(0, np.float64))
 
     cand_flat = np.fromiter(cand_keys, dtype=np.int64, count=len(cand_keys))
     cand_flat.sort()
@@ -445,9 +445,9 @@ def build_candidate_features(
         same_vendor=_same(vendor),
         same_netype=_same(netype),
     )
-    # type_group = per-type alarm-type index (for inductive per-alarm-type μ);
-    # -1 for types with unknown alarm type.
-    return cand_t, cand_s, phi, layout.feature_names, list(attrs["at_vocab"]), at_id.copy()
+    # topo_vec (C,) = per-candidate topology score, returned so the feature-mode
+    # fit can apply it as a pseudo-count topology prior (device-parity).
+    return cand_t, cand_s, phi, layout.feature_names, list(attrs["at_vocab"]), at_id.copy(), topo_vec
 
 
 class RuntimeFeatureScorer:

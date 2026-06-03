@@ -1024,6 +1024,8 @@ def fit_mhp_feature(
     l2: float = 1e-3,
     mu_phi: Optional[np.ndarray] = None,
     mu_feature_names: Optional[list] = None,
+    cand_topo_score: Optional[np.ndarray] = None,
+    topo_prior_boost: float = 0.0,
     iter_callback: Optional[Callable[[dict], None]] = None,
 ) -> MHPResult:
     """Feature-weighted MAP EM: α on a fixed CANDIDATE pair set is a log-linear
@@ -1064,8 +1066,40 @@ def fit_mhp_feature(
 
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
     exposure = n_source[cand_sources]                      # E_c
+
+    # Topology PRIOR as pseudo-observations (mirrors device-mode
+    # topology_prior_boost). For a topology-related candidate c we inject a
+    # Gamma-style prior on α_c by augmenting its sufficient statistics:
+    #   N_c += K·boost·score_c   (pseudo excitation count)
+    #   E_c += K                 (pseudo exposure)
+    # so the per-row MAP target becomes (N_c + K·boost·score)/(E_c + K) — at
+    # zero co-occurrence α_c → boost·score_c (a zero-shot topology edge), and
+    # for rare sources (small E_c) the prior dominates, exactly where data is
+    # missing; for data-rich pairs the likelihood washes it out. The prior
+    # steers the weight-fit only; the reported LL below uses the RAW exposure.
+    prior_num = np.zeros(C, dtype=np.float64)
+    prior_exp = np.zeros(C, dtype=np.float64)
+    if topo_prior_boost > 0.0 and cand_topo_score is not None:
+        topo_score_sorted = np.asarray(cand_topo_score, dtype=np.float64)[order]
+        K_topo = float(config.alpha_prior_strength)
+        prior_num = K_topo * float(topo_prior_boost) * np.maximum(topo_score_sorted, 0.0)
+        prior_exp = np.where(topo_score_sorted > 0.0, K_topo, 0.0)
+
     F = cand_phi.shape[1]
     w = np.zeros(F) if w_prior_mean is None else np.asarray(w_prior_mean, dtype=np.float64).copy()
+
+    # Seed the α BIAS (feature index 0) so the initial model is SUBCRITICAL.
+    # With all non-bias weights at 0, α_c = softplus(w[0]) uniformly. Left at 0,
+    # softplus(0)=0.693 on every candidate → with a large candidate set the
+    # initial branching ratio Σ_c E_c·α/N is enormous, and the first M-step sees
+    # a ~ΣE_c-sized integral-term gradient that overshoots α (and then μ) to the
+    # degenerate all-zero fixed point. Choose w[0] so the initial global
+    # branching ratio Σ_c E_c·α / N ≈ 0.5 (symmetric to the μ-bias seed below).
+    if w_prior_mean is None:
+        total_exposure = float(exposure.sum())
+        if total_exposure > 0.0:
+            alpha_init = min(max(0.5 * N / total_exposure, 1e-6), 0.5)
+            w[0] = float(np.log(np.expm1(alpha_init)))   # inverse softplus
 
     # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
     # function of the type's OWN features ψ (alarm_type, ne_type, vendor, domain)
@@ -1163,8 +1197,11 @@ def fit_mhp_feature(
         # parameterized (mu_phi), else per-type closed form.
         from .feature_kernel import fit_weights_mstep
 
+        # Topology prior enters here as pseudo-observations on the candidate
+        # statistics (no-op when prior_num/prior_exp are all zero).
         w_new = fit_weights_mstep(
-            cand_phi, n_resp, exposure, w, l2=l2, w_prior_mean=w_prior_mean, max_iter=50
+            cand_phi, n_resp + prior_num, exposure + prior_exp, w,
+            l2=l2, w_prior_mean=w_prior_mean, max_iter=50
         )
         alpha_new = softplus(cand_phi @ w_new)
 

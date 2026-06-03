@@ -86,6 +86,10 @@ class AlarmMHPConfig:
     feature_l2: float = 1e-3                  # ridge on feature weights
     feature_topo_max_hops: int = 2            # candidate topology reach (feature mode)
     feature_topo_min_score: float = 0.0       # candidate topology score floor
+    # Topology PRIOR for feature mode (device-parity): pseudo-count prior that
+    # injects α≈boost·score on topology-related candidate edges, strongest where
+    # data is sparse, washed out where data is rich. 0 = pure MLE (no prior).
+    feature_topo_prior_boost: float = 0.0
     mu_count_smoothing: str = "log"
     beta_mode: str = "shared"
     beta_shared_value: float = 1.0
@@ -139,6 +143,8 @@ class AlarmMHPConfig:
             raise ValueError("feature_topo_max_hops must be >= 1")
         if not (0.0 <= self.feature_topo_min_score <= 1.0):
             raise ValueError("feature_topo_min_score must be in [0, 1]")
+        if self.feature_topo_prior_boost < 0:
+            raise ValueError("feature_topo_prior_boost must be non-negative")
         if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
             raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.beta_mode not in BETA_MODES:
@@ -571,8 +577,8 @@ def train_alarm_mhp(
                 ignored.append("--beta-mode per_edge (feature mode uses shared β)")
             if config.topology_prior_boost > 0:
                 ignored.append(
-                    "--topology-prior-boost (topology enters as a φ feature in feature mode, "
-                    "not as a prior)"
+                    "--topology-prior-boost (device-mode prior; in feature mode use "
+                    "--feature-topo-prior-boost for the equivalent pseudo-count topology prior)"
                 )
             for msg in ignored:
                 print(f"[train] WARN: edge_mode=feature ignores {msg}", flush=True)
@@ -586,7 +592,7 @@ def train_alarm_mhp(
             print("[train] edge_mode=feature → building candidate pair features ...", flush=True)
         from alarm_flow_mhp.feature_spec import build_mu_features
 
-        cand_t, cand_s, phi, feat_names, feat_at_vocab, feat_type_group = build_candidate_features(
+        cand_t, cand_s, phi, feat_names, feat_at_vocab, feat_type_group, cand_topo_score = build_candidate_features(
             train_events,
             vocabs,
             config.type_fields,
@@ -618,6 +624,8 @@ def train_alarm_mhp(
             l2=config.feature_l2,
             mu_phi=mu_phi,                       # inductive parameterized μ
             mu_feature_names=mu_spec.feature_names,
+            cand_topo_score=cand_topo_score,     # topology pseudo-count prior
+            topo_prior_boost=config.feature_topo_prior_boost,
             iter_callback=iter_callback,
         )
         # Stationarity check (feature mode has no hard cap): warn if the
