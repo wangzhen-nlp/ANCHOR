@@ -195,6 +195,62 @@ def test_death_removes_childless_missing():
     assert removed and x.eid not in s.events
 
 
+def test_death_respects_real_parent_support():
+    """A childless missing event with a strong REAL parent must not be over-
+    deleted (death uses actual incoming intensity, not μ). The same node as an
+    immigrant with tiny μ is readily culled."""
+    adapter = ExpKernelAdapter(
+        mu_by_type={0: 1e-6, 1: 0.01},     # the missing type (0) has tiny μ
+        edges={(0, 1): (1e6, 1.0)},        # p(type1) → x(type0) extremely strong
+        time_scale_sec=60.0,
+    )
+    s = MissingChainSampler(
+        adapter, SamplerConfig(lag_sec=1e9, missing_log_prior=0.0, seed=5)
+    )
+    s.now = 200.0
+    p = s._new_event(ts=40.0, type_id=1, observed=True, meta={}, depth=0)
+    s._insert_ordered(p)
+    x = s._new_event(ts=50.0, type_id=0, observed=False, meta={}, depth=1)
+    s._insert_ordered(x)
+    s._set_parent(x, p.eid)                # x is strongly supported by parent p
+    # High incoming intensity ⇒ death ratio ~ exp(-large) ⇒ rejected.
+    assert s._try_death(x) is False
+    assert x.eid in s.events
+    # Detach → immigrant with tiny μ ⇒ now readily culled.
+    s._set_parent(x, -1)
+    assert s._try_death(x) is True
+    assert x.eid not in s.events
+
+
+def test_orphan_and_missing_indices_stay_consistent():
+    adapter = ExpKernelAdapter(
+        mu_by_type={0: 0.05, 1: 0.0005},
+        edges={(1, 0): (3.0, 1.0)},
+        time_scale_sec=60.0,
+        meta_by_type={0: {"alarm_type": "S"}},
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=100.0, history_window_sec=300.0, sweeps_per_tick=10,
+                      missing_log_prior=0.0, seed=21),
+    )
+    s.ingest(100.0, 1, {"event_id": "B"})
+
+    missing = [e for e in s.events.values() if e.is_missing()]
+    assert missing, "expected an imputed missing event"
+    assert set(s._missing_set) == {e.eid for e in missing}
+    assert set(s._orphan_list) == set(s._orphan_idx)
+    for i, eid in enumerate(s._orphan_list):
+        assert s._orphan_idx[eid] == i
+        ev = s.events[eid]
+        assert ev.parent == -1 and not ev.committed
+
+    groups = s.flush()
+    assert groups
+    assert not s.events
+    assert not s._orphan_list and not s._orphan_idx and not s._missing_set
+
+
 def test_strong_prior_suppresses_births():
     """A very negative κ prior should keep the sampler from inventing events."""
     adapter = ExpKernelAdapter(
@@ -288,7 +344,10 @@ def test_feature_birth_imputes_missing_parent():
     adapter = _build_feature_adapter()
     s = MissingChainSampler(
         adapter,
-        SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0, seed=11),
+        # max_depth=1 isolates the single-hop intent (the fake adapter also has
+        # R→S, which would otherwise legitimately grow a 2nd hop).
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0,
+                      max_depth=1, seed=11),
     )
     s.ingest(100.0, ("B", "n1"))         # orphan B on device n1
     missing = [e for e in s.events.values() if e.is_missing()]
@@ -303,7 +362,7 @@ def test_feature_multi_hop_chain():
     s = MissingChainSampler(
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=30, missing_log_prior=0.0,
-                      max_depth=4, seed=12),
+                      max_depth=4, seed=1),
     )
     s.ingest(100.0, ("B", "n1"))
     assert any(e.depth >= 2 for e in s.events.values() if e.is_missing()), \

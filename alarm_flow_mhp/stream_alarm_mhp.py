@@ -668,6 +668,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
         max_births_per_sweep=int(args.impute_max_births),
         max_history_events=int(args.impute_max_history),
         sweep_recent_events=int(args.impute_sweep_recent),
+        max_birth_attempts_per_sweep=int(args.impute_max_birth_attempts),
         seed=int(getattr(artifact.config, "seed", 0) or 0),
     )
     sampler = MissingChainSampler(adapter, cfg)
@@ -898,8 +899,18 @@ def main():
         type=int,
         default=64,
         help=(
-            "A sweep only re-touches the most recent N uncommitted events (local "
-            "sweep). Lower = faster, less re-mixing of older events. Default: 64."
+            "PARENT re-sampling only re-touches the most recent N uncommitted "
+            "events (bounded local approximation). Does NOT gate birth/death. "
+            "Default: 64."
+        ),
+    )
+    parser.add_argument(
+        "--impute-max-birth-attempts",
+        type=int,
+        default=32,
+        help=(
+            "Birth is attempted over ALL active orphans (fair, no age bias) but "
+            "bounded to this many attempts per sweep to cap cost. Default: 32."
         ),
     )
     parser.add_argument("--quiet", action="store_true")
@@ -985,6 +996,10 @@ def main():
                 "impute_sweeps": args.impute_sweeps,
                 "impute_kappa": args.impute_kappa,
                 "impute_max_depth": args.impute_max_depth,
+                "impute_max_births": args.impute_max_births,
+                "impute_max_history": args.impute_max_history,
+                "impute_sweep_recent": args.impute_sweep_recent,
+                "impute_max_birth_attempts": args.impute_max_birth_attempts,
             },
             "group_count": len(groups),
             "modeled_event_count": impute_stats["processed"],

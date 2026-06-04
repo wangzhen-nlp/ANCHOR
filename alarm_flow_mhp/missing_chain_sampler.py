@@ -40,9 +40,9 @@ Status
 Skeleton / v1. Parent resampling (Move A) is an exact Gibbs step. Birth/death
 (Move B) uses a documented v1 acceptance ratio carrying the dominant likelihood
 terms + a per-missing-event log-prior (κ knob); the exact reversible-jump
-correction is marked TODO. Not yet wired to ``stream_alarm_mhp``; driven here by
-the :class:`ModelAdapter` interface and exercised by the unit tests with a small
-exp-kernel adapter.
+correction is marked TODO. The sampler is wired into ``stream_alarm_mhp`` via
+``--impute`` and is also exercised directly by the unit tests with small
+adapters.
 """
 
 from __future__ import annotations
@@ -227,12 +227,19 @@ class SamplerConfig:
     max_history_events: int = 256      # cap on candidate parents scored per event
                                        # (nearest-in-time first) — bounds per-tick
                                        # cost; the dominant perf knob at scale
-    sweep_recent_events: int = 64      # a sweep only re-touches the most recent N
-                                       # uncommitted events (LOCAL sweep). Older
-                                       # active events are already near-stable
-                                       # (their candidate parents are fixed in the
-                                       # past), so re-scoring the whole window
-                                       # every tick is wasted work at scale.
+    sweep_recent_events: int = 64      # PARENT re-sampling (Move A) only re-touches
+                                       # the most recent N uncommitted events. This
+                                       # is a bounded local approximation: an older
+                                       # event's candidate parents are fixed in the
+                                       # past, but repeated Gibbs draws would still
+                                       # refine its parent votes. (It does NOT gate
+                                       # birth/death — those cover the whole active
+                                       # window, see below — otherwise older orphans
+                                       # would be starved of imputation chances.)
+    max_birth_attempts_per_sweep: int = 32  # birth is attempted over ALL active
+                                       # orphans (fair, shuffled) but bounded to this
+                                       # many ATTEMPTS/sweep to cap cost without
+                                       # introducing an age bias.
     seed: int = 0
 
     def window_sec(self) -> float:
@@ -250,8 +257,14 @@ class SamplerConfig:
             raise ValueError("sweeps_per_tick must be >= 0")
         if self.max_missing < 0 or self.max_depth < 0:
             raise ValueError("caps must be >= 0")
+        if self.max_births_per_sweep < 0:
+            raise ValueError("max_births_per_sweep must be >= 0")
         if self.max_history_events < 1:
             raise ValueError("max_history_events must be >= 1")
+        if self.sweep_recent_events < 1:
+            raise ValueError("sweep_recent_events must be >= 1")
+        if self.max_birth_attempts_per_sweep < 0:
+            raise ValueError("max_birth_attempts_per_sweep must be >= 0")
 
 
 class MissingChainSampler:
@@ -270,6 +283,13 @@ class MissingChainSampler:
         self._next_eid: int = 0
         self.now: float = NEG_INF
         self._missing_count: int = 0
+        # Incremental indices so birth/death don't scan the whole active window:
+        #  _orphan_list/_orphan_idx : uncommitted immigrants (parent == -1) as a
+        #    swap-remove list → O(1) add/remove + O(k) uniform sampling for birth.
+        #  _missing_set : uncommitted missing events → death iterates only these.
+        self._orphan_list: list[int] = []
+        self._orphan_idx: dict[int, int] = {}
+        self._missing_set: set[int] = set()
         # stats
         self.births = 0
         self.deaths = 0
@@ -310,13 +330,31 @@ class MissingChainSampler:
 
     # ---- event bookkeeping ----------------------------------------------
 
+    def _orphan_add(self, eid: int):
+        if eid in self._orphan_idx:
+            return
+        self._orphan_idx[eid] = len(self._orphan_list)
+        self._orphan_list.append(eid)
+
+    def _orphan_remove(self, eid: int):
+        i = self._orphan_idx.pop(eid, None)
+        if i is None:
+            return
+        last = self._orphan_list.pop()
+        if last != eid:
+            self._orphan_list[i] = last
+            self._orphan_idx[last] = i
+
     def _new_event(self, *, ts, type_id, observed, meta, depth) -> SamplerEvent:
         ev = SamplerEvent(eid=self._next_eid, ts=ts, type_id=type_id,
                           observed=observed, meta=meta, depth=depth)
         self._next_eid += 1
         self.events[ev.eid] = ev
+        # New events start as immigrants (parent == -1) until Gibbs/birth.
+        self._orphan_add(ev.eid)
         if not observed:
             self._missing_count += 1
+            self._missing_set.add(ev.eid)
         return ev
 
     def _insert_ordered(self, ev: SamplerEvent):
@@ -343,8 +381,11 @@ class MissingChainSampler:
             child = self.events.get(cid)
             if child is not None:
                 child.parent = -1          # orphaned; re-parented next sweep
+                self._orphan_add(cid)
         if ev.is_missing():
             self._missing_count -= 1
+        self._orphan_remove(ev.eid)
+        self._missing_set.discard(ev.eid)
         self.events.pop(ev.eid, None)
         # Remove from the parallel order arrays. Locate by ts via bisect, then
         # scan the (tiny) equal-ts run for the matching eid.
@@ -370,6 +411,9 @@ class MissingChainSampler:
         child.parent = parent_eid
         if parent_eid != -1:
             self.events[parent_eid].children.add(child.eid)
+            self._orphan_remove(child.eid)
+        else:
+            self._orphan_add(child.eid)
 
     # ---- candidate parents ----------------------------------------------
 
@@ -516,6 +560,15 @@ class MissingChainSampler:
         # X's own incoming term (immigrant for now): μ_s
         # X's survival penalty over its window:    exp(-compensator_total)
         # per-missing-event prior:                 exp(missing_log_prior)
+        #
+        # NOTE (asymmetry with _try_death, intentional — not a bug): here X's
+        # incoming term is μ_s because at PROPOSAL time X has no parent yet — the
+        # _gibbs_parent(x) below (a separate, reversible Gibbs move) assigns it
+        # only AFTER acceptance. _try_death instead evaluates the CURRENT state,
+        # where X may already have a real parent, so it uses the actual incoming
+        # intensity (see _incoming_intensity). Birth=proposal-state (immigrant),
+        # death=current-state (actual parent); the intervening Gibbs re-parent
+        # reconciles the two.
         mu_s = self.adapter.mu(s_type)
         comp = self._total_compensator(s_type, t_prime)
         log_ratio = (
@@ -541,15 +594,33 @@ class MissingChainSampler:
         self.births += 1
         return True
 
+    def _incoming_intensity(self, ev: SamplerEvent) -> float:
+        """ev's ACTUAL incoming-edge term in the joint: μ if it's an immigrant,
+        else the triggering intensity from its current (real) parent."""
+        if ev.parent == -1:
+            return self.adapter.mu(ev.type_id)
+        par = self.events.get(ev.parent)
+        if par is None:
+            return self.adapter.mu(ev.type_id)
+        return self.adapter.kernel_intensity(par.type_id, ev.type_id, ev.ts - par.ts)
+
     def _try_death(self, ev: SamplerEvent) -> bool:
-        """Remove a childless missing event (reverse of birth)."""
+        """Remove a childless missing event by the joint likelihood ratio of the
+        current state with vs without it.
+
+        The removed terms are ev's incoming edge, its survival penalty exp(-comp)
+        and the per-missing-event prior. Crucially the incoming edge is ev's
+        ACTUAL support — μ only if ev is still an immigrant, otherwise the
+        triggering intensity from its current parent. (After birth, a later
+        Gibbs step may have given ev a real parent; charging it μ here would
+        over-delete missing events a parent genuinely supports.)
+        """
         if not ev.is_missing() or ev.committed or ev.children:
             return False
-        # Reverse ratio of _try_birth for a node that currently explains nothing.
         comp = self._total_compensator(ev.type_id, ev.ts)
-        mu_s = self.adapter.mu(ev.type_id)
-        # log p(death)/p(birth-stay) ≈ -(its incoming μ term - comp + prior)
-        log_ratio = -(math.log(max(mu_s, EPS)) - comp + self.config.missing_log_prior)
+        incoming = self._incoming_intensity(ev)
+        # log p(without ev) / p(with ev) = -(log incoming - comp + prior)
+        log_ratio = -(math.log(max(incoming, EPS)) - comp + self.config.missing_log_prior)
         if not self._accept(log_ratio):
             return False
         self._remove_event(ev)
@@ -657,38 +728,41 @@ class MissingChainSampler:
         return out
 
     def _sweep(self):
-        active = self._active_eids()
-        # Move A: resample every active event's parent (time order).
-        for eid in active:
+        # ---- Move A (re-parent): LOCAL to the most recent events. This is a
+        # bounded approximation: an older event's candidate parents are fixed in
+        # the past, but extra Gibbs draws would still refine its parent votes.
+        for eid in self._active_eids():            # recent-N
             ev = self.events.get(eid)
             if ev is not None and not ev.committed:
                 self._gibbs_parent(ev)
-        # Move B (death): prune childless missing events.
-        for eid in list(active):
+
+        # ---- Move B (death + birth): cover ALL uncommitted orphans/missing,
+        # NOT just recent-N — restricting to recent-N would bias toward UNDER-
+        # imputation (an orphan ageing out of scope before a birth succeeds would
+        # never be retried). Both run off incremental indices (no window scan):
+        #   death  → iterate the (small) uncommitted-missing set
+        #   birth  → uniform sample of up to max_birth_attempts orphans
+        for eid in list(self._missing_set):
             ev = self.events.get(eid)
             if ev is not None:
-                self._try_death(ev)
-        # Move B (birth): explain immigrants, capped at max_births_per_sweep
-        # NEW missing events. Crucially we SHUFFLE the immigrant candidates
-        # first: iterating in fixed time order would let the earliest nodes
-        # (and freshly-born missing events, which insert at earlier times and so
-        # sort to the front) capture the budget every sweep, systematically
-        # starving later orphans — they could age out to commit unexplained.
-        # Random order gives every orphan fair coverage across sweeps and is the
-        # MCMC-faithful "pick an event at random" choice.
-        immigrants = [eid for eid in active
-                      if (ev := self.events.get(eid)) is not None
-                      and not ev.committed and ev.parent == -1]
-        self.rng.shuffle(immigrants)
-        births = 0
-        for eid in immigrants:
-            if births >= self.config.max_births_per_sweep:
-                break
-            ev = self.events.get(eid)
-            if ev is None or ev.committed or ev.parent != -1:
-                continue
-            if self._birth(ev):
-                births += 1
+                self._try_death(ev)                 # childless-missing only; cheap
+
+        n = len(self._orphan_list)
+        if n:
+            k = min(self.config.max_birth_attempts_per_sweep, n)
+            if k > 0:
+                # Sample eids up front (O(k)); the orphan index mutates as births
+                # succeed, so we re-check each candidate before using it.
+                picks = [self._orphan_list[j] for j in self.rng.sample(range(n), k)]
+                births = 0
+                for eid in picks:
+                    if births >= self.config.max_births_per_sweep:
+                        break
+                    ev = self.events.get(eid)
+                    if ev is None or ev.committed or ev.parent != -1:
+                        continue
+                    if self._birth(ev):
+                        births += 1
 
     def _birth(self, ev: SamplerEvent) -> bool:
         return self._try_birth(ev)
@@ -719,6 +793,9 @@ class MissingChainSampler:
             self._set_parent(ev, map_parent if (map_parent == -1 or map_parent in self.events) else -1)
             ev.commit_parent_prob = float(prob)
             ev.committed = True
+            # Committed events are no longer birth/death targets.
+            self._orphan_remove(ev.eid)
+            self._missing_set.discard(ev.eid)
             self.committed_count += 1
 
     def _root_of(self, ev: SamplerEvent) -> int:
