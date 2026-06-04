@@ -55,9 +55,9 @@ EDGE_MODES = frozenset({"device", "feature"})
 #   off           — static features only (current behavior)
 #   source        — +3 booleans: source device's uncleared state at t_j
 #                   (exact in both occurrence and compensator terms)
-#   source_target — also +3 booleans: target device's state at t_j (package B:
-#                   exact target@t_j with a proper compensator penalty)
-DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "source_target"})
+#   source_target is intentionally not accepted until its compensator penalty is
+#   implemented end-to-end.
+DYNAMIC_ALPHA_MODES = frozenset({"off", "source"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -515,6 +515,11 @@ def train_alarm_mhp(
     dyn_combo_bits = None
     dyn_feature_names = None
     if config.edge_mode == "feature" and config.dynamic_alpha != "off":
+        if config.dynamic_alpha == "source_target":
+            raise NotImplementedError(
+                "dynamic_alpha='source_target' (target@t_j) is not implemented yet; "
+                "use 'source' for the source-device dynamic state."
+            )
         from alarm_flow_mhp.dynamic_state import (
             build_event_states, states_to_combo, combo_bits as _combo_bits,
         )

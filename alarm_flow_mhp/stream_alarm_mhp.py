@@ -71,6 +71,9 @@ class OnlineEvent:
     parent_score: float = 0.0   # score that won (for debugging / output)
     alarm_type: str = ""        # feature mode: link/power/offline
     ne: str = ""                # feature mode: alarm_source (device id)
+    src_mark: tuple = (0, 0, 0) # dynamic α: source device's uncleared (link,power,
+                                # offline) booleans frozen at THIS event's fire time
+                                # (excl self) — used when this event is a parent
 
 
 @dataclass
@@ -190,6 +193,20 @@ class StreamMHPAssigner:
             if floor <= 0:
                 floor = float(getattr(artifact.config, "edge_threshold", 0.0))
             self._feat_alpha_floor = float(floor)
+        # Dynamic (stateful) α: track per-device uncleared-alarm state (clear-
+        # aware), snapshotting each event's source mark at fire time. Same state
+        # machine as training (keyed on alarm_source + alarm_type_from_title), so
+        # marks are train/infer-consistent.
+        self.dynamic_mode = (
+            self.feature_mode
+            and getattr(artifact.config, "dynamic_alpha", "off") != "off"
+        )
+        self._state_tracker = None
+        self.n_dynamic = 0
+        if self.dynamic_mode:
+            from alarm_flow_mhp.dynamic_state import DeviceStateTracker, STATE_DIM
+            self._state_tracker = DeviceStateTracker()
+            self.n_dynamic = STATE_DIM
         # Sliding window of recent events kept as parallel arrays with a head
         # pointer (amortized O(1) append + eviction, O(cap) tail slice for
         # vectorized scoring). `_buf_events` holds the OnlineEvent objects;
@@ -330,7 +347,15 @@ class StreamMHPAssigner:
         src_nes = [e.ne for e in src_events]
         ts_tail = np.asarray(self._buf_ts[lo:], dtype=np.float64)
         dts = (target_ts - ts_tail) / self.config.time_scale_sec
-        alpha = self.feature_scorer.alpha_for_target(target_at, target_ne, src_ats, src_nes)
+        # Dynamic α: each candidate parent's frozen source mark (its source
+        # device's uncleared state at the parent's fire time).
+        src_marks = (
+            np.array([e.src_mark for e in src_events], dtype=np.float64)
+            if self.n_dynamic > 0 else None
+        )
+        alpha = self.feature_scorer.alpha_for_target(
+            target_at, target_ne, src_ats, src_nes, src_marks=src_marks
+        )
         # α floor: treat too-weak edges as non-edges (inference analog of
         # device-mode edge_threshold) — guards the soft model against linking
         # unrelated pairs whose baseline α is small but positive.
@@ -342,8 +367,21 @@ class StreamMHPAssigner:
 
     def process(self, alarm_event: dict):
         """Ingest one alarm event in time order, run inference, update state."""
+        alarm_dict = alarm_event.get("alarm", {}) if isinstance(alarm_event, dict) else {}
+        is_clear = is_clear_alarm(alarm_dict)
+        # Dynamic α: feed EVERY event (raises AND clears) to the device-state
+        # machine in time order, BEFORE the clear/no-type drops. The returned
+        # snapshot (excl self) is this event's frozen source mark, used later if
+        # it becomes a candidate parent.
+        src_mark = (0, 0, 0)
+        if self.dynamic_mode:
+            from alarm_flow_isahp.sequences import alarm_type_from_title
+            dev = alarm_event.get("alarm_source", "")
+            atype_state = alarm_type_from_title(alarm_event.get("alarm_title", ""))
+            snap = self._state_tracker.snapshot_then_apply(dev, atype_state, is_clear)
+            src_mark = (int(snap[0]), int(snap[1]), int(snap[2]))
         # Filtering: skip events we can't model
-        if is_clear_alarm(alarm_event.get("alarm", {}) if isinstance(alarm_event, dict) else {}):
+        if is_clear:
             self.dropped_clear += 1
             return None
         atype = alarm_type_label(alarm_event)
@@ -443,6 +481,7 @@ class StreamMHPAssigner:
             parent_score=parent_score,
             alarm_type=atype if self.feature_mode else "",
             ne=ne,
+            src_mark=src_mark,
         )
         self._next_event_index += 1
         cascade.add(event)
@@ -1073,16 +1112,21 @@ def main():
         topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
         if not args.quiet:
             print(f"[stream] topology index max_hops={infer_hops} (from artifact.config)", flush=True)
+        # Dynamic α: kernel carries STATE_DIM extra weights (source mark bits).
+        dyn_mode = getattr(artifact.config, "dynamic_alpha", "off") != "off"
+        n_dynamic = 3 if dyn_mode else 0
         feature_scorer = RuntimeFeatureScorer(
             kernel=FeatureKernel.from_dict(fk),
             at_vocab=rt.get("at_vocab", []),
             graph_context=graph_ctx,
             topology_index=topo_idx,
             beta=float(rt.get("beta", 1.0)),
+            n_dynamic=n_dynamic,
         )
         if not args.quiet:
             print(
-                f"[stream] feature scorer: {feature_scorer.layout.n_features} features, "
+                f"[stream] feature scorer: {feature_scorer.layout.n_features} features"
+                f"{f' + {n_dynamic} dynamic (source state)' if n_dynamic else ''}, "
                 f"device-OPEN (new devices accepted)",
                 flush=True,
             )

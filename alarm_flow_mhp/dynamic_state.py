@@ -39,56 +39,6 @@ def alarm_state_index(alarm_type) -> int:
     return _TYPE_INDEX.get(alarm_type, -1)
 
 
-def device_state_pass(
-    items: Iterable,
-    *,
-    is_clear: Callable[[object], bool],
-    device_of: Callable[[object], str],
-    alarm_type_of: Callable[[object], object],
-) -> np.ndarray:
-    """Forward pass producing the per-(non-clear)-event device-state snapshot.
-
-    Parameters
-    ----------
-    items : iterable in non-decreasing time order (raises and clears mixed)
-    is_clear : item -> bool (clear vs raise)
-    device_of : item -> device id (alarm_source)
-    alarm_type_of : item -> "link"/"power"/"offline" (or anything else → no
-        state contribution)
-
-    Returns
-    -------
-    ev_state : (n_nonclear, 3) uint8
-        Row k = the device-state (link, power, offline) booleans for the k-th
-        NON-CLEAR item, snapshotted JUST BEFORE that item (excludes itself).
-        Aligned by order with the non-clear items in `items`.
-    """
-    counts: dict[str, list] = {}
-    rows: list = []
-    for it in items:
-        dev = device_of(it)
-        ti = _TYPE_INDEX.get(alarm_type_of(it), -1)
-        cur = counts.get(dev)
-        if is_clear(it):
-            # State transition only; clears are not modeled events.
-            if cur is not None and ti >= 0 and cur[ti] > 0:
-                cur[ti] -= 1
-            continue
-        # Raise: snapshot BEFORE incrementing → own alarm excluded.
-        if cur is None:
-            rows.append((0, 0, 0))
-        else:
-            rows.append((1 if cur[0] else 0, 1 if cur[1] else 0, 1 if cur[2] else 0))
-        if ti >= 0:
-            if cur is None:
-                cur = [0, 0, 0]
-                counts[dev] = cur
-            cur[ti] += 1
-    if not rows:
-        return np.zeros((0, STATE_DIM), dtype=np.uint8)
-    return np.asarray(rows, dtype=np.uint8)
-
-
 def build_event_states(
     full_stream: Iterable,
     modeled_events: list,
@@ -142,7 +92,8 @@ def combo_bits(n_combos: int = 8) -> np.ndarray:
 
 
 class DeviceStateTracker:
-    """Incremental version of `device_state_pass` for streaming inference.
+    """Incremental device-state machine for streaming inference (mirrors the
+    forward pass used by `build_event_states`).
 
     Maintains the same per-(device, alarm_type) active counts. At inference the
     stream feeds events in time order; call `snapshot_then_apply` for each

@@ -461,7 +461,7 @@ class RuntimeFeatureScorer:
     device vocabulary.
     """
 
-    def __init__(self, kernel, at_vocab, graph_context, topology_index, beta: float):
+    def __init__(self, kernel, at_vocab, graph_context, topology_index, beta: float, n_dynamic: int = 0):
         from mhp.feature_kernel import softplus
 
         self.kernel = kernel
@@ -472,10 +472,13 @@ class RuntimeFeatureScorer:
         self.topology_index = topology_index
         self.beta = float(beta)
         self._topo_cache = {}
-        if self.layout.n_features != kernel.n_features:
+        # Dynamic (stateful) α: the kernel carries n_dynamic extra weights after
+        # the static features; the caller appends per-candidate mark bits to φ.
+        self.n_dynamic = int(n_dynamic)
+        if self.layout.n_features + self.n_dynamic != kernel.n_features:
             raise ValueError(
-                f"feature layout ({self.layout.n_features}) != kernel weights "
-                f"({kernel.n_features}); artifact/feature mismatch"
+                f"feature layout ({self.layout.n_features}) + dynamic ({self.n_dynamic}) "
+                f"!= kernel weights ({kernel.n_features}); artifact/feature mismatch"
             )
 
     def _attr(self, ne_id):
@@ -484,11 +487,14 @@ class RuntimeFeatureScorer:
             return ("", "", "")
         return (info.site_id or "", info.manufacturer or "", info.ne_type or "")
 
-    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes):
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
         """Vectorized α for one target vs a batch of source candidates.
 
         target_at/target_ne : scalars (alarm_type str, ne str)
         src_ats / src_nes   : lists of source alarm_type / ne
+        src_marks : (n, n_dynamic) per-candidate source-mark bits (dynamic mode),
+                    each row the source device's frozen uncleared-state booleans
+                    at the candidate parent's fire time. Required iff n_dynamic>0.
         Returns (n,) α array.
         """
         n = len(src_nes)
@@ -510,4 +516,9 @@ class RuntimeFeatureScorer:
             same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
             same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
         phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype)
+        if self.n_dynamic > 0:
+            if src_marks is None:
+                raise ValueError("src_marks is required when RuntimeFeatureScorer.n_dynamic > 0")
+            marks = np.asarray(src_marks, dtype=np.float64).reshape(n, self.n_dynamic)
+            phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)

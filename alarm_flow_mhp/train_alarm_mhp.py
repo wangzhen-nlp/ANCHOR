@@ -123,6 +123,7 @@ def _build_config(args):
         feature_topo_max_hops=args.feature_topo_max_hops,
         feature_topo_min_score=args.feature_topo_min_score,
         feature_topo_prior_boost=args.feature_topo_prior_boost,
+        dynamic_alpha=args.dynamic_alpha,
         mu_count_smoothing=args.mu_count_smoothing,
         beta_mode=args.beta_mode,
         beta_shared_value=args.beta_shared_value,
@@ -233,6 +234,18 @@ def main():
             "data is sparse (rare/zero-co-occurrence but physically connected pairs "
             "still form an edge), washed out where data is rich. 0 disables (pure "
             "MLE). Try 0.3. Needs the NE graph (feature mode loads it anyway)."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-alpha",
+        choices=("off", "source"),
+        default="off",
+        help=(
+            "Feature-mode DYNAMIC (stateful) α: condition excitation on devices' "
+            "current uncleared link/power/offline alarms, snapshotted at the source "
+            "event's fire time (clear-aware, train/infer-consistent). 'off' (default) "
+            "static only; 'source' adds the source device's 3 state booleans (exact, "
+            "penalized). Needs clears in the input stream."
         ),
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)

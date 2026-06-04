@@ -1205,6 +1205,13 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
     """
     if getattr(artifact.config, "edge_mode", "device") != "feature":
         raise ValueError("feature_adapter_from_artifact requires edge_mode='feature'")
+    dynamic_alpha = getattr(artifact.config, "dynamic_alpha", "off")
+    if dynamic_alpha != "off":
+        raise NotImplementedError(
+            "--impute does not support feature artifacts trained with "
+            f"dynamic_alpha={dynamic_alpha!r}. Run streaming without --impute, "
+            "or train/export a non-dynamic feature artifact for imputation."
+        )
     from mhp.feature_kernel import FeatureKernel
     from alarm_flow_mhp.feature_spec import MuFeatureSpec, RuntimeFeatureScorer, RuntimeMuScorer
     from alarm_flow_isahp.ne_topology import NETopologyIndex
