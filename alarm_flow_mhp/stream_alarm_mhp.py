@@ -629,6 +629,99 @@ def _cascade_size_stats(size_counter: Counter) -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# Missing-chain imputation path (fixed-lag sampler wrapper)
+# --------------------------------------------------------------------------
+
+
+def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
+    """Drive the fixed-lag missing-chain sampler over the alarm stream.
+
+    Non-invasive: consumes the same alarm events, emits brunch-compatible group
+    dicts (with imputed missing events tagged virtual). Returns (groups, stats).
+    """
+    from alarm_flow_mhp.missing_chain_sampler import (
+        MissingChainSampler,
+        SamplerConfig,
+        device_adapter_from_artifact,
+        feature_adapter_from_artifact,
+    )
+
+    feature_mode = getattr(artifact.config, "edge_mode", "device") == "feature"
+    if feature_mode:
+        floor = args.feature_alpha_floor or None
+        adapter = feature_adapter_from_artifact(artifact, args.ne_graph, alpha_floor=floor)
+    else:
+        if getattr(artifact.params, "kernel_type", "exp") != "exp":
+            raise NotImplementedError(
+                "--impute device path supports exp kernel only (piecewise adapter TODO)"
+            )
+        adapter = device_adapter_from_artifact(artifact)
+
+    history = float(stream_config.history_window_sec)
+    lag = float(args.impute_lag_sec) if args.impute_lag_sec is not None else history
+    cfg = SamplerConfig(
+        lag_sec=lag,
+        history_window_sec=history,
+        sweeps_per_tick=int(args.impute_sweeps),
+        missing_log_prior=float(args.impute_kappa),
+        max_depth=int(args.impute_max_depth),
+        max_births_per_sweep=int(args.impute_max_births),
+        seed=int(getattr(artifact.config, "seed", 0) or 0),
+    )
+    sampler = MissingChainSampler(adapter, cfg)
+    if not quiet:
+        print(
+            f"[stream] impute: mode={'feature' if feature_mode else 'device'} "
+            f"lag={cfg.lag_sec:.0f}s history={cfg.history_window_sec:.0f}s "
+            f"sweeps={cfg.sweeps_per_tick} kappa={cfg.missing_log_prior} "
+            f"max_depth={cfg.max_depth}",
+            flush=True,
+        )
+
+    type_fields = artifact.config.type_fields
+    groups: list = []
+    dropped = {"clear": 0, "no_type": 0, "unknown_type": 0}
+    processed = 0
+    for i, alarm in enumerate(alarm_events):
+        if is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {}):
+            dropped["clear"] += 1
+            continue
+        atype = alarm_type_label(alarm)
+        if atype is None:
+            dropped["no_type"] += 1
+            continue
+        meta = summarize_alarm_event(alarm, i)
+        if feature_mode:
+            from alarm_flow_mhp.feature_spec import runtime_ne_at
+
+            ne, atype_feat = runtime_ne_at(alarm, type_fields)
+            at = atype_feat or atype
+            type_key = (at, ne)
+            meta["alarm_type"] = at
+            if ne:
+                meta["alarm_source"] = ne
+        else:
+            type_label = event_type_label(alarm, type_fields)
+            tid = artifact.vocabs.type_vocab.get(type_label)
+            if tid is None:
+                dropped["unknown_type"] += 1
+                continue
+            type_key = int(tid)
+            meta["type_label"] = type_label
+        processed += 1
+        groups.extend(sampler.ingest(float(alarm.get("ts", 0.0)), type_key, meta))
+    groups.extend(sampler.flush())
+
+    # Output filter: keep cascades with at least min_group_events real alarms.
+    min_ev = int(stream_config.min_group_events)
+    if min_ev > 1:
+        groups = [g for g in groups if g["real_event_count"] >= min_ev]
+    stats = sampler.stats()
+    stats.update({"processed": processed, "dropped": dropped})
+    return groups, stats
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -730,6 +823,53 @@ def main():
         default=50_000,
         help="Print stream progress every N events. 0 = silent. Default: 50000.",
     )
+    # ---- missing-chain imputation (fixed-lag sampler) --------------------
+    parser.add_argument(
+        "--impute",
+        action="store_true",
+        help=(
+            "Reconstruct cascades through UNOBSERVED (missing) events of known "
+            "types using the fixed-lag missing-chain sampler instead of the "
+            "single-pass argmax assigner. Groups then include imputed missing "
+            "events (tagged virtual, with confidence) that bridge otherwise-"
+            "disconnected alarms. Works for device and feature edge modes (exp "
+            "kernel). Adds latency: a cascade is emitted only after it leaves "
+            "kernel reach."
+        ),
+    )
+    parser.add_argument(
+        "--impute-lag-sec",
+        type=float,
+        default=None,
+        help="Fixed-lag commit delay (s). Default: history_window_sec.",
+    )
+    parser.add_argument(
+        "--impute-sweeps",
+        type=int,
+        default=3,
+        help="MCMC sweeps per ingested alarm. Default: 3.",
+    )
+    parser.add_argument(
+        "--impute-kappa",
+        type=float,
+        default=-2.0,
+        help=(
+            "Log-prior penalty per imputed missing event (κ knob). More negative "
+            "⇒ fewer / shallower imputed chains. Default: -2.0."
+        ),
+    )
+    parser.add_argument(
+        "--impute-max-depth",
+        type=int,
+        default=3,
+        help="Max imputed missing-chain depth (multi-hop). Default: 3.",
+    )
+    parser.add_argument(
+        "--impute-max-births",
+        type=int,
+        default=8,
+        help="Max new missing events born per sweep (rate limit). Default: 8.",
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -784,6 +924,63 @@ def main():
             f"immigrant_bias={stream_config.immigrant_bias}",
             flush=True,
         )
+
+    # ---- missing-chain imputation path (fixed-lag sampler) --------------
+    if args.impute:
+        t_imp_start = time.monotonic()
+        groups, impute_stats = _run_imputation(
+            artifact, alarm_events, args, stream_config, quiet=args.quiet
+        )
+        elapsed = time.monotonic() - t_imp_start
+        if not args.quiet:
+            print(
+                f"[stream] impute done: groups={len(groups)}, "
+                f"births={impute_stats['births']}, deaths={impute_stats['deaths']}, "
+                f"processed={impute_stats['processed']}, elapsed={elapsed:.1f}s",
+                flush=True,
+            )
+        metadata = {
+            "algorithm": "alarm_flow_mhp.stream+impute",
+            "model": os.path.abspath(args.model),
+            "input": os.path.abspath(args.alarms),
+            "alarm_metadata": alarm_metadata,
+            "regions": sorted(regions) if regions else [],
+            "config": {
+                "history_window_sec": stream_config.history_window_sec,
+                "min_group_events": stream_config.min_group_events,
+                "time_scale_sec": stream_config.time_scale_sec,
+                "impute_lag_sec": float(args.impute_lag_sec) if args.impute_lag_sec is not None else stream_config.history_window_sec,
+                "impute_sweeps": args.impute_sweeps,
+                "impute_kappa": args.impute_kappa,
+                "impute_max_depth": args.impute_max_depth,
+            },
+            "group_count": len(groups),
+            "modeled_event_count": impute_stats["processed"],
+            "imputed_missing_events": sum(g.get("virtual_event_count", 0) for g in groups),
+            "births": impute_stats["births"],
+            "deaths": impute_stats["deaths"],
+            "drop_stats": impute_stats["dropped"],
+            "total_wall_clock_seconds": float(time.monotonic() - t_total_start),
+        }
+        if args.groups_output:
+            _write_json(args.groups_output, {"metadata": metadata, "groups": groups})
+            print(f"groups written to: {args.groups_output}; groups={len(groups)}")
+        if args.edges_output:
+            edges = []
+            for group in groups:
+                edges.extend(group.get("edges", []))
+            n = _write_jsonl(args.edges_output, edges)
+            print(f"branching edges written to: {args.edges_output}; edges={n}")
+        if args.visual_output:
+            visual_count = write_visual_groups(
+                args.visual_output,
+                groups,
+                ne_graph_path=args.ne_graph,
+                site_graph_path=args.site_graph,
+                ne_scope=args.visual_ne_scope,
+            )
+            print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
+        return
     if stream_config.close_inactive_sec < stream_config.history_window_sec:
         print(
             f"[stream] WARN: close_inactive_sec ({stream_config.close_inactive_sec:.0f}s) < "
