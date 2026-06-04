@@ -900,7 +900,8 @@ class MissingChainSampler:
                 "latent": False,                       # no latent-everywhere mode
                 "inferred_virtual": True,
                 "confidence": float(conf),
-                "virtual_source": str(ev.type_id),     # the imputed type key
+                # readable imputed-type label (falls back to the raw key)
+                "virtual_source": self._type_label(ev),
                 "parent_virtual": self._is_parent_missing(ev),
             })
         else:

@@ -1022,7 +1022,9 @@ def main():
             n = _write_jsonl(args.edges_output, edges)
             print(f"branching edges written to: {args.edges_output}; edges={n}")
         if args.visual_output:
-            visual_count = write_visual_groups(
+            from alarm_flow_mhp.visual_output import write_visual_groups_mhp
+
+            visual_count = write_visual_groups_mhp(
                 args.visual_output,
                 groups,
                 ne_graph_path=args.ne_graph,
