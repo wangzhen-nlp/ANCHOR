@@ -47,6 +47,7 @@ exp-kernel adapter.
 
 from __future__ import annotations
 
+import bisect
 import math
 import random
 from collections import Counter
@@ -223,6 +224,15 @@ class SamplerConfig:
                                        # more negative ⇒ fewer / shallower chains
     max_births_per_sweep: int = 8      # cap on NEW missing events born per sweep
                                        # (rate limit; chains deepen over sweeps)
+    max_history_events: int = 256      # cap on candidate parents scored per event
+                                       # (nearest-in-time first) — bounds per-tick
+                                       # cost; the dominant perf knob at scale
+    sweep_recent_events: int = 64      # a sweep only re-touches the most recent N
+                                       # uncommitted events (LOCAL sweep). Older
+                                       # active events are already near-stable
+                                       # (their candidate parents are fixed in the
+                                       # past), so re-scoring the whole window
+                                       # every tick is wasted work at scale.
     seed: int = 0
 
     def window_sec(self) -> float:
@@ -240,6 +250,8 @@ class SamplerConfig:
             raise ValueError("sweeps_per_tick must be >= 0")
         if self.max_missing < 0 or self.max_depth < 0:
             raise ValueError("caps must be >= 0")
+        if self.max_history_events < 1:
+            raise ValueError("max_history_events must be >= 1")
 
 
 class MissingChainSampler:
@@ -254,6 +266,7 @@ class MissingChainSampler:
         self.rng = random.Random(self.config.seed)
         self.events: dict[int, SamplerEvent] = {}
         self._order: list[int] = []          # eids kept time-ascending
+        self._order_ts: list[float] = []     # parallel ts array for bisect
         self._next_eid: int = 0
         self.now: float = NEG_INF
         self._missing_count: int = 0
@@ -307,20 +320,18 @@ class MissingChainSampler:
         return ev
 
     def _insert_ordered(self, ev: SamplerEvent):
-        # Append is the common case (forward stream); fall back to a small
-        # insertion for missing events placed in the past.
-        order = self._order
-        if not order or self.events[order[-1]].ts <= ev.ts:
-            order.append(ev.eid)
+        # Keep _order (eids) and _order_ts (parallel times) sorted by ts. Append
+        # is the common case (forward stream); bisect handles past-dated missing
+        # events. The parallel ts array lets _candidate_parents bisect to ev's
+        # neighbourhood in O(log n) instead of scanning from the front.
+        ts = ev.ts
+        if not self._order_ts or self._order_ts[-1] <= ts:
+            self._order.append(ev.eid)
+            self._order_ts.append(ts)
             return
-        lo, hi = 0, len(order)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if self.events[order[mid]].ts <= ev.ts:
-                lo = mid + 1
-            else:
-                hi = mid
-        order.insert(lo, ev.eid)
+        pos = bisect.bisect_right(self._order_ts, ts)
+        self._order.insert(pos, ev.eid)
+        self._order_ts.insert(pos, ts)
 
     def _remove_event(self, ev: SamplerEvent):
         # Detach from parent / children before dropping.
@@ -335,10 +346,15 @@ class MissingChainSampler:
         if ev.is_missing():
             self._missing_count -= 1
         self.events.pop(ev.eid, None)
-        try:
-            self._order.remove(ev.eid)
-        except ValueError:
-            pass
+        # Remove from the parallel order arrays. Locate by ts via bisect, then
+        # scan the (tiny) equal-ts run for the matching eid.
+        lo = bisect.bisect_left(self._order_ts, ev.ts)
+        hi = bisect.bisect_right(self._order_ts, ev.ts)
+        for i in range(lo, hi):
+            if self._order[i] == ev.eid:
+                del self._order[i]
+                del self._order_ts[i]
+                break
 
     def _set_parent(self, child: SamplerEvent, parent_eid: int):
         # NOTE: `depth` is the child's missing-chain layer, fixed at birth (a
@@ -357,27 +373,40 @@ class MissingChainSampler:
 
     # ---- candidate parents ----------------------------------------------
 
-    def _candidate_parents(self, ev: SamplerEvent) -> list[tuple[int, float]]:
-        """Real candidate parents earlier than ``ev`` within kernel reach, as
-        ``(parent_eid, intensity)``. Immigrant (μ) is handled separately."""
-        out: list[tuple[int, float]] = []
+    def _candidate_parents(self, ev: SamplerEvent):
+        """Up to ``max_history_events`` candidate parents nearest in time before
+        ``ev`` and within kernel reach. Returns parallel lists
+        ``(eids, src_types, dts)`` so the caller can batch-score intensities.
+
+        Bisect to ev's position, then walk backward (newest-first). Capping +
+        nearest-first matters: under an exp kernel the closest events carry
+        almost all the mass, and the cap bounds per-event cost from O(window) to
+        O(cap) — the difference between tractable and not at scale.
+        """
         reach = self.config.history_window_sec
-        for oid in self._order:
-            other = self.events[oid]
-            if other.ts >= ev.ts:
-                break                       # _order is time-ascending
-            if other.eid == ev.eid:
-                continue
-            dt = ev.ts - other.ts
+        cap = self.config.max_history_events
+        eids: list[int] = []
+        src_types: list = []
+        dts: list[float] = []
+        # First index strictly before ev.ts (skip equal-ts and later events).
+        i = bisect.bisect_left(self._order_ts, ev.ts) - 1
+        while i >= 0 and len(eids) < cap:
+            dt = ev.ts - self._order_ts[i]
             if dt > reach:
+                break                       # everything older is out of reach too
+            oid = self._order[i]
+            i -= 1
+            if oid == ev.eid:
                 continue
-            # Avoid cycles: a missing event may not parent its own ancestor.
-            if not ev.observed and self._is_descendant(other.eid, ev.eid):
+            other = self.events.get(oid)
+            if other is None:
                 continue
-            inten = self.adapter.kernel_intensity(other.type_id, ev.type_id, dt)
-            if inten > EPS:
-                out.append((other.eid, inten))
-        return out
+            if not ev.observed and self._is_descendant(oid, ev.eid):
+                continue
+            eids.append(oid)
+            src_types.append(other.type_id)
+            dts.append(dt)
+        return eids, src_types, dts
 
     def _is_descendant(self, maybe_descendant: int, ancestor: int) -> bool:
         cur = self.events.get(maybe_descendant)
@@ -402,13 +431,15 @@ class MissingChainSampler:
         """
         if ev.committed:
             return
-        cands = self._candidate_parents(ev)
+        eids, src_types, dts = self._candidate_parents(ev)
+        intens = self._batch_intensity(ev.type_id, src_types, dts)
         mu = self.adapter.mu(ev.type_id)
         weights = [mu]
         choices = [-1]
-        for pid, inten in cands:
-            weights.append(inten)
-            choices.append(pid)
+        for pid, inten in zip(eids, intens):
+            if inten > EPS:
+                weights.append(float(inten))
+                choices.append(pid)
         total = sum(weights)
         if total <= 0:
             self._set_parent(ev, -1)
@@ -425,6 +456,18 @@ class MissingChainSampler:
         # Record the marginal vote (post-move) for the commit summary.
         ev.parent_votes[ev.parent] += 1
         ev.sweep_count += 1
+
+    def _batch_intensity(self, target_type, src_types: list, dts: list):
+        """Triggering intensities for a batch of candidate parents. Uses the
+        adapter's vectorised path when available (essential for feature mode,
+        where each α is a feature build) and falls back to per-pair otherwise."""
+        if not src_types:
+            return []
+        batch = getattr(self.adapter, "kernel_intensity_batch", None)
+        if batch is not None:
+            return batch(target_type, src_types, dts)
+        return [self.adapter.kernel_intensity(s, target_type, dt)
+                for s, dt in zip(src_types, dts)]
 
     # ---- Move B: birth / death of missing events ------------------------
 
@@ -595,9 +638,23 @@ class MissingChainSampler:
     # ---- one sweep over the active set ----------------------------------
 
     def _active_eids(self) -> list[int]:
+        """The most recent ``sweep_recent_events`` uncommitted events (LOCAL
+        sweep scope), time-ascending. Walking from the newest end and stopping
+        early bounds per-tick work independent of how dense the lag window is."""
         cutoff = self.now - self.config.lag_sec
-        return [eid for eid in self._order
-                if not self.events[eid].committed and self.events[eid].ts > cutoff]
+        limit = self.config.sweep_recent_events
+        out: list[int] = []
+        for i in range(len(self._order) - 1, -1, -1):
+            if self._order_ts[i] <= cutoff:
+                break
+            ev = self.events.get(self._order[i])
+            if ev is None or ev.committed:
+                continue
+            out.append(self._order[i])
+            if len(out) >= limit:
+                break
+        out.reverse()
+        return out
 
     def _sweep(self):
         active = self._active_eids()
@@ -932,6 +989,24 @@ class FeatureKernelAdapter:
             return 0.0
         dt = dt_sec / self.time_scale_sec
         return float(a * self.beta * math.exp(-self.beta * dt))
+
+    def kernel_intensity_batch(self, target_type, source_types: list, dts: list):
+        """Vectorised intensities for many candidate sources vs one target — the
+        feature-mode hot path: ONE alpha_for_target call (the scorer's native
+        shape) instead of per-pair feature builds."""
+        import numpy as np
+
+        n = len(source_types)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        (t_at, t_ne) = target_type
+        src_ats = [s[0] for s in source_types]
+        src_nes = [s[1] for s in source_types]
+        alphas = np.asarray(self.fs.alpha_for_target(t_at, t_ne, src_ats, src_nes), dtype=np.float64)
+        if self.alpha_floor > 0:
+            alphas = np.where(alphas >= self.alpha_floor, alphas, 0.0)
+        dt = np.asarray(dts, dtype=np.float64) / self.time_scale_sec
+        return np.where(dt >= 0, alphas * self.beta * np.exp(-self.beta * dt), 0.0)
 
     def compensator(self, source_type, target_type, dt_sec: float) -> float:
         if dt_sec <= 0:

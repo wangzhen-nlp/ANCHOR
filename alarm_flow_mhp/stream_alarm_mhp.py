@@ -666,6 +666,8 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
         missing_log_prior=float(args.impute_kappa),
         max_depth=int(args.impute_max_depth),
         max_births_per_sweep=int(args.impute_max_births),
+        max_history_events=int(args.impute_max_history),
+        sweep_recent_events=int(args.impute_sweep_recent),
         seed=int(getattr(artifact.config, "seed", 0) or 0),
     )
     sampler = MissingChainSampler(adapter, cfg)
@@ -682,7 +684,19 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
     groups: list = []
     dropped = {"clear": 0, "no_type": 0, "unknown_type": 0}
     processed = 0
+    _t0 = time.monotonic()
+    _n = len(alarm_events)
     for i, alarm in enumerate(alarm_events):
+        if args.progress_every and (i + 1) % args.progress_every == 0 and not quiet:
+            el = time.monotonic() - _t0
+            rate = (i + 1) / el if el > 0 else 0
+            st = sampler.stats()
+            print(
+                f"[stream] impute {i + 1}/{_n} ({rate:.0f} evt/s, "
+                f"live={st['live_events']}, missing={st['live_missing']}, "
+                f"births={st['births']}, groups={len(groups)}, elapsed={el:.0f}s)",
+                flush=True,
+            )
         if is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {}):
             dropped["clear"] += 1
             continue
@@ -869,6 +883,24 @@ def main():
         type=int,
         default=8,
         help="Max new missing events born per sweep (rate limit). Default: 8.",
+    )
+    parser.add_argument(
+        "--impute-max-history",
+        type=int,
+        default=256,
+        help=(
+            "Max candidate parents scored per event (nearest in time). Lower = "
+            "faster. The dominant perf knob in feature mode. Default: 256."
+        ),
+    )
+    parser.add_argument(
+        "--impute-sweep-recent",
+        type=int,
+        default=64,
+        help=(
+            "A sweep only re-touches the most recent N uncommitted events (local "
+            "sweep). Lower = faster, less re-mixing of older events. Default: 64."
+        ),
     )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
