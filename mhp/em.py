@@ -1026,6 +1026,9 @@ def fit_mhp_feature(
     mu_feature_names: Optional[list] = None,
     cand_topo_score: Optional[np.ndarray] = None,
     topo_prior_boost: float = 0.0,
+    src_combo: Optional[np.ndarray] = None,
+    dynamic_combo_bits: Optional[np.ndarray] = None,
+    dynamic_feature_names: Optional[list] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
 ) -> MHPResult:
     """Feature-weighted MAP EM: α on a fixed CANDIDATE pair set is a log-linear
@@ -1101,6 +1104,29 @@ def fit_mhp_feature(
             alpha_init = min(max(0.5 * N / total_exposure, 1e-6), 0.5)
             w[0] = float(np.log(np.expm1(alpha_init)))   # inverse softplus
 
+    # Dynamic (stateful) α: α on (candidate c, source-mark combo k) =
+    # softplus(cand_phi[c]·w_static + combo_bits[k]·w_dyn). The mark combo is a
+    # per-source-EVENT property (src_combo[event]) so responsibility/exposure are
+    # bucketed by (c, k). Exposure E_{c,k} = #source events of type v=source(c)
+    # with combo k (exact in the compensator, since the source mark is frozen at
+    # the source's fire time → constant in the kernel integral). w grows by D
+    # dynamic columns appended after the F static ones.
+    use_dynamic = src_combo is not None and dynamic_combo_bits is not None
+    if use_dynamic:
+        dynamic_combo_bits = np.asarray(dynamic_combo_bits, dtype=np.float64)  # (K, D)
+        K_combo, D_dyn = dynamic_combo_bits.shape
+        src_combo = np.asarray(src_combo, dtype=np.int64).reshape(-1)
+        # n_source_by_combo[v, k] = #events of type v with source-mark combo k.
+        n_src_by_combo = np.zeros((M, K_combo), dtype=np.float64)
+        np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
+        exposure_2d = n_src_by_combo[cand_sources]                # (C, K) E_{c,k}
+        # Topology pseudo-count prior: attach to the baseline combo (k=0, no
+        # active alarms) — it is a prior on edge existence, state-independent.
+        if topo_prior_boost > 0.0 and cand_topo_score is not None:
+            exposure_2d = exposure_2d.copy()
+            exposure_2d[:, 0] += prior_exp
+        w = np.concatenate([w, np.zeros(D_dyn)])                  # static ⊕ dynamic
+
     # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
     # function of the type's OWN features ψ (alarm_type, ne_type, vendor, domain)
     # — symmetric to α. Learned by the same gradient M-step. A brand-new device
@@ -1151,10 +1177,17 @@ def fit_mhp_feature(
 
     for it in range(config.max_iters):
         t_iter = time.monotonic()
-        alpha_cand = softplus(cand_phi @ w)                # (C,) current amplitudes
+        if use_dynamic:
+            z_static_c = cand_phi @ w[:F]                  # (C,)
+            z_dyn_k = dynamic_combo_bits @ w[F:]           # (K,)
+            # Baseline α (combo 0 = no active alarms) for diagnostics / materialization.
+            alpha_cand = softplus(z_static_c + z_dyn_k[0])
+            n_resp2d = np.zeros((C, K_combo), dtype=np.float64)
+        else:
+            alpha_cand = softplus(cand_phi @ w)            # (C,) current amplitudes
+            n_resp = np.zeros(C, dtype=np.float64)         # N_c
 
         p_self = np.zeros(N, dtype=np.float64)
-        n_resp = np.zeros(C, dtype=np.float64)             # N_c
         mu_num = np.zeros(M, dtype=np.float64)
         ll_term1 = 0.0
 
@@ -1163,7 +1196,7 @@ def fit_mhp_feature(
             csize = chunk_end - chunk_start
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
-            (_, _, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+            (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
                 events.times, events.dims, chunk_start, chunk_end,
                 history_window, max_history_events,
             )
@@ -1178,32 +1211,56 @@ def fit_mhp_feature(
             idx = np.minimum(np.searchsorted(cand_keys, pk), C - 1)
             valid = (cand_keys[idx] == pk) & (pair_dt >= 0)
             score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
+            combo_v = None
             if valid.any():
                 vi = idx[valid]
                 b = float(beta_scalar)
-                score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt[valid])
+                if use_dynamic:
+                    # Per-pair α uses the SOURCE event's mark combo at fire time.
+                    combo_v = src_combo[pair_source[valid]]
+                    a_pair = softplus(z_static_c[vi] + z_dyn_k[combo_v])
+                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt[valid])
+                else:
+                    score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt[valid])
             sum_score = _segment_sum(score_pair, pair_tlocal, csize)
             rate = np.maximum(mu_chunk + sum_score, _EPS)
             p_self_chunk = mu_chunk / rate
             p_self[chunk_start:chunk_end] = p_self_chunk
             p_ij = score_pair / rate[pair_tlocal]
             if valid.any():
-                np.add.at(n_resp, idx[valid], p_ij[valid])
+                if use_dynamic:
+                    np.add.at(n_resp2d.reshape(-1), vi * K_combo + combo_v, p_ij[valid])
+                else:
+                    np.add.at(n_resp, idx[valid], p_ij[valid])
             mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
             ll_term1 += float(np.log(rate).sum())
 
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
         # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
         # parameterized (mu_phi), else per-type closed form.
-        from .feature_kernel import fit_weights_mstep
+        from .feature_kernel import fit_weights_mstep, fit_dynamic_weights_mstep
 
-        # Topology prior enters here as pseudo-observations on the candidate
-        # statistics (no-op when prior_num/prior_exp are all zero).
-        w_new = fit_weights_mstep(
-            cand_phi, n_resp + prior_num, exposure + prior_exp, w,
-            l2=l2, w_prior_mean=w_prior_mean, max_iter=50
-        )
-        alpha_new = softplus(cand_phi @ w_new)
+        if use_dynamic:
+            # Bucketed M-step over (candidate, source-mark combo). Topology prior
+            # already folded into exposure_2d[:, 0]; baseline N gets prior_num too.
+            n2d = n_resp2d
+            if topo_prior_boost > 0.0 and cand_topo_score is not None:
+                n2d = n_resp2d.copy()
+                n2d[:, 0] += prior_num
+            w_new = fit_dynamic_weights_mstep(
+                cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
+                l2=l2, w_prior_mean=w_prior_mean, max_iter=50,
+            )
+            # Baseline α (combo 0) for diagnostics / materialization.
+            alpha_new = softplus(cand_phi @ w_new[:F])
+        else:
+            # Topology prior enters here as pseudo-observations on the candidate
+            # statistics (no-op when prior_num/prior_exp are all zero).
+            w_new = fit_weights_mstep(
+                cand_phi, n_resp + prior_num, exposure + prior_exp, w,
+                l2=l2, w_prior_mean=w_prior_mean, max_iter=50
+            )
+            alpha_new = softplus(cand_phi @ w_new)
 
         if use_mu_features:
             w_mu_new = fit_weights_mstep(
@@ -1219,7 +1276,17 @@ def fit_mhp_feature(
         # objective Σ[N_c·log α_c − E_c·α_c] — so best-iteration selection tracks
         # the actual objective rather than an unweighted Σα that would bias
         # toward large α on high-frequency sources.
-        ll = ll_term1 - horizon * float(mu_new.sum()) - float((alpha_new * exposure).sum())
+        if use_dynamic:
+            # Compensator Σ_{c,k} E_{c,k}·α_{c,k} (exact per (candidate, combo)).
+            z_s_new = cand_phi @ w_new[:F]
+            z_d_new = dynamic_combo_bits @ w_new[F:]
+            compensator = sum(
+                float((exposure_2d[:, k] * softplus(z_s_new + z_d_new[k])).sum())
+                for k in range(K_combo)
+            )
+        else:
+            compensator = float((alpha_new * exposure).sum())
+        ll = ll_term1 - horizon * float(mu_new.sum()) - compensator
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
         if ll > best_ll:
@@ -1266,15 +1333,25 @@ def fit_mhp_feature(
             break
         prev_ll = ll
 
-    kernel = FeatureKernel(weights=best_w, feature_names=list(feature_names), l2=l2)
+    # In dynamic mode the kernel carries F static ⊕ D dynamic weights; its
+    # feature_names are extended so inference can append the live mark bits to φ.
+    kernel_names = list(feature_names)
+    if use_dynamic:
+        kernel_names = kernel_names + list(dynamic_feature_names or [])
+    kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2)
     mu_kernel = (
         FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
         if use_mu_features and best_w_mu is not None
         else None
     )
     # Materialize the final sparse α on candidate pairs (for artifact / device-
-    # style consumers); inference can instead recompute α from the kernel.
-    alpha_final = kernel.alpha(cand_phi)
+    # style consumers); inference can instead recompute α from the kernel. In
+    # dynamic mode the materialized α is the BASELINE (combo 0, no active alarms);
+    # dynamic boosts are applied live at inference.
+    if use_dynamic:
+        alpha_final = softplus(cand_phi @ best_w[:F])
+    else:
+        alpha_final = kernel.alpha(cand_phi)
     keep = alpha_final > config.edge_threshold
     final_params = MHPParams.from_edges(
         M=M,

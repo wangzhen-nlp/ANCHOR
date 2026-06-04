@@ -110,6 +110,85 @@ def _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask):
     return q, grad
 
 
+def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+    """Bucketed objective Σ_{c,k}[N_{c,k}·log α_{c,k} − E_{c,k}·α_{c,k}] − ridge,
+    with α_{c,k} = softplus(z_s[c] + z_d[k]), z_s = cand_phi·w_s, z_d = combo_bits·w_d
+    and w = [w_s (F), w_d (D)]. Gradient decomposes over the static and dynamic
+    blocks WITHOUT materializing the (C, K) row matrix:
+        ∂Q/∂w_s = cand_phiᵀ · Σ_k coef[:,k]
+        ∂Q/∂w_d = combo_bitsᵀ · (Σ_c coef[:,k])_k
+    """
+    F = cand_phi.shape[1]
+    K, D = combo_bits.shape
+    ws, wd = w[:F], w[F:]
+    z_s = cand_phi @ ws                     # (C,)
+    z_d = combo_bits @ wd                   # (K,)
+    q = 0.0
+    grad_s = np.zeros(F)
+    coef_sum_per_combo = np.zeros(K)        # Σ_c coef[:,k]
+    for k in range(K):
+        z = z_s + z_d[k]
+        a = softplus(z)
+        a_safe = np.maximum(a, _EPS)
+        nk = n2d[:, k]
+        ek = e2d[:, k]
+        q += float(np.sum(nk * np.log(a_safe) - ek * a))
+        coef = (nk / a_safe - ek) * sigmoid(z)
+        grad_s += cand_phi.T @ coef
+        coef_sum_per_combo[k] = float(coef.sum())
+    grad_d = combo_bits.T @ coef_sum_per_combo   # (D,)
+    q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    grad = np.concatenate([grad_s, grad_d]) - 2.0 * l2 * reg_mask * (w - w0)
+    return q, grad
+
+
+def fit_dynamic_weights_mstep(
+    cand_phi: np.ndarray,
+    combo_bits: np.ndarray,
+    n2d: np.ndarray,
+    e2d: np.ndarray,
+    w_init: np.ndarray,
+    *,
+    l2: float = 1e-3,
+    w_prior_mean: np.ndarray | None = None,
+    max_iter: int = 50,
+) -> np.ndarray:
+    """M-step for dynamic (bucketed) α. w = [static (F), dynamic (D)]; α on row
+    (candidate c, combo k) = softplus(cand_phi[c]·w_s + combo_bits[k]·w_d).
+
+    cand_phi : (C, F)   static per-candidate features
+    combo_bits : (K, D) one row per mark combo, its D dynamic-feature bits
+    n2d, e2d : (C, K)   responsibility N and exposure E per (candidate, combo)
+    """
+    F = cand_phi.shape[1]
+    D = combo_bits.shape[1]
+    n_w = F + D
+    w0 = np.zeros(n_w) if w_prior_mean is None else np.asarray(w_prior_mean, dtype=np.float64).reshape(-1)
+    reg_mask = np.ones(n_w)
+    reg_mask[0] = 0.0  # bias exempt
+    w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
+
+    q, grad = _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+    for _ in range(max_iter):
+        gnorm = float(np.linalg.norm(grad))
+        if gnorm < 1e-8:
+            break
+        t = 1.0
+        c = 1e-4
+        improved = False
+        for _bt in range(30):
+            w_new = w + t * grad
+            q_new, grad_new = _q_and_grad_dynamic(w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+            if q_new >= q + c * t * gnorm * gnorm:
+                w, q, grad = w_new, q_new, grad_new
+                improved = True
+                break
+            t *= 0.5
+        if not improved:
+            break
+    return w
+
+
 def fit_weights_mstep(
     phi: np.ndarray,
     n_resp: np.ndarray,

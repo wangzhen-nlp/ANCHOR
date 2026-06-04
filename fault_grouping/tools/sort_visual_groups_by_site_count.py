@@ -21,6 +21,9 @@ if __package__ in (None, ""):
 from fault_grouping.tools.analyze_group_site_distribution import extract_site_ids
 
 
+ALARM_TYPE_CHOICES = frozenset({"offline", "power", "link"})
+
+
 def iter_jsonl_records(path):
     input_path = Path(path)
     if not input_path.exists():
@@ -53,16 +56,92 @@ def group_id(record):
     )
 
 
+def normalize_alarm_type(value):
+    return str(value or "").strip().lower()
+
+
+def parse_alarm_types(raw_values):
+    selected = set()
+    for raw in raw_values or []:
+        for part in str(raw).split(","):
+            value = normalize_alarm_type(part)
+            if value:
+                selected.add(value)
+    invalid = sorted(selected - ALARM_TYPE_CHOICES)
+    if invalid:
+        raise SystemExit(
+            "不支持的 alarm_type: "
+            + ", ".join(invalid)
+            + "；可选值: "
+            + ", ".join(sorted(ALARM_TYPE_CHOICES))
+        )
+    return selected
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def extract_alarm_types(record):
+    """Extract coarse alarm types from a visual/group record."""
+    if not isinstance(record, dict):
+        return set()
+
+    out = set()
+
+    for key in ("alarm_type_counts",):
+        for alarm_type in _as_dict(record.get(key)).keys():
+            value = normalize_alarm_type(alarm_type)
+            if value:
+                out.add(value)
+
+    cascade_info = _as_dict(record.get("cascade_info"))
+    for alarm_type in _as_dict(cascade_info.get("alarm_type_counts")).keys():
+        value = normalize_alarm_type(alarm_type)
+        if value:
+            out.add(value)
+
+    for symptoms in (record.get("symptoms"), _as_dict(record.get("match_info")).get("symptoms")):
+        for symptom in _as_list(symptoms):
+            if not isinstance(symptom, dict):
+                continue
+            for key in ("alarm_type", "alarm"):
+                value = normalize_alarm_type(symptom.get(key))
+                if value:
+                    out.add(value)
+
+    ne_info = _as_dict(record.get("ne_info"))
+    for ne_meta in ne_info.values():
+        if not isinstance(ne_meta, dict):
+            continue
+        for alarm in _as_list(ne_meta.get("alarm")):
+            if not isinstance(alarm, dict):
+                continue
+            for key in ("alarm_type", "alarm"):
+                value = normalize_alarm_type(alarm.get(key))
+                if value:
+                    out.add(value)
+
+    return out
+
+
 def sort_and_filter_visual_groups(
     input_path,
     output_path,
     *,
     min_site_count: int,
-    add_site_count: bool = False,
+    alarm_types: set[str] | None = None,
 ):
     rows = []
     total = 0
     max_site_count = 0
+    dropped_by_site_count = 0
+    dropped_by_alarm_type = 0
+    alarm_types = set(alarm_types or [])
 
     for ordinal, (_line_num, record) in enumerate(iter_jsonl_records(input_path)):
         total += 1
@@ -70,11 +149,12 @@ def sort_and_filter_visual_groups(
         site_count = len(sites)
         max_site_count = max(max_site_count, site_count)
         if site_count < min_site_count:
+            dropped_by_site_count += 1
             continue
-        if add_site_count:
-            record = dict(record)
-            record["site_count"] = site_count
-            record["site_list_sorted"] = sites
+        record_alarm_types = extract_alarm_types(record)
+        if alarm_types and record_alarm_types.isdisjoint(alarm_types):
+            dropped_by_alarm_type += 1
+            continue
         rows.append((site_count, group_id(record), ordinal, record))
 
     rows.sort(key=lambda item: (-item[0], item[1], item[2]))
@@ -92,12 +172,14 @@ def sort_and_filter_visual_groups(
         "input": str(input_path),
         "output": str(output_path),
         "min_site_count": min_site_count,
+        "alarm_types": sorted(alarm_types),
         "total_groups": total,
         "kept_groups": len(rows),
         "dropped_groups": total - len(rows),
+        "dropped_by_site_count": dropped_by_site_count,
+        "dropped_by_alarm_type": dropped_by_alarm_type,
         "max_seen_site_count": max_site_count,
         "sort": "site_count_desc",
-        "add_site_count": add_site_count,
     }
 
 
@@ -115,9 +197,13 @@ def main():
         help="只保留覆盖站点数 >= N 的 group",
     )
     parser.add_argument(
-        "--add-site-count",
-        action="store_true",
-        help="在输出记录中附加 site_count 和 site_list_sorted，便于人工检查",
+        "--alarm-type",
+        action="append",
+        default=[],
+        help=(
+            "只保留至少包含一个指定告警类型的 group。可重复传入或用逗号分隔；"
+            "可选: offline,power,link。多个类型按并集保留。"
+        ),
     )
     args = parser.parse_args()
 
@@ -128,7 +214,7 @@ def main():
         args.input,
         args.output,
         min_site_count=args.min_site_count,
-        add_site_count=args.add_site_count,
+        alarm_types=parse_alarm_types(args.alarm_type),
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2), file=sys.stderr if args.output == "-" else sys.stdout)
 

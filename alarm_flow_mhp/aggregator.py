@@ -49,6 +49,15 @@ MU_COUNT_SMOOTHINGS = frozenset({"linear", "log"})
 BETA_MODES = frozenset({"shared", "per_edge"})
 KERNEL_TYPES = frozenset({"exp", "piecewise"})
 EDGE_MODES = frozenset({"device", "feature"})
+# Dynamic (stateful) α features — condition excitation on the devices' current
+# uncleared-alarm state (link/power/offline), snapshotted at the source event's
+# fire time (train/infer-consistent, clear-aware). feature mode only.
+#   off           — static features only (current behavior)
+#   source        — +3 booleans: source device's uncleared state at t_j
+#                   (exact in both occurrence and compensator terms)
+#   source_target — also +3 booleans: target device's state at t_j (package B:
+#                   exact target@t_j with a proper compensator penalty)
+DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "source_target"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -90,6 +99,9 @@ class AlarmMHPConfig:
     # injects α≈boost·score on topology-related candidate edges, strongest where
     # data is sparse, washed out where data is rich. 0 = pure MLE (no prior).
     feature_topo_prior_boost: float = 0.0
+    # Dynamic stateful α features (feature mode). See DYNAMIC_ALPHA_MODES.
+    # Needs clear events in the input stream to track uncleared-alarm state.
+    dynamic_alpha: str = "off"
     mu_count_smoothing: str = "log"
     beta_mode: str = "shared"
     beta_shared_value: float = 1.0
@@ -145,6 +157,11 @@ class AlarmMHPConfig:
             raise ValueError("feature_topo_min_score must be in [0, 1]")
         if self.feature_topo_prior_boost < 0:
             raise ValueError("feature_topo_prior_boost must be non-negative")
+        if self.dynamic_alpha not in DYNAMIC_ALPHA_MODES:
+            raise ValueError(f"dynamic_alpha must be one of {sorted(DYNAMIC_ALPHA_MODES)}")
+        # NOTE: dynamic state reads clears from the raw input stream directly (the
+        # state machine runs before clears are dropped); modeled events still
+        # exclude clears, so include_clear stays as-is (default False).
         if self.mu_count_smoothing not in MU_COUNT_SMOOTHINGS:
             raise ValueError(f"mu_count_smoothing must be one of {sorted(MU_COUNT_SMOOTHINGS)}")
         if self.beta_mode not in BETA_MODES:
@@ -491,6 +508,35 @@ def train_alarm_mhp(
     train_events = _events_to_collection(train_view, M)
     val_events = _events_to_collection(val_view, M) if val_view is not None else None
 
+    # Dynamic (stateful) α: per-modeled-event source-mark combo, aligned to the
+    # TRAIN slice. The state machine runs over the full stream (clears included)
+    # before clears are dropped; combos pack the 3 uncleared-alarm booleans.
+    train_src_combo = None
+    dyn_combo_bits = None
+    dyn_feature_names = None
+    if config.edge_mode == "feature" and config.dynamic_alpha != "off":
+        from alarm_flow_mhp.dynamic_state import (
+            build_event_states, states_to_combo, combo_bits as _combo_bits,
+        )
+        ev_state_full = build_event_states(
+            sorted_alarm_events,
+            sequence.events,
+            is_clear=lambda e: is_clear_alarm(e.get("alarm", {})),
+            device_of=lambda e: e.get("alarm_source", ""),
+            alarm_type_of=lambda e: alarm_type_from_title(e.get("alarm_title", "")),
+        )
+        combo_full = states_to_combo(ev_state_full)
+        train_src_combo = combo_full[: train_events.n]
+        dyn_combo_bits = _combo_bits(8)
+        dyn_feature_names = ["src_uncleared_link", "src_uncleared_power", "src_uncleared_offline"]
+        if verbose:
+            nz = int((train_src_combo > 0).sum())
+            print(
+                f"[train] dynamic_alpha={config.dynamic_alpha}: source marks on "
+                f"{nz}/{train_events.n} train events ({100.0*nz/max(train_events.n,1):.1f}% with active state)",
+                flush=True,
+            )
+
     _emit_progress(
         progress_callback,
         "fit_start",
@@ -626,6 +672,9 @@ def train_alarm_mhp(
             mu_feature_names=mu_spec.feature_names,
             cand_topo_score=cand_topo_score,     # topology pseudo-count prior
             topo_prior_boost=config.feature_topo_prior_boost,
+            src_combo=train_src_combo,            # dynamic stateful α (source mark)
+            dynamic_combo_bits=dyn_combo_bits,
+            dynamic_feature_names=dyn_feature_names,
             iter_callback=iter_callback,
         )
         # Stationarity check (feature mode has no hard cap): warn if the
