@@ -240,6 +240,12 @@ class SamplerConfig:
                                        # orphans (fair, shuffled) but bounded to this
                                        # many ATTEMPTS/sweep to cap cost without
                                        # introducing an age bias.
+    commit_check_interval_sec: float = 0.0  # only rebuild/close cascades when event
+                                       # time has advanced this far since the last
+                                       # close (the O(live) cluster scan is wasteful
+                                       # every tick). 0 = every tick (test default);
+                                       # the stream sets a fraction of lag. Affects
+                                       # only OUTPUT timing, never sampling.
     seed: int = 0
 
     def window_sec(self) -> float:
@@ -290,6 +296,9 @@ class MissingChainSampler:
         self._orphan_list: list[int] = []
         self._orphan_idx: dict[int, int] = {}
         self._missing_set: set[int] = set()
+        # Incremental-freeze frontier + close throttle (both O(live)-avoidance):
+        self._frozen_through_ts: float = NEG_INF
+        self._last_commit_check_ts: float = NEG_INF
         # stats
         self.births = 0
         self.deaths = 0
@@ -318,8 +327,13 @@ class MissingChainSampler:
         self._gibbs_parent(ev)            # initial assignment
         for _ in range(self.config.sweeps_per_tick):
             self._sweep()
-        self._freeze_aged()
-        return self._close_clusters()
+        self._freeze_aged()               # incremental: O(newly-frozen), cheap
+        # Closing rebuilds cascades over the window (O(live)); throttle it by
+        # event time so it doesn't run every tick. Output-timing only.
+        if (self.now - self._last_commit_check_ts) >= self.config.commit_check_interval_sec:
+            self._last_commit_check_ts = self.now
+            return self._close_clusters()
+        return []
 
     def flush(self) -> list[dict]:
         """Close every remaining cascade (call at end of stream)."""
@@ -772,13 +786,26 @@ class MissingChainSampler:
     def _freeze_aged(self, force: bool = False):
         """Freeze events older than the lag: lock in the MAP (marginal) parent
         and mark them immutable. They stay in the window as candidate parents
-        until their whole cascade leaves kernel reach (see _close_clusters)."""
+        until their whole cascade leaves kernel reach (see _close_clusters).
+
+        Incremental: only the events whose ts entered ``(_frozen_through_ts,
+        cutoff]`` since the last call are visited (each event is frozen exactly
+        once over its lifetime → O(N) amortised, not O(live) per tick). Missing
+        events are always created at ts > cutoff, so they never fall inside an
+        already-passed freeze range.
+        """
         cutoff = self.now - self.config.lag_sec
-        for eid in list(self._order):
+        if force:
+            lo, hi = 0, len(self._order)
+        else:
+            if cutoff <= self._frozen_through_ts:
+                return
+            lo = bisect.bisect_right(self._order_ts, self._frozen_through_ts)
+            hi = bisect.bisect_right(self._order_ts, cutoff)
+        for idx in range(lo, hi):
+            eid = self._order[idx]
             ev = self.events.get(eid)
             if ev is None or ev.committed:
-                continue
-            if not (force or ev.ts <= cutoff):
                 continue
             # MAP parent from accumulated votes, FILTERED to parents that still
             # exist (a voted missing parent may have been culled meanwhile) — so
@@ -797,6 +824,8 @@ class MissingChainSampler:
             self._orphan_remove(ev.eid)
             self._missing_set.discard(ev.eid)
             self.committed_count += 1
+        if not force:
+            self._frozen_through_ts = cutoff
 
     def _root_of(self, ev: SamplerEvent) -> int:
         """Immigrant root eid of ev's cascade (follow parent pointers)."""
@@ -817,6 +846,10 @@ class MissingChainSampler:
         future alarm can attach to any member, so the structure is final.
         """
         evict_cut = self.now - self.config.window_sec()
+        # Cheap guard: if nothing has crossed the evict boundary there is nothing
+        # to close, so skip the O(live) cluster rebuild entirely.
+        if not force and (not self._order_ts or self._order_ts[0] >= evict_cut):
+            return []
         # Group live events by cascade root.
         clusters: dict[int, list[SamplerEvent]] = {}
         for eid in self._order:

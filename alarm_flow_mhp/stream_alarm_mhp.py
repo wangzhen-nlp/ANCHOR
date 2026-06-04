@@ -669,6 +669,9 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
         max_history_events=int(args.impute_max_history),
         sweep_recent_events=int(args.impute_sweep_recent),
         max_birth_attempts_per_sweep=int(args.impute_max_birth_attempts),
+        # Throttle the O(live) cascade-close scan to a fraction of the lag — it
+        # only governs output timing, and running it every event is wasteful.
+        commit_check_interval_sec=max(lag * 0.2, 30.0),
         seed=int(getattr(artifact.config, "seed", 0) or 0),
     )
     sampler = MissingChainSampler(adapter, cfg)
