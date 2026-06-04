@@ -50,7 +50,7 @@ from __future__ import annotations
 import bisect
 import math
 import random
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Protocol, runtime_checkable
 
@@ -1030,6 +1030,7 @@ class FeatureKernelAdapter:
         alpha_floor: float = 0.0,
         candidate_max_hops: Optional[int] = None,
         max_candidates: int = 256,
+        cache_max_entries: int = 200_000,
     ):
         if time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
@@ -1050,9 +1051,13 @@ class FeatureKernelAdapter:
             self._max_hops = int(candidate_max_hops)
         else:
             self._max_hops = int(getattr(self._topo, "max_hops", 1) or 1)
-        # caches
-        self._pair_alpha: dict[tuple, float] = {}
-        self._alpha_out_sum: dict[tuple, float] = {}
+        # caches — bounded LRU (OrderedDict) so a long stream can't grow them
+        # without limit. Over 442k feature events the (src,tgt) pair space is
+        # (ATs×NEs)², which would otherwise balloon to GB and slow the run down
+        # as it progresses. _neighbor_cache is naturally bounded by #NEs.
+        self._cache_max = max(1, int(cache_max_entries))
+        self._pair_alpha: "OrderedDict[tuple, float]" = OrderedDict()
+        self._alpha_out_sum: "OrderedDict[tuple, float]" = OrderedDict()
         self._neighbor_cache: dict[str, list] = {}
 
     # ---- helpers ----
@@ -1073,8 +1078,10 @@ class FeatureKernelAdapter:
 
     def _alpha(self, src_key, tgt_key) -> float:
         ck = (src_key, tgt_key)
-        a = self._pair_alpha.get(ck)
+        cache = self._pair_alpha
+        a = cache.get(ck)
         if a is not None:
+            cache.move_to_end(ck)              # LRU touch
             return a
         (s_at, s_ne) = src_key
         (t_at, t_ne) = tgt_key
@@ -1082,7 +1089,9 @@ class FeatureKernelAdapter:
         val = float(arr[0]) if len(arr) else 0.0
         if val < self.alpha_floor:
             val = 0.0
-        self._pair_alpha[ck] = val
+        cache[ck] = val
+        if len(cache) > self._cache_max:
+            cache.popitem(last=False)          # evict least-recently-used
         return val
 
     # ---- ModelAdapter surface ----
@@ -1153,8 +1162,11 @@ class FeatureKernelAdapter:
     def total_compensator(self, source_type, horizon_sec: float) -> float:
         if horizon_sec <= 0:
             return 0.0
-        s_sum = self._alpha_out_sum.get(source_type)
-        if s_sum is None:
+        cache = self._alpha_out_sum
+        s_sum = cache.get(source_type)
+        if s_sum is not None:
+            cache.move_to_end(source_type)        # LRU touch
+        else:
             (s_at, s_ne) = source_type
             total = 0.0
             # transpose: one source vs many targets — not vectorisable via
@@ -1165,7 +1177,9 @@ class FeatureKernelAdapter:
                     if a >= self.alpha_floor and a > 0:
                         total += a
             s_sum = total
-            self._alpha_out_sum[source_type] = s_sum
+            cache[source_type] = s_sum
+            if len(cache) > self._cache_max:
+                cache.popitem(last=False)          # evict least-recently-used
         dt = horizon_sec / self.time_scale_sec
         return float(s_sum * (1.0 - math.exp(-self.beta * dt)))
 

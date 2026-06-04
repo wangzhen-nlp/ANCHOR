@@ -444,6 +444,20 @@ def test_group_is_visual_output_compatible():
     assert MHP_VIRTUAL_RULE in vm["merged_rules"]
 
 
+def test_feature_alpha_cache_is_bounded():
+    """The per-pair α cache must not grow without limit over a long stream."""
+    fs = _FakeFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 1.0},
+        topo=_FakeTopo({}, max_hops=1), node_infos={}, beta=1.0,
+    )
+    ad = FeatureKernelAdapter(fs, mu_by_alarm_type={"S": 0.1, "B": 0.1},
+                              time_scale_sec=60.0, cache_max_entries=50)
+    # Probe many distinct (src,tgt) pairs → far more than the cap.
+    for i in range(500):
+        ad._alpha(("S", f"n{i}"), ("B", f"m{i}"))
+    assert len(ad._pair_alpha) <= 50, f"cache exceeded cap: {len(ad._pair_alpha)}"
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
