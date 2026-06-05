@@ -1451,9 +1451,27 @@ def fit_mhp_feature(
             if topo_prior_boost > 0.0 and cand_topo_score is not None:
                 n2d = n_resp2d.copy()
                 n2d[:, 0] += prior_num
+            # Heartbeat for the dynamic M-step (it can take tens of seconds at
+            # large C — print throttled so it never looks hung).
+            _ms_t0 = time.monotonic()
+            _ms_beat = [_ms_t0]
+
+            def _mstep_progress(mi, q, gn, _it=it, _t0=_ms_t0, _beat=_ms_beat):
+                if not config.verbose or C < 200_000:
+                    return
+                now = time.monotonic()
+                if now - _beat[0] >= 8.0:
+                    print(
+                        f"[mhp-feat]   iter={_it:3d} M-step inner {mi} "
+                        f"(Q={q:.1f}, |g|={gn:.2e}, {_fmt_secs(now - _t0)})",
+                        flush=True,
+                    )
+                    _beat[0] = now
+
             w_new = fit_dynamic_weights_mstep(
                 cand_phi, dynamic_combo_bits, n2d, exposure_2d_fit, w,
                 l2=l2, w_prior_mean=w_prior_mean, max_iter=50,
+                progress=_mstep_progress,
             )
             # Baseline α (combo 0) for diagnostics / materialization.
             alpha_new = softplus(cand_phi @ w_new[:F])

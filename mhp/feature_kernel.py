@@ -97,6 +97,14 @@ class FeatureKernel:
         )
 
 
+def _q_only(w, phi, n_resp, exposure, l2, w0, reg_mask):
+    """Objective Q(w) only — for the Armijo line search (skips the phiᵀ·coef matmul)."""
+    z = phi @ w
+    a = softplus(z)
+    a_safe = np.maximum(a, _EPS)
+    return float(np.sum(n_resp * np.log(a_safe) - exposure * a) - l2 * np.sum(reg_mask * (w - w0) ** 2))
+
+
 def _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask):
     """Objective Q(w) = Σ_c [N_c·log α_c − E_c·α_c] − λ·Σ reg·(w−w0)² and its
     gradient (to be MAXIMIZED).
@@ -110,22 +118,42 @@ def _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask):
     return q, grad
 
 
+def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+    """Objective Q only (no gradient) — for the Armijo line search, which only
+    needs to test the Q increase. Skips the expensive cand_phiᵀ·coef matmul.
+    """
+    F = cand_phi.shape[1]
+    K = combo_bits.shape[0]
+    ws, wd = w[:F], w[F:]
+    z_s = cand_phi @ ws                     # (C,) one matmul
+    z_d = combo_bits @ wd                   # (K,)
+    q = 0.0
+    for k in range(K):
+        z = z_s + z_d[k]
+        a = softplus(z)
+        a_safe = np.maximum(a, _EPS)
+        q += float(np.sum(n2d[:, k] * np.log(a_safe) - e2d[:, k] * a))
+    q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    return q
+
+
 def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
     """Bucketed objective Σ_{c,k}[N_{c,k}·log α_{c,k} − E_{c,k}·α_{c,k}] − ridge,
     with α_{c,k} = softplus(z_s[c] + z_d[k]), z_s = cand_phi·w_s, z_d = combo_bits·w_d
     and w = [w_s (F), w_d (D)]. Gradient decomposes over the static and dynamic
-    blocks WITHOUT materializing the (C, K) row matrix:
-        ∂Q/∂w_s = cand_phiᵀ · Σ_k coef[:,k]
+    blocks WITHOUT materializing the (C, K) row matrix. The static-block gradient
+    collapses the K matmuls into ONE via linearity:
+        ∂Q/∂w_s = cand_phiᵀ · Σ_k coef[:,k]   (one cand_phiᵀ·coef_total matmul)
         ∂Q/∂w_d = combo_bitsᵀ · (Σ_c coef[:,k])_k
     """
     F = cand_phi.shape[1]
     K, D = combo_bits.shape
     ws, wd = w[:F], w[F:]
-    z_s = cand_phi @ ws                     # (C,)
+    z_s = cand_phi @ ws                     # (C,) one matmul
     z_d = combo_bits @ wd                   # (K,)
     q = 0.0
-    grad_s = np.zeros(F)
-    coef_sum_per_combo = np.zeros(K)        # Σ_c coef[:,k]
+    coef_total = np.zeros(cand_phi.shape[0])   # Σ_k coef[:,k]  (C,)
+    coef_sum_per_combo = np.zeros(K)           # Σ_c coef[:,k]
     for k in range(K):
         z = z_s + z_d[k]
         a = softplus(z)
@@ -134,8 +162,9 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
         ek = e2d[:, k]
         q += float(np.sum(nk * np.log(a_safe) - ek * a))
         coef = (nk / a_safe - ek) * sigmoid(z)
-        grad_s += cand_phi.T @ coef
+        coef_total += coef
         coef_sum_per_combo[k] = float(coef.sum())
+    grad_s = cand_phi.T @ coef_total             # ONE (F×C) matmul instead of K
     grad_d = combo_bits.T @ coef_sum_per_combo   # (D,)
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
     grad = np.concatenate([grad_s, grad_d]) - 2.0 * l2 * reg_mask * (w - w0)
@@ -152,6 +181,7 @@ def fit_dynamic_weights_mstep(
     l2: float = 1e-3,
     w_prior_mean: np.ndarray | None = None,
     max_iter: int = 50,
+    progress=None,
 ) -> np.ndarray:
     """M-step for dynamic (bucketed) α. w = [static (F), dynamic (D)]; α on row
     (candidate c, combo k) = softplus(cand_phi[c]·w_s + combo_bits[k]·w_d).
@@ -159,6 +189,7 @@ def fit_dynamic_weights_mstep(
     cand_phi : (C, F)   static per-candidate features
     combo_bits : (K, D) one row per mark combo, its D dynamic-feature bits
     n2d, e2d : (C, K)   responsibility N and exposure E per (candidate, combo)
+    progress : optional callable(outer_iter, q, gnorm) for a heartbeat on large C.
     """
     F = cand_phi.shape[1]
     D = combo_bits.shape[1]
@@ -169,18 +200,28 @@ def fit_dynamic_weights_mstep(
     w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
 
     q, grad = _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
-    for _ in range(max_iter):
+    # Warm-start the step size across outer iterations: with a large exposure E
+    # the gradient is large, so Armijo from t=1 backtracks 20-30× every step.
+    # Starting near the last accepted t (×2, capped at 1) cuts that to ~1-2.
+    t_prev = 1.0
+    for _it in range(max_iter):
         gnorm = float(np.linalg.norm(grad))
+        if progress is not None:
+            progress(_it, q, gnorm)
         if gnorm < 1e-8:
             break
-        t = 1.0
+        t = min(1.0, 2.0 * t_prev)
         c = 1e-4
         improved = False
-        for _bt in range(30):
+        for _bt in range(40):
             w_new = w + t * grad
-            q_new, grad_new = _q_and_grad_dynamic(w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+            # Line search needs Q only (cheap); the gradient at the accepted
+            # point is recomputed once below.
+            q_new = _q_dynamic(w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
             if q_new >= q + c * t * gnorm * gnorm:
-                w, q, grad = w_new, q_new, grad_new
+                t_prev = t
+                w, q = w_new, q_new
+                grad = _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)[1]
                 improved = True
                 break
             t *= 0.5
@@ -221,19 +262,24 @@ def fit_weights_mstep(
     w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
 
     q, grad = _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask)
+    # Warm-start the step size across iterations (see fit_dynamic_weights_mstep):
+    # large exposure → large gradient → Armijo from t=1 backtracks many times.
+    t_prev = 1.0
     for _ in range(max_iter):
         gnorm = float(np.linalg.norm(grad))
         if gnorm < 1e-8:
             break
         # Armijo backtracking ascent: find t so Q(w + t·g) >= Q(w) + c·t·||g||²
-        t = 1.0
+        t = min(1.0, 2.0 * t_prev)
         c = 1e-4
         improved = False
-        for _bt in range(30):
+        for _bt in range(40):
             w_new = w + t * grad
-            q_new, grad_new = _q_and_grad(w_new, phi, n_resp, exposure, l2, w0, reg_mask)
+            q_new = _q_only(w_new, phi, n_resp, exposure, l2, w0, reg_mask)
             if q_new >= q + c * t * gnorm * gnorm:
-                w, q, grad = w_new, q_new, grad_new
+                t_prev = t
+                w, q = w_new, q_new
+                grad = _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask)[1]
                 improved = True
                 break
             t *= 0.5
