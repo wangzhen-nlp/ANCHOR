@@ -97,6 +97,26 @@ class FeatureKernel:
         )
 
 
+def _newton_direction(H, grad, eye):
+    """Ascent direction Δ solving (−H + μI)·Δ = grad for MAXIMIZATION, with
+    Levenberg damping μ raised until −H+μI is positive-definite (Cholesky
+    succeeds). Falls back to the diagonal-scaled gradient if that fails.
+    """
+    negH = -H
+    diag = np.diag(negH).copy()
+    base = max(1e-12, float(np.max(np.abs(diag))))
+    mu = 0.0
+    for _ in range(40):
+        try:
+            L = np.linalg.cholesky(negH + mu * eye)
+        except np.linalg.LinAlgError:
+            mu = base * 1e-8 if mu == 0.0 else mu * 10.0
+            continue
+        y = np.linalg.solve(L, grad)
+        return np.linalg.solve(L.T, y)
+    return grad / np.maximum(diag, _EPS)
+
+
 def _q_only(w, phi, n_resp, exposure, l2, w0, reg_mask):
     """Objective Q(w) only — for the Armijo line search (skips the phiᵀ·coef matmul)."""
     z = phi @ w
@@ -116,6 +136,25 @@ def _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask):
     coef = (n_resp / a_safe - exposure) * sigmoid(z)
     grad = phi.T @ coef - 2.0 * l2 * reg_mask * (w - w0)
     return q, grad
+
+
+def _q_grad_hess(w, phi, n_resp, exposure, l2, w0, reg_mask):
+    """_q_and_grad plus the full F×F Hessian (for Newton): H = phiᵀ·diag(h)·phi
+    − 2λ·reg, h = (N/α−E)·σ(1−σ) − N·σ²/α²."""
+    F = phi.shape[1]
+    z = phi @ w
+    a = softplus(z)
+    a_safe = np.maximum(a, _EPS)
+    s = sigmoid(z)
+    q = float(np.sum(n_resp * np.log(a_safe) - exposure * a) - l2 * np.sum(reg_mask * (w - w0) ** 2))
+    coef = (n_resp / a_safe - exposure) * s
+    grad = phi.T @ coef - 2.0 * l2 * reg_mask * (w - w0)
+    h = (n_resp / a_safe - exposure) * s * (1.0 - s) - n_resp * (s * s) / (a_safe * a_safe)
+    H = np.empty((F, F))
+    for i in range(F):
+        H[:, i] = phi.T @ (phi[:, i] * h)
+    H[np.arange(F), np.arange(F)] -= 2.0 * l2 * reg_mask
+    return q, grad, H
 
 
 def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
@@ -171,6 +210,59 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
     return q, grad
 
 
+def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+    """_q_and_grad_dynamic plus the FULL (F+D)×(F+D) Hessian, for Newton steps.
+    Per-(c,k) 2nd derivative w.r.t. z:  h = (N/α−E)·σ(1−σ) − N·σ²/α².
+    Hessian blocks (no (C,K) materialization):
+        H_ss = cand_phiᵀ·diag(Σ_k h)·cand_phi      (via F column matmuls)
+        H_dd = combo_bitsᵀ·diag(Σ_c h)·combo_bits
+        H_sd = Σ_k (cand_phiᵀ·h[:,k]) ⊗ combo_bits[k]
+    minus the ridge curvature 2λ·reg on the diagonal.
+    """
+    C, F = cand_phi.shape
+    K, D = combo_bits.shape
+    nw = F + D
+    ws, wd = w[:F], w[F:]
+    z_s = cand_phi @ ws
+    z_d = combo_bits @ wd
+    q = 0.0
+    coef_total = np.zeros(C)
+    coef_sum_per_combo = np.zeros(K)
+    h_total = np.zeros(C)
+    h_per_combo = np.zeros(K)
+    Hsd = np.zeros((F, D))
+    for k in range(K):
+        z = z_s + z_d[k]
+        a = softplus(z)
+        a_safe = np.maximum(a, _EPS)
+        s = sigmoid(z)
+        nk = n2d[:, k]
+        ek = e2d[:, k]
+        q += float(np.sum(nk * np.log(a_safe) - ek * a))
+        coef = (nk / a_safe - ek) * s
+        coef_total += coef
+        coef_sum_per_combo[k] = float(coef.sum())
+        h = (nk / a_safe - ek) * s * (1.0 - s) - nk * (s * s) / (a_safe * a_safe)
+        h_total += h
+        h_per_combo[k] = float(h.sum())
+        Hsd += np.outer(cand_phi.T @ h, combo_bits[k])
+    grad_s = cand_phi.T @ coef_total
+    grad_d = combo_bits.T @ coef_sum_per_combo
+    q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    grad = np.concatenate([grad_s, grad_d]) - 2.0 * l2 * reg_mask * (w - w0)
+    Hss = np.empty((F, F))
+    for i in range(F):                                     # avoid a (C,F) temp
+        Hss[:, i] = cand_phi.T @ (cand_phi[:, i] * h_total)
+    Hdd = combo_bits.T @ (combo_bits * h_per_combo[:, None])
+    H = np.empty((nw, nw))
+    H[:F, :F] = Hss
+    H[:F, F:] = Hsd
+    H[F:, :F] = Hsd.T
+    H[F:, F:] = Hdd
+    H[np.arange(nw), np.arange(nw)] -= 2.0 * l2 * reg_mask
+    return q, grad, H
+
+
 def fit_dynamic_weights_mstep(
     cand_phi: np.ndarray,
     combo_bits: np.ndarray,
@@ -199,29 +291,30 @@ def fit_dynamic_weights_mstep(
     reg_mask[0] = 0.0  # bias exempt
     w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
 
-    q, grad = _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
-    # Warm-start the step size across outer iterations: with a large exposure E
-    # the gradient is large, so Armijo from t=1 backtracks 20-30× every step.
-    # Starting near the last accepted t (×2, capped at 1) cuts that to ~1-2.
-    t_prev = 1.0
+    # DAMPED NEWTON. The objective is badly conditioned (the unregularized bias
+    # has a huge curvature from Σ E, the others tiny), so plain gradient ascent
+    # crawls (50 iters). With only ~21 parameters the full Hessian is cheap;
+    # Newton converges in a handful of iters to the SAME optimum. Levenberg
+    # damping (−H + μI) keeps the step an ascent direction when the (non-canonical
+    # softplus link) objective is locally non-concave.
+    q, grad, H = _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+    eye = np.eye(F + D)
     for _it in range(max_iter):
-        gnorm = float(np.linalg.norm(grad))
         if progress is not None:
-            progress(_it, q, gnorm)
-        if gnorm < 1e-8:
-            break
-        t = min(1.0, 2.0 * t_prev)
+            progress(_it, q, float(np.linalg.norm(grad)))
+        direction = _newton_direction(H, grad, eye)
+        dderiv = float(grad @ direction)          # Newton decrement ≈ 2·(Q* − Q)
+        if dderiv <= 1e-9 * max(abs(q), 1.0):
+            break  # near-optimal (scale-invariant test)
+        t = 1.0
         c = 1e-4
         improved = False
         for _bt in range(40):
-            w_new = w + t * grad
-            # Line search needs Q only (cheap); the gradient at the accepted
-            # point is recomputed once below.
+            w_new = w + t * direction
             q_new = _q_dynamic(w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
-            if q_new >= q + c * t * gnorm * gnorm:
-                t_prev = t
+            if q_new >= q + c * t * dderiv:
                 w, q = w_new, q_new
-                grad = _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)[1]
+                q, grad, H = _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
                 improved = True
                 break
             t *= 0.5
@@ -261,25 +354,23 @@ def fit_weights_mstep(
     reg_mask[0] = 0.0  # do not regularize the bias term
     w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
 
-    q, grad = _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask)
-    # Warm-start the step size across iterations (see fit_dynamic_weights_mstep):
-    # large exposure → large gradient → Armijo from t=1 backtracks many times.
-    t_prev = 1.0
+    # Damped Newton — see fit_dynamic_weights_mstep.
+    q, grad, H = _q_grad_hess(w, phi, n_resp, exposure, l2, w0, reg_mask)
+    eye = np.eye(F)
     for _ in range(max_iter):
-        gnorm = float(np.linalg.norm(grad))
-        if gnorm < 1e-8:
-            break
-        # Armijo backtracking ascent: find t so Q(w + t·g) >= Q(w) + c·t·||g||²
-        t = min(1.0, 2.0 * t_prev)
+        direction = _newton_direction(H, grad, eye)
+        dderiv = float(grad @ direction)
+        if dderiv <= 1e-9 * max(abs(q), 1.0):
+            break  # Newton decrement negligible → converged
+        t = 1.0
         c = 1e-4
         improved = False
         for _bt in range(40):
-            w_new = w + t * grad
+            w_new = w + t * direction
             q_new = _q_only(w_new, phi, n_resp, exposure, l2, w0, reg_mask)
-            if q_new >= q + c * t * gnorm * gnorm:
-                t_prev = t
+            if q_new >= q + c * t * dderiv:
                 w, q = w_new, q_new
-                grad = _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask)[1]
+                q, grad, H = _q_grad_hess(w, phi, n_resp, exposure, l2, w0, reg_mask)
                 improved = True
                 break
             t *= 0.5

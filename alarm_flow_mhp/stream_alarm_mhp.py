@@ -975,7 +975,9 @@ def main():
     parser.add_argument(
         "--visual-output",
         default="",
-        help="Optional visualization JSONL compatible with the fault group browser and propagation visualizer.",
+        help="Visualization JSONL compatible with the fault group browser and "
+             "propagation visualizer. ALWAYS produced: if omitted, defaults to "
+             "<groups-output or input-name>[.impute].visual.jsonl.",
     )
     parser.add_argument(
         "--site-graph",
@@ -1148,6 +1150,16 @@ def main():
     )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+
+    # Visual output is a required artifact: if not given, derive a default path
+    # from the groups-output (or the input cache) so it is always produced.
+    if not args.visual_output:
+        if args.groups_output:
+            base = args.groups_output[:-5] if args.groups_output.endswith(".json") else args.groups_output
+        else:
+            base = os.path.splitext(os.path.basename(args.alarms.rstrip("/\\")))[0] or "mhp_stream"
+        suffix = ".impute" if args.impute else ""
+        args.visual_output = f"{base}{suffix}.visual.jsonl"
 
     t_total_start = time.monotonic()
     if not args.quiet:
