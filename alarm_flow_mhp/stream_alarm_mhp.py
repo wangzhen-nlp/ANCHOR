@@ -52,6 +52,19 @@ from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_
 EPS = 1e-12
 
 
+def _resolve_visual_snapshot_check_interval(age_sec: float, configured_sec) -> float:
+    """Stream-time cadence for visual snapshot scans.
+
+    The snapshot scan walks live cascades/clusters, so the default is deliberately
+    not per-event once age snapshots are enabled.
+    """
+    if age_sec <= 0:
+        return 0.0
+    if configured_sec is not None and float(configured_sec) > 0:
+        return float(configured_sec)
+    return min(max(float(age_sec) / 6.0, 1.0), 60.0)
+
+
 # --------------------------------------------------------------------------
 # Core data structures
 # --------------------------------------------------------------------------
@@ -86,6 +99,10 @@ class Cascade:
     root_index: int = -1                              # index of root event
     last_ts: float = 0.0
     start_ts: float = 0.0
+    snapshot_seq: int = 0
+    last_snapshot_event_indexes: set = field(default_factory=set)
+    snapshot_frontier_uuids: set = field(default_factory=set)
+    snapshot_related_uuids: set = field(default_factory=set)
 
     def add(self, event: OnlineEvent):
         if any(e.index == event.index for e in self.events):
@@ -93,6 +110,8 @@ class Cascade:
         if not self.events:
             self.root_index = event.index
             self.start_ts = event.ts
+        else:
+            self.start_ts = min(self.start_ts, event.ts)
         self.events.append(event)
         self.last_ts = max(self.last_ts, event.ts)
         event.cascade_id = self.cascade_id
@@ -473,6 +492,10 @@ class StreamMHPAssigner:
             return keep
         for ev in list(drop.events):
             keep.add(ev)
+        keep.snapshot_seq = max(keep.snapshot_seq, drop.snapshot_seq)
+        keep.last_snapshot_event_indexes |= drop.last_snapshot_event_indexes
+        keep.snapshot_frontier_uuids |= drop.snapshot_frontier_uuids
+        keep.snapshot_related_uuids |= drop.snapshot_related_uuids
         self.cascades.pop(drop_id, None)
         return keep
 
@@ -635,6 +658,42 @@ class StreamMHPAssigner:
             cascade = self.cascades.pop(cid)
             self._record_closed(cascade)
 
+    def snapshot_ready_groups(self, age_sec: float, now_ts: float) -> list[dict]:
+        """Return visual-only snapshots for old active cascades without closing.
+
+        A cascade is emitted again only when its event membership has changed
+        since the last snapshot. The real close path remains responsible for
+        removing it from memory.
+        """
+        if age_sec <= 0:
+            return []
+        cutoff = float(now_ts) - float(age_sec)
+        out: list[dict] = []
+        for cascade in list(self.cascades.values()):
+            if cascade.event_count() < self.config.min_group_events:
+                continue
+            if any(not e.finalized for e in cascade.events):
+                continue
+            if cascade.start_ts > cutoff:
+                continue
+            event_indexes = {e.index for e in cascade.events}
+            if event_indexes == cascade.last_snapshot_event_indexes:
+                continue
+            group = _cascade_to_group(cascade)
+            base_group_id = group["group_id"]
+            cascade.snapshot_seq += 1
+            snapshot_group_id = f"{base_group_id}.snapshot-{cascade.snapshot_seq:04d}"
+            related = cascade.snapshot_related_uuids | cascade.snapshot_frontier_uuids
+            group["base_group_id"] = base_group_id
+            group["group_id"] = snapshot_group_id
+            group["related_group_uuids"] = sorted(related)
+            group["snapshot_seq"] = cascade.snapshot_seq
+            cascade.last_snapshot_event_indexes = event_indexes
+            cascade.snapshot_frontier_uuids = {snapshot_group_id}
+            cascade.snapshot_related_uuids = related | {snapshot_group_id}
+            out.append(group)
+        return out
+
     def close_remaining(self):
         """Emit any still-active cascades. Call once at end of stream."""
         self._finalize_ready(np.inf)
@@ -650,7 +709,17 @@ class StreamMHPAssigner:
         self.closed_cascade_count += 1
         self.closed_size_counter[cascade.event_count()] += 1
         if cascade.event_count() >= self.config.min_group_events:
-            self.closed_groups.append(_cascade_to_group(cascade))
+            group = _cascade_to_group(cascade)
+            if (
+                cascade.snapshot_seq
+                or cascade.snapshot_related_uuids
+                or cascade.snapshot_frontier_uuids
+            ):
+                related = cascade.snapshot_related_uuids | cascade.snapshot_frontier_uuids
+                if related:
+                    group["base_group_id"] = group.get("group_id", "")
+                    group["related_group_uuids"] = sorted(related)
+            self.closed_groups.append(group)
             self.emitted_group_count += 1
 
     def stats(self) -> dict:
@@ -888,6 +957,12 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
     processed = 0
     _t0 = time.monotonic()
     _n = len(alarm_events)
+    visual_snapshot_age_sec = float(getattr(args, "visual_snapshot_age_sec", 0.0) or 0.0)
+    visual_snapshot_check_interval_sec = _resolve_visual_snapshot_check_interval(
+        visual_snapshot_age_sec,
+        getattr(args, "visual_snapshot_check_interval_sec", None),
+    )
+    last_visual_snapshot_check_ts = -np.inf
 
     def _accept_output_groups(new_groups, *, finalization_reason):
         if not new_groups:
@@ -900,6 +975,17 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
         if visual_output is not None and accepted:
             visual_output.emit_groups(accepted, finalization_reason=finalization_reason)
         return accepted
+
+    def _emit_visual_snapshots(now_ts: float):
+        nonlocal last_visual_snapshot_check_ts
+        if visual_output is None or visual_snapshot_age_sec <= 0:
+            return []
+        now_ts = float(now_ts)
+        if now_ts < last_visual_snapshot_check_ts + visual_snapshot_check_interval_sec:
+            return []
+        last_visual_snapshot_check_ts = max(last_visual_snapshot_check_ts, now_ts)
+        snapshots = sampler.visual_snapshot_groups(visual_snapshot_age_sec, now_ts=now_ts)
+        return _accept_output_groups(snapshots, finalization_reason="age_snapshot")
 
     for i, alarm in enumerate(alarm_events):
         if args.progress_every and (i + 1) % args.progress_every == 0 and not quiet:
@@ -923,10 +1009,12 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             state_timeline.prune_before(float(alarm.get("ts", 0.0)) - cfg.window_sec())
         if is_clear:
             dropped["clear"] += 1
+            _emit_visual_snapshots(float(alarm.get("ts", 0.0)))
             continue
         atype = alarm_type_label(alarm)
         if atype is None:
             dropped["no_type"] += 1
+            _emit_visual_snapshots(float(alarm.get("ts", 0.0)))
             continue
         meta = summarize_alarm_event(alarm, i)
         if feature_mode:
@@ -943,6 +1031,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             tid = artifact.vocabs.type_vocab.get(type_label)
             if tid is None:
                 dropped["unknown_type"] += 1
+                _emit_visual_snapshots(float(alarm.get("ts", 0.0)))
                 continue
             type_key = int(tid)
             meta["type_label"] = type_label
@@ -954,6 +1043,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             src_mark=src_mark,
         )
         groups.extend(_accept_output_groups(closed, finalization_reason="closed"))
+        _emit_visual_snapshots(float(alarm.get("ts", 0.0)))
     groups.extend(
         _accept_output_groups(sampler.flush(), finalization_reason="stream_end")
     )
@@ -1001,6 +1091,27 @@ def main():
         choices=("alarm-only", "site-context"),
         default="alarm-only",
         help="NEs in --visual-output: grouped alarm devices only, or all devices at group sites.",
+    )
+    parser.add_argument(
+        "--visual-snapshot-age-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Emit visual-only snapshots for active fault groups whose earliest "
+            "alarm is at least this old, without closing/removing the group. "
+            "Later snapshots/final output are linked through related_group_uuids. "
+            "Default: 0 (disabled). Example: 360 for six minutes."
+        ),
+    )
+    parser.add_argument(
+        "--visual-snapshot-check-interval-sec",
+        type=float,
+        default=None,
+        help=(
+            "Minimum stream-time interval between active visual snapshot scans. "
+            "Only used when --visual-snapshot-age-sec > 0. Default: auto "
+            "(min(age/6, 60s), at least 1s)."
+        ),
     )
     parser.add_argument(
         "--topo",
@@ -1183,6 +1294,10 @@ def main():
     )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
+    if args.visual_snapshot_age_sec < 0:
+        parser.error("--visual-snapshot-age-sec must be >= 0")
+    if args.visual_snapshot_check_interval_sec is not None and args.visual_snapshot_check_interval_sec < 0:
+        parser.error("--visual-snapshot-check-interval-sec must be >= 0")
 
     # Visual output is a required artifact: if not given, derive a default path
     # from the groups-output (or the input cache) so it is always produced.
@@ -1239,6 +1354,10 @@ def main():
         late_penalty_half_life_sec=args.late_penalty_half_life_sec,
     )
     if not args.quiet:
+        visual_snapshot_check_interval_sec = _resolve_visual_snapshot_check_interval(
+            float(args.visual_snapshot_age_sec or 0.0),
+            args.visual_snapshot_check_interval_sec,
+        )
         print(
             f"[stream] config: history_window={stream_config.history_window_sec:.0f}s "
             f"time_slack={stream_config.time_slack_sec:.0f}s "
@@ -1246,7 +1365,9 @@ def main():
             f"max_history={stream_config.max_history_events} "
             f"close_inactive={stream_config.close_inactive_sec:.0f}s "
             f"min_group_events={stream_config.min_group_events} "
-            f"immigrant_bias={stream_config.immigrant_bias}",
+            f"immigrant_bias={stream_config.immigrant_bias} "
+            f"visual_snapshot_age={args.visual_snapshot_age_sec:.0f}s "
+            f"visual_snapshot_check_interval={visual_snapshot_check_interval_sec:.0f}s",
             flush=True,
         )
 
@@ -1305,6 +1426,11 @@ def main():
                 "impute_sweep_recent": args.impute_sweep_recent,
                 "impute_future_candidate_reset_limit": args.impute_future_candidate_reset_limit,
                 "impute_max_birth_attempts": args.impute_max_birth_attempts,
+                "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
+                "visual_snapshot_check_interval_sec": _resolve_visual_snapshot_check_interval(
+                    float(args.visual_snapshot_age_sec or 0.0),
+                    args.visual_snapshot_check_interval_sec,
+                ),
             },
             "group_count": len(groups),
             "modeled_event_count": impute_stats["processed"],
@@ -1411,6 +1537,12 @@ def main():
     )
     visual_output = None
     visual_group_cursor = 0
+    visual_snapshot_age_sec = float(args.visual_snapshot_age_sec or 0.0)
+    visual_snapshot_check_interval_sec = _resolve_visual_snapshot_check_interval(
+        visual_snapshot_age_sec,
+        args.visual_snapshot_check_interval_sec,
+    )
+    last_visual_snapshot_check_ts = -np.inf
     if args.visual_output:
         visual_output = AlarmBRUNCHVisualOutputSession.from_files(
             args.visual_output,
@@ -1429,6 +1561,21 @@ def main():
                 new_groups = assigner.closed_groups[visual_group_cursor:]
                 visual_output.emit_groups(new_groups, finalization_reason="closed")
                 visual_group_cursor = len(assigner.closed_groups)
+            if (
+                visual_output is not None
+                and visual_snapshot_age_sec > 0
+                and float(alarm.get("ts", 0.0)) >= last_visual_snapshot_check_ts + visual_snapshot_check_interval_sec
+            ):
+                last_visual_snapshot_check_ts = max(
+                    last_visual_snapshot_check_ts,
+                    float(alarm.get("ts", 0.0)),
+                )
+                snapshots = assigner.snapshot_ready_groups(
+                    visual_snapshot_age_sec,
+                    float(alarm.get("ts", 0.0)),
+                )
+                if snapshots:
+                    visual_output.emit_groups(snapshots, finalization_reason="age_snapshot")
             if args.progress_every and (i + 1) % args.progress_every == 0 and not args.quiet:
                 now = time.monotonic()
                 elapsed = now - t_stream_start
@@ -1491,6 +1638,8 @@ def main():
             "min_group_events": stream_config.min_group_events,
             "immigrant_bias": stream_config.immigrant_bias,
             "time_scale_sec": stream_config.time_scale_sec,
+            "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
+            "visual_snapshot_check_interval_sec": visual_snapshot_check_interval_sec,
         },
         "group_count": len(groups),
         "emitted_group_count": len(groups),

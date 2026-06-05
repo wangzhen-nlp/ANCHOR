@@ -231,7 +231,7 @@ def group_to_visual_match(group, ne_graph_data=None):
         "uuid": group.get("group_id", ""),
         "rule": group.get("rule") or BRUNCH_RULE,
         "merged_rules": merged_rules,
-        "related_group_uuids": [],
+        "related_group_uuids": list(group.get("related_group_uuids") or []),
         "inferred_roots": inferred_roots,
         "role_mapping": {"cascade": list(group.get("site_list") or [])},
         "uses_missing_topology": bool(missing_topology_edges),
@@ -242,6 +242,8 @@ def group_to_visual_match(group, ne_graph_data=None):
         ],
         "cascade_info": {
             "cascade_id": group.get("cascade_id"),
+            "base_group_id": group.get("base_group_id", group.get("group_id", "")),
+            "snapshot_seq": group.get("snapshot_seq"),
             "event_count": group.get("event_count", 0),
             "start_ts": group.get("start_ts"),
             "end_ts": group.get("end_ts"),

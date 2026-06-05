@@ -379,6 +379,8 @@ class MissingChainSampler:
         self.deaths = 0
         self.committed_count = 0
         self.closed_group_count = 0
+        self._visual_snapshot_seq = 0
+        self._visual_snapshot_history: dict[frozenset[str], set[str]] = {}
 
     # ---- public API ------------------------------------------------------
 
@@ -424,6 +426,45 @@ class MissingChainSampler:
             self.now = self.events[self._order[-1]].ts + self.config.window_sec() + 1.0
         self._freeze_aged(force=True)
         return self._close_clusters(force=True)
+
+    def visual_snapshot_groups(self, age_sec: float, now_ts: Optional[float] = None) -> list[dict]:
+        """Return visual-only snapshots for old live clusters without closing.
+
+        Snapshot history is matched by overlapping observed event ids so that a
+        later snapshot/final output can point at the previous visual row through
+        ``related_group_uuids`` even if Gibbs re-parenting changes the root id.
+        """
+        if age_sec <= 0 or not self.events:
+            return []
+        now = self.now if now_ts is None else max(self.now, float(now_ts))
+        cutoff = now - float(age_sec)
+        clusters = self._live_clusters()
+        out: list[dict] = []
+        for members in clusters.values():
+            if not members:
+                continue
+            observed_ids = self._members_observed_event_ids(members)
+            if not observed_ids:
+                continue
+            if self._visual_snapshot_history.get(observed_ids):
+                continue
+            observed_start = min(m.ts for m in members if m.observed)
+            if observed_start > cutoff:
+                continue
+            group = self._build_group(members)
+            if group is None:
+                continue
+            related = self._related_visual_snapshot_uuids(observed_ids)
+            self._visual_snapshot_seq += 1
+            base_group_id = group["group_id"]
+            snapshot_group_id = f"{base_group_id}.snapshot-{self._visual_snapshot_seq:04d}"
+            group["base_group_id"] = base_group_id
+            group["group_id"] = snapshot_group_id
+            group["related_group_uuids"] = sorted(related)
+            group["snapshot_seq"] = self._visual_snapshot_seq
+            self._replace_visual_snapshot_history(observed_ids, snapshot_group_id, related)
+            out.append(group)
+        return out
 
     # ---- event bookkeeping ----------------------------------------------
 
@@ -1011,22 +1052,10 @@ class MissingChainSampler:
                 break
         return cur.eid
 
-    def _close_clusters(self, force: bool = False) -> list[dict]:
-        """Emit + remove cascades that have fully left kernel reach.
-
-        A cascade closes when all its members are frozen and its newest member is
-        older than the evict boundary (now - lag - history - slack) — past that
-        point no future alarm can attach to any member, so the structure is
-        final.
-        """
-        evict_cut = self.now - self.config.window_sec()
-        # Cheap guard: if nothing has crossed the evict boundary there is nothing
-        # to close, so skip the O(live) cluster rebuild entirely.
-        if not force and (not self._order_ts or self._order_ts[0] >= evict_cut):
-            return []
-        # Group live events by cascade root. Memoize roots with path compression
-        # so grouping is O(live), not O(live·depth) — deep chains (the
-        # over-merging case) would otherwise make this O(live²) per close.
+    def _live_clusters(self) -> dict[int, list[SamplerEvent]]:
+        # Memoize roots with path compression so grouping is O(live), not
+        # O(live*depth). The seen guard keeps a bad sampled cycle from hanging
+        # the output path.
         root_memo: dict[int, int] = {}
 
         def _memo_root(start_eid: int) -> int:
@@ -1057,6 +1086,22 @@ class MissingChainSampler:
             ev = self.events.get(eid)
             if ev is not None:
                 clusters.setdefault(_memo_root(eid), []).append(ev)
+        return clusters
+
+    def _close_clusters(self, force: bool = False) -> list[dict]:
+        """Emit + remove cascades that have fully left kernel reach.
+
+        A cascade closes when all its members are frozen and its newest member is
+        older than the evict boundary (now - lag - history - slack) — past that
+        point no future alarm can attach to any member, so the structure is
+        final.
+        """
+        evict_cut = self.now - self.config.window_sec()
+        # Cheap guard: if nothing has crossed the evict boundary there is nothing
+        # to close, so skip the O(live) cluster rebuild entirely.
+        if not force and (not self._order_ts or self._order_ts[0] >= evict_cut):
+            return []
+        clusters = self._live_clusters()
         out: list[dict] = []
         for members in clusters.values():
             all_frozen = all(m.committed for m in members)
@@ -1065,11 +1110,66 @@ class MissingChainSampler:
                 continue
             group = self._build_group(members)
             if group is not None:          # pure-missing cascades are dropped
+                if self._visual_snapshot_history:
+                    observed_ids = self._group_observed_event_ids(group)
+                    related = self._pop_related_visual_snapshot_uuids(observed_ids)
+                    if related:
+                        group["base_group_id"] = group.get("group_id", "")
+                        group["related_group_uuids"] = sorted(related)
                 out.append(group)
                 self.closed_group_count += 1
             for m in members:
                 self._remove_event(m)
         return out
+
+    def _members_observed_event_ids(self, members: list[SamplerEvent]) -> frozenset[str]:
+        return frozenset(self._event_id(m) for m in members if m.observed)
+
+    def _group_observed_event_ids(self, group: dict) -> frozenset[str]:
+        return frozenset(
+            str(s.get("event_id", "") or "")
+            for s in group.get("symptoms") or []
+            if s.get("event_id") and not bool(s.get("virtual"))
+        )
+
+    def _related_visual_snapshot_uuids(self, observed_ids: frozenset[str]) -> set[str]:
+        if not observed_ids:
+            return set()
+        related: set[str] = set()
+        for prior_ids, uuids in self._visual_snapshot_history.items():
+            if observed_ids & prior_ids:
+                related.update(uuids)
+        return related
+
+    def _pop_related_visual_snapshot_uuids(self, observed_ids: frozenset[str]) -> set[str]:
+        if not observed_ids:
+            return set()
+        related: set[str] = set()
+        stale = [
+            prior_ids
+            for prior_ids in self._visual_snapshot_history
+            if observed_ids & prior_ids
+        ]
+        for prior_ids in stale:
+            related.update(self._visual_snapshot_history.pop(prior_ids, set()))
+        return related
+
+    def _replace_visual_snapshot_history(
+        self,
+        observed_ids: frozenset[str],
+        uuid: str,
+        related_uuids: Optional[set[str]] = None,
+    ):
+        if not observed_ids or not uuid:
+            return
+        stale = [
+            prior_ids
+            for prior_ids in self._visual_snapshot_history
+            if observed_ids & prior_ids
+        ]
+        for prior_ids in stale:
+            self._visual_snapshot_history.pop(prior_ids, None)
+        self._visual_snapshot_history[observed_ids] = set(related_uuids or set()) | {uuid}
 
     # ---- group / event serialization (brunch-compatible) -----------------
 

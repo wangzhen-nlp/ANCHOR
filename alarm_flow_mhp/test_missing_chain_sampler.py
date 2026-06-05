@@ -355,6 +355,8 @@ def test_flush_closes_everything():
     groups = s.flush()
     total_real = sum(g["real_event_count"] for g in groups)
     assert total_real == 2, f"flush should emit both observed events, got {total_real}"
+    assert all("base_group_id" not in g for g in groups)
+    assert all("related_group_uuids" not in g for g in groups)
 
 
 def test_feature_candidate_sources_bounded_by_topology():
@@ -548,6 +550,58 @@ def test_observed_state_timeline_prune_keeps_baseline_state():
     assert len(timeline._times["n1"]) == 2
     assert timeline.state_at("n1", 26.0) == (0, 1, 0)
     assert timeline.state_at("n1", 35.0) == (0, 1, 1)
+
+
+def test_visual_snapshots_link_to_previous_versions_without_closing():
+    adapter = ExpKernelAdapter(
+        mu_by_type={0: 0.1, 1: 0.001, 2: 0.001},
+        edges={
+            (1, 0): (3.0, 1.0),
+            (2, 1): (3.0, 1.0),
+        },
+        time_scale_sec=60.0,
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=5, max_births_per_sweep=0, seed=43),
+    )
+    s.ingest(0.0, 0, {"event_id": "A"})
+    s.ingest(10.0, 1, {"event_id": "B"})
+    first = s.visual_snapshot_groups(5.0)
+    assert len(first) == 1
+    assert first[0]["group_id"].endswith(".snapshot-0001")
+    assert first[0]["related_group_uuids"] == []
+    assert s.events, "snapshot must not close/remove live sampler events"
+    assert s.visual_snapshot_groups(5.0) == []
+
+    s.ingest(20.0, 2, {"event_id": "C"})
+    second = s.visual_snapshot_groups(5.0)
+    assert len(second) == 1
+    assert second[0]["related_group_uuids"] == [first[0]["group_id"]]
+
+    final = s.flush()
+    assert len(final) == 1
+    assert final[0]["base_group_id"] == "mhp-online-000000"
+    assert final[0]["related_group_uuids"] == [first[0]["group_id"], second[0]["group_id"]]
+    assert s._visual_snapshot_history == {}
+
+
+def test_visual_snapshot_can_use_external_stream_time_without_advancing_sampler():
+    adapter = ExpKernelAdapter(
+        mu_by_type={0: 0.1},
+        edges={},
+        time_scale_sec=60.0,
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=0, max_births_per_sweep=0, seed=44),
+    )
+    s.ingest(0.0, 0, {"event_id": "A"})
+    assert s.visual_snapshot_groups(5.0) == []
+    snap = s.visual_snapshot_groups(5.0, now_ts=6.0)
+    assert len(snap) == 1
+    assert s.now == 0.0
+    assert s.events, "visual-only snapshot must not close/remove sampler events"
 
 
 def _run_all():
