@@ -809,6 +809,18 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
     )
 
     feature_mode = getattr(artifact.config, "edge_mode", "device") == "feature"
+    dynamic_mode = (
+        feature_mode
+        and getattr(artifact.config, "dynamic_alpha", "off") != "off"
+    )
+    state_timeline = None
+    alarm_type_from_title_fn = None
+    if dynamic_mode:
+        from alarm_flow_mhp.dynamic_state import ObservedStateTimeline
+        from alarm_flow_isahp.sequences import alarm_type_from_title
+
+        state_timeline = ObservedStateTimeline()
+        alarm_type_from_title_fn = alarm_type_from_title
     if feature_mode:
         floor = args.feature_alpha_floor or None
         adapter = feature_adapter_from_artifact(
@@ -817,6 +829,9 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
             alpha_floor=floor,
             time_slack_sec=stream_config.time_slack_sec,
             late_penalty_half_life_sec=stream_config.late_penalty_half_life_sec,
+            source_mark_at=(
+                state_timeline.source_mark_at if state_timeline is not None else None
+            ),
         )
     else:
         if getattr(artifact.params, "kernel_type", "exp") != "exp":
@@ -877,7 +892,15 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
                 f"births={st['births']}, groups={len(groups)}, elapsed={el:.0f}s)",
                 flush=True,
             )
-        if is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {}):
+        is_clear = is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {})
+        src_mark = None
+        if dynamic_mode:
+            dev = alarm.get("alarm_source", "")
+            atype_state = alarm_type_from_title_fn(alarm.get("alarm_title", ""))
+            src_mark = state_timeline.ingest(
+                float(alarm.get("ts", 0.0)), dev, atype_state, is_clear
+            )
+        if is_clear:
             dropped["clear"] += 1
             continue
         atype = alarm_type_label(alarm)
@@ -903,7 +926,14 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
             type_key = int(tid)
             meta["type_label"] = type_label
         processed += 1
-        groups.extend(sampler.ingest(float(alarm.get("ts", 0.0)), type_key, meta))
+        groups.extend(
+            sampler.ingest(
+                float(alarm.get("ts", 0.0)),
+                type_key,
+                meta,
+                src_mark=src_mark,
+            )
+        )
     groups.extend(sampler.flush())
 
     # Output filter: keep cascades with at least min_group_events real alarms.

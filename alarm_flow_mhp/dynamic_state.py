@@ -24,6 +24,7 @@ event schema.
 
 from __future__ import annotations
 
+import bisect
 from typing import Callable, Iterable
 
 import numpy as np
@@ -130,3 +131,46 @@ class DeviceStateTracker:
                 self._counts[device] = cur
             cur[ti] += 1
         return snap
+
+
+class ObservedStateTimeline:
+    """Read-only dynamic-state history built from observed stream events.
+
+    It records the post-event observed state per device, so a hypothesised
+    missing event can read the state at its proposed timestamp without mutating
+    the state machine. Observed modeled events should still use the returned
+    pre-event snapshot from :meth:`ingest`, matching training's read-before-write
+    convention.
+    """
+
+    def __init__(self):
+        self._tracker = DeviceStateTracker()
+        self._times: dict[str, list[float]] = {}
+        self._states: dict[str, list[tuple]] = {}
+
+    def ingest(self, ts: float, device: str, alarm_type, is_clear: bool) -> tuple:
+        device = str(device or "")
+        snap = self._tracker.snapshot_then_apply(device, alarm_type, bool(is_clear))
+        post = tuple(int(x) for x in self._tracker.state_of(device))
+        times = self._times.setdefault(device, [])
+        states = self._states.setdefault(device, [])
+        if not states or states[-1] != post:
+            times.append(float(ts))
+            states.append(post)
+        return tuple(int(x) for x in snap)
+
+    def state_at(self, device: str, ts: float) -> tuple:
+        times = self._times.get(str(device or ""))
+        if not times:
+            return tuple(0 for _ in range(STATE_DIM))
+        idx = bisect.bisect_right(times, float(ts)) - 1
+        if idx < 0:
+            return tuple(0 for _ in range(STATE_DIM))
+        return self._states[str(device or "")][idx]
+
+    def source_mark_at(self, source_type, ts: float) -> tuple:
+        try:
+            _at, ne = source_type
+        except Exception:
+            ne = ""
+        return self.state_at(ne, ts)

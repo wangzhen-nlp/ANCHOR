@@ -22,6 +22,7 @@ from alarm_flow_mhp.missing_chain_sampler import (
     MissingChainSampler,
     SamplerConfig,
 )
+from alarm_flow_mhp.dynamic_state import ObservedStateTimeline
 
 
 # --- minimal fakes mimicking the feature-mode runtime scorers ---------------
@@ -60,12 +61,26 @@ class _FakeFeatureScorer:
             return 1.0
         return 1.0 if s_ne in self.topology_index.undirected_hops.get(t_ne, {}) else 0.0
 
-    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes):
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
         out = np.zeros(len(src_nes), dtype=np.float64)
         for i, (s_at, s_ne) in enumerate(zip(src_ats, src_nes)):
             base = self.trigger.get((s_at, target_at), 0.0)
             out[i] = base * self._topo_ok(s_ne, target_ne)
         return out
+
+
+class _FakeDynamicFeatureScorer(_FakeFeatureScorer):
+    """Adds source-state gain to the static fake scorer."""
+
+    n_dynamic = 3
+
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
+        base = super().alpha_for_target(target_at, target_ne, src_ats, src_nes)
+        marks = np.zeros((len(src_nes), self.n_dynamic), dtype=np.float64)
+        if src_marks is not None:
+            marks = np.asarray(src_marks, dtype=np.float64).reshape(len(src_nes), self.n_dynamic)
+        # Only a source with active power state can trigger B in this fake model.
+        return base * marks[:, 1]
 
 
 class _FakeMuScorer:
@@ -375,7 +390,7 @@ def test_feature_total_compensator_cached_and_positive():
     # S(n1) can trigger B on {n1,n2} → positive outgoing mass; cached on 2nd call.
     c1 = adapter.total_compensator(("S", "n1"), 600.0)
     assert c1 > 0.0
-    assert ("S", "n1") in adapter._alpha_out_sum
+    assert (("S", "n1"), ()) in adapter._alpha_out_sum
     c2 = adapter.total_compensator(("S", "n1"), 600.0)
     assert c1 == c2
     # Larger horizon ⇒ larger (or equal) survival mass.
@@ -456,6 +471,58 @@ def test_feature_alpha_cache_is_bounded():
     for i in range(500):
         ad._alpha(("S", f"n{i}"), ("B", f"m{i}"))
     assert len(ad._pair_alpha) <= 50, f"cache exceeded cap: {len(ad._pair_alpha)}"
+
+
+def test_dynamic_feature_impute_uses_observed_source_mark():
+    topo = _FakeTopo({"n1": {}}, max_hops=1)
+    fs = _FakeDynamicFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 4.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA")}, beta=1.0,
+    )
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 1e-6},
+        time_scale_sec=60.0,
+        alpha_floor=0.0,
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=3, max_births_per_sweep=0, seed=31),
+    )
+    s.ingest(0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    s.ingest(20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
+    src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
+    tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
+    assert tgt.parent == src.eid
+
+
+def test_dynamic_feature_missing_sources_use_timeline_mark():
+    topo = _FakeTopo({"n1": {}}, max_hops=1)
+    fs = _FakeDynamicFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 4.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA")}, beta=1.0,
+    )
+    timeline = ObservedStateTimeline()
+    timeline.ingest(0.0, "n1", "power", False)
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 1e-6},
+        time_scale_sec=60.0,
+        alpha_floor=0.0,
+        source_mark_at=timeline.source_mark_at,
+    )
+    assert adapter.kernel_intensity(("S", "n1"), ("B", "n1"), 10.0, source_mark=(0, 1, 0)) > 0
+    assert adapter.kernel_intensity(("S", "n1"), ("B", "n1"), 10.0, source_mark=(0, 0, 0)) == 0
+    assert ("S", "n1") in dict(adapter.candidate_sources(("B", "n1")))
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0,
+                      max_depth=1, seed=41),
+    )
+    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
+    missing = [e for e in s.events.values() if e.is_missing()]
+    assert missing, "expected timeline-backed dynamic missing parent"
+    assert any(e.type_id == ("S", "n1") and e.src_mark == (0, 1, 0) for e in missing)
 
 
 def _run_all():
