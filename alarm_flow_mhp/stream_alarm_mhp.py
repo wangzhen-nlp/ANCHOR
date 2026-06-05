@@ -837,6 +837,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             source_mark_at=(
                 state_timeline.source_mark_at if state_timeline is not None else None
             ),
+            cache_max_entries=int(getattr(args, "impute_cache_max", 200_000)),
         )
     else:
         if getattr(artifact.params, "kernel_type", "exp") != "exp":
@@ -1156,6 +1157,16 @@ def main():
         help=(
             "Birth is attempted over ALL active orphans (fair, no age bias) but "
             "bounded to this many attempts per sweep to cap cost. Default: 32."
+        ),
+    )
+    parser.add_argument(
+        "--impute-cache-max",
+        type=int,
+        default=200_000,
+        help=(
+            "Feature-adapter LRU cache size (entries) for per-pair α / per-source "
+            "Σα / candidate sets. Larger = fewer recomputations on a big device "
+            "space, at more memory. Default: 200000."
         ),
     )
     parser.add_argument("--quiet", action="store_true")

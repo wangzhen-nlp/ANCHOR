@@ -850,26 +850,27 @@ class MissingChainSampler:
             return None
         n = 32
         step = span / n
-        grid = []
-        cum = []
-        total = 0.0
-        for i in range(n):
-            t = lower + (i + 0.5) * step
-            dt = orphan.ts - t
-            w = self.adapter.kernel_intensity(
-                s_type,
-                orphan.type_id,
-                dt,
-                source_mark=self._source_mark_for_missing(s_type, t),
-            )
-            total += max(w, 0.0)
-            grid.append(t)
-            cum.append(total)
+        grid = [lower + (i + 0.5) * step for i in range(n)]
+        marks = [self._source_mark_for_missing(s_type, t) for t in grid]
+        batch = getattr(self.adapter, "kernel_intensity_batch", None)
+        if batch is not None:
+            # One batched α call over the whole grid (per-point source marks)
+            # instead of 32 scalar kernel_intensity calls.
+            dts = [orphan.ts - t for t in grid]
+            ws = [max(float(w), 0.0)
+                  for w in batch(orphan.type_id, [s_type] * n, dts, src_marks=marks)]
+        else:
+            ws = [max(self.adapter.kernel_intensity(s_type, orphan.type_id, orphan.ts - t,
+                                                    source_mark=m), 0.0)
+                  for t, m in zip(grid, marks)]
+        total = float(sum(ws))
         if total <= 0:
             return None
         r = self.rng.random() * total
-        for t, c in zip(grid, cum):
-            if r <= c:
+        cum = 0.0
+        for t, w in zip(grid, ws):
+            cum += w
+            if r <= cum:
                 # jitter within the cell so times aren't quantised to the grid
                 return min(upper - EPS, max(lower + EPS, t + (self.rng.random() - 0.5) * step))
         return grid[-1]
@@ -1332,26 +1333,64 @@ class FeatureKernelAdapter:
         dt = dt_eff_sec / self.time_scale_sec
         return float(a * self.beta * math.exp(-self.beta * dt) * late_weight)
 
+    def _alpha_batch_cached(self, target_type, source_types, marks_norm):
+        """Floored α for (each source, fixed target, its mark), served from the
+        shared _pair_alpha LRU. Only cache MISSES go through alpha_for_target
+        (one batched feature build) — the win for Gibbs, which re-scores the same
+        (event, candidate-parent, mark) triples every sweep until the event
+        freezes. α is deterministic in (target, source, mark) so this is exact."""
+        import numpy as np
+
+        n = len(source_types)
+        alphas = np.empty(n, dtype=np.float64)
+        cache = self._pair_alpha
+        miss_i: list = []
+        miss_at: list = []
+        miss_ne: list = []
+        miss_mk: list = []
+        for i in range(n):
+            s = source_types[i]
+            ck = (s, target_type, marks_norm[i])
+            v = cache.get(ck)
+            if v is None:
+                miss_i.append(i)
+                miss_at.append(s[0])
+                miss_ne.append(s[1])
+                miss_mk.append(marks_norm[i])
+            else:
+                cache.move_to_end(ck)
+                alphas[i] = v
+        if miss_i:
+            (t_at, t_ne) = target_type
+            ma = np.asarray(
+                self.fs.alpha_for_target(
+                    t_at, t_ne, miss_at, miss_ne,
+                    src_marks=self._mark_matrix(len(miss_i), miss_mk),
+                ),
+                dtype=np.float64,
+            )
+            if self.alpha_floor > 0:
+                ma = np.where(ma >= self.alpha_floor, ma, 0.0)
+            for j, i in enumerate(miss_i):
+                val = float(ma[j])
+                alphas[i] = val
+                cache[(source_types[i], target_type, marks_norm[i])] = val
+            while len(cache) > self._cache_max:
+                cache.popitem(last=False)
+        return alphas
+
     def kernel_intensity_batch(self, target_type, source_types: list, dts: list, *, src_marks=None):
         """Vectorised intensities for many candidate sources vs one target — the
-        feature-mode hot path: ONE alpha_for_target call (the scorer's native
-        shape) instead of per-pair feature builds."""
+        feature-mode hot path. α is served from the shared LRU cache (only misses
+        rebuild features), then the kernel/decay factor is applied vectorised."""
         import numpy as np
 
         n = len(source_types)
         if n == 0:
             return np.zeros(0, dtype=np.float64)
-        (t_at, t_ne) = target_type
-        src_ats = [s[0] for s in source_types]
-        src_nes = [s[1] for s in source_types]
-        alphas = np.asarray(
-            self.fs.alpha_for_target(
-                t_at, t_ne, src_ats, src_nes, src_marks=self._mark_matrix(n, src_marks)
-            ),
-            dtype=np.float64,
-        )
-        if self.alpha_floor > 0:
-            alphas = np.where(alphas >= self.alpha_floor, alphas, 0.0)
+        marks_in = src_marks if src_marks is not None else [None] * n
+        marks_norm = [self._mark_tuple(m) for m in marks_in]
+        alphas = self._alpha_batch_cached(target_type, source_types, marks_norm)
         dt_sec = np.asarray(dts, dtype=np.float64)
         dt_eff_sec, late_weight = self._signed_dt_vec(dt_sec)
         dt = dt_eff_sec / self.time_scale_sec
@@ -1488,7 +1527,8 @@ class FeatureKernelAdapter:
 def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
                                   candidate_max_hops=None, time_slack_sec=None,
                                   late_penalty_half_life_sec=None,
-                                  source_mark_at=None) -> FeatureKernelAdapter:
+                                  source_mark_at=None,
+                                  cache_max_entries=200_000) -> FeatureKernelAdapter:
     """Build a :class:`FeatureKernelAdapter` from a feature-mode artifact.
 
     Mirrors the scorer construction in ``stream_alarm_mhp.main`` so the imputed
@@ -1550,6 +1590,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         alpha_floor=float(floor),
         candidate_max_hops=candidate_max_hops,
         source_mark_at=source_mark_at,
+        cache_max_entries=int(cache_max_entries),
     )
 
 
