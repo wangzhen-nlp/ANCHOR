@@ -195,36 +195,48 @@ def _build_chunk_pair_arrays(
     chunk_size = chunk_end - chunk_start
     target_event_ids = np.arange(chunk_start, chunk_end, dtype=np.int64)
     if time_slack > 0:
-        pair_targets = []
-        pair_sources = []
-        counts = np.zeros(chunk_size, dtype=np.int64)
+        # Vectorized signed-window build (no Python per-target loop). For each
+        # target, candidates are the `max_hist` NEAREST by |dt| within
+        # [tt - history_window, tt + time_slack], excluding self — matching the
+        # stream's two-pointer nearest expansion. Bounded-memory trick: since
+        # `times` is sorted, |dt| is V-shaped, so the nearest set is a subset of
+        # [max(lo, target - max_hist), hi) — any past event outside the max_hist
+        # most-recent is farther than all of them. So we only materialize that
+        # bounded range, then keep the nearest max_hist per target.
         max_hist = max(int(max_history_events), 1)
-        for local_idx, target_id in enumerate(target_event_ids):
-            tt = times[target_id]
-            lo = int(np.searchsorted(times, tt - history_window, side="left"))
-            hi = int(np.searchsorted(times, tt + time_slack, side="right"))
-            if hi <= lo:
-                continue
-            cand = np.arange(lo, hi, dtype=np.int64)
-            cand = cand[cand != target_id]
-            if cand.size == 0:
-                continue
-            if cand.size > max_hist:
-                dist = np.abs(times[cand] - tt)
-                keep = np.argpartition(dist, max_hist - 1)[:max_hist]
-                cand = cand[keep]
-                order = np.lexsort((cand, np.abs(times[cand] - tt)))
-                cand = cand[order]
-            counts[local_idx] = cand.size
-            pair_targets.append(np.full(cand.size, target_id, dtype=np.int64))
-            pair_sources.append(cand)
-        P = int(counts.sum())
-        if P == 0:
+        tt = times[target_event_ids]
+        lo = np.searchsorted(times, tt - history_window, side="left")
+        hi = np.searchsorted(times, tt + time_slack, side="right")
+        start = np.maximum(lo, target_event_ids - max_hist)
+        raw_counts = np.maximum(hi - start, 0).astype(np.int64)
+        Praw = int(raw_counts.sum())
+        if Praw == 0:
             empty_i64 = np.empty(0, dtype=np.int64)
             empty_f32 = np.empty(0, dtype=np.float32)
-            return empty_i64, empty_i64, empty_f32, empty_i64, empty_i64, empty_i64, counts
-        pair_target = np.concatenate(pair_targets)
-        pair_source = np.concatenate(pair_sources)
+            return empty_i64, empty_i64, empty_f32, empty_i64, empty_i64, empty_i64, np.zeros(chunk_size, dtype=np.int64)
+        offs = np.zeros(chunk_size + 1, dtype=np.int64)
+        np.cumsum(raw_counts, out=offs[1:])
+        ev_idx = np.repeat(np.arange(chunk_size, dtype=np.int64), raw_counts)
+        within = np.arange(Praw, dtype=np.int64) - offs[ev_idx]
+        pair_source = start[ev_idx] + within
+        pair_target = target_event_ids[ev_idx]
+        # Exclude the target event itself.
+        keep_self = pair_source != pair_target
+        pair_source = pair_source[keep_self]
+        pair_target = pair_target[keep_self]
+        ev_idx = ev_idx[keep_self]
+        abs_dt = np.abs(times[pair_target] - times[pair_source])
+        # Keep the nearest `max_hist` per target: sort by (target, |dt|), then
+        # take within-group rank < max_hist.
+        counts_excl = np.bincount(ev_idx, minlength=chunk_size)
+        g_start = np.zeros(chunk_size, dtype=np.int64)
+        np.cumsum(counts_excl[:-1], out=g_start[1:])
+        order = np.lexsort((abs_dt, ev_idx))         # primary ev_idx, secondary |dt|
+        rank = np.arange(order.size, dtype=np.int64) - g_start[ev_idx[order]]
+        sel = order[rank < max_hist]
+        pair_source = pair_source[sel]
+        pair_target = pair_target[sel]
+        counts = np.bincount(ev_idx[sel], minlength=chunk_size).astype(np.int64)
         pair_dt = (times[pair_target] - times[pair_source]).astype(np.float32)
         pair_target_dim = dims[pair_target]
         pair_source_dim = dims[pair_source]

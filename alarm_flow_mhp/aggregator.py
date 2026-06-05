@@ -174,6 +174,13 @@ class AlarmMHPConfig:
             raise ValueError("feature_topo_prior_boost must be non-negative")
         if self.dynamic_alpha not in DYNAMIC_ALPHA_MODES:
             raise ValueError(f"dynamic_alpha must be one of {sorted(DYNAMIC_ALPHA_MODES)}")
+        if self.dynamic_alpha != "off" and self.edge_mode != "feature":
+            # Dynamic α is wired only into the feature kernel; in device mode it
+            # would be silently ignored — fail loudly instead.
+            raise ValueError(
+                "dynamic_alpha requires edge_mode='feature' "
+                f"(got edge_mode={self.edge_mode!r})"
+            )
         # NOTE: dynamic state reads clears from the raw input stream directly (the
         # state machine runs before clears are dropped); modeled events still
         # exclude clears, so include_clear stays as-is (default False).
@@ -540,11 +547,12 @@ def train_alarm_mhp(
         from alarm_flow_mhp.dynamic_state import (
             build_event_states, states_to_combo, combo_bits as _combo_bits,
         )
+        from alarm_flow_mhp.feature_spec import runtime_ne_at
         ev_state_full = build_event_states(
             sorted_alarm_events,
             sequence.events,
             is_clear=lambda e: is_clear_alarm(e.get("alarm", {})),
-            device_of=lambda e: e.get("alarm_source", ""),
+            device_of=lambda e: runtime_ne_at(e, config.type_fields)[0],
             alarm_type_of=lambda e: alarm_type_from_title(e.get("alarm_title", "")),
         )
         combo_full = states_to_combo(ev_state_full)

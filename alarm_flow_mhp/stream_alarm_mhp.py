@@ -207,8 +207,8 @@ class StreamMHPAssigner:
             self._feat_alpha_floor = float(floor)
         # Dynamic (stateful) α: track per-device uncleared-alarm state (clear-
         # aware), snapshotting each event's source mark at fire time. Same state
-        # machine as training (keyed on alarm_source + alarm_type_from_title), so
-        # marks are train/infer-consistent.
+        # machine as training (keyed on parsed feature NE + alarm_type_from_title),
+        # so marks are train/infer-consistent.
         self.dynamic_mode = (
             self.feature_mode
             and getattr(artifact.config, "dynamic_alpha", "off") != "off"
@@ -547,7 +547,9 @@ class StreamMHPAssigner:
         src_mark = (0, 0, 0)
         if self.dynamic_mode:
             from alarm_flow_isahp.sequences import alarm_type_from_title
-            dev = alarm_event.get("alarm_source", "")
+            from alarm_flow_mhp.feature_spec import runtime_ne_at
+
+            dev, _ = runtime_ne_at(alarm_event, self.artifact.config.type_fields)
             atype_state = alarm_type_from_title(alarm_event.get("alarm_title", ""))
             snap = self._state_tracker.snapshot_then_apply(dev, atype_state, is_clear)
             src_mark = (int(snap[0]), int(snap[1]), int(snap[2]))
@@ -815,12 +817,15 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
     )
     state_timeline = None
     alarm_type_from_title_fn = None
+    runtime_ne_at_fn = None
     if dynamic_mode:
         from alarm_flow_mhp.dynamic_state import ObservedStateTimeline
         from alarm_flow_isahp.sequences import alarm_type_from_title
+        from alarm_flow_mhp.feature_spec import runtime_ne_at
 
         state_timeline = ObservedStateTimeline()
         alarm_type_from_title_fn = alarm_type_from_title
+        runtime_ne_at_fn = runtime_ne_at
     if feature_mode:
         floor = args.feature_alpha_floor or None
         adapter = feature_adapter_from_artifact(
@@ -895,11 +900,12 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
         is_clear = is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {})
         src_mark = None
         if dynamic_mode:
-            dev = alarm.get("alarm_source", "")
+            dev, _ = runtime_ne_at_fn(alarm, type_fields)
             atype_state = alarm_type_from_title_fn(alarm.get("alarm_title", ""))
             src_mark = state_timeline.ingest(
                 float(alarm.get("ts", 0.0)), dev, atype_state, is_clear
             )
+            state_timeline.prune_before(float(alarm.get("ts", 0.0)) - cfg.window_sec())
         if is_clear:
             dropped["clear"] += 1
             continue

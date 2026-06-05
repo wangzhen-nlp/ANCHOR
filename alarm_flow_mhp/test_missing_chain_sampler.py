@@ -525,6 +525,18 @@ def test_dynamic_feature_missing_sources_use_timeline_mark():
     assert any(e.type_id == ("S", "n1") and e.src_mark == (0, 1, 0) for e in missing)
 
 
+def test_observed_state_timeline_prune_keeps_baseline_state():
+    timeline = ObservedStateTimeline()
+    timeline.ingest(0.0, "n1", "power", False)
+    timeline.ingest(10.0, "n1", "link", False)
+    timeline.ingest(20.0, "n1", "link", True)
+    timeline.ingest(30.0, "n1", "offline", False)
+    timeline.prune_before(25.0)
+    assert len(timeline._times["n1"]) == 2
+    assert timeline.state_at("n1", 26.0) == (0, 1, 0)
+    assert timeline.state_at("n1", 35.0) == (0, 1, 1)
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

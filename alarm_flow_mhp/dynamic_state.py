@@ -160,13 +160,14 @@ class ObservedStateTimeline:
         return tuple(int(x) for x in snap)
 
     def state_at(self, device: str, ts: float) -> tuple:
-        times = self._times.get(str(device or ""))
+        device = str(device or "")
+        times = self._times.get(device)
         if not times:
             return tuple(0 for _ in range(STATE_DIM))
         idx = bisect.bisect_right(times, float(ts)) - 1
         if idx < 0:
             return tuple(0 for _ in range(STATE_DIM))
-        return self._states[str(device or "")][idx]
+        return self._states[device][idx]
 
     def source_mark_at(self, source_type, ts: float) -> tuple:
         try:
@@ -174,3 +175,20 @@ class ObservedStateTimeline:
         except Exception:
             ne = ""
         return self.state_at(ne, ts)
+
+    def prune_before(self, cutoff_ts: float):
+        """Drop old per-device history while preserving state continuity.
+
+        The latest state change before ``cutoff_ts`` is retained as the baseline
+        for future ``state_at`` calls. Entries at or after the cutoff are kept.
+        """
+        cutoff_ts = float(cutoff_ts)
+        for device in list(self._times.keys()):
+            times = self._times[device]
+            states = self._states[device]
+            idx = bisect.bisect_left(times, cutoff_ts)
+            if idx <= 1:
+                continue
+            keep_from = idx - 1
+            self._times[device] = times[keep_from:]
+            self._states[device] = states[keep_from:]
