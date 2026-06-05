@@ -531,7 +531,7 @@ class MissingChainSampler:
         n = len(self._order_ts)
         while len(eids) < cap:
             left_ok = left >= 0 and ev.ts - self._order_ts[left] <= reach
-            right_ok = right < n and self._order_ts[right] - ev.ts <= slack
+            right_ok = slack > 0 and right < n and self._order_ts[right] - ev.ts <= slack
             if not left_ok and not right_ok:
                 break
             if left_ok and right_ok:
