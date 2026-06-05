@@ -1444,6 +1444,9 @@ def fit_mhp_feature(
         # parameterized (mu_phi), else per-type closed form.
         from .feature_kernel import fit_weights_mstep, fit_dynamic_weights_mstep
 
+        _MSTEP_MAX = 50          # max inner gradient-ascent iters (usually fewer)
+        _ms_t0 = time.monotonic()
+        _ms_last = [0]           # records the last inner iter actually run
         if use_dynamic:
             # Bucketed M-step over (candidate, source-mark combo). Topology prior
             # already folded into exposure_2d[:, 0]; baseline N gets prior_num too.
@@ -1452,17 +1455,19 @@ def fit_mhp_feature(
                 n2d = n_resp2d.copy()
                 n2d[:, 0] += prior_num
             # Heartbeat for the dynamic M-step (it can take tens of seconds at
-            # large C — print throttled so it never looks hung).
-            _ms_t0 = time.monotonic()
+            # large C — print throttled so it never looks hung). It converges
+            # early (||g||→0), so the inner count is usually well below the cap.
             _ms_beat = [_ms_t0]
 
-            def _mstep_progress(mi, q, gn, _it=it, _t0=_ms_t0, _beat=_ms_beat):
+            def _mstep_progress(mi, q, gn, _it=it, _t0=_ms_t0, _beat=_ms_beat,
+                                _last=_ms_last, _mx=_MSTEP_MAX):
+                _last[0] = mi
                 if not config.verbose or C < 200_000:
                     return
                 now = time.monotonic()
                 if now - _beat[0] >= 8.0:
                     print(
-                        f"[mhp-feat]   iter={_it:3d} M-step inner {mi} "
+                        f"[mhp-feat]   iter={_it:3d} M-step inner {mi}/{_mx} "
                         f"(Q={q:.1f}, |g|={gn:.2e}, {_fmt_secs(now - _t0)})",
                         flush=True,
                     )
@@ -1470,7 +1475,7 @@ def fit_mhp_feature(
 
             w_new = fit_dynamic_weights_mstep(
                 cand_phi, dynamic_combo_bits, n2d, exposure_2d_fit, w,
-                l2=l2, w_prior_mean=w_prior_mean, max_iter=50,
+                l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
                 progress=_mstep_progress,
             )
             # Baseline α (combo 0) for diagnostics / materialization.
@@ -1480,9 +1485,16 @@ def fit_mhp_feature(
             # statistics (no-op when prior_num/prior_exp are all zero).
             w_new = fit_weights_mstep(
                 cand_phi, n_resp + prior_num, exposure + prior_exp, w,
-                l2=l2, w_prior_mean=w_prior_mean, max_iter=50
+                l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX
             )
             alpha_new = softplus(cand_phi @ w_new)
+        if config.verbose and n_chunks > 1:
+            _iters_msg = f" ({_ms_last[0] + 1} inner iters)" if use_dynamic else ""
+            print(
+                f"[mhp-feat]   iter={it:3d} M-step done in "
+                f"{_fmt_secs(time.monotonic() - _ms_t0)}{_iters_msg}",
+                flush=True,
+            )
 
         if use_mu_features:
             w_mu_new = fit_weights_mstep(
