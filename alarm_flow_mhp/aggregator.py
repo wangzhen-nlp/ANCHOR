@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 import json
+import os
 import time
 from typing import Iterable, Optional
 
@@ -497,6 +498,7 @@ def train_alarm_mhp(
     region_filter_stats=None,
     topology_index: Optional[NETopologyIndex] = None,
     ne_graph_data=None,
+    best_checkpoint_path: Optional[str] = None,
 ) -> AlarmMHPArtifact:
     """Fit alarm-flow MHP parameters via windowed sparse MAP EM.
 
@@ -639,6 +641,58 @@ def train_alarm_mhp(
 
     feat_at_vocab = None
     feat_mu_spec = None
+
+    def write_best_checkpoint(best_result: MHPResult, trace_entry: dict):
+        if not best_checkpoint_path:
+            return
+        metadata = {
+            "checkpoint": True,
+            "checkpoint_kind": "best_train_log_likelihood",
+            "checkpoint_iter": int(trace_entry.get("iter", best_result.iterations_run - 1)),
+            "checkpoint_metric": "train_log_likelihood",
+            "considered_event_count": considered_event_count,
+            "region_filter": region_filter_stats,
+            "sequence_stats": sequence_stats,
+            "modeled_event_count": train_events.n + (val_events.n if val_events else 0),
+            "train_event_count": train_events.n,
+            "val_event_count": (val_events.n if val_events else 0),
+            "type_count": M,
+            "active_edge_count": len(best_result.params.edge_alpha),
+            "best_log_likelihood": float(best_result.log_likelihood),
+            "best_val_log_likelihood": None,
+            "iterations_run": int(best_result.iterations_run),
+            "converged": False,
+            "type_labels": list(vocabs.type_vocab.labels),
+            "time_slack_sec": float(config.time_slack_sec),
+            "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
+            "feature_kernel": (
+                best_result.feature_kernel.to_dict()
+                if best_result.feature_kernel is not None else None
+            ),
+            "feature_runtime": (
+                _build_feature_runtime(best_result, vocabs, config, feat_at_vocab, feat_mu_spec)
+                if config.edge_mode == "feature"
+                else None
+            ),
+            "val_trace": list(val_trace),
+        }
+        artifact = AlarmMHPArtifact(
+            params=best_result.params,
+            vocabs=vocabs,
+            config=config,
+            training_metadata=metadata,
+            trace=best_result.trace,
+        )
+        tmp_path = f"{best_checkpoint_path}.tmp"
+        save_alarm_mhp_artifact(tmp_path, artifact)
+        os.replace(tmp_path, best_checkpoint_path)
+        if verbose:
+            print(
+                f"[train] best checkpoint updated: {best_checkpoint_path} "
+                f"(iter={metadata['checkpoint_iter']}, ll={best_result.log_likelihood:.2f})",
+                flush=True,
+            )
+
     if config.edge_mode == "feature":
         # Feature-weighted α = softplus(w·φ) over device-agnostic pair features.
         from alarm_flow_mhp.feature_spec import build_candidate_features
@@ -707,6 +761,7 @@ def train_alarm_mhp(
             dynamic_combo_bits=dyn_combo_bits,
             dynamic_feature_names=dyn_feature_names,
             iter_callback=iter_callback,
+            best_callback=write_best_checkpoint,
         )
         # Stationarity check (feature mode has no hard cap): warn if the
         # materialized α matrix's spectral radius ≥ 1 → cluster-Poisson diverges.
@@ -747,12 +802,14 @@ def train_alarm_mhp(
             edge_targets=stage1.params.edge_targets,
             edge_sources=stage1.params.edge_sources,
             init_mu=stage1.params.mu,
+            best_callback=write_best_checkpoint,
         )
     else:
         result = fit_mhp(
             train_events,
             mhp_config,
             iter_callback=iter_callback,
+            best_callback=write_best_checkpoint,
             topo_prior_flat=topo_prior_flat,
             topo_prior_score=topo_prior_score,
         )
@@ -827,6 +884,7 @@ def train_alarm_mhp(
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,
         "bucket_mass_distribution": bucket_mass,
+        "best_checkpoint_path": os.path.abspath(best_checkpoint_path) if best_checkpoint_path else "",
         # Feature-mode: persist the learned weights (interpretable + enables
         # live-α inference for unseen devices) and the runtime info needed to
         # rebuild the scorer (alarm-type vocab + μ aggregated per alarm-type so

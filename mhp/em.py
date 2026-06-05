@@ -584,6 +584,7 @@ def fit_mhp(
     init_beta: Optional[np.ndarray] = None,
     init_mu: Optional[np.ndarray] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
+    best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
     topo_prior_flat: Optional[np.ndarray] = None,
     topo_prior_score: Optional[np.ndarray] = None,
 ) -> MHPResult:
@@ -708,7 +709,8 @@ def fit_mhp(
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
         beta_is_scalar = np.ndim(beta_new) == 0
-        if ll > best_ll:
+        is_best = ll > best_ll
+        if is_best:
             best_ll = ll
             nz_t, nz_s = np.nonzero(alpha_new)
             best_edge_targets = nz_t.copy()
@@ -766,6 +768,35 @@ def fit_mhp(
         trace.append(trace_entry)
         if iter_callback is not None:
             iter_callback(trace_entry)
+        if is_best and best_callback is not None:
+            if best_beta_scalar is not None:
+                edge_beta_arr = np.full(len(best_edge_targets), best_beta_scalar, dtype=np.float64)
+            else:
+                edge_beta_arr = (
+                    best_edge_beta if best_edge_beta is not None else np.zeros(len(best_edge_targets))
+                )
+            checkpoint_params = MHPParams.from_edges(
+                M=M,
+                mu=best_mu,
+                edge_targets=best_edge_targets,
+                edge_sources=best_edge_sources,
+                edge_alpha=best_edge_alpha,
+                edge_beta=edge_beta_arr,
+                edge_threshold=config.edge_threshold,
+                max_active_sources_per_dim=config.max_active_sources_per_dim,
+                beta_shared=(config.beta_mode == "shared"),
+            )
+            best_callback(
+                MHPResult(
+                    params=checkpoint_params,
+                    log_likelihood=best_ll,
+                    iterations_run=len(trace),
+                    converged=False,
+                    trace=list(trace),
+                    p_self=best_p_self,
+                ),
+                trace_entry,
+            )
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
@@ -940,6 +971,7 @@ def fit_mhp_piecewise(
     edge_sources: np.ndarray,
     init_mu: np.ndarray,
     iter_callback: Optional[Callable[[dict], None]] = None,
+    best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
 ) -> MHPResult:
     """Stage-2 box-basis kernel learning on a FIXED active edge set.
 
@@ -1104,7 +1136,8 @@ def fit_mhp_piecewise(
         ll = ll_term1 - horizon * float(mu_new.sum()) - term3
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
-        if ll > best_ll:
+        is_best = ll > best_ll
+        if is_best:
             best_ll = ll
             best_theta = theta_new.copy()
             best_mu = mu_new.copy()
@@ -1125,6 +1158,32 @@ def fit_mhp_piecewise(
         trace.append(trace_entry)
         if iter_callback is not None:
             iter_callback(trace_entry)
+        if is_best and best_callback is not None:
+            branching = (best_theta * widths[None, :]).sum(axis=1)
+            checkpoint_params = MHPParams.from_edges(
+                M=M,
+                mu=best_mu,
+                edge_targets=edge_targets,
+                edge_sources=edge_sources,
+                edge_alpha=branching,
+                edge_beta=np.zeros(E, dtype=np.float64),
+                edge_threshold=0.0,
+                max_active_sources_per_dim=config.max_active_sources_per_dim,
+                kernel_type="piecewise",
+                edge_theta=best_theta,
+                bucket_edges=tuple(config.bucket_edges),
+            )
+            best_callback(
+                MHPResult(
+                    params=checkpoint_params,
+                    log_likelihood=best_ll,
+                    iterations_run=len(trace),
+                    converged=False,
+                    trace=list(trace),
+                    p_self=best_p_self,
+                ),
+                trace_entry,
+            )
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp-pw] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
@@ -1197,6 +1256,7 @@ def fit_mhp_feature(
     dynamic_combo_bits: Optional[np.ndarray] = None,
     dynamic_feature_names: Optional[list] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
+    best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
 ) -> MHPResult:
     """Feature-weighted MAP EM: α on a fixed CANDIDATE pair set is a log-linear
     function of pair features, α_c = softplus(w · φ_c). EM alternates:
@@ -1523,7 +1583,8 @@ def fit_mhp_feature(
         ll = ll_term1 - horizon * float(mu_new.sum()) - compensator
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
-        if ll > best_ll:
+        is_best = ll > best_ll
+        if is_best:
             best_ll = ll
             best_w = w_new.copy()
             best_mu = mu_new.copy()
@@ -1546,6 +1607,45 @@ def fit_mhp_feature(
         trace.append(entry)
         if iter_callback is not None:
             iter_callback(entry)
+        if is_best and best_callback is not None:
+            kernel_names = list(feature_names)
+            if use_dynamic:
+                kernel_names = kernel_names + list(dynamic_feature_names or [])
+            checkpoint_kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2)
+            checkpoint_mu_kernel = (
+                FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
+                if use_mu_features and best_w_mu is not None
+                else None
+            )
+            if use_dynamic:
+                alpha_checkpoint = softplus(cand_phi @ best_w[:F])
+            else:
+                alpha_checkpoint = checkpoint_kernel.alpha(cand_phi)
+            keep = alpha_checkpoint > config.edge_threshold
+            checkpoint_params = MHPParams.from_edges(
+                M=M,
+                mu=best_mu,
+                edge_targets=cand_targets[keep],
+                edge_sources=cand_sources[keep],
+                edge_alpha=alpha_checkpoint[keep],
+                edge_beta=np.full(int(keep.sum()), float(beta_scalar), dtype=np.float64),
+                edge_threshold=config.edge_threshold,
+                max_active_sources_per_dim=config.max_active_sources_per_dim,
+                beta_shared=True,
+            )
+            best_callback(
+                MHPResult(
+                    params=checkpoint_params,
+                    log_likelihood=best_ll,
+                    iterations_run=len(trace),
+                    converged=False,
+                    trace=list(trace),
+                    p_self=best_p_self,
+                    feature_kernel=checkpoint_kernel,
+                    mu_kernel=checkpoint_mu_kernel,
+                ),
+                entry,
+            )
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp-feat] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "

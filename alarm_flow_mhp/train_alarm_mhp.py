@@ -156,10 +156,30 @@ def _adopt_loaded_regions(config, alarm_metadata):
     return replace(config, regions=regions) if regions else config
 
 
+def _default_best_output(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if ext.lower() == ".json":
+        return f"{root}.best{ext}"
+    return f"{path}.best.json"
+
+
 def main():
     parser = ArgumentParser(description="Train alarm-flow MHP via MAP EM.")
     parser.add_argument("alarms", help="Raw alarms or prepare_sorted_alarms cache.")
     parser.add_argument("-o", "--output", required=True, help="Output MHP model artifact JSON.")
+    parser.add_argument(
+        "--best-output",
+        default=None,
+        help=(
+            "Write a best-so-far checkpoint whenever train LL improves. "
+            "Default: output path with .best before .json."
+        ),
+    )
+    parser.add_argument(
+        "--no-best-checkpoint",
+        action="store_true",
+        help="Disable best-so-far checkpoint writing during training.",
+    )
     parser.add_argument(
         "--topo",
         default=SITE_GRAPH_BY_NE_JSON,
@@ -430,6 +450,9 @@ def main():
             max_hops=index_hops,
         )
 
+    best_output = None if args.no_best_checkpoint else (args.best_output or _default_best_output(args.output))
+    if best_output:
+        _print_progress(f"[train] best checkpoint path: {best_output}", args)
     _print_progress("[train] fitting model (MAP EM)...", args)
     artifact = train_alarm_mhp(
         alarm_events,
@@ -439,6 +462,7 @@ def main():
         verbose=_progress_enabled(args),
         topology_index=topology_index,
         ne_graph_data=ne_graph_data,
+        best_checkpoint_path=best_output,
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata
