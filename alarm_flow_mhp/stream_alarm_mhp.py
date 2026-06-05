@@ -37,7 +37,7 @@ if __package__ in (None, ""):
 import numpy as np
 
 from alarm_flow_brunch.region_filter import parse_regions
-from alarm_flow_brunch.visual_output import write_visual_groups
+from alarm_flow_brunch.visual_output import AlarmBRUNCHVisualOutputSession
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
 from alarm_flow_isahp.sequences import alarm_type_label, event_type_label
 from alarm_flow_mhp.aggregator import (
@@ -797,7 +797,7 @@ def _cascade_size_stats(size_counter: Counter) -> dict | None:
 # --------------------------------------------------------------------------
 
 
-def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
+def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, visual_output=None):
     """Drive the fixed-lag missing-chain sampler over the alarm stream.
 
     Non-invasive: consumes the same alarm events, emits brunch-compatible group
@@ -886,6 +886,19 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
     processed = 0
     _t0 = time.monotonic()
     _n = len(alarm_events)
+
+    def _accept_output_groups(new_groups, *, finalization_reason):
+        if not new_groups:
+            return []
+        min_ev = int(stream_config.min_group_events)
+        accepted = (
+            [g for g in new_groups if g["real_event_count"] >= min_ev]
+            if min_ev > 1 else list(new_groups)
+        )
+        if visual_output is not None and accepted:
+            visual_output.emit_groups(accepted, finalization_reason=finalization_reason)
+        return accepted
+
     for i, alarm in enumerate(alarm_events):
         if args.progress_every and (i + 1) % args.progress_every == 0 and not quiet:
             el = time.monotonic() - _t0
@@ -932,20 +945,17 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
             type_key = int(tid)
             meta["type_label"] = type_label
         processed += 1
-        groups.extend(
-            sampler.ingest(
-                float(alarm.get("ts", 0.0)),
-                type_key,
-                meta,
-                src_mark=src_mark,
-            )
+        closed = sampler.ingest(
+            float(alarm.get("ts", 0.0)),
+            type_key,
+            meta,
+            src_mark=src_mark,
         )
-    groups.extend(sampler.flush())
+        groups.extend(_accept_output_groups(closed, finalization_reason="closed"))
+    groups.extend(
+        _accept_output_groups(sampler.flush(), finalization_reason="stream_end")
+    )
 
-    # Output filter: keep cascades with at least min_group_events real alarms.
-    min_ev = int(stream_config.min_group_events)
-    if min_ev > 1:
-        groups = [g for g in groups if g["real_event_count"] >= min_ev]
     stats = sampler.stats()
     stats.update({"processed": processed, "dropped": dropped})
     return groups, stats
@@ -1220,9 +1230,29 @@ def main():
     # ---- missing-chain imputation path (fixed-lag sampler) --------------
     if args.impute:
         t_imp_start = time.monotonic()
-        groups, impute_stats = _run_imputation(
-            artifact, alarm_events, args, stream_config, quiet=args.quiet
-        )
+        visual_output = None
+        if args.visual_output:
+            from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
+
+            visual_output = AlarmMHPVisualOutputSession.from_files(
+                args.visual_output,
+                args.ne_graph,
+                args.site_graph,
+                ne_scope=args.visual_ne_scope,
+            )
+            visual_output.reset_output_file()
+        try:
+            groups, impute_stats = _run_imputation(
+                artifact,
+                alarm_events,
+                args,
+                stream_config,
+                quiet=args.quiet,
+                visual_output=visual_output,
+            )
+        finally:
+            if visual_output is not None:
+                visual_output.close()
         elapsed = time.monotonic() - t_imp_start
         if not args.quiet:
             print(
@@ -1255,6 +1285,7 @@ def main():
             "group_count": len(groups),
             "modeled_event_count": impute_stats["processed"],
             "imputed_missing_events": sum(g.get("virtual_event_count", 0) for g in groups),
+            "visual_group_count": visual_output.emitted_count if visual_output is not None else 0,
             "births": impute_stats["births"],
             "deaths": impute_stats["deaths"],
             "drop_stats": impute_stats["dropped"],
@@ -1270,15 +1301,7 @@ def main():
             n = _write_jsonl(args.edges_output, edges)
             print(f"branching edges written to: {args.edges_output}; edges={n}")
         if args.visual_output:
-            from alarm_flow_mhp.visual_output import write_visual_groups_mhp
-
-            visual_count = write_visual_groups_mhp(
-                args.visual_output,
-                groups,
-                ne_graph_path=args.ne_graph,
-                site_graph_path=args.site_graph,
-                ne_scope=args.visual_ne_scope,
-            )
+            visual_count = visual_output.emitted_count if visual_output is not None else 0
             print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
         return
     min_close = stream_config.history_window_sec + stream_config.time_slack_sec
@@ -1362,31 +1385,55 @@ def main():
     assigner = StreamMHPAssigner(
         artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
     )
+    visual_output = None
+    visual_group_cursor = 0
+    if args.visual_output:
+        visual_output = AlarmBRUNCHVisualOutputSession.from_files(
+            args.visual_output,
+            args.ne_graph,
+            args.site_graph,
+            ne_scope=args.visual_ne_scope,
+        )
+        visual_output.reset_output_file()
 
     t_stream_start = time.monotonic()
     last_print = t_stream_start
-    for i, alarm in enumerate(alarm_events):
-        assigner.process(alarm)
-        if args.progress_every and (i + 1) % args.progress_every == 0 and not args.quiet:
-            now = time.monotonic()
-            elapsed = now - t_stream_start
-            rate = (i + 1) / elapsed if elapsed > 0 else 0
-            stats = assigner.stats()
-            print(
-                f"[stream] processed {i + 1}/{len(alarm_events)} "
-                f"({rate:.0f} evt/s, "
-                f"open={stats['open_cascade_count']}, "
-                f"closed={stats['closed_cascade_count']}, "
-                f"immigrants={stats['total_immigrants']}, "
-                f"elapsed={elapsed:.1f}s)",
-                flush=True,
-            )
-            last_print = now
+    try:
+        for i, alarm in enumerate(alarm_events):
+            assigner.process(alarm)
+            if visual_output is not None and len(assigner.closed_groups) > visual_group_cursor:
+                new_groups = assigner.closed_groups[visual_group_cursor:]
+                visual_output.emit_groups(new_groups, finalization_reason="closed")
+                visual_group_cursor = len(assigner.closed_groups)
+            if args.progress_every and (i + 1) % args.progress_every == 0 and not args.quiet:
+                now = time.monotonic()
+                elapsed = now - t_stream_start
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                stats = assigner.stats()
+                visual_count = visual_output.emitted_count if visual_output is not None else 0
+                print(
+                    f"[stream] processed {i + 1}/{len(alarm_events)} "
+                    f"({rate:.0f} evt/s, "
+                    f"open={stats['open_cascade_count']}, "
+                    f"closed={stats['closed_cascade_count']}, "
+                    f"visual={visual_count}, "
+                    f"immigrants={stats['total_immigrants']}, "
+                    f"elapsed={elapsed:.1f}s)",
+                    flush=True,
+                )
+                last_print = now
 
-    # Drain
-    if not args.quiet:
-        print("[stream] draining remaining cascades ...", flush=True)
-    assigner.close_remaining()
+        # Drain
+        if not args.quiet:
+            print("[stream] draining remaining cascades ...", flush=True)
+        assigner.close_remaining()
+        if visual_output is not None and len(assigner.closed_groups) > visual_group_cursor:
+            new_groups = assigner.closed_groups[visual_group_cursor:]
+            visual_output.emit_groups(new_groups, finalization_reason="stream_end")
+            visual_group_cursor = len(assigner.closed_groups)
+    finally:
+        if visual_output is not None:
+            visual_output.close()
     t_stream_end = time.monotonic()
 
     stats = assigner.stats()
@@ -1423,6 +1470,7 @@ def main():
         },
         "group_count": len(groups),
         "emitted_group_count": len(groups),
+        "visual_group_count": visual_output.emitted_count if visual_output is not None else 0,
         "closed_cascade_count": stats["closed_cascade_count"],
         "modeled_event_count": stats["total_events_processed"],
         "immigrant_count": stats["total_immigrants"],
@@ -1450,13 +1498,7 @@ def main():
         print(f"branching edges written to: {args.edges_output}; edges={n}")
 
     if args.visual_output:
-        visual_count = write_visual_groups(
-            args.visual_output,
-            groups,
-            ne_graph_path=args.ne_graph,
-            site_graph_path=args.site_graph,
-            ne_scope=args.visual_ne_scope,
-        )
+        visual_count = visual_output.emitted_count if visual_output is not None else 0
         print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
 
     if cascade_stats and not args.quiet:

@@ -68,6 +68,13 @@ class _FakeFeatureScorer:
             out[i] = base * self._topo_ok(s_ne, target_ne)
         return out
 
+    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None):
+        out = np.zeros(len(tgt_nes), dtype=np.float64)
+        for i, (t_at, t_ne) in enumerate(zip(tgt_ats, tgt_nes)):
+            base = self.trigger.get((source_at, t_at), 0.0)
+            out[i] = base * self._topo_ok(source_ne, t_ne)
+        return out
+
 
 class _FakeDynamicFeatureScorer(_FakeFeatureScorer):
     """Adds source-state gain to the static fake scorer."""
@@ -81,6 +88,12 @@ class _FakeDynamicFeatureScorer(_FakeFeatureScorer):
             marks = np.asarray(src_marks, dtype=np.float64).reshape(len(src_nes), self.n_dynamic)
         # Only a source with active power state can trigger B in this fake model.
         return base * marks[:, 1]
+
+    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None):
+        base = super().alpha_for_source(source_at, source_ne, tgt_ats, tgt_nes)
+        m = (np.zeros(self.n_dynamic) if src_mark is None
+             else np.asarray(src_mark, dtype=np.float64).reshape(self.n_dynamic))
+        return base * m[1]
 
 
 class _FakeMuScorer:

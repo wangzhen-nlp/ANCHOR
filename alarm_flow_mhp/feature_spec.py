@@ -525,3 +525,43 @@ class RuntimeFeatureScorer:
             marks = np.asarray(src_marks, dtype=np.float64).reshape(n, self.n_dynamic)
             phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)
+
+    def envelope_mark(self):
+        """The source mark that MAXIMIZES α over all 2^n_dynamic states: bit i = 1
+        iff the dynamic weight i is positive (softplus is monotonic in w·φ). Lets
+        candidate enumeration use one call instead of a 2^n sweep."""
+        if self.n_dynamic <= 0:
+            return np.zeros(0, dtype=np.float64)
+        w_dyn = np.asarray(self.kernel.weights, dtype=np.float64)[-self.n_dynamic:]
+        return (w_dyn > 0).astype(np.float64)
+
+    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None):
+        """Vectorized α for ONE source vs a batch of targets — the transpose of
+        alpha_for_target (the compensator hot path: one source excites many
+        targets). The source mark is fixed (one row, broadcast to all targets).
+        Returns (n,) α array.
+        """
+        n = len(tgt_nes)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        at_v = np.full(n, self.at_to_id.get(str(source_at), -1), dtype=np.int64)
+        at_u = np.array([self.at_to_id.get(str(a), -1) for a in tgt_ats], dtype=np.int64)
+        s_site, s_vendor, s_netype = self._attr(source_ne)
+        topo = np.empty(n, dtype=np.float64)
+        is_same_ne = np.empty(n, dtype=np.float64)
+        same_site = np.empty(n, dtype=np.float64)
+        same_vendor = np.empty(n, dtype=np.float64)
+        same_netype = np.empty(n, dtype=np.float64)
+        for i, tne in enumerate(tgt_nes):
+            topo[i] = _topo_score(source_ne, tne, self.topology_index, self._topo_cache)
+            is_same_ne[i] = 1.0 if source_ne == tne else 0.0
+            t_site, t_vendor, t_netype = self._attr(tne)
+            same_site[i] = 1.0 if (t_site and t_site == s_site) else 0.0
+            same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
+            same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
+        phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype)
+        if self.n_dynamic > 0:
+            row = (np.zeros(self.n_dynamic, dtype=np.float64) if src_mark is None
+                   else np.asarray(src_mark, dtype=np.float64).reshape(self.n_dynamic))
+            phi = np.concatenate([phi, np.tile(row, (n, 1))], axis=1)
+        return self.kernel.alpha(phi)

@@ -1232,6 +1232,7 @@ class FeatureKernelAdapter:
         self._alpha_out_sum: "OrderedDict[tuple, float]" = OrderedDict()
         self._candidate_source_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._neighbor_cache: dict[str, list] = {}
+        self._envelope_mark = None        # cached α-maximizing source mark
 
     # ---- helpers ----
     def _mark_tuple(self, source_mark=None) -> tuple:
@@ -1260,16 +1261,23 @@ class FeatureKernelAdapter:
             return self._mark_tuple()
         return self._mark_tuple(self._source_mark_at(source_type, ts))
 
-    def _candidate_mark_matrices(self, n: int):
+    def _envelope_mark_matrix(self, n: int):
+        """Upper-envelope source mark for candidate enumeration: the mark that
+        MAXIMIZES α over all 2^n_dynamic states. Since α = softplus(z_static +
+        Σ_i mark_i·w_dyn_i) is monotonic in z, the max is at mark_i = 1{w_dyn_i>0}
+        — so one call instead of 2^n. Returns None when no dynamic features."""
         if self.n_dynamic <= 0:
-            return [None]
+            return None
         import numpy as np
 
-        mats = []
-        for mask in range(1 << self.n_dynamic):
-            mark = [(mask >> i) & 1 for i in range(self.n_dynamic)]
-            mats.append(np.tile(np.asarray(mark, dtype=np.float64), (n, 1)))
-        return mats
+        if self._envelope_mark is None:
+            ev = getattr(self.fs, "envelope_mark", None)
+            if callable(ev):
+                self._envelope_mark = np.asarray(ev(), dtype=np.float64).reshape(self.n_dynamic)
+            else:
+                # Scorer without weight introspection → over-inclusive all-ones.
+                self._envelope_mark = np.ones(self.n_dynamic, dtype=np.float64)
+        return np.tile(self._envelope_mark, (n, 1))
 
     def _neighbors(self, ne: str) -> list:
         cached = self._neighbor_cache.get(ne)
@@ -1410,10 +1418,11 @@ class FeatureKernelAdapter:
         # Birth first needs a finite candidate source set before it has sampled
         # t'. In dynamic mode, take a possible-state upper envelope so edges that
         # only activate under a nonzero observed state slice are not filtered out.
-        alphas = None
-        for marks in self._candidate_mark_matrices(len(src_ats)):
-            cur = self.fs.alpha_for_target(t_at, t_ne, src_ats, src_nes, src_marks=marks)
-            alphas = cur if alphas is None else np.maximum(alphas, cur)
+        # The envelope is a SINGLE call with the α-maximizing mark (no 2^n loop).
+        alphas = self.fs.alpha_for_target(
+            t_at, t_ne, src_ats, src_nes,
+            src_marks=self._envelope_mark_matrix(len(src_ats)),
+        )
         out: list[tuple] = []
         for at, ne, a in zip(src_ats, src_nes, alphas):
             av = float(a)
@@ -1436,20 +1445,26 @@ class FeatureKernelAdapter:
         if s_sum is not None:
             cache.move_to_end(cache_key)          # LRU touch
         else:
+            import numpy as np
+
             (s_at, s_ne) = source_type
-            total = 0.0
-            # transpose: one source vs many targets — not vectorisable via
-            # alpha_for_target (target is fixed per call), so loop once + cache.
+            # ONE batched transpose call (one source vs all candidate targets)
+            # instead of a per-target scalar loop.
+            tgt_ats: list = []
+            tgt_nes: list = []
             for ne in self._candidate_nes(s_ne):
                 for at in self._at_vocab:
-                    a = float(
-                        self.fs.alpha_for_target(
-                            at, ne, [s_at], [s_ne], src_marks=self._mark_matrix(1, [mark])
-                        )[0]
-                    )
-                    if a >= self.alpha_floor and a > 0:
-                        total += a
-            s_sum = total
+                    tgt_ats.append(at)
+                    tgt_nes.append(ne)
+            if tgt_ats:
+                a = np.asarray(
+                    self.fs.alpha_for_source(s_at, s_ne, tgt_ats, tgt_nes, src_mark=mark),
+                    dtype=np.float64,
+                )
+                a = a[a >= self.alpha_floor]
+                s_sum = float(a[a > 0].sum())
+            else:
+                s_sum = 0.0
             cache[cache_key] = s_sum
             if len(cache) > self._cache_max:
                 cache.popitem(last=False)          # evict least-recently-used

@@ -197,3 +197,79 @@ def write_visual_groups_mhp(output_path, groups, *, ne_graph_path, site_graph_pa
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
     return count
+
+
+class AlarmMHPVisualOutputSession:
+    """Append MHP online cascades in match-rules visualization JSONL format."""
+
+    def __init__(self, output_path, ne_graph_data, site_graph_data, ne_scope="alarm-only"):
+        if ne_scope not in VISUAL_NE_SCOPES:
+            raise ValueError(f"unsupported visual NE scope: {ne_scope}")
+        self.output_path = Path(output_path)
+        self.ne_graph_data = ne_graph_data
+        self.site_graph_data = site_graph_data
+        self.ne_scope = ne_scope
+        self.site_to_ne_ids = (
+            build_site_to_ne_ids(ne_graph_data)
+            if ne_scope == "site-context"
+            else {}
+        )
+        self.ne_link_info_cache = {}
+        self.emitted_group_ids = set()
+        self.emitted_count = 0
+        self._handle = None
+
+    @classmethod
+    def from_files(cls, output_path, ne_graph_path, site_graph_path, ne_scope="alarm-only"):
+        return cls(
+            output_path=output_path,
+            ne_graph_data=load_json_object(ne_graph_path),
+            site_graph_data=load_json_object(site_graph_path),
+            ne_scope=ne_scope,
+        )
+
+    def reset_output_file(self):
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.close()
+        self._handle = self.output_path.open("w", encoding="utf-8")
+
+    def close(self):
+        if self._handle is None:
+            return
+        self._handle.close()
+        self._handle = None
+
+    def emit_groups(self, groups, *, finalization_reason):
+        writable_groups = [
+            group
+            for group in groups
+            if group.get("group_id") and group["group_id"] not in self.emitted_group_ids
+        ]
+        if not writable_groups:
+            return 0
+        if self._handle is None:
+            self.reset_output_file()
+
+        emitted = 0
+        for group in writable_groups:
+            match = group_to_visual_match_mhp(group, ne_graph_data=self.ne_graph_data)
+            if not match.get("uuid"):
+                continue
+            cascade_info = dict(match.get("cascade_info") or {})
+            cascade_info["finalization_reason"] = finalization_reason
+            match["cascade_info"] = cascade_info
+            record = build_jsonl_match_output(
+                match,
+                self.ne_graph_data,
+                self.site_graph_data,
+                alarm_metadata_index={},
+                site_to_ne_ids=self.site_to_ne_ids,
+                ne_link_info_cache=self.ne_link_info_cache,
+            )
+            _attach_virtual_alarm_flags(record)
+            self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.emitted_group_ids.add(group["group_id"])
+            emitted += 1
+        self._handle.flush()
+        self.emitted_count += emitted
+        return emitted
