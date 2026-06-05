@@ -863,6 +863,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
         max_births_per_sweep=int(args.impute_max_births),
         max_history_events=int(args.impute_max_history),
         sweep_recent_events=int(args.impute_sweep_recent),
+        future_candidate_reset_limit=int(args.impute_future_candidate_reset_limit),
         max_birth_attempts_per_sweep=int(args.impute_max_birth_attempts),
         # Throttle the O(live) cascade-close scan to a fraction of the lag — it
         # only governs output timing, and running it every event is wasteful.
@@ -1151,6 +1152,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--impute-future-candidate-reset-limit",
+        type=int,
+        default=0,
+        help=(
+            "When time slack lets a new event become a future parent for older "
+            "events, re-sample all affected older events by default. Set >0 to "
+            "only repair the nearest N affected events for speed. Default: 0 "
+            "(unlimited, exact old behavior)."
+        ),
+    )
+    parser.add_argument(
         "--impute-max-birth-attempts",
         type=int,
         default=32,
@@ -1291,6 +1303,7 @@ def main():
                 "impute_max_births": args.impute_max_births,
                 "impute_max_history": args.impute_max_history,
                 "impute_sweep_recent": args.impute_sweep_recent,
+                "impute_future_candidate_reset_limit": args.impute_future_candidate_reset_limit,
                 "impute_max_birth_attempts": args.impute_max_birth_attempts,
             },
             "group_count": len(groups),

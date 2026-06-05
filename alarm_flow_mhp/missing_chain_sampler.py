@@ -297,6 +297,11 @@ class SamplerConfig:
                                        # birth/death — those cover the whole active
                                        # window, see below — otherwise older orphans
                                        # would be starved of imputation chances.)
+    future_candidate_reset_limit: int = 0  # When time_slack allows a newly inserted
+                                       # event to become a future parent, clear and
+                                       # re-sample all affected older events by
+                                       # default. Set >0 to cap this expensive repair
+                                       # to the nearest N affected events.
     max_birth_attempts_per_sweep: int = 32  # birth is attempted over ALL active
                                        # orphans (fair, shuffled) but bounded to this
                                        # many ATTEMPTS/sweep to cap cost without
@@ -337,6 +342,8 @@ class SamplerConfig:
             raise ValueError("max_history_events must be >= 1")
         if self.sweep_recent_events < 1:
             raise ValueError("sweep_recent_events must be >= 1")
+        if self.future_candidate_reset_limit < 0:
+            raise ValueError("future_candidate_reset_limit must be >= 0")
         if self.max_birth_attempts_per_sweep < 0:
             raise ValueError("max_birth_attempts_per_sweep must be >= 0")
 
@@ -494,6 +501,12 @@ class MissingChainSampler:
             return
         lo = bisect.bisect_left(self._order_ts, new_ev.ts - slack)
         hi = bisect.bisect_left(self._order_ts, new_ev.ts)
+        limit = self.config.future_candidate_reset_limit
+        if limit > 0:
+            # Optional approximation: a dense slack window can hold hundreds of
+            # events, so only repair the nearest affected events when configured.
+            # The default (0) keeps the exact pre-optimization behaviour.
+            lo = max(lo, hi - limit)
         for i in range(lo, hi):
             ev = self.events.get(self._order[i])
             if ev is None or ev.committed or ev.eid == new_ev.eid:
@@ -1011,12 +1024,39 @@ class MissingChainSampler:
         # to close, so skip the O(live) cluster rebuild entirely.
         if not force and (not self._order_ts or self._order_ts[0] >= evict_cut):
             return []
-        # Group live events by cascade root.
+        # Group live events by cascade root. Memoize roots with path compression
+        # so grouping is O(live), not O(live·depth) — deep chains (the
+        # over-merging case) would otherwise make this O(live²) per close.
+        root_memo: dict[int, int] = {}
+
+        def _memo_root(start_eid: int) -> int:
+            path = []
+            seen = set()
+            cur = start_eid
+            while True:
+                r = root_memo.get(cur)
+                if r is not None:
+                    break
+                if cur in seen:
+                    r = cur
+                    break
+                seen.add(cur)
+                ev = self.events.get(cur)
+                if ev is None or ev.parent == -1 or ev.parent not in self.events:
+                    r = cur
+                    break
+                path.append(cur)
+                cur = ev.parent
+            for p in path:
+                root_memo[p] = r
+            root_memo[cur] = r
+            return r
+
         clusters: dict[int, list[SamplerEvent]] = {}
         for eid in self._order:
             ev = self.events.get(eid)
             if ev is not None:
-                clusters.setdefault(self._root_of(ev), []).append(ev)
+                clusters.setdefault(_memo_root(eid), []).append(ev)
         out: list[dict] = []
         for members in clusters.values():
             all_frozen = all(m.committed for m in members)
