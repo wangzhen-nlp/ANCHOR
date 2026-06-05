@@ -1369,9 +1369,26 @@ def fit_mhp_feature(
         mu_num = np.zeros(M, dtype=np.float64)
         ll_term1 = 0.0
 
-        for chunk_start in range(0, N, chunk_size):
+        # Intra-iteration progress: the E-step scans ~N/chunk_size chunks, which
+        # can take minutes on large data — print a throttled heartbeat so a long
+        # iteration doesn't look hung.
+        n_chunks = (N + chunk_size - 1) // chunk_size
+        _estep_t0 = time.monotonic()
+        _last_beat = _estep_t0
+        for ci, chunk_start in enumerate(range(0, N, chunk_size)):
             chunk_end = min(chunk_start + chunk_size, N)
             csize = chunk_end - chunk_start
+            if config.verbose and n_chunks > 1:
+                _now = time.monotonic()
+                if _now - _last_beat >= 10.0:
+                    rate = chunk_end / max(_now - _estep_t0, 1e-9)
+                    print(
+                        f"[mhp-feat]   iter={it:3d} E-step chunk {ci + 1}/{n_chunks} "
+                        f"({chunk_end}/{N} events, {rate:.0f} evt/s, "
+                        f"{_fmt_secs(_now - _estep_t0)})",
+                        flush=True,
+                    )
+                    _last_beat = _now
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
             (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
@@ -1416,6 +1433,12 @@ def fit_mhp_feature(
             mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
             ll_term1 += float(np.log(rate).sum())
 
+        if config.verbose and n_chunks > 1:
+            print(
+                f"[mhp-feat]   iter={it:3d} E-step done in {_fmt_secs(time.monotonic() - _estep_t0)}, "
+                f"fitting weights (M-step) ...",
+                flush=True,
+            )
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
         # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
         # parameterized (mu_phi), else per-type closed form.
