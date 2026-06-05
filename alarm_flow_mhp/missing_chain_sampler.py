@@ -78,9 +78,10 @@ MHP_VIRTUAL_RULE = "alarm_flow_mhp_virtual_event"
 class ModelAdapter(Protocol):
     """Read-only view of a trained MHP, in terms the sampler needs.
 
-    All ``dt_sec`` are real (un-scaled) seconds with ``dt_sec >= 0`` (parent
-    strictly before child); the adapter applies ``time_scale`` internally so the
-    sampler never has to know about scaled time.
+    ``dt_sec`` values are real (un-scaled) seconds. They may be slightly
+    negative when timestamp-jitter slack is enabled (parent timestamp after the
+    child); the adapter applies ``time_scale`` and the late-parent penalty
+    internally so the sampler never has to know about scaled time.
     """
 
     def mu(self, type_id: TypeKey) -> float:
@@ -126,12 +127,18 @@ class ExpKernelAdapter:
     edges: dict[tuple[int, int], tuple[float, float]]
     time_scale_sec: float = 60.0
     meta_by_type: dict[int, dict] = field(default_factory=dict)
+    time_slack_sec: float = 0.0
+    late_penalty_half_life_sec: float = 1.0
     _sources_by_target: dict[int, list[tuple[int, float]]] = field(default_factory=dict, init=False)
     _targets_by_source: dict[int, list[int]] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         if self.time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
+        if self.time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if self.late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
         by_target: dict[int, list[tuple[int, float]]] = {}
         by_source: dict[int, list[int]] = {}
         for (tgt, src), (alpha, _beta) in self.edges.items():
@@ -148,25 +155,45 @@ class ExpKernelAdapter:
         return float(self.mu_by_type.get(int(type_id), 0.0))
 
     def kernel_intensity(self, source_type: int, target_type: int, dt_sec: float) -> float:
-        if dt_sec < 0:
+        dt_eff_sec, late_weight = self._signed_dt(dt_sec)
+        if late_weight <= 0:
             return 0.0
         edge = self.edges.get((int(target_type), int(source_type)))
         if edge is None:
             return 0.0
         alpha, beta = edge
-        dt = dt_sec / self.time_scale_sec
-        return float(alpha * beta * math.exp(-beta * dt))
+        dt = dt_eff_sec / self.time_scale_sec
+        return float(alpha * beta * math.exp(-beta * dt) * late_weight)
 
     def compensator(self, source_type: int, target_type: int, dt_sec: float) -> float:
-        if dt_sec <= 0:
-            return 0.0
         edge = self.edges.get((int(target_type), int(source_type)))
         if edge is None:
             return 0.0
         alpha, beta = edge
-        dt = dt_sec / self.time_scale_sec
-        # ∫_0^dt α·β·e^{-β u} du = α (1 - e^{-β dt})
-        return float(alpha * (1.0 - math.exp(-beta * dt)))
+        pos = 0.0
+        if dt_sec > 0:
+            dt = dt_sec / self.time_scale_sec
+            # ∫_0^dt α·β·e^{-β u} du = α (1 - e^{-β dt})
+            pos = alpha * (1.0 - math.exp(-beta * dt))
+        neg = alpha * beta * self._negative_penalty_integral_model()
+        return float(pos + neg)
+
+    def _signed_dt(self, dt_sec: float) -> tuple[float, float]:
+        if dt_sec >= 0:
+            return float(dt_sec), 1.0
+        late = -float(dt_sec)
+        if self.time_slack_sec <= 0 or late > self.time_slack_sec:
+            return 0.0, 0.0
+        lam = math.log(2.0) / self.late_penalty_half_life_sec
+        return 0.0, math.exp(-lam * late)
+
+    def _negative_penalty_integral_model(self) -> float:
+        if self.time_slack_sec <= 0:
+            return 0.0
+        slack = self.time_slack_sec / self.time_scale_sec
+        half = self.late_penalty_half_life_sec / self.time_scale_sec
+        lam = math.log(2.0) / half
+        return float((1.0 - math.exp(-lam * slack)) / lam)
 
     def candidate_sources(self, target_type: int) -> list[tuple[int, float]]:
         return list(self._sources_by_target.get(int(target_type), ()))
@@ -217,6 +244,8 @@ class SamplerEvent:
 class SamplerConfig:
     lag_sec: float = 300.0              # commit delay (latency vs completeness)
     history_window_sec: float = 900.0  # kernel reach for candidate parents
+    time_slack_sec: float = 0.0        # small timestamp-jitter tolerance
+    late_penalty_half_life_sec: float = 1.0
     sweeps_per_tick: int = 2           # local MCMC sweeps per ingest
     max_missing: int = 200             # cap on live missing events in window
     max_depth: int = 4                 # cap on missing-chain depth
@@ -252,13 +281,20 @@ class SamplerConfig:
         # Committed events must stay available as candidate parents while any
         # still-active event can reach them, so keep them until fully out of
         # kernel reach.
-        return self.lag_sec + self.history_window_sec
+        return self.lag_sec + self.history_window_sec + self.time_slack_sec
+
+    def freeze_delay_sec(self) -> float:
+        return self.lag_sec + self.time_slack_sec
 
     def validate(self):
         if self.lag_sec <= 0:
             raise ValueError("lag_sec must be > 0")
         if self.history_window_sec <= 0:
             raise ValueError("history_window_sec must be > 0")
+        if self.time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if self.late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
         if self.sweeps_per_tick < 0:
             raise ValueError("sweeps_per_tick must be >= 0")
         if self.max_missing < 0 or self.max_depth < 0:
@@ -324,6 +360,7 @@ class MissingChainSampler:
         ev = self._new_event(ts=ts, type_id=type_id, observed=True,
                              meta=dict(meta or {}), depth=0)
         self._insert_ordered(ev)
+        self._reset_votes_for_future_candidate(ev)
         self._gibbs_parent(ev)            # initial assignment
         for _ in range(self.config.sweeps_per_tick):
             self._sweep()
@@ -385,6 +422,25 @@ class MissingChainSampler:
         self._order.insert(pos, ev.eid)
         self._order_ts.insert(pos, ts)
 
+    def _reset_votes_for_future_candidate(self, new_ev: SamplerEvent):
+        """A newly inserted event can become a future parent for older events
+        within slack. Those older events' candidate sets just changed, so old
+        parent votes collected before this candidate existed should not dominate
+        their eventual MAP commit.
+        """
+        slack = self.config.time_slack_sec
+        if slack <= 0:
+            return
+        lo = bisect.bisect_left(self._order_ts, new_ev.ts - slack)
+        hi = bisect.bisect_left(self._order_ts, new_ev.ts)
+        for i in range(lo, hi):
+            ev = self.events.get(self._order[i])
+            if ev is None or ev.committed or ev.eid == new_ev.eid:
+                continue
+            ev.parent_votes.clear()
+            ev.sweep_count = 0
+            self._gibbs_parent(ev)
+
     def _remove_event(self, ev: SamplerEvent):
         # Detach from parent / children before dropping.
         if ev.parent != -1:
@@ -416,6 +472,12 @@ class MissingChainSampler:
         # missing event's depth = how many missing hops it sits above the
         # observed event it ultimately explains). It does NOT depend on the
         # event's own parent, so re-parenting must not touch it.
+        if parent_eid == child.eid:
+            parent_eid = -1
+        elif parent_eid != -1:
+            parent = self.events.get(parent_eid)
+            if parent is None or self._is_descendant(parent_eid, child.eid):
+                parent_eid = -1
         if child.parent == parent_eid:
             return
         if child.parent != -1:
@@ -432,38 +494,58 @@ class MissingChainSampler:
     # ---- candidate parents ----------------------------------------------
 
     def _candidate_parents(self, ev: SamplerEvent):
-        """Up to ``max_history_events`` candidate parents nearest in time before
-        ``ev`` and within kernel reach. Returns parallel lists
+        """Up to ``max_history_events`` candidate parents nearest in signed time
+        distance within [ev.ts-history, ev.ts+slack]. Returns parallel lists
         ``(eids, src_types, dts)`` so the caller can batch-score intensities.
 
-        Bisect to ev's position, then walk backward (newest-first). Capping +
-        nearest-first matters: under an exp kernel the closest events carry
-        almost all the mass, and the cap bounds per-event cost from O(window) to
-        O(cap) — the difference between tractable and not at scale.
+        Capping + nearest-first matters: under an exp kernel the closest events
+        carry almost all the mass, and the cap bounds per-event cost from
+        O(window) to O(cap) — the difference between tractable and not at scale.
         """
         reach = self.config.history_window_sec
+        slack = self.config.time_slack_sec
         cap = self.config.max_history_events
         eids: list[int] = []
         src_types: list = []
         dts: list[float] = []
-        # First index strictly before ev.ts (skip equal-ts and later events).
-        i = bisect.bisect_left(self._order_ts, ev.ts) - 1
-        while i >= 0 and len(eids) < cap:
-            dt = ev.ts - self._order_ts[i]
-            if dt > reach:
-                break                       # everything older is out of reach too
-            oid = self._order[i]
-            i -= 1
+
+        def maybe_add(pos: int) -> bool:
+            oid = self._order[pos]
             if oid == ev.eid:
-                continue
+                return False
             other = self.events.get(oid)
             if other is None:
-                continue
-            if not ev.observed and self._is_descendant(oid, ev.eid):
-                continue
+                return False
+            dt = ev.ts - other.ts
+            if dt < -slack or dt > reach:
+                return False
+            if self._is_descendant(oid, ev.eid):
+                return False
             eids.append(oid)
             src_types.append(other.type_id)
             dts.append(dt)
+            return True
+
+        left = bisect.bisect_left(self._order_ts, ev.ts) - 1
+        right = bisect.bisect_left(self._order_ts, ev.ts)
+        n = len(self._order_ts)
+        while len(eids) < cap:
+            left_ok = left >= 0 and ev.ts - self._order_ts[left] <= reach
+            right_ok = right < n and self._order_ts[right] - ev.ts <= slack
+            if not left_ok and not right_ok:
+                break
+            if left_ok and right_ok:
+                left_dist = ev.ts - self._order_ts[left]
+                right_dist = self._order_ts[right] - ev.ts
+                take_left = left_dist <= right_dist
+            else:
+                take_left = left_ok
+            if take_left:
+                maybe_add(left)
+                left -= 1
+            else:
+                maybe_add(right)
+                right += 1
         return eids, src_types, dts
 
     def _is_descendant(self, maybe_descendant: int, ancestor: int) -> bool:
@@ -474,7 +556,7 @@ class MissingChainSampler:
                 return True
             cur = self.events.get(cur.parent)
             guard += 1
-            if guard > self.config.max_depth + 2:
+            if guard > len(self.events) + 1:
                 break
         return False
 
@@ -548,18 +630,21 @@ class MissingChainSampler:
         cands = self.adapter.candidate_sources(orphan.type_id)
         if not cands:
             return False
-        # Birth must land in the still-mutable region (within lag of the child),
-        # so committed structure stays final.
-        lower = max(self.now - cfg.lag_sec, orphan.ts - cfg.history_window_sec)
-        if orphan.ts - lower <= EPS:
+        # Birth must land in the still-mutable region, so committed structure
+        # stays final. With timestamp slack, a missing parent can be slightly
+        # after the child, but never beyond the current stream time.
+        lower = max(self.now - cfg.freeze_delay_sec(), orphan.ts - cfg.history_window_sec)
+        upper = min(self.now, orphan.ts + cfg.time_slack_sec)
+        if upper - lower <= EPS:
             return False
 
         # --- propose source type s ∝ edge weight ---
         s_type = self._weighted_choice(cands)
-        # --- propose time t' from the kernel-implied parent-time density ---
-        #     dt = (child - parent) ~ Exp(β-ish); we sample from the actual
-        #     intensity profile by inverse-CDF on a fine grid (kernel-agnostic).
-        t_prime = self._propose_parent_time(s_type, orphan, lower)
+        # --- propose time t' from the signed kernel-implied parent-time density ---
+        #     dt = child - parent may be slightly negative under timestamp slack.
+        #     We sample from the actual intensity profile by inverse-CDF on a
+        #     fine grid (kernel-agnostic).
+        t_prime = self._propose_parent_time(s_type, orphan, lower, upper)
         if t_prime is None:
             return False
         dt = orphan.ts - t_prime
@@ -603,6 +688,7 @@ class MissingChainSampler:
                             meta=self.adapter.type_meta(s_type),
                             depth=orphan.depth + 1)
         self._insert_ordered(x)
+        self._reset_votes_for_future_candidate(x)
         self._set_parent(orphan, x.eid)
         self._gibbs_parent(x)              # give X its own parent immediately
         self.births += 1
@@ -655,10 +741,7 @@ class MissingChainSampler:
              — the simple per-edge loop (device mode).
           3. Neither ⇒ 0; the κ prior alone regularises.
         """
-        horizon = self.now - ts
-        if horizon <= 0:
-            return 0.0
-        horizon = min(horizon, self.config.history_window_sec)
+        horizon = min(max(self.now - ts, 0.0), self.config.history_window_sec)
         batched = getattr(self.adapter, "total_compensator", None)
         if batched is not None:
             return float(batched(source_type, horizon))
@@ -685,13 +768,13 @@ class MissingChainSampler:
         return items[-1][0]
 
     def _propose_parent_time(self, s_type: int, orphan: SamplerEvent,
-                             lower: float) -> Optional[float]:
-        """Sample a parent time in (lower, orphan.ts) ∝ intensity profile.
+                             lower: float, upper: float) -> Optional[float]:
+        """Sample a parent time in (lower, upper) ∝ intensity profile.
 
         Inverse-CDF on a coarse grid — kernel-agnostic so it works for exp and
         piecewise alike (the adapter only needs kernel_intensity).
         """
-        span = orphan.ts - lower
+        span = upper - lower
         if span <= 0:
             return None
         n = 32
@@ -712,7 +795,7 @@ class MissingChainSampler:
         for t, c in zip(grid, cum):
             if r <= c:
                 # jitter within the cell so times aren't quantised to the grid
-                return min(orphan.ts - EPS, max(lower + EPS, t + (self.rng.random() - 0.5) * step))
+                return min(upper - EPS, max(lower + EPS, t + (self.rng.random() - 0.5) * step))
         return grid[-1]
 
     def _accept(self, log_ratio: float) -> bool:
@@ -726,7 +809,7 @@ class MissingChainSampler:
         """The most recent ``sweep_recent_events`` uncommitted events (LOCAL
         sweep scope), time-ascending. Walking from the newest end and stopping
         early bounds per-tick work independent of how dense the lag window is."""
-        cutoff = self.now - self.config.lag_sec
+        cutoff = self.now - self.config.freeze_delay_sec()
         limit = self.config.sweep_recent_events
         out: list[int] = []
         for i in range(len(self._order) - 1, -1, -1):
@@ -794,7 +877,7 @@ class MissingChainSampler:
         events are always created at ts > cutoff, so they never fall inside an
         already-passed freeze range.
         """
-        cutoff = self.now - self.config.lag_sec
+        cutoff = self.now - self.config.freeze_delay_sec()
         if force:
             lo, hi = 0, len(self._order)
         else:
@@ -842,8 +925,9 @@ class MissingChainSampler:
         """Emit + remove cascades that have fully left kernel reach.
 
         A cascade closes when all its members are frozen and its newest member is
-        older than the evict boundary (now - lag - history) — past that point no
-        future alarm can attach to any member, so the structure is final.
+        older than the evict boundary (now - lag - history - slack) — past that
+        point no future alarm can attach to any member, so the structure is
+        final.
         """
         evict_cut = self.now - self.config.window_sec()
         # Cheap guard: if nothing has crossed the evict boundary there is nothing
@@ -1027,6 +1111,8 @@ class FeatureKernelAdapter:
         mu_by_alarm_type: Optional[dict] = None,
         mu_default: float = 0.0,
         time_scale_sec: float = 60.0,
+        time_slack_sec: float = 0.0,
+        late_penalty_half_life_sec: float = 1.0,
         alpha_floor: float = 0.0,
         candidate_max_hops: Optional[int] = None,
         max_candidates: int = 256,
@@ -1034,11 +1120,17 @@ class FeatureKernelAdapter:
     ):
         if time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
+        if time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
         self.fs = feature_scorer
         self.mu_scorer = mu_scorer
         self.mu_by_alarm_type = dict(mu_by_alarm_type or {})
         self.mu_default = float(mu_default)
         self.time_scale_sec = float(time_scale_sec)
+        self.time_slack_sec = float(time_slack_sec)
+        self.late_penalty_half_life_sec = float(late_penalty_half_life_sec)
         self.alpha_floor = float(alpha_floor)
         self.beta = float(getattr(feature_scorer, "beta", 1.0))
         self.max_candidates = int(max_candidates)
@@ -1102,13 +1194,14 @@ class FeatureKernelAdapter:
         return float(self.mu_by_alarm_type.get(at, self.mu_default))
 
     def kernel_intensity(self, source_type, target_type, dt_sec: float) -> float:
-        if dt_sec < 0:
+        dt_eff_sec, late_weight = self._signed_dt(dt_sec)
+        if late_weight <= 0:
             return 0.0
         a = self._alpha(source_type, target_type)
         if a <= 0:
             return 0.0
-        dt = dt_sec / self.time_scale_sec
-        return float(a * self.beta * math.exp(-self.beta * dt))
+        dt = dt_eff_sec / self.time_scale_sec
+        return float(a * self.beta * math.exp(-self.beta * dt) * late_weight)
 
     def kernel_intensity_batch(self, target_type, source_types: list, dts: list):
         """Vectorised intensities for many candidate sources vs one target — the
@@ -1125,17 +1218,51 @@ class FeatureKernelAdapter:
         alphas = np.asarray(self.fs.alpha_for_target(t_at, t_ne, src_ats, src_nes), dtype=np.float64)
         if self.alpha_floor > 0:
             alphas = np.where(alphas >= self.alpha_floor, alphas, 0.0)
-        dt = np.asarray(dts, dtype=np.float64) / self.time_scale_sec
-        return np.where(dt >= 0, alphas * self.beta * np.exp(-self.beta * dt), 0.0)
+        dt_sec = np.asarray(dts, dtype=np.float64)
+        dt_eff_sec, late_weight = self._signed_dt_vec(dt_sec)
+        dt = dt_eff_sec / self.time_scale_sec
+        return alphas * self.beta * np.exp(-self.beta * dt) * late_weight
 
     def compensator(self, source_type, target_type, dt_sec: float) -> float:
-        if dt_sec <= 0:
-            return 0.0
         a = self._alpha(source_type, target_type)
         if a <= 0:
             return 0.0
-        dt = dt_sec / self.time_scale_sec
-        return float(a * (1.0 - math.exp(-self.beta * dt)))
+        pos = 0.0
+        if dt_sec > 0:
+            dt = dt_sec / self.time_scale_sec
+            pos = a * (1.0 - math.exp(-self.beta * dt))
+        neg = a * self.beta * self._negative_penalty_integral_model()
+        return float(pos + neg)
+
+    def _signed_dt(self, dt_sec: float) -> tuple[float, float]:
+        if dt_sec >= 0:
+            return float(dt_sec), 1.0
+        late = -float(dt_sec)
+        if self.time_slack_sec <= 0 or late > self.time_slack_sec:
+            return 0.0, 0.0
+        lam = math.log(2.0) / self.late_penalty_half_life_sec
+        return 0.0, math.exp(-lam * late)
+
+    def _signed_dt_vec(self, dt_sec):
+        import numpy as np
+
+        dt_sec = np.asarray(dt_sec, dtype=np.float64)
+        dt_eff = np.maximum(dt_sec, 0.0)
+        late = np.maximum(-dt_sec, 0.0)
+        if self.time_slack_sec <= 0:
+            weight = (late <= 0).astype(np.float64)
+        else:
+            lam = math.log(2.0) / self.late_penalty_half_life_sec
+            weight = np.where(late <= self.time_slack_sec, np.exp(-lam * late), 0.0)
+        return dt_eff, weight
+
+    def _negative_penalty_integral_model(self) -> float:
+        if self.time_slack_sec <= 0:
+            return 0.0
+        slack = self.time_slack_sec / self.time_scale_sec
+        half = self.late_penalty_half_life_sec / self.time_scale_sec
+        lam = math.log(2.0) / half
+        return float((1.0 - math.exp(-lam * slack)) / lam)
 
     def candidate_sources(self, target_type) -> list[tuple]:
         (t_at, t_ne) = target_type
@@ -1160,8 +1287,7 @@ class FeatureKernelAdapter:
         return out
 
     def total_compensator(self, source_type, horizon_sec: float) -> float:
-        if horizon_sec <= 0:
-            return 0.0
+        horizon_sec = max(float(horizon_sec), 0.0)
         cache = self._alpha_out_sum
         s_sum = cache.get(source_type)
         if s_sum is not None:
@@ -1181,7 +1307,9 @@ class FeatureKernelAdapter:
             if len(cache) > self._cache_max:
                 cache.popitem(last=False)          # evict least-recently-used
         dt = horizon_sec / self.time_scale_sec
-        return float(s_sum * (1.0 - math.exp(-self.beta * dt)))
+        pos = s_sum * (1.0 - math.exp(-self.beta * dt)) if horizon_sec > 0 else 0.0
+        neg = s_sum * self.beta * self._negative_penalty_integral_model()
+        return float(pos + neg)
 
     def type_meta(self, type_key) -> dict:
         at, ne = type_key
@@ -1196,7 +1324,8 @@ class FeatureKernelAdapter:
 
 
 def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
-                                  candidate_max_hops=None) -> FeatureKernelAdapter:
+                                  candidate_max_hops=None, time_slack_sec=None,
+                                  late_penalty_half_life_sec=None) -> FeatureKernelAdapter:
     """Build a :class:`FeatureKernelAdapter` from a feature-mode artifact.
 
     Mirrors the scorer construction in ``stream_alarm_mhp.main`` so the imputed
@@ -1252,6 +1381,14 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         mu_by_alarm_type=rt.get("mu_by_alarm_type", {}) or {},
         mu_default=float(rt.get("mu_default", 0.0)),
         time_scale_sec=float(getattr(artifact.config, "time_scale_sec", 60.0)),
+        time_slack_sec=float(
+            getattr(artifact.config, "time_slack_sec", 0.0)
+            if time_slack_sec is None else time_slack_sec
+        ),
+        late_penalty_half_life_sec=float(
+            getattr(artifact.config, "late_penalty_half_life_sec", 1.0)
+            if late_penalty_half_life_sec is None else late_penalty_half_life_sec
+        ),
         alpha_floor=float(floor),
         candidate_max_hops=candidate_max_hops,
     )
@@ -1262,7 +1399,9 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
 # --------------------------------------------------------------------------
 
 
-def device_adapter_from_artifact(artifact) -> ExpKernelAdapter:
+def device_adapter_from_artifact(
+    artifact, *, time_slack_sec=None, late_penalty_half_life_sec=None
+) -> ExpKernelAdapter:
     """Build an ExpKernelAdapter from a device-mode exp-kernel artifact.
 
     NOTE: only valid for ``edge_mode='device'`` + ``kernel_type='exp'``. Feature
@@ -1288,4 +1427,12 @@ def device_adapter_from_artifact(artifact) -> ExpKernelAdapter:
         mu_by_type=mu_by_type,
         edges=edges,
         time_scale_sec=float(getattr(artifact.config, "time_scale_sec", 60.0)),
+        time_slack_sec=float(
+            getattr(artifact.config, "time_slack_sec", 0.0)
+            if time_slack_sec is None else time_slack_sec
+        ),
+        late_penalty_half_life_sec=float(
+            getattr(artifact.config, "late_penalty_half_life_sec", 1.0)
+            if late_penalty_half_life_sec is None else late_penalty_half_life_sec
+        ),
     )

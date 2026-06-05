@@ -74,6 +74,7 @@ class OnlineEvent:
     src_mark: tuple = (0, 0, 0) # dynamic α: source device's uncleared (link,power,
                                 # offline) booleans frozen at THIS event's fire time
                                 # (excl self) — used when this event is a parent
+    finalized: bool = False     # parent assignment is frozen after the slack lag
 
 
 @dataclass
@@ -87,11 +88,14 @@ class Cascade:
     start_ts: float = 0.0
 
     def add(self, event: OnlineEvent):
+        if any(e.index == event.index for e in self.events):
+            return
         if not self.events:
             self.root_index = event.index
             self.start_ts = event.ts
         self.events.append(event)
         self.last_ts = max(self.last_ts, event.ts)
+        event.cascade_id = self.cascade_id
 
     def event_count(self) -> int:
         return len(self.events)
@@ -107,6 +111,8 @@ class StreamConfig:
     """Inference-time knobs (mostly inherited from artifact.config)."""
 
     history_window_sec: float = 900.0       # sliding window for candidate parents
+    time_slack_sec: float = 0.0             # fixed-lag timestamp jitter tolerance
+    late_penalty_half_life_sec: float = 1.0 # late-parent discount half-life
     max_history_events: int = 256           # cap candidates per event
     time_scale_sec: float = 60.0            # convert real seconds to model time
     close_inactive_sec: float = 7200.0      # cascades quiet for this long are closed
@@ -123,6 +129,8 @@ class StreamConfig:
     def from_artifact_config(cls, cfg: AlarmMHPConfig, **overrides):
         base = cls(
             history_window_sec=cfg.history_window_sec,
+            time_slack_sec=getattr(cfg, "time_slack_sec", 0.0),
+            late_penalty_half_life_sec=getattr(cfg, "late_penalty_half_life_sec", 1.0),
             max_history_events=cfg.max_history_events,
             time_scale_sec=cfg.time_scale_sec,
             min_group_events=cfg.min_group_events,
@@ -136,6 +144,10 @@ class StreamConfig:
     def validate(self):
         if self.history_window_sec <= 0:
             raise ValueError("history_window_sec must be > 0")
+        if self.time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if self.late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
         if self.max_history_events < 1:
             raise ValueError("max_history_events must be >= 1")
         if self.time_scale_sec <= 0:
@@ -160,12 +172,12 @@ class StreamMHPAssigner:
       - vocabs for label → id resolution
 
     Per incoming alarm:
-      1. Drop expired events from `recent`
-      2. Look up type_id; if unseen, mark as immigrant (fall-back)
-      3. Score candidates in recent: α[u_target, u_source] · β · exp(-β·Δt)
+      1. Append the event to the recent buffer and pending queue
+      2. Advance a watermark at now - time_slack_sec
+      3. Finalize pending events behind the watermark by scoring candidate
+         parents in [target-W, target+slack]
       4. Compare against μ[u_target] · immigrant_bias
-      5. argmax → assign to parent's cascade, or start a new immigrant cascade
-      6. Append to recent
+      5. argmax → bind/merge with the parent's cascade, or mark immigrant
     """
 
     def __init__(self, artifact, config: StreamConfig, feature_scorer=None, mu_scorer=None):
@@ -215,6 +227,9 @@ class StreamMHPAssigner:
         self._buf_ts: list[float] = []
         self._buf_type: list[int] = []
         self._head: int = 0                      # logical front index into the bufs
+        self._pending_events: list[OnlineEvent] = []
+        self._pending_head: int = 0
+        self._events_by_index: dict[int, OnlineEvent] = {}
         self.cascades: dict[int, Cascade] = {}
         self._next_cascade_id: int = 0
         self._next_event_index: int = 0
@@ -281,10 +296,83 @@ class StreamMHPAssigner:
             self._buf_type = self._buf_type[head:]
             self._head = 0
 
+    def _time_slack_score(self, dts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Training-consistent signed-dt handling in model-time units."""
+        dts = np.asarray(dts, dtype=np.float64)
+        if dts.size == 0:
+            return dts, np.ones(0, dtype=np.float64)
+        slack = self.config.time_slack_sec / self.config.time_scale_sec
+        dt_eff = np.maximum(dts, 0.0)
+        late = np.maximum(-dts, 0.0)
+        if slack <= 0:
+            weight = (late <= 0).astype(np.float64)
+        else:
+            lam = np.log(2.0) / (self.config.late_penalty_half_life_sec / self.config.time_scale_sec)
+            weight = np.where(late <= slack, np.exp(-lam * late), 0.0)
+        return dt_eff, weight
+
+    def _candidate_positions_for(self, target_event: OnlineEvent) -> np.ndarray:
+        """Candidate parents in [target-W, target+slack], excluding target.
+
+        The event buffer is time-ordered because inputs are loaded sorted by ts.
+        With slack enabled, some candidates are pending/future relative to the
+        target and may not have their own parent finalized yet.
+        """
+        n = len(self._buf_ts)
+        live = n - self._head
+        if live <= 0:
+            return np.empty(0, dtype=np.int64)
+        ts_arr = np.asarray(self._buf_ts, dtype=np.float64)
+        cap = int(self.config.max_history_events)
+        positions: list[int] = []
+
+        def maybe_add(pos: int):
+            ev = self._buf_events[int(pos)]
+            if ev.index == target_event.index:
+                return
+            if self._is_descendant(ev, target_event):
+                return
+            if ev.cascade_id != -1 and ev.cascade_id not in self.cascades:
+                return
+            positions.append(int(pos))
+
+        left = max(int(np.searchsorted(ts_arr, target_event.ts, side="left")) - 1, self._head - 1)
+        right = max(int(np.searchsorted(ts_arr, target_event.ts, side="left")), self._head)
+        while len(positions) < cap:
+            left_ok = left >= self._head and target_event.ts - ts_arr[left] <= self.config.history_window_sec
+            right_ok = right < n and ts_arr[right] - target_event.ts <= self.config.time_slack_sec
+            if not left_ok and not right_ok:
+                break
+            if left_ok and right_ok:
+                take_left = (target_event.ts - ts_arr[left]) <= (ts_arr[right] - target_event.ts)
+            else:
+                take_left = left_ok
+            if take_left:
+                maybe_add(left)
+                left -= 1
+            else:
+                maybe_add(right)
+                right += 1
+        return np.asarray(positions, dtype=np.int64)
+
+    def _is_descendant(self, maybe_descendant: OnlineEvent, ancestor: OnlineEvent) -> bool:
+        cur = maybe_descendant
+        guard = 0
+        while cur.parent_index != -1:
+            if cur.parent_index == ancestor.index:
+                return True
+            cur = self._events_by_index.get(cur.parent_index)
+            if cur is None:
+                return False
+            guard += 1
+            if guard > self.total_events_processed + 1:
+                return True
+        return False
+
     def _score_batch(self, target_type_id: int, src_types: np.ndarray, dts: np.ndarray) -> np.ndarray:
         """Vectorized kernel score for a batch of candidates — sparse binary
         search over sorted edge keys, dispatching on kernel_type. Bit-for-bit
-        consistent with params.pair_score (f64, Δt>=0 gate; only Δt<0 excluded).
+        consistent with training's signed-dt slack scoring.
         """
         n = len(src_types)
         out = np.zeros(n, dtype=np.float64)
@@ -292,25 +380,23 @@ class StreamMHPAssigner:
             return out
         keys = int(target_type_id) * self._M + src_types
         idx = np.minimum(np.searchsorted(self._edge_keys, keys), self._E - 1)
-        # Gate only dt < 0 (keep dt == 0 → full peak), matching pair_score /
-        # compute_hard_parents / training so run and stream agree on
-        # simultaneous events.
-        valid = (self._edge_keys[idx] == keys) & (dts >= 0)
+        dts_eff, late_weight = self._time_slack_score(dts)
+        valid = (self._edge_keys[idx] == keys) & (late_weight > 0)
         if not valid.any():
             return out
         vi = idx[valid]
         if self.params.kernel_type == "piecewise":
             from mhp.params import bucket_index_vec
 
-            pb = bucket_index_vec(dts[valid], self._bucket_edges)
-            out[valid] = self._theta[vi, pb]
+            pb = bucket_index_vec(dts_eff[valid], self._bucket_edges)
+            out[valid] = self._theta[vi, pb] * late_weight[valid]
         else:
             a = self._edge_alpha[vi]
             b = self._edge_beta[vi]
-            out[valid] = a * b * np.exp(-b * dts[valid])
+            out[valid] = a * b * np.exp(-b * dts_eff[valid]) * late_weight[valid]
         return out
 
-    def _candidate_scores(self, target_type_id: int, target_ts: float):
+    def _candidate_scores(self, target_event: OnlineEvent):
         """Score the most recent `max_history_events` candidates in one numpy
         batch.
 
@@ -318,35 +404,28 @@ class StreamMHPAssigner:
         index of candidate k (so the caller can fetch the OnlineEvent), and
         scores[k] is its kernel score against the target.
         """
-        n = len(self._buf_ts)
-        live = n - self._head
-        if live <= 0:
+        positions = self._candidate_positions_for(target_event)
+        if positions.size == 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-        cap = min(live, self.config.max_history_events)
-        lo = n - cap                                  # tail start (newest `cap`)
-        positions = np.arange(lo, n, dtype=np.int64)
-        ts_tail = np.asarray(self._buf_ts[lo:], dtype=np.float64)
-        type_tail = np.asarray(self._buf_type[lo:], dtype=np.int64)
-        dts = (target_ts - ts_tail) / self.config.time_scale_sec
-        scores = self._score_batch(target_type_id, type_tail, dts)
+        ts_tail = np.asarray([self._buf_ts[int(p)] for p in positions], dtype=np.float64)
+        type_tail = np.asarray([self._buf_type[int(p)] for p in positions], dtype=np.int64)
+        dts = (target_event.ts - ts_tail) / self.config.time_scale_sec
+        scores = self._score_batch(target_event.type_id, type_tail, dts)
         return positions, scores
 
-    def _candidate_scores_feature(self, target_at: str, target_ne: str, target_ts: float):
+    def _candidate_scores_feature(self, target_event: OnlineEvent):
         """Feature-mode candidate scoring: live α = softplus(w·φ) per source
         candidate (device-OPEN), then α·β·exp(-β·Δt). Returns (positions, scores).
         """
-        n = len(self._buf_ts)
-        live = n - self._head
-        if live <= 0:
+        positions = self._candidate_positions_for(target_event)
+        if positions.size == 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-        cap = min(live, self.config.max_history_events)
-        lo = n - cap
-        positions = np.arange(lo, n, dtype=np.int64)
-        src_events = self._buf_events[lo:]
+        src_events = [self._buf_events[int(p)] for p in positions]
         src_ats = [e.alarm_type for e in src_events]
         src_nes = [e.ne for e in src_events]
-        ts_tail = np.asarray(self._buf_ts[lo:], dtype=np.float64)
-        dts = (target_ts - ts_tail) / self.config.time_scale_sec
+        ts_tail = np.asarray([e.ts for e in src_events], dtype=np.float64)
+        dts = (target_event.ts - ts_tail) / self.config.time_scale_sec
+        dts_eff, late_weight = self._time_slack_score(dts)
         # Dynamic α: each candidate parent's frozen source mark (its source
         # device's uncleared state at the parent's fire time).
         src_marks = (
@@ -354,7 +433,7 @@ class StreamMHPAssigner:
             if self.n_dynamic > 0 else None
         )
         alpha = self.feature_scorer.alpha_for_target(
-            target_at, target_ne, src_ats, src_nes, src_marks=src_marks
+            target_event.alarm_type, target_event.ne, src_ats, src_nes, src_marks=src_marks
         )
         # α floor: treat too-weak edges as non-edges (inference analog of
         # device-mode edge_threshold) — guards the soft model against linking
@@ -362,12 +441,104 @@ class StreamMHPAssigner:
         if self._feat_alpha_floor > 0:
             alpha = np.where(alpha >= self._feat_alpha_floor, alpha, 0.0)
         b = self._feat_beta
-        scores = np.where(dts >= 0, alpha * b * np.exp(-b * dts), 0.0)
+        scores = alpha * b * np.exp(-b * dts_eff) * late_weight
         return positions, scores
 
+    def _new_cascade(self) -> Cascade:
+        cid = self._next_cascade_id
+        self._next_cascade_id += 1
+        cascade = Cascade(cascade_id=cid)
+        self.cascades[cid] = cascade
+        return cascade
+
+    def _ensure_cascade(self, event: OnlineEvent) -> Cascade:
+        cascade = self.cascades.get(event.cascade_id)
+        if cascade is not None:
+            cascade.add(event)
+            return cascade
+        cascade = self._new_cascade()
+        cascade.add(event)
+        return cascade
+
+    def _merge_cascades(self, keep_id: int, drop_id: int) -> Cascade:
+        if keep_id == drop_id and keep_id in self.cascades:
+            return self.cascades[keep_id]
+        keep = self.cascades.get(keep_id)
+        drop = self.cascades.get(drop_id)
+        if keep is None and drop is None:
+            return self._new_cascade()
+        if keep is None:
+            return drop
+        if drop is None:
+            return keep
+        for ev in list(drop.events):
+            keep.add(ev)
+        self.cascades.pop(drop_id, None)
+        return keep
+
+    def _assign_parent(self, event: OnlineEvent):
+        """Finalize one modeled event's parent assignment."""
+        if event.finalized:
+            return event
+        # Score candidates + immigrant baseline μ. Feature mode is INDUCTIVE:
+        # μ = softplus(w_μ·ψ) from the type's own features (parameterized).
+        if self.feature_mode:
+            positions, scores = self._candidate_scores_feature(event)
+            if self.mu_scorer is not None:
+                base_mu = self.mu_scorer.mu_for(event.alarm_type, event.ne)
+            else:
+                base_mu = self._mu_by_at.get(event.alarm_type, self._mu_default)
+            mu = base_mu * self.config.immigrant_bias
+        else:
+            positions, scores = self._candidate_scores(event)
+            mu = float(self.params.mu[event.type_id]) * self.config.immigrant_bias
+
+        if scores.size == 0 or scores.max() < mu:
+            # Immigrant/root. If this event already has a cascade because earlier
+            # children picked it as a future parent, keep that component.
+            cascade = self._ensure_cascade(event)
+            event.parent_index = -1
+            event.parent_score = mu
+            self.total_immigrants += 1
+        else:
+            best_local = int(scores.argmax())
+            parent_event = self._buf_events[int(positions[best_local])]
+            parent_cascade = self._ensure_cascade(parent_event)
+            event_cascade = self._ensure_cascade(event)
+            cascade = (
+                self._merge_cascades(parent_cascade.cascade_id, event_cascade.cascade_id)
+                if parent_cascade.cascade_id != event_cascade.cascade_id
+                else parent_cascade
+            )
+            cascade.add(parent_event)
+            cascade.add(event)
+            event.parent_index = parent_event.index
+            event.parent_score = float(scores[best_local])
+        event.finalized = True
+        return event
+
+    def _finalize_ready(self, watermark_ts: float):
+        """Finalize pending events whose slack horizon is fully observed."""
+        while self._pending_head < len(self._pending_events):
+            ev = self._pending_events[self._pending_head]
+            if ev.ts > watermark_ts:
+                break
+            self._assign_parent(ev)
+            self._pending_head += 1
+        if self._pending_head > 4096 and self._pending_head * 2 > len(self._pending_events):
+            self._pending_events = self._pending_events[self._pending_head:]
+            self._pending_head = 0
+
+    def _advance_watermark(self, now_ts: float):
+        watermark = float(now_ts) - self.config.time_slack_sec
+        self._finalize_ready(watermark)
+        self._close_inactive(watermark)
+        self._evict_expired(watermark)
+
     def process(self, alarm_event: dict):
-        """Ingest one alarm event in time order, run inference, update state."""
+        """Ingest one alarm event, delay final assignment until slack has passed."""
         alarm_dict = alarm_event.get("alarm", {}) if isinstance(alarm_event, dict) else {}
+        ts = float(alarm_event.get("ts", 0.0))
         is_clear = is_clear_alarm(alarm_dict)
         # Dynamic α: feed EVERY event (raises AND clears) to the device-state
         # machine in time order, BEFORE the clear/no-type drops. The returned
@@ -383,10 +554,12 @@ class StreamMHPAssigner:
         # Filtering: skip events we can't model
         if is_clear:
             self.dropped_clear += 1
+            self._advance_watermark(ts)
             return None
         atype = alarm_type_label(alarm_event)
         if atype is None:
             self.dropped_no_type += 1
+            self._advance_watermark(ts)
             return None
 
         if self.feature_mode:
@@ -409,66 +582,10 @@ class StreamMHPAssigner:
             resolved = self._resolve_type_id(alarm_event)
             if resolved is None:
                 self.dropped_unknown_type += 1
+                self._advance_watermark(ts)
                 return None
             type_id, type_label = resolved
             ne = ""
-
-        ts = float(alarm_event.get("ts", 0.0))
-        # Close cascades silent past close_inactive_sec. This only governs
-        # OUTPUT timing — its order relative to scoring is irrelevant: when
-        # close_inactive_sec >= history_window_sec a closable cascade has no
-        # in-window candidate parents anyway, so it can never catch a new event
-        # regardless of when we close it (same reason the close-scan throttle is
-        # result-preserving).
-        self._close_inactive(ts)
-        self._evict_expired(ts)
-
-        # Score candidates + immigrant baseline μ. Feature mode is INDUCTIVE:
-        # μ = softplus(w_μ·ψ) from the type's own features (parameterized) —
-        # seen and new devices treated identically, no per-device memorization.
-        # Falls back to the per-alarm-type table if no μ scorer / attrs missing.
-        if self.feature_mode:
-            positions, scores = self._candidate_scores_feature(atype, ne, ts)
-            if self.mu_scorer is not None:
-                base_mu = self.mu_scorer.mu_for(atype, ne)
-            else:
-                base_mu = self._mu_by_at.get(atype, self._mu_default)
-            mu = base_mu * self.config.immigrant_bias
-        else:
-            positions, scores = self._candidate_scores(type_id, ts)
-            mu = float(self.params.mu[type_id]) * self.config.immigrant_bias
-        # argmax over (μ, top_candidate). Use strict `< mu` so a candidate that
-        # ties μ binds to its parent — matching training's compute_hard_parents
-        # (immigrant iff mu > best_score, i.e. candidate wins on a tie).
-        if scores.size == 0 or scores.max() < mu:
-            # Immigrant: start a new cascade
-            cascade_id = self._next_cascade_id
-            self._next_cascade_id += 1
-            cascade = Cascade(cascade_id=cascade_id)
-            self.cascades[cascade_id] = cascade
-            parent_index = -1
-            parent_score = mu
-            self.total_immigrants += 1
-        else:
-            # Bind to most-likely parent's cascade
-            best_local = int(scores.argmax())
-            parent_event = self._buf_events[int(positions[best_local])]
-            cascade_id = parent_event.cascade_id
-            cascade = self.cascades.get(cascade_id)
-            if cascade is None:
-                # Edge case: parent's cascade was already closed. Fall back
-                # to immigrant rather than reviving the closed cascade —
-                # closed-cascade output already emitted.
-                cascade_id = self._next_cascade_id
-                self._next_cascade_id += 1
-                cascade = Cascade(cascade_id=cascade_id)
-                self.cascades[cascade_id] = cascade
-                parent_index = -1
-                parent_score = mu
-                self.total_immigrants += 1
-            else:
-                parent_index = parent_event.index
-                parent_score = float(scores[best_local])
 
         event = OnlineEvent(
             index=self._next_event_index,
@@ -476,19 +593,21 @@ class StreamMHPAssigner:
             type_id=type_id,
             type_label=type_label,
             alarm=alarm_event,
-            parent_index=parent_index,
-            cascade_id=cascade_id,
-            parent_score=parent_score,
+            parent_index=-1,
+            cascade_id=-1,
+            parent_score=0.0,
             alarm_type=atype if self.feature_mode else "",
             ne=ne,
             src_mark=src_mark,
         )
         self._next_event_index += 1
-        cascade.add(event)
+        self._events_by_index[event.index] = event
         self._buf_events.append(event)
         self._buf_ts.append(ts)
         self._buf_type.append(type_id)
+        self._pending_events.append(event)
         self.total_events_processed += 1
+        self._advance_watermark(ts)
         return event
 
     def _close_inactive(self, now_ts: float):
@@ -506,6 +625,8 @@ class StreamMHPAssigner:
         cutoff = now_ts - self.config.close_inactive_sec
         to_close: list[int] = []
         for cid, cascade in self.cascades.items():
+            if any(not e.finalized for e in cascade.events):
+                continue
             if cascade.last_ts < cutoff:
                 to_close.append(cid)
         for cid in to_close:
@@ -514,6 +635,7 @@ class StreamMHPAssigner:
 
     def close_remaining(self):
         """Emit any still-active cascades. Call once at end of stream."""
+        self._finalize_ready(np.inf)
         for cid in list(self.cascades.keys()):
             cascade = self.cascades.pop(cid)
             self._record_closed(cascade)
@@ -536,6 +658,7 @@ class StreamMHPAssigner:
             "closed_cascade_count": self.closed_cascade_count,
             "open_cascade_count": len(self.cascades),
             "recent_window_size": len(self._buf_ts) - self._head,
+            "pending_event_count": len(self._pending_events) - self._pending_head,
             "dropped_clear": self.dropped_clear,
             "dropped_no_type": self.dropped_no_type,
             "dropped_unknown_type": self.dropped_unknown_type,
@@ -688,19 +811,31 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
     feature_mode = getattr(artifact.config, "edge_mode", "device") == "feature"
     if feature_mode:
         floor = args.feature_alpha_floor or None
-        adapter = feature_adapter_from_artifact(artifact, args.ne_graph, alpha_floor=floor)
+        adapter = feature_adapter_from_artifact(
+            artifact,
+            args.ne_graph,
+            alpha_floor=floor,
+            time_slack_sec=stream_config.time_slack_sec,
+            late_penalty_half_life_sec=stream_config.late_penalty_half_life_sec,
+        )
     else:
         if getattr(artifact.params, "kernel_type", "exp") != "exp":
             raise NotImplementedError(
                 "--impute device path supports exp kernel only (piecewise adapter TODO)"
             )
-        adapter = device_adapter_from_artifact(artifact)
+        adapter = device_adapter_from_artifact(
+            artifact,
+            time_slack_sec=stream_config.time_slack_sec,
+            late_penalty_half_life_sec=stream_config.late_penalty_half_life_sec,
+        )
 
     history = float(stream_config.history_window_sec)
     lag = float(args.impute_lag_sec) if args.impute_lag_sec is not None else history
     cfg = SamplerConfig(
         lag_sec=lag,
         history_window_sec=history,
+        time_slack_sec=float(stream_config.time_slack_sec),
+        late_penalty_half_life_sec=float(stream_config.late_penalty_half_life_sec),
         sweeps_per_tick=int(args.impute_sweeps),
         missing_log_prior=float(args.impute_kappa),
         max_depth=int(args.impute_max_depth),
@@ -718,6 +853,8 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False):
         print(
             f"[stream] impute: mode={'feature' if feature_mode else 'device'} "
             f"lag={cfg.lag_sec:.0f}s history={cfg.history_window_sec:.0f}s "
+            f"time_slack={cfg.time_slack_sec:.0f}s "
+            f"late_half_life={cfg.late_penalty_half_life_sec:.0f}s "
             f"sweeps={cfg.sweeps_per_tick} kappa={cfg.missing_log_prior} "
             f"max_depth={cfg.max_depth}",
             flush=True,
@@ -828,6 +965,24 @@ def main():
     parser.add_argument("--start-time", default="")
     parser.add_argument("--end-time", default="")
     parser.add_argument("--clear-delay-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--time-slack-sec",
+        type=float,
+        default=None,
+        help=(
+            "Override timestamp-jitter tolerance for online parent assignment. "
+            "Default: artifact config."
+        ),
+    )
+    parser.add_argument(
+        "--late-penalty-half-life-sec",
+        type=float,
+        default=None,
+        help=(
+            "Override late-parent penalty half-life for online assignment. "
+            "Default: artifact config."
+        ),
+    )
     parser.add_argument(
         "--regions",
         "--region",
@@ -999,10 +1154,14 @@ def main():
         immigrant_bias=args.immigrant_bias,
         max_history_events=args.max_history_events,
         feature_alpha_floor=args.feature_alpha_floor,
+        time_slack_sec=args.time_slack_sec,
+        late_penalty_half_life_sec=args.late_penalty_half_life_sec,
     )
     if not args.quiet:
         print(
             f"[stream] config: history_window={stream_config.history_window_sec:.0f}s "
+            f"time_slack={stream_config.time_slack_sec:.0f}s "
+            f"late_half_life={stream_config.late_penalty_half_life_sec:.0f}s "
             f"max_history={stream_config.max_history_events} "
             f"close_inactive={stream_config.close_inactive_sec:.0f}s "
             f"min_group_events={stream_config.min_group_events} "
@@ -1032,6 +1191,8 @@ def main():
             "regions": sorted(regions) if regions else [],
             "config": {
                 "history_window_sec": stream_config.history_window_sec,
+                "time_slack_sec": stream_config.time_slack_sec,
+                "late_penalty_half_life_sec": stream_config.late_penalty_half_life_sec,
                 "min_group_events": stream_config.min_group_events,
                 "time_scale_sec": stream_config.time_scale_sec,
                 "impute_lag_sec": float(args.impute_lag_sec) if args.impute_lag_sec is not None else stream_config.history_window_sec,
@@ -1072,12 +1233,14 @@ def main():
             )
             print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
         return
-    if stream_config.close_inactive_sec < stream_config.history_window_sec:
+    min_close = stream_config.history_window_sec + stream_config.time_slack_sec
+    if stream_config.close_inactive_sec < min_close:
         print(
             f"[stream] WARN: close_inactive_sec ({stream_config.close_inactive_sec:.0f}s) < "
-            f"history_window_sec ({stream_config.history_window_sec:.0f}s). A cascade can be "
+            f"history_window_sec + time_slack_sec ({min_close:.0f}s). A cascade can be "
             f"closed while its events are still candidate parents, turning would-be children "
-            f"into 'orphan' immigrants. Set close_inactive_sec >= history_window_sec to avoid this.",
+            f"into 'orphan' immigrants. Set close_inactive_sec >= history_window_sec + "
+            f"time_slack_sec to avoid this.",
             flush=True,
         )
 
@@ -1202,6 +1365,8 @@ def main():
         "regions": sorted(regions) if regions else [],
         "config": {
             "history_window_sec": stream_config.history_window_sec,
+            "time_slack_sec": stream_config.time_slack_sec,
+            "late_penalty_half_life_sec": stream_config.late_penalty_half_life_sec,
             "max_history_events": stream_config.max_history_events,
             "close_inactive_sec": stream_config.close_inactive_sec,
             "min_group_events": stream_config.min_group_events,

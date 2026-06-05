@@ -55,6 +55,13 @@ class MHPConfig:
     """EM hyperparameters."""
 
     history_window: float = 10.0
+    # Optional timestamp-jitter tolerance in model-time units. When > 0, a
+    # candidate parent may occur up to this far after the target event. The
+    # signed dt is still treated as timestamp disorder, not reverse causality:
+    # scoring uses max(dt, 0) and discounts late parents by an exponential
+    # penalty.
+    time_slack: float = 0.0
+    late_penalty_half_life: float = 1.0
     max_history_events: int = 128
     max_iters: int = 50
     tol: float = 1e-4
@@ -95,6 +102,46 @@ class MHPConfig:
     verbose: bool = True
 
 
+def _late_penalty_lambda(config: MHPConfig) -> float:
+    half_life = float(getattr(config, "late_penalty_half_life", 1.0))
+    if half_life <= 0:
+        raise ValueError("late_penalty_half_life must be > 0")
+    return float(np.log(2.0) / half_life)
+
+
+def _negative_penalty_integral(config: MHPConfig) -> float:
+    """∫_0^slack exp(-λs) ds in model-time units."""
+    slack = float(getattr(config, "time_slack", 0.0))
+    if slack <= 0:
+        return 0.0
+    lam = _late_penalty_lambda(config)
+    return float((1.0 - np.exp(-lam * slack)) / lam)
+
+
+def _apply_time_slack(pair_dt: np.ndarray, config: MHPConfig):
+    """Return (effective_dt, late_weight) for signed candidate dt values.
+
+    Positive dt is unchanged. Negative dt (parent timestamp slightly after child)
+    is clamped to 0 and exponentially discounted, modeling timestamp jitter
+    rather than reverse-time triggering.
+    """
+    dt = np.asarray(pair_dt)
+    slack = float(getattr(config, "time_slack", 0.0))
+    if dt.size == 0:
+        return dt, np.ones(dt.shape, dtype=np.float32)
+    dt_eff = np.maximum(dt, 0.0).astype(dt.dtype, copy=False)
+    late = np.maximum(-dt.astype(np.float64), 0.0)
+    if slack <= 0:
+        weight = (late <= 0).astype(np.float32)
+    else:
+        weight = np.where(
+            late <= slack,
+            np.exp(-_late_penalty_lambda(config) * late),
+            0.0,
+        ).astype(np.float32)
+    return dt_eff, weight
+
+
 @dataclass
 class MHPResult:
     params: MHPParams
@@ -125,6 +172,7 @@ def _build_chunk_pair_arrays(
     chunk_end: int,
     history_window: float,
     max_history_events: int,
+    time_slack: float = 0.0,
 ):
     """Build pair arrays for a chunk of events.
 
@@ -137,10 +185,59 @@ def _build_chunk_pair_arrays(
     pair_target_local : (P,) int64  # pair_target - chunk_start
     counts_per_event : (chunk_size,) int64
 
-    All arrays are fully vectorized — no Python per-event loop.
+    When time_slack == 0, all arrays are fully vectorized and only earlier
+    events are candidates. When time_slack > 0, signed dt candidates are drawn
+    from [target_time - history_window, target_time + time_slack], excluding the
+    target event itself and keeping the nearest max_history_events by timestamp
+    distance.
     """
+    time_slack = max(float(time_slack), 0.0)
     chunk_size = chunk_end - chunk_start
     target_event_ids = np.arange(chunk_start, chunk_end, dtype=np.int64)
+    if time_slack > 0:
+        pair_targets = []
+        pair_sources = []
+        counts = np.zeros(chunk_size, dtype=np.int64)
+        max_hist = max(int(max_history_events), 1)
+        for local_idx, target_id in enumerate(target_event_ids):
+            tt = times[target_id]
+            lo = int(np.searchsorted(times, tt - history_window, side="left"))
+            hi = int(np.searchsorted(times, tt + time_slack, side="right"))
+            if hi <= lo:
+                continue
+            cand = np.arange(lo, hi, dtype=np.int64)
+            cand = cand[cand != target_id]
+            if cand.size == 0:
+                continue
+            if cand.size > max_hist:
+                dist = np.abs(times[cand] - tt)
+                keep = np.argpartition(dist, max_hist - 1)[:max_hist]
+                cand = cand[keep]
+                order = np.lexsort((cand, np.abs(times[cand] - tt)))
+                cand = cand[order]
+            counts[local_idx] = cand.size
+            pair_targets.append(np.full(cand.size, target_id, dtype=np.int64))
+            pair_sources.append(cand)
+        P = int(counts.sum())
+        if P == 0:
+            empty_i64 = np.empty(0, dtype=np.int64)
+            empty_f32 = np.empty(0, dtype=np.float32)
+            return empty_i64, empty_i64, empty_f32, empty_i64, empty_i64, empty_i64, counts
+        pair_target = np.concatenate(pair_targets)
+        pair_source = np.concatenate(pair_sources)
+        pair_dt = (times[pair_target] - times[pair_source]).astype(np.float32)
+        pair_target_dim = dims[pair_target]
+        pair_source_dim = dims[pair_source]
+        pair_target_local = pair_target - chunk_start
+        return (
+            pair_target,
+            pair_source,
+            pair_dt,
+            pair_target_dim,
+            pair_source_dim,
+            pair_target_local,
+            counts,
+        )
     # Window lower bound for each event in chunk
     window_starts = np.searchsorted(times, times[target_event_ids] - history_window, side="left")
     lower = np.maximum(window_starts, target_event_ids - max_history_events)
@@ -207,13 +304,15 @@ def _accumulate_initial_pair_stats(
             chunk_end,
             config.history_window,
             max(int(config.max_history_events), 1),
+            getattr(config, "time_slack", 0.0),
         )
         if pair_dt.size == 0:
             continue
         flat_uv = pair_target_dim.astype(np.int64) * M + pair_source_dim.astype(np.int64)
-        np.add.at(n_pair.ravel(), flat_uv, 1.0)
+        pair_dt_eff, late_weight = _apply_time_slack(pair_dt, config)
+        np.add.at(n_pair.ravel(), flat_uv, late_weight.astype(np.float64))
         if sum_dt is not None:
-            np.add.at(sum_dt.ravel(), flat_uv, pair_dt.astype(np.float64))
+            np.add.at(sum_dt.ravel(), flat_uv, pair_dt_eff.astype(np.float64) * late_weight.astype(np.float64))
     return n_pair, sum_dt
 
 
@@ -264,7 +363,6 @@ def _compute_initial_alpha_beta(
     K = config.alpha_prior_strength
     m = config.alpha_prior_mean
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
-    denom = n_source[np.newaxis, :] + K
     if config.beta_mode == "per_edge":
         # β must be computed from n_pair BEFORE n_pair is mutated below.
         K_b = config.beta_prior_strength
@@ -273,6 +371,9 @@ def _compute_initial_alpha_beta(
         np.clip(beta, config.beta_min, config.beta_max, out=beta)
     else:
         beta = np.float32(config.beta_shared_value)  # 0-d scalar, not (M, M)
+    neg_int = _negative_penalty_integral(config)
+    exposure_factor = 1.0 + (beta.astype(np.float64) if np.ndim(beta) else float(beta)) * neg_int
+    denom = n_source[np.newaxis, :] * exposure_factor + K
     # In-place: alpha = (n_pair + K*m [+ topology prior]) / denom.
     n_pair += K * m
     _add_topology_prior(n_pair, config, topo_prior_flat, topo_prior_score)
@@ -379,6 +480,7 @@ def _run_estep_iteration(
             chunk_end,
             history_window,
             max_history_events,
+            getattr(config, "time_slack", 0.0),
         )
 
         if pair_dt.size == 0:
@@ -396,8 +498,9 @@ def _run_estep_iteration(
         # β is a 0-d scalar in shared mode (saves a dense (M,M) array) or a
         # dense matrix in per_edge mode. Both broadcast in the score formula.
         beta_pair = beta if np.ndim(beta) == 0 else beta[pair_target_dim, pair_source_dim]
-        # Score: α · β · exp(-β · Δt)
-        score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt)
+        pair_dt_eff, late_weight = _apply_time_slack(pair_dt, config)
+        # Score: α · β · exp(-β · max(Δt,0)) · late_penalty(max(-Δt,0))
+        score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt_eff) * late_weight
         # rate_per_event = μ_{u_i} + Σ_j score(i, j)
         sum_score = _segment_sum(score_pair.astype(np.float64), pair_target_local, chunk_size_local)
         rate = np.maximum(mu_chunk + sum_score, _EPS)
@@ -413,7 +516,7 @@ def _run_estep_iteration(
             np.add.at(
                 beta_num_dt.ravel(),
                 flat_uv,
-                p_ij.astype(np.float64) * pair_dt.astype(np.float64),
+                p_ij.astype(np.float64) * pair_dt_eff.astype(np.float64),
             )
         mu_num_chunk = _segment_sum(p_self_chunk, target_dims_chunk, M)
         mu_num += mu_num_chunk
@@ -426,17 +529,38 @@ def _log_likelihood_global(
     rate_term: float,
     mu: np.ndarray,
     alpha: np.ndarray,
+    beta: np.ndarray,
     horizon: float,
+    config: MHPConfig,
+    n_source: Optional[np.ndarray] = None,
 ) -> float:
     """LL ≈ Σ_i log rate_i − T · Σ_d μ_d − Σ_{u,v} α[u,v]·G_int.
 
-    The third term approximates the kernel integral assuming each parent
-    contributes its full unit mass (β·exp integrates to 1 over [0, ∞)). Since
-    Σ α[u,v]·n_v under windowing is hard to bound tightly, we use the proxy
-    Σ α — sufficient for relative LL comparison across iterations / models.
+    The third term uses the same source exposure as the α M-step:
+    each source-type event contributes one positive-time kernel mass plus the
+    optional negative-jitter mass β·∫late_penalty.
     """
     term2 = horizon * float(mu.sum())
-    term3 = float(alpha.sum())
+    neg_int = _negative_penalty_integral(config)
+    if neg_int <= 0:
+        return rate_term - term2 - float(alpha.sum())
+    if n_source is None:
+        # Backwards-compatible fallback; callers in this module pass n_source.
+        n_source = np.ones(alpha.shape[1], dtype=np.float64)
+    else:
+        n_source = np.asarray(n_source, dtype=np.float64)
+    if np.ndim(beta) == 0:
+        exposure = n_source * (1.0 + float(beta) * neg_int)
+        term3 = float(np.dot(alpha.sum(axis=0, dtype=np.float64), exposure))
+    else:
+        # Avoid materializing another full MxM float64 exposure matrix.
+        beta_arr = np.asarray(beta)
+        term3 = 0.0
+        row_chunk = 1024
+        for start in range(0, alpha.shape[0], row_chunk):
+            end = min(start + row_chunk, alpha.shape[0])
+            factor = 1.0 + beta_arr[start:end].astype(np.float64) * neg_int
+            term3 += float((alpha[start:end].astype(np.float64) * factor * n_source[np.newaxis, :]).sum())
     return rate_term - term2 - term3
 
 
@@ -461,6 +585,11 @@ def fit_mhp(
     M = events.M
     N = events.n
     horizon = events.T
+    if getattr(config, "time_slack", 0.0) > 0 and config.beta_mode == "per_edge":
+        raise NotImplementedError(
+            "time_slack > 0 currently supports beta_mode='shared' only; "
+            "per_edge beta needs a coupled beta/exposure M-step"
+        )
 
     t_total_start = time.monotonic()
     if config.verbose:
@@ -534,8 +663,6 @@ def fit_mhp(
         n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
         K = config.alpha_prior_strength
         m = config.alpha_prior_mean
-        denom = n_source[np.newaxis, :] + K
-
         if config.beta_mode == "per_edge":
             # β must be read from alpha_num BEFORE the in-place α mutation below.
             K_b = config.beta_prior_strength
@@ -546,6 +673,11 @@ def fit_mhp(
             np.clip(beta_new, config.beta_min, config.beta_max, out=beta_new)
         else:
             beta_new = beta  # scalar
+        neg_int = _negative_penalty_integral(config)
+        exposure_factor = 1.0 + (
+            beta_new.astype(np.float64) if np.ndim(beta_new) else float(beta_new)
+        ) * neg_int
+        denom = n_source[np.newaxis, :] * exposure_factor + K
 
         # In-place: alpha_new = (alpha_num + K*m [+ topology prior]) / denom,
         # reusing the f64 accumulator buffer to avoid a transient (M,M) copy
@@ -560,7 +692,7 @@ def fit_mhp(
         n_rescaled = _apply_branching_cap(alpha_new, config.branching_cap)
         _apply_top_k_per_target(alpha_new, config.max_active_sources_per_dim, config.edge_threshold)
 
-        ll = _log_likelihood_global(ll_term1, mu_new, alpha_new, horizon)
+        ll = _log_likelihood_global(ll_term1, mu_new, alpha_new, beta_new, horizon, config, n_source)
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
         beta_is_scalar = np.ndim(beta_new) == 0
@@ -714,7 +846,7 @@ def fit_mhp(
     )
 
 
-def _make_pair_scorer(params: MHPParams):
+def _make_pair_scorer(params: MHPParams, config: Optional[MHPConfig] = None):
     """Return a vectorized score_fn(pair_target_dim, pair_source_dim, pair_dt)
     that dispatches on params.kernel_type.
 
@@ -754,8 +886,13 @@ def _make_pair_scorer(params: MHPParams):
             out = np.zeros(pair_dt.shape, dtype=np.float64)
             ei, valid = _lookup(pair_tdim, pair_sdim)
             if valid.any():
-                pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
-                out[valid] = theta[ei[valid], pb]
+                if config is not None:
+                    dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
+                else:
+                    dt_eff = pair_dt[valid]
+                    late_weight = 1.0
+                pb = bucket_index_vec(dt_eff.astype(np.float64), bucket_edges)
+                out[valid] = theta[ei[valid], pb] * late_weight
             return out
 
         return score_fn
@@ -772,8 +909,12 @@ def _make_pair_scorer(params: MHPParams):
         if valid.any():
             a = edge_alpha[ei[valid]]                       # f32
             b = edge_beta[ei[valid]]                        # f32
-            dt = pair_dt[valid]                             # f32 (as passed)
-            out[valid] = a * b * np.exp(-b * dt)            # f32 compute, widened on assign
+            if config is not None:
+                dt, late_weight = _apply_time_slack(pair_dt[valid], config)
+            else:
+                dt = pair_dt[valid]
+                late_weight = 1.0
+            out[valid] = a * b * np.exp(-b * dt) * late_weight
         return out
 
     return score_fn
@@ -809,6 +950,11 @@ def fit_mhp_piecewise(
     if B == 0:
         raise ValueError("piecewise kernel requires non-empty bucket_edges")
     widths = bucket_widths(bucket_edges)                      # (B,)
+    fit_widths = widths.copy()
+    if config.time_slack > 0:
+        # Negative jitter maps to the dt=0 bucket, discounted by the late-parent
+        # penalty; its integrated exposure is added to bucket 0's width.
+        fit_widths[0] += _negative_penalty_integral(config)
     E = len(edge_targets)
     edge_targets = np.asarray(edge_targets, dtype=np.int64)
     edge_sources = np.asarray(edge_sources, dtype=np.int64)
@@ -855,16 +1001,18 @@ def fit_mhp_piecewise(
         (_, _, pair_dt, pair_tdim, pair_sdim, _, _) = _build_chunk_pair_arrays(
             events.times, events.dims, chunk_start, chunk_end,
             config.history_window, max(int(config.max_history_events), 1),
+            getattr(config, "time_slack", 0.0),
         )
         if pair_dt.size == 0:
             continue
         pe, valid = _edge_lookup(pair_tdim, pair_sdim)
         if not valid.any():
             continue
-        pb = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
+        pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
+        pb = bucket_index_vec(pair_dt_eff.astype(np.float64), bucket_edges)
         flat = pe[valid].astype(np.int64) * B + pb
-        np.add.at(resp_init.ravel(), flat, 1.0)
-    theta = (resp_init + K * m) / (n_v_per_edge[:, None] * widths[None, :] + K)
+        np.add.at(resp_init.ravel(), flat, late_weight.astype(np.float64))
+    theta = (resp_init + K * m) / (n_v_per_edge[:, None] * fit_widths[None, :] + K)
     mu = np.asarray(init_mu, dtype=np.float64).reshape(-1).copy()
 
     trace: list[dict] = []
@@ -890,6 +1038,7 @@ def fit_mhp_piecewise(
             (_, _, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
                 events.times, events.dims, chunk_start, chunk_end,
                 config.history_window, max(int(config.max_history_events), 1),
+                getattr(config, "time_slack", 0.0),
             )
             if pair_dt.size == 0:
                 rate = np.maximum(mu_chunk, _EPS)
@@ -901,9 +1050,10 @@ def fit_mhp_piecewise(
             pb = np.zeros(pair_dt.shape, dtype=np.int64)
             score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
             if valid.any():
-                pb_valid = bucket_index_vec(pair_dt[valid].astype(np.float64), bucket_edges)
+                pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
+                pb_valid = bucket_index_vec(pair_dt_eff.astype(np.float64), bucket_edges)
                 pb[valid] = pb_valid
-                score_pair[valid] = theta[pe[valid], pb_valid]
+                score_pair[valid] = theta[pe[valid], pb_valid] * late_weight
             sum_score = _segment_sum(score_pair, pair_tlocal, csize)
             rate = np.maximum(mu_chunk + sum_score, _EPS)
             p_self_chunk = mu_chunk / rate
@@ -917,7 +1067,7 @@ def fit_mhp_piecewise(
 
         # M-step
         mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
-        theta_new = (resp + K * m) / (n_v_per_edge[:, None] * widths[None, :] + K)
+        theta_new = (resp + K * m) / (n_v_per_edge[:, None] * fit_widths[None, :] + K)
 
         # Branching cap on Σ_k θ·w, grouped per source type.
         if config.branching_cap > 0:
@@ -934,7 +1084,12 @@ def fit_mhp_piecewise(
             n_rescaled = 0
 
         branching_per_edge = (theta_new * widths[None, :]).sum(axis=1)
-        ll = ll_term1 - horizon * float(mu_new.sum()) - float(branching_per_edge.sum())
+        compensator_per_edge = (theta_new * fit_widths[None, :]).sum(axis=1)
+        if config.time_slack > 0:
+            term3 = float((n_v_per_edge * compensator_per_edge).sum())
+        else:
+            term3 = float(branching_per_edge.sum())
+        ll = ll_term1 - horizon * float(mu_new.sum()) - term3
         delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
 
         if ll > best_ll:
@@ -1051,6 +1206,10 @@ def fit_mhp_feature(
     M = events.M
     N = events.n
     horizon = events.T
+    if getattr(config, "time_slack", 0.0) > 0 and config.beta_mode != "shared":
+        raise NotImplementedError(
+            "feature time_slack > 0 currently supports beta_mode='shared' only"
+        )
     beta_scalar = np.float32(config.beta_shared_value)
 
     cand_targets = np.asarray(cand_targets, dtype=np.int64)
@@ -1069,6 +1228,8 @@ def fit_mhp_feature(
 
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
     exposure = n_source[cand_sources]                      # E_c
+    if config.time_slack > 0:
+        exposure = exposure * (1.0 + float(beta_scalar) * _negative_penalty_integral(config))
 
     # Topology PRIOR as pseudo-observations (mirrors device-mode
     # topology_prior_boost). For a topology-related candidate c we inject a
@@ -1120,11 +1281,16 @@ def fit_mhp_feature(
         n_src_by_combo = np.zeros((M, K_combo), dtype=np.float64)
         np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
         exposure_2d = n_src_by_combo[cand_sources]                # (C, K) E_{c,k}
+        if config.time_slack > 0:
+            exposure_2d = exposure_2d * (
+                1.0 + float(beta_scalar) * _negative_penalty_integral(config)
+            )
+        exposure_2d_fit = exposure_2d
         # Topology pseudo-count prior: attach to the baseline combo (k=0, no
         # active alarms) — it is a prior on edge existence, state-independent.
         if topo_prior_boost > 0.0 and cand_topo_score is not None:
-            exposure_2d = exposure_2d.copy()
-            exposure_2d[:, 0] += prior_exp
+            exposure_2d_fit = exposure_2d.copy()
+            exposure_2d_fit[:, 0] += prior_exp
         w = np.concatenate([w, np.zeros(D_dyn)])                  # static ⊕ dynamic
 
     # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
@@ -1199,6 +1365,7 @@ def fit_mhp_feature(
             (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
                 events.times, events.dims, chunk_start, chunk_end,
                 history_window, max_history_events,
+                getattr(config, "time_slack", 0.0),
             )
             if pair_dt.size == 0:
                 rate = np.maximum(mu_chunk, _EPS)
@@ -1206,22 +1373,24 @@ def fit_mhp_feature(
                 mu_num += _segment_sum(np.ones(csize), tdims_chunk, M)
                 ll_term1 += float(np.log(rate).sum())
                 continue
-            # Map each pair to its candidate index (binary search), gate dt>=0.
+            # Map each pair to its candidate index (binary search). Negative dt
+            # candidates are possible only within time_slack and are discounted.
             pk = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
             idx = np.minimum(np.searchsorted(cand_keys, pk), C - 1)
-            valid = (cand_keys[idx] == pk) & (pair_dt >= 0)
+            valid = cand_keys[idx] == pk
             score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
             combo_v = None
             if valid.any():
                 vi = idx[valid]
                 b = float(beta_scalar)
+                pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
                 if use_dynamic:
                     # Per-pair α uses the SOURCE event's mark combo at fire time.
                     combo_v = src_combo[pair_source[valid]]
                     a_pair = softplus(z_static_c[vi] + z_dyn_k[combo_v])
-                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt[valid])
+                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
                 else:
-                    score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt[valid])
+                    score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt_eff) * late_weight
             sum_score = _segment_sum(score_pair, pair_tlocal, csize)
             rate = np.maximum(mu_chunk + sum_score, _EPS)
             p_self_chunk = mu_chunk / rate
@@ -1248,7 +1417,7 @@ def fit_mhp_feature(
                 n2d = n_resp2d.copy()
                 n2d[:, 0] += prior_num
             w_new = fit_dynamic_weights_mstep(
-                cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
+                cand_phi, dynamic_combo_bits, n2d, exposure_2d_fit, w,
                 l2=l2, w_prior_mean=w_prior_mean, max_iter=50,
             )
             # Baseline α (combo 0) for diagnostics / materialization.
@@ -1409,7 +1578,7 @@ def compute_hard_parents(
     history_window = cfg.history_window
     max_history_events = max(int(cfg.max_history_events), 1)
     chunk_size = max(int(cfg.chunk_size), 1)
-    score_fn = _make_pair_scorer(params)
+    score_fn = _make_pair_scorer(params, cfg)
     parent = np.arange(N, dtype=np.int64)  # default: each event is its own parent
 
     for chunk_start in range(0, N, chunk_size):
@@ -1432,6 +1601,7 @@ def compute_hard_parents(
             chunk_end,
             history_window,
             max_history_events,
+            getattr(cfg, "time_slack", 0.0),
         )
         if pair_dt.size == 0:
             # All events in chunk are immigrants (no candidates in window)
@@ -1476,7 +1646,15 @@ def compute_cascade_of(parent: np.ndarray) -> np.ndarray:
         # Walk up parents until we find a known cascade or a root
         path = []
         cur = i
+        seen = {}
         while cascade[cur] == -1:
+            if cur in seen:
+                # A small time-slack window can produce parent cycles (e.g. two
+                # near-simultaneous events choose each other). Treat the whole
+                # cycle as one root component instead of assuming every chain
+                # reaches a self-parent.
+                break
+            seen[cur] = len(path)
             path.append(cur)
             if parent[cur] == cur:
                 break
@@ -1511,7 +1689,7 @@ def log_likelihood(
     history_window = cfg.history_window
     max_history_events = max(int(cfg.max_history_events), 1)
     chunk_size = max(int(cfg.chunk_size), 1)
-    score_fn = _make_pair_scorer(params)
+    score_fn = _make_pair_scorer(params, cfg)
 
     rate_term = 0.0
     for chunk_start in range(0, N, chunk_size):
@@ -1534,6 +1712,7 @@ def log_likelihood(
             chunk_end,
             history_window,
             max_history_events,
+            getattr(cfg, "time_slack", 0.0),
         )
         if pair_dt.size == 0:
             rate = np.maximum(mu_chunk, _EPS)
@@ -1545,7 +1724,23 @@ def log_likelihood(
         rate_term += float(np.log(rate).sum())
 
     # term3: integral proxy = total branching mass (Σ edge_alpha, which for
-    # piecewise is Σ branching ratio per edge).
+    # piecewise is Σ positive-time branching ratio per edge). With time_slack,
+    # add the matching negative-jitter exposure so held-out LL uses the same
+    # scoring surface as training.
     term2 = events.T * float(params.mu.sum())
-    term3 = float(params.edge_alpha.sum()) if len(params.edge_alpha) else 0.0
+    n_source = np.bincount(dims, minlength=params.M).astype(np.float64)
+    if not len(params.edge_alpha):
+        term3 = 0.0
+    elif getattr(cfg, "time_slack", 0.0) > 0 and params.kernel_type == "piecewise":
+        neg_int = _negative_penalty_integral(cfg)
+        per_edge = params.edge_alpha.astype(np.float64)
+        if params.edge_theta is not None and params.edge_theta.shape[1] > 0:
+            per_edge = per_edge + params.edge_theta[:, 0].astype(np.float64) * neg_int
+        term3 = float((n_source[params.edge_sources] * per_edge).sum())
+    elif getattr(cfg, "time_slack", 0.0) > 0:
+        neg_int = _negative_penalty_integral(cfg)
+        factor = 1.0 + np.asarray(params.edge_beta, dtype=np.float64) * neg_int
+        term3 = float((n_source[params.edge_sources] * params.edge_alpha * factor).sum())
+    else:
+        term3 = float(params.edge_alpha.sum())
     return rate_term - term2 - term3

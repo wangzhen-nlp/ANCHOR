@@ -337,7 +337,7 @@ def _build_type_attributes(vocabs, type_fields, graph_context):
     }
 
 
-def _collect_cooccurred_pairs(events: EventCollection, window, max_hist, chunk_size):
+def _collect_cooccurred_pairs(events: EventCollection, window, max_hist, chunk_size, time_slack=0.0):
     """Distinct (target_type, source_type) flat keys that co-occur in a window."""
     M = events.M
     keys = set()
@@ -345,7 +345,7 @@ def _collect_cooccurred_pairs(events: EventCollection, window, max_hist, chunk_s
     for cs in range(0, N, chunk_size):
         ce = min(cs + chunk_size, N)
         _, _, pair_dt, ptd, psd, _, _ = _build_chunk_pair_arrays(
-            events.times, events.dims, cs, ce, window, max_hist
+            events.times, events.dims, cs, ce, window, max_hist, time_slack
         )
         if pair_dt.size == 0:
             continue
@@ -364,6 +364,7 @@ def build_candidate_features(
     history_window,
     max_history_events,
     chunk_size,
+    time_slack=0.0,
     topo_max_hops=2,
     topo_min_score=0.0,
 ):
@@ -382,7 +383,9 @@ def build_candidate_features(
     n_at = max(len(attrs["at_vocab"]), 1)
 
     # --- candidate pair set ---
-    cooccur = _collect_cooccurred_pairs(events, history_window, max_history_events, chunk_size)
+    cooccur = _collect_cooccurred_pairs(
+        events, history_window, max_history_events, chunk_size, time_slack
+    )
     cand_keys = set(cooccur)
 
     # topology pairs: group active types by NE, cross same-NE + reachable NEs

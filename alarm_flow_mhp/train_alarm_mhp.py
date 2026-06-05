@@ -107,6 +107,8 @@ def _build_config(args):
     return AlarmMHPConfig(
         type_fields=parse_type_fields(args.type_fields),
         history_window_sec=args.history_window_sec,
+        time_slack_sec=args.time_slack_sec,
+        late_penalty_half_life_sec=args.late_penalty_half_life_sec,
         max_history_events=args.max_history_events,
         min_events=args.min_events,
         time_scale_sec=args.time_scale_sec,
@@ -177,6 +179,25 @@ def main():
         help="Comma-separated alarm fields defining the type.",
     )
     parser.add_argument("--history-window-sec", type=float, default=900.0)
+    parser.add_argument(
+        "--time-slack-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Training timestamp-jitter tolerance. Candidate parents may be up to "
+            "this many seconds later than the target, with a late-parent penalty. "
+            "0 keeps the original strictly-past parent set. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--late-penalty-half-life-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Half-life for discounting parents whose timestamp is later than the "
+            "target within --time-slack-sec. Smaller = harsher penalty. Default: 1."
+        ),
+    )
     parser.add_argument("--max-history-events", type=int, default=128)
     parser.add_argument("--min-events", type=int, default=2)
     parser.add_argument("--time-scale-sec", type=float, default=60.0)

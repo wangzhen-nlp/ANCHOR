@@ -72,6 +72,12 @@ class AlarmMHPConfig:
 
     type_fields: tuple = ("alarm_source", "alarm_type")
     history_window_sec: float = 900.0
+    # Timestamp jitter tolerance used by training and inherited by stream
+    # inference. A candidate parent can be up to this many seconds later than
+    # the target; negative dt is clamped to the kernel peak and discounted by
+    # late_penalty_half_life_sec.
+    time_slack_sec: float = 0.0
+    late_penalty_half_life_sec: float = 1.0
     max_history_events: int = 128
     min_events: int = 2
     time_scale_sec: float = 60.0
@@ -133,6 +139,15 @@ class AlarmMHPConfig:
     def __post_init__(self):
         object.__setattr__(self, "regions", parse_regions(self.regions))
         sequence_config = self.sequence_config()
+        if self.time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if self.late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
+        if self.time_slack_sec > 0 and self.beta_mode == "per_edge":
+            raise ValueError(
+                "time_slack_sec > 0 currently requires beta_mode='shared'; "
+                "per_edge beta needs a coupled beta/exposure M-step"
+            )
         if self.max_iters < 1:
             raise ValueError("max_iters must be >= 1")
         if self.tol < 0:
@@ -224,6 +239,8 @@ class AlarmMHPConfig:
         """
         return MHPConfig(
             history_window=self.history_window_sec / self.time_scale_sec,
+            time_slack=self.time_slack_sec / self.time_scale_sec,
+            late_penalty_half_life=self.late_penalty_half_life_sec / self.time_scale_sec,
             max_history_events=self.max_history_events,
             max_iters=self.max_iters,
             tol=self.tol,
@@ -652,6 +669,7 @@ def train_alarm_mhp(
             history_window=mhp_config.history_window,
             max_history_events=mhp_config.max_history_events,
             chunk_size=mhp_config.chunk_size,
+            time_slack=mhp_config.time_slack,
             topo_max_hops=config.feature_topo_max_hops,
             topo_min_score=config.feature_topo_min_score,
         )
@@ -795,6 +813,8 @@ def train_alarm_mhp(
         "converged": result.converged,
         "event_type_counts": _event_type_counts(sequence),
         "type_labels": list(vocabs.type_vocab.labels),
+        "time_slack_sec": float(config.time_slack_sec),
+        "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
         "cascade_size_stats_soft": cascade_stats_soft,
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,
