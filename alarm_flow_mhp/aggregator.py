@@ -56,9 +56,11 @@ EDGE_MODES = frozenset({"device", "feature"})
 #   off           — static features only (current behavior)
 #   source        — +3 booleans: source device's uncleared state at t_j
 #                   (exact in both occurrence and compensator terms)
-#   source_target is intentionally not accepted until its compensator penalty is
-#   implemented end-to-end.
-DYNAMIC_ALPHA_MODES = frozenset({"off", "source"})
+#   source_target — +6 booleans: source state plus target device pre-state.
+#                   Training uses the B-fast approximation: E-step reads the
+#                   target event's pre-state (time-slack safe); compensator
+#                   buckets target state sampled at source_ts.
+DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "source_target"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -485,6 +487,77 @@ def _events_to_collection(view, M: int) -> EventCollection:
     return EventCollection(times=times, dims=dims, M=M, T=T)
 
 
+def _state_combo(state) -> int:
+    vals = tuple(int(x) for x in state)
+    vals = (vals + (0, 0, 0))[:3]
+    return int(vals[0] + 2 * vals[1] + 4 * vals[2])
+
+
+def _source_target_combo_bits(base_bits: np.ndarray) -> np.ndarray:
+    base_bits = np.asarray(base_bits, dtype=np.float64)
+    return np.concatenate(
+        [
+            np.repeat(base_bits, base_bits.shape[0], axis=0),
+            np.tile(base_bits, (base_bits.shape[0], 1)),
+        ],
+        axis=1,
+    )
+
+
+def _build_source_target_dynamic_exposure(
+    train_events: EventCollection,
+    cand_targets: np.ndarray,
+    cand_sources: np.ndarray,
+    *,
+    type_ne: np.ndarray,
+    train_event_ne: list[str],
+    train_abs_times: list[float],
+    train_src_combo: np.ndarray,
+    train_pre_combo: np.ndarray,
+    state_timeline,
+) -> np.ndarray:
+    """B-fast source_target exposure buckets.
+
+    For each source event and candidate target type, sample the target device
+    state at source_ts (or the source event's pre-state for same-NE pairs to
+    avoid counting the source raise itself), then bucket exposure by
+    source_combo*8 + target_combo. Kernel/time-slack scale is applied in EM.
+    """
+    cand_targets = np.asarray(cand_targets, dtype=np.int64)
+    cand_sources = np.asarray(cand_sources, dtype=np.int64)
+    exposure = np.zeros((len(cand_targets), 64), dtype=np.float64)
+    # Group candidate rows by source type and target NE. A source event often
+    # fans out to several target alarm types on the same NE; query that NE's
+    # state once, then update all matching candidate rows in one numpy slice.
+    by_source_ne: dict[int, dict[str, np.ndarray]] = defaultdict(dict)
+    tmp: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for ci, (tgt_tid, src_tid) in enumerate(zip(cand_targets, cand_sources)):
+        tmp[int(src_tid)][str(type_ne[int(tgt_tid)] or "")].append(ci)
+    for src_tid, by_ne in tmp.items():
+        by_source_ne[src_tid] = {
+            ne: np.asarray(rows, dtype=np.int64)
+            for ne, rows in by_ne.items()
+        }
+
+    dims = np.asarray(train_events.dims, dtype=np.int64)
+    for ei, src_tid in enumerate(dims):
+        by_ne = by_source_ne.get(int(src_tid))
+        if not by_ne:
+            continue
+        src_ne = str(train_event_ne[ei] or "")
+        src_k = int(train_src_combo[ei])
+        ts = float(train_abs_times[ei])
+        for tgt_ne, rows in by_ne.items():
+            if tgt_ne and tgt_ne == src_ne:
+                tgt_k = int(train_pre_combo[ei])
+            else:
+                # Use the state just before source_ts to avoid same-timestamp
+                # raises leaking into the B-fast compensator sample.
+                tgt_k = _state_combo(state_timeline.state_at(tgt_ne, np.nextafter(ts, -np.inf)))
+            exposure[rows, src_k * 8 + int(tgt_k)] += 1.0
+    return exposure
+
+
 def _emit_progress(progress_callback, progress_stage, **payload):
     if progress_callback is not None:
         progress_callback(progress_stage, payload)
@@ -534,22 +607,28 @@ def train_alarm_mhp(
     train_events = _events_to_collection(train_view, M)
     val_events = _events_to_collection(val_view, M) if val_view is not None else None
 
-    # Dynamic (stateful) α: per-modeled-event source-mark combo, aligned to the
-    # TRAIN slice. The state machine runs over the full stream (clears included)
-    # before clears are dropped; combos pack the 3 uncleared-alarm booleans.
+    # Dynamic (stateful) α: per-modeled-event marks, aligned to the TRAIN slice.
+    # The state machine runs over the full stream (clears included) before
+    # clears are dropped; combos pack the 3 uncleared-alarm booleans.
     train_src_combo = None
+    train_tgt_combo = None
     dyn_combo_bits = None
+    dyn_exposure_2d = None
     dyn_feature_names = None
     if config.edge_mode == "feature" and config.dynamic_alpha != "off":
-        if config.dynamic_alpha == "source_target":
-            raise NotImplementedError(
-                "dynamic_alpha='source_target' (target@t_j) is not implemented yet; "
-                "use 'source' for the source-device dynamic state."
-            )
+        if config.dynamic_alpha == "source_target" and "alarm_source" not in tuple(config.type_fields):
+            raise ValueError("dynamic_alpha='source_target' requires alarm_source in type_fields")
         from alarm_flow_mhp.dynamic_state import (
-            build_event_states, states_to_combo, combo_bits as _combo_bits,
+            ObservedStateTimeline,
+            build_event_states,
+            states_to_combo,
+            combo_bits as _combo_bits,
         )
-        from alarm_flow_mhp.feature_spec import runtime_ne_at
+        from alarm_flow_mhp.feature_spec import (
+            _type_field_indices,
+            parse_label_ne_at,
+            runtime_ne_at,
+        )
         ev_state_full = build_event_states(
             sorted_alarm_events,
             sequence.events,
@@ -559,15 +638,34 @@ def train_alarm_mhp(
         )
         combo_full = states_to_combo(ev_state_full)
         train_src_combo = combo_full[: train_events.n]
-        dyn_combo_bits = _combo_bits(8)
-        dyn_feature_names = ["src_uncleared_link", "src_uncleared_power", "src_uncleared_offline"]
+        base_combo_bits = _combo_bits(8)
+        if config.dynamic_alpha == "source_target":
+            train_tgt_combo = train_src_combo.copy()
+            dyn_combo_bits = _source_target_combo_bits(base_combo_bits)
+            dyn_feature_names = [
+                "src_uncleared_link",
+                "src_uncleared_power",
+                "src_uncleared_offline",
+                "tgt_uncleared_link",
+                "tgt_uncleared_power",
+                "tgt_uncleared_offline",
+            ]
+        else:
+            dyn_combo_bits = base_combo_bits
+            dyn_feature_names = ["src_uncleared_link", "src_uncleared_power", "src_uncleared_offline"]
         if verbose:
             nz = int((train_src_combo > 0).sum())
-            print(
+            msg = (
                 f"[train] dynamic_alpha={config.dynamic_alpha}: source marks on "
-                f"{nz}/{train_events.n} train events ({100.0*nz/max(train_events.n,1):.1f}% with active state)",
-                flush=True,
+                f"{nz}/{train_events.n} train events ({100.0*nz/max(train_events.n,1):.1f}% with active state)"
             )
+            if train_tgt_combo is not None:
+                tnz = int((train_tgt_combo > 0).sum())
+                msg += (
+                    f"; target marks on {tnz}/{train_events.n} train events "
+                    f"({100.0*tnz/max(train_events.n,1):.1f}% with active state)"
+                )
+            print(msg, flush=True)
 
     _emit_progress(
         progress_callback,
@@ -745,6 +843,45 @@ def train_alarm_mhp(
                 f"{feat_names}",
                 flush=True,
             )
+        if config.dynamic_alpha == "source_target":
+            state_timeline = ObservedStateTimeline()
+            for ev in sorted(sorted_alarm_events, key=lambda e: float(e.get("ts", 0.0))):
+                ne, _ = runtime_ne_at(ev, config.type_fields)
+                state_timeline.ingest(
+                    float(ev.get("ts", 0.0)),
+                    ne,
+                    alarm_type_from_title(ev.get("alarm_title", "")),
+                    is_clear_alarm(ev.get("alarm", {})),
+                )
+            src_idx, at_idx = _type_field_indices(config.type_fields)
+            type_ne = np.asarray(
+                [
+                    parse_label_ne_at(label, src_idx, at_idx)[0]
+                    for label in vocabs.type_vocab.labels
+                ],
+                dtype=object,
+            )
+            train_event_objs = sequence.events[: train_events.n]
+            train_event_ne = [runtime_ne_at(ev, config.type_fields)[0] for ev in train_event_objs]
+            train_abs_times = [float(t) for t in sequence.times[: train_events.n]]
+            dyn_exposure_2d = _build_source_target_dynamic_exposure(
+                train_events,
+                cand_t,
+                cand_s,
+                type_ne=type_ne,
+                train_event_ne=train_event_ne,
+                train_abs_times=train_abs_times,
+                train_src_combo=train_src_combo,
+                train_pre_combo=train_tgt_combo,
+                state_timeline=state_timeline,
+            )
+            if verbose:
+                nonzero = int((dyn_exposure_2d > 0).sum())
+                print(
+                    f"[train] dynamic_alpha=source_target: B-fast exposure buckets "
+                    f"nonzero={nonzero}/{dyn_exposure_2d.size}",
+                    flush=True,
+                )
         result = fit_mhp_feature(
             train_events,
             mhp_config,
@@ -758,7 +895,9 @@ def train_alarm_mhp(
             cand_topo_score=cand_topo_score,     # topology pseudo-count prior
             topo_prior_boost=config.feature_topo_prior_boost,
             src_combo=train_src_combo,            # dynamic stateful α (source mark)
+            tgt_combo=train_tgt_combo,            # source_target: target pre-state mark
             dynamic_combo_bits=dyn_combo_bits,
+            dynamic_exposure_2d=dyn_exposure_2d,
             dynamic_feature_names=dyn_feature_names,
             iter_callback=iter_callback,
             best_callback=write_best_checkpoint,

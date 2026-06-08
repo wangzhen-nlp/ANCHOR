@@ -279,14 +279,15 @@ def main():
     )
     parser.add_argument(
         "--dynamic-alpha",
-        choices=("off", "source"),
+        choices=("off", "source", "source_target"),
         default="off",
         help=(
             "Feature-mode DYNAMIC (stateful) α: condition excitation on devices' "
-            "current uncleared link/power/offline alarms, snapshotted at the source "
-            "event's fire time (clear-aware, train/infer-consistent). 'off' (default) "
-            "static only; 'source' adds the source device's 3 state booleans (exact, "
-            "penalized). Needs clears in the input stream."
+            "current uncleared link/power/offline alarms. 'off' (default) static "
+            "only; 'source' adds the source device's 3 state booleans (exact, "
+            "penalized); 'source_target' adds source + target 3-state booleans "
+            "using the B-fast training approximation (target pre-state in E-step, "
+            "target state at source_ts in exposure). Needs clears in the input stream."
         ),
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)

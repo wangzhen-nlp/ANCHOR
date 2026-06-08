@@ -1253,7 +1253,9 @@ def fit_mhp_feature(
     cand_topo_score: Optional[np.ndarray] = None,
     topo_prior_boost: float = 0.0,
     src_combo: Optional[np.ndarray] = None,
+    tgt_combo: Optional[np.ndarray] = None,
     dynamic_combo_bits: Optional[np.ndarray] = None,
+    dynamic_exposure_2d: Optional[np.ndarray] = None,
     dynamic_feature_names: Optional[list] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
     best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
@@ -1296,6 +1298,8 @@ def fit_mhp_feature(
     cand_targets = cand_targets[order]
     cand_sources = cand_sources[order]
     cand_phi = cand_phi[order]
+    if dynamic_exposure_2d is not None:
+        dynamic_exposure_2d = np.asarray(dynamic_exposure_2d, dtype=np.float64)[order]
     cand_keys = cand_targets * M + cand_sources
 
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
@@ -1337,26 +1341,44 @@ def fit_mhp_feature(
             alpha_init = min(max(0.5 * N / total_exposure, 1e-6), 0.5)
             w[0] = float(np.log(np.expm1(alpha_init)))   # inverse softplus
 
-    # Dynamic (stateful) α: α on (candidate c, source-mark combo k) =
-    # softplus(cand_phi[c]·w_static + combo_bits[k]·w_dyn). The mark combo is a
-    # per-source-EVENT property (src_combo[event]) so responsibility/exposure are
-    # bucketed by (c, k). Exposure E_{c,k} = #source events of type v=source(c)
-    # with combo k (exact in the compensator, since the source mark is frozen at
-    # the source's fire time → constant in the kernel integral). w grows by D
-    # dynamic columns appended after the F static ones.
+    # Dynamic (stateful) α: α on (candidate c, combo k) =
+    # softplus(cand_phi[c]·w_static + combo_bits[k]·w_dyn). For source-only,
+    # combo is the source event's 3-bit mark. For source_target B-fast, combo is
+    # source_combo*8 + target_pre_combo: the E-step uses the target event's
+    # read-before-write state (time-slack safe), while the compensator/exposure
+    # is precomputed with the target state sampled at source_ts.
     use_dynamic = src_combo is not None and dynamic_combo_bits is not None
     if use_dynamic:
         dynamic_combo_bits = np.asarray(dynamic_combo_bits, dtype=np.float64)  # (K, D)
         K_combo, D_dyn = dynamic_combo_bits.shape
         src_combo = np.asarray(src_combo, dtype=np.int64).reshape(-1)
-        # n_source_by_combo[v, k] = #events of type v with source-mark combo k.
-        n_src_by_combo = np.zeros((M, K_combo), dtype=np.float64)
-        np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
-        exposure_2d = n_src_by_combo[cand_sources]                # (C, K) E_{c,k}
+        if len(src_combo) != N:
+            raise ValueError("src_combo must be aligned to events")
+        use_target_dynamic = tgt_combo is not None
+        if use_target_dynamic:
+            tgt_combo = np.asarray(tgt_combo, dtype=np.int64).reshape(-1)
+            if len(tgt_combo) != N:
+                raise ValueError("tgt_combo must be aligned to events")
+            if K_combo != 64:
+                raise ValueError("source_target dynamic mode requires 64 combo rows")
+            if dynamic_exposure_2d is None:
+                raise ValueError("source_target dynamic mode requires dynamic_exposure_2d")
+        if dynamic_exposure_2d is not None:
+            exposure_2d = np.asarray(dynamic_exposure_2d, dtype=np.float64)
+            if exposure_2d.shape != (C, K_combo):
+                raise ValueError(
+                    f"dynamic_exposure_2d shape {exposure_2d.shape} != {(C, K_combo)}"
+                )
+        else:
+            # n_source_by_combo[v, k] = #events of type v with source-mark combo k.
+            n_src_by_combo = np.zeros((M, K_combo), dtype=np.float64)
+            np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
+            exposure_2d = n_src_by_combo[cand_sources]            # (C, K) E_{c,k}
         if config.time_slack > 0:
             exposure_2d = exposure_2d * (
                 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
             )
+        exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
         exposure_2d_fit = exposure_2d
         # Topology pseudo-count prior: attach to the baseline combo (k=0, no
         # active alarms) — it is a prior on edge existence, state-independent.
@@ -1474,8 +1496,16 @@ def fit_mhp_feature(
                 b = float(beta_scalar)
                 pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
                 if use_dynamic:
-                    # Per-pair α uses the SOURCE event's mark combo at fire time.
-                    combo_v = src_combo[pair_source[valid]]
+                    if use_target_dynamic:
+                        # B-fast + time-slack-safe: target mark is the target
+                        # event's pre-state, so a late parent never sees the
+                        # target event's own raise.
+                        target_global = chunk_start + pair_tlocal[valid]
+                        combo_v = src_combo[pair_source[valid]] * 8 + tgt_combo[target_global]
+                    else:
+                        # Source-only: per-pair α uses the source event's mark
+                        # combo at fire time.
+                        combo_v = src_combo[pair_source[valid]]
                     a_pair = softplus(z_static_c[vi] + z_dyn_k[combo_v])
                     score_pair[valid] = a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
                 else:
@@ -1576,7 +1606,7 @@ def fit_mhp_feature(
             z_d_new = dynamic_combo_bits @ w_new[F:]
             compensator = sum(
                 float((exposure_2d[:, k] * softplus(z_s_new + z_d_new[k])).sum())
-                for k in range(K_combo)
+                for k in exposure_combo_idx
             )
         else:
             compensator = float((alpha_new * exposure).sum())
