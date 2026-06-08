@@ -157,7 +157,12 @@ def _q_grad_hess(w, phi, n_resp, exposure, l2, w0, reg_mask):
     return q, grad, H
 
 
-def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+def _with_extra(x, extra):
+    return x if extra is None else x + extra
+
+
+def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+               n0_extra=None, e0_extra=None):
     """Objective Q only (no gradient) — for the Armijo line search, which only
     needs to test the Q increase. Skips the expensive cand_phiᵀ·coef matmul.
     """
@@ -171,12 +176,18 @@ def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
         z = z_s + z_d[k]
         a = softplus(z)
         a_safe = np.maximum(a, _EPS)
-        q += float(np.sum(n2d[:, k] * np.log(a_safe) - e2d[:, k] * a))
+        nk = n2d[:, k]
+        ek = e2d[:, k]
+        if k == 0:
+            nk = _with_extra(nk, n0_extra)
+            ek = _with_extra(ek, e0_extra)
+        q += float(np.sum(nk * np.log(a_safe) - ek * a))
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
     return q
 
 
-def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+                        n0_extra=None, e0_extra=None):
     """Bucketed objective Σ_{c,k}[N_{c,k}·log α_{c,k} − E_{c,k}·α_{c,k}] − ridge,
     with α_{c,k} = softplus(z_s[c] + z_d[k]), z_s = cand_phi·w_s, z_d = combo_bits·w_d
     and w = [w_s (F), w_d (D)]. Gradient decomposes over the static and dynamic
@@ -199,6 +210,9 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
         a_safe = np.maximum(a, _EPS)
         nk = n2d[:, k]
         ek = e2d[:, k]
+        if k == 0:
+            nk = _with_extra(nk, n0_extra)
+            ek = _with_extra(ek, e0_extra)
         q += float(np.sum(nk * np.log(a_safe) - ek * a))
         coef = (nk / a_safe - ek) * sigmoid(z)
         coef_total += coef
@@ -210,7 +224,8 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
     return q, grad
 
 
-def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
+def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+                         n0_extra=None, e0_extra=None):
     """_q_and_grad_dynamic plus the FULL (F+D)×(F+D) Hessian, for Newton steps.
     Per-(c,k) 2nd derivative w.r.t. z:  h = (N/α−E)·σ(1−σ) − N·σ²/α².
     Hessian blocks (no (C,K) materialization):
@@ -238,6 +253,9 @@ def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask):
         s = sigmoid(z)
         nk = n2d[:, k]
         ek = e2d[:, k]
+        if k == 0:
+            nk = _with_extra(nk, n0_extra)
+            ek = _with_extra(ek, e0_extra)
         q += float(np.sum(nk * np.log(a_safe) - ek * a))
         coef = (nk / a_safe - ek) * s
         coef_total += coef
@@ -274,6 +292,8 @@ def fit_dynamic_weights_mstep(
     w_prior_mean: np.ndarray | None = None,
     max_iter: int = 50,
     progress=None,
+    n0_extra: np.ndarray | None = None,
+    e0_extra: np.ndarray | None = None,
 ) -> np.ndarray:
     """M-step for dynamic (bucketed) α. w = [static (F), dynamic (D)]; α on row
     (candidate c, combo k) = softplus(cand_phi[c]·w_s + combo_bits[k]·w_d).
@@ -281,6 +301,8 @@ def fit_dynamic_weights_mstep(
     cand_phi : (C, F)   static per-candidate features
     combo_bits : (K, D) one row per mark combo, its D dynamic-feature bits
     n2d, e2d : (C, K)   responsibility N and exposure E per (candidate, combo)
+    n0_extra, e0_extra : optional (C,) pseudo-counts added to combo 0 only,
+        without materializing another (C, K) matrix.
     progress : optional callable(outer_iter, q, gnorm) for a heartbeat on large C.
     """
     F = cand_phi.shape[1]
@@ -290,6 +312,12 @@ def fit_dynamic_weights_mstep(
     reg_mask = np.ones(n_w)
     reg_mask[0] = 0.0  # bias exempt
     w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
+    n0_extra = None if n0_extra is None else np.asarray(n0_extra, dtype=np.float64).reshape(-1)
+    e0_extra = None if e0_extra is None else np.asarray(e0_extra, dtype=np.float64).reshape(-1)
+    if n0_extra is not None and len(n0_extra) != cand_phi.shape[0]:
+        raise ValueError("n0_extra must be aligned to candidate rows")
+    if e0_extra is not None and len(e0_extra) != cand_phi.shape[0]:
+        raise ValueError("e0_extra must be aligned to candidate rows")
 
     # DAMPED NEWTON. The objective is badly conditioned (the unregularized bias
     # has a huge curvature from Σ E, the others tiny), so plain gradient ascent
@@ -297,7 +325,10 @@ def fit_dynamic_weights_mstep(
     # Newton converges in a handful of iters to the SAME optimum. Levenberg
     # damping (−H + μI) keeps the step an ascent direction when the (non-canonical
     # softplus link) objective is locally non-concave.
-    q, grad, H = _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+    q, grad, H = _q_grad_hess_dynamic(
+        w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+        n0_extra=n0_extra, e0_extra=e0_extra,
+    )
     eye = np.eye(F + D)
     for _it in range(max_iter):
         if progress is not None:
@@ -311,10 +342,16 @@ def fit_dynamic_weights_mstep(
         improved = False
         for _bt in range(40):
             w_new = w + t * direction
-            q_new = _q_dynamic(w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+            q_new = _q_dynamic(
+                w_new, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+                n0_extra=n0_extra, e0_extra=e0_extra,
+            )
             if q_new >= q + c * t * dderiv:
                 w, q = w_new, q_new
-                q, grad, H = _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask)
+                q, grad, H = _q_grad_hess_dynamic(
+                    w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
+                    n0_extra=n0_extra, e0_extra=e0_extra,
+                )
                 improved = True
                 break
             t *= 0.5

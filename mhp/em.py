@@ -1381,12 +1381,13 @@ def fit_mhp_feature(
             if dynamic_exposure_2d is not None and dynamic_exposure_2d.dtype == np.float32:
                 exposure_2d = exposure_2d.astype(np.float32, copy=False)
         exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
-        exposure_2d_fit = exposure_2d
+        dynamic_n0_extra = None
+        dynamic_e0_extra = None
         # Topology pseudo-count prior: attach to the baseline combo (k=0, no
         # active alarms) — it is a prior on edge existence, state-independent.
         if topo_prior_boost > 0.0 and cand_topo_score is not None:
-            exposure_2d_fit = exposure_2d.copy()
-            exposure_2d_fit[:, 0] += prior_exp
+            dynamic_n0_extra = prior_num
+            dynamic_e0_extra = prior_exp
         w = np.concatenate([w, np.zeros(D_dyn)])                  # static ⊕ dynamic
 
     # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
@@ -1542,11 +1543,9 @@ def fit_mhp_feature(
         _ms_last = [0]           # records the last inner iter actually run
         if use_dynamic:
             # Bucketed M-step over (candidate, source-mark combo). Topology prior
-            # already folded into exposure_2d[:, 0]; baseline N gets prior_num too.
+            # is passed as combo-0 extra vectors to avoid copying the whole
+            # (candidate, combo) table.
             n2d = n_resp2d
-            if topo_prior_boost > 0.0 and cand_topo_score is not None:
-                n2d = n_resp2d.copy()
-                n2d[:, 0] += prior_num
             # Heartbeat for the dynamic M-step (it can take tens of seconds at
             # large C — print throttled so it never looks hung). It converges
             # early (||g||→0), so the inner count is usually well below the cap.
@@ -1567,9 +1566,11 @@ def fit_mhp_feature(
                     _beat[0] = now
 
             w_new = fit_dynamic_weights_mstep(
-                cand_phi, dynamic_combo_bits, n2d, exposure_2d_fit, w,
+                cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
                 l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
                 progress=_mstep_progress,
+                n0_extra=dynamic_n0_extra,
+                e0_extra=dynamic_e0_extra,
             )
             # Baseline α (combo 0) for diagnostics / materialization.
             alpha_new = softplus(cand_phi @ w_new[:F])
