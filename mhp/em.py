@@ -253,8 +253,8 @@ def _build_chunk_pair_arrays(
             return empty_i64, empty_i64, empty_f32, empty_i64, empty_i64, empty_i64, np.zeros(chunk_size, dtype=np.int64)
         offs = np.zeros(chunk_size + 1, dtype=np.int64)
         np.cumsum(raw_counts, out=offs[1:])
-        ev_idx = np.repeat(np.arange(chunk_size, dtype=np.int64), raw_counts)
-        within = np.arange(Praw, dtype=np.int64) - offs[ev_idx]
+        ev_idx = np.repeat(np.arange(chunk_size, dtype=np.int32), raw_counts)
+        within = np.arange(Praw, dtype=np.int32) - offs[ev_idx].astype(np.int32, copy=False)
         pair_source = start[ev_idx] + within
         pair_target = target_event_ids[ev_idx]
         # Exclude the target event itself.
@@ -262,14 +262,14 @@ def _build_chunk_pair_arrays(
         pair_source = pair_source[keep_self]
         pair_target = pair_target[keep_self]
         ev_idx = ev_idx[keep_self]
-        abs_dt = np.abs(times[pair_target] - times[pair_source])
+        abs_dt = np.abs(times[pair_target] - times[pair_source]).astype(np.float32)
         # Keep the nearest `max_hist` per target: sort by (target, |dt|), then
         # take within-group rank < max_hist.
         counts_excl = np.bincount(ev_idx, minlength=chunk_size)
         g_start = np.zeros(chunk_size, dtype=np.int64)
         np.cumsum(counts_excl[:-1], out=g_start[1:])
         order = np.lexsort((abs_dt, ev_idx))         # primary ev_idx, secondary |dt|
-        rank = np.arange(order.size, dtype=np.int64) - g_start[ev_idx[order]]
+        rank = np.arange(order.size, dtype=np.int32) - g_start[ev_idx[order]].astype(np.int32, copy=False)
         sel = order[rank < max_hist]
         pair_source = pair_source[sel]
         pair_target = pair_target[sel]
@@ -1453,16 +1453,28 @@ def fit_mhp_feature(
         w_mu[0] = float(np.log(np.expm1(m0)))   # inverse softplus of m0
         mu = softplus(mu_phi @ w_mu)
 
-    chunk_size = max(int(config.chunk_size), 1)
+    requested_chunk_size = max(int(config.chunk_size), 1)
+    chunk_size = requested_chunk_size
     history_window = config.history_window
     max_history_events = max(int(config.max_history_events), 1)
+    if getattr(config, "time_slack", 0.0) > 0.0:
+        # With time slack, one target can consider up to max_history_events
+        # recent past events plus nearby future events. Large chunks therefore
+        # create tens of millions of temporary pair rows before candidate-edge
+        # filtering. Keep the raw pair builder in a bounded memory regime.
+        pair_row_cap = 3_000_000
+        safe_chunk = max(1_000, int(pair_row_cap // max(max_history_events + 1, 1)))
+        chunk_size = min(chunk_size, safe_chunk)
 
     t_total_start = time.monotonic()
     if config.verbose:
+        chunk_msg = f"chunk_size={chunk_size}"
+        if chunk_size != requested_chunk_size:
+            chunk_msg += f" (auto-reduced from {requested_chunk_size} for time_slack)"
         print(
             f"[mhp-feat] events={N}, candidate pairs={C}, features={F}, "
             f"mu_features={(mu_phi.shape[1] if use_mu_features else 0)}, "
-            f"chunk_size={chunk_size}",
+            f"{chunk_msg}",
             flush=True,
         )
 
