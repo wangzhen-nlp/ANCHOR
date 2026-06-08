@@ -161,6 +161,13 @@ def _with_extra(x, extra):
     return x if extra is None else x + extra
 
 
+def _sparse_column(n2d, k):
+    if hasattr(n2d, "shape"):
+        return None
+    idx, val = n2d[k]
+    return np.asarray(idx, dtype=np.int64), np.asarray(val, dtype=np.float64)
+
+
 def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
                n0_extra=None, e0_extra=None):
     """Objective Q only (no gradient) — for the Armijo line search, which only
@@ -176,12 +183,21 @@ def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
         z = z_s + z_d[k]
         a = softplus(z)
         a_safe = np.maximum(a, _EPS)
-        nk = n2d[:, k]
         ek = e2d[:, k]
+        sp = _sparse_column(n2d, k)
+        if sp is None:
+            nk = n2d[:, k]
+            q += float(np.sum(nk * np.log(a_safe)))
+        else:
+            idx, val = sp
+            if len(idx):
+                q += float(np.sum(val * np.log(a_safe[idx])))
+        q -= float(np.sum(ek * a))
         if k == 0:
-            nk = _with_extra(nk, n0_extra)
-            ek = _with_extra(ek, e0_extra)
-        q += float(np.sum(nk * np.log(a_safe) - ek * a))
+            if n0_extra is not None:
+                q += float(np.sum(n0_extra * np.log(a_safe)))
+            if e0_extra is not None:
+                q -= float(np.sum(e0_extra * a))
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
     return q
 
@@ -208,13 +224,26 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
         z = z_s + z_d[k]
         a = softplus(z)
         a_safe = np.maximum(a, _EPS)
-        nk = n2d[:, k]
         ek = e2d[:, k]
+        coef = -ek * sigmoid(z)
+        q -= float(np.sum(ek * a))
+        sp = _sparse_column(n2d, k)
+        if sp is None:
+            nk = n2d[:, k]
+            q += float(np.sum(nk * np.log(a_safe)))
+            coef += (nk / a_safe) * sigmoid(z)
+        else:
+            idx, val = sp
+            if len(idx):
+                q += float(np.sum(val * np.log(a_safe[idx])))
+                np.add.at(coef, idx, (val / a_safe[idx]) * sigmoid(z[idx]))
         if k == 0:
-            nk = _with_extra(nk, n0_extra)
-            ek = _with_extra(ek, e0_extra)
-        q += float(np.sum(nk * np.log(a_safe) - ek * a))
-        coef = (nk / a_safe - ek) * sigmoid(z)
+            if n0_extra is not None:
+                q += float(np.sum(n0_extra * np.log(a_safe)))
+                coef += (n0_extra / a_safe) * sigmoid(z)
+            if e0_extra is not None:
+                q -= float(np.sum(e0_extra * a))
+                coef -= e0_extra * sigmoid(z)
         coef_total += coef
         coef_sum_per_combo[k] = float(coef.sum())
     grad_s = cand_phi.T @ coef_total             # ONE (F×C) matmul instead of K
@@ -251,16 +280,40 @@ def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
         a = softplus(z)
         a_safe = np.maximum(a, _EPS)
         s = sigmoid(z)
-        nk = n2d[:, k]
         ek = e2d[:, k]
+        q -= float(np.sum(ek * a))
+        coef = -ek * s
+        h = -ek * s * (1.0 - s)
+        sp = _sparse_column(n2d, k)
+        if sp is None:
+            nk = n2d[:, k]
+            q += float(np.sum(nk * np.log(a_safe)))
+            coef += (nk / a_safe) * s
+            h += (nk / a_safe) * s * (1.0 - s) - nk * (s * s) / (a_safe * a_safe)
+        else:
+            idx, val = sp
+            if len(idx):
+                q += float(np.sum(val * np.log(a_safe[idx])))
+                s_idx = s[idx]
+                a_idx = a_safe[idx]
+                np.add.at(coef, idx, (val / a_idx) * s_idx)
+                np.add.at(
+                    h,
+                    idx,
+                    (val / a_idx) * s_idx * (1.0 - s_idx)
+                    - val * (s_idx * s_idx) / (a_idx * a_idx),
+                )
         if k == 0:
-            nk = _with_extra(nk, n0_extra)
-            ek = _with_extra(ek, e0_extra)
-        q += float(np.sum(nk * np.log(a_safe) - ek * a))
-        coef = (nk / a_safe - ek) * s
+            if n0_extra is not None:
+                q += float(np.sum(n0_extra * np.log(a_safe)))
+                coef += (n0_extra / a_safe) * s
+                h += (n0_extra / a_safe) * s * (1.0 - s) - n0_extra * (s * s) / (a_safe * a_safe)
+            if e0_extra is not None:
+                q -= float(np.sum(e0_extra * a))
+                coef -= e0_extra * s
+                h -= e0_extra * s * (1.0 - s)
         coef_total += coef
         coef_sum_per_combo[k] = float(coef.sum())
-        h = (nk / a_safe - ek) * s * (1.0 - s) - nk * (s * s) / (a_safe * a_safe)
         h_total += h
         h_per_combo[k] = float(h.sum())
         Hsd += np.outer(cand_phi.T @ h, combo_bits[k])

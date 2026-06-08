@@ -165,6 +165,43 @@ def _segment_sum(values: np.ndarray, segment_ids: np.ndarray, n_segments: int) -
     return out
 
 
+def _append_sparse_dynamic_resp(parts, cand_idx: np.ndarray, combo_idx: np.ndarray, values: np.ndarray, K: int):
+    """Append chunk-level sparse responsibility sums by dynamic combo."""
+    if len(cand_idx) == 0:
+        return
+    flat = cand_idx.astype(np.int64, copy=False) * int(K) + combo_idx.astype(np.int64, copy=False)
+    uniq, inv = np.unique(flat, return_inverse=True)
+    sums = np.bincount(inv, weights=values).astype(np.float32, copy=False)
+    combos = (uniq % int(K)).astype(np.int64, copy=False)
+    rows = (uniq // int(K)).astype(np.int64, copy=False)
+    for k in np.unique(combos):
+        mask = combos == k
+        parts[int(k)].append((rows[mask].astype(np.int32, copy=False), sums[mask]))
+
+
+def _finalize_sparse_dynamic_resp(parts, C: int):
+    """Consolidate chunk sparse responsibility parts into one sparse column per combo."""
+    out = []
+    for col_parts in parts:
+        if not col_parts:
+            out.append((np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32)))
+            continue
+        rows = np.concatenate([p[0] for p in col_parts])
+        vals = np.concatenate([p[1] for p in col_parts])
+        if len(rows) == 0:
+            out.append((np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32)))
+            continue
+        order = np.argsort(rows, kind="stable")
+        rows = rows[order]
+        vals = vals[order]
+        boundary = np.flatnonzero(rows[1:] != rows[:-1]) + 1
+        starts = np.concatenate(([0], boundary))
+        rows_u = rows[starts]
+        vals_u = np.add.reduceat(vals, starts).astype(np.float32, copy=False)
+        out.append((rows_u.astype(np.int64 if C > np.iinfo(np.int32).max else np.int32, copy=False), vals_u))
+    return out
+
+
 def _build_chunk_pair_arrays(
     times: np.ndarray,
     dims: np.ndarray,
@@ -1445,8 +1482,12 @@ def fit_mhp_feature(
             z_dyn_k = dynamic_combo_bits @ w[F:]           # (K,)
             # Baseline α (combo 0 = no active alarms) for diagnostics / materialization.
             alpha_cand = softplus(z_static_c + z_dyn_k[0])
-            stat_dtype = np.float32 if use_target_dynamic else np.float64
-            n_resp2d = np.zeros((C, K_combo), dtype=stat_dtype)
+            use_sparse_resp = bool(use_target_dynamic)
+            if use_sparse_resp:
+                n_resp2d_parts = [[] for _ in range(K_combo)]
+                n_resp2d = None
+            else:
+                n_resp2d = np.zeros((C, K_combo), dtype=np.float64)
         else:
             alpha_cand = softplus(cand_phi @ w)            # (C,) current amplitudes
             n_resp = np.zeros(C, dtype=np.float64)         # N_c
@@ -1521,16 +1562,29 @@ def fit_mhp_feature(
             p_ij = score_pair / rate[pair_tlocal]
             if valid.any():
                 if use_dynamic:
-                    np.add.at(n_resp2d.reshape(-1), vi * K_combo + combo_v, p_ij[valid])
+                    if use_sparse_resp:
+                        _append_sparse_dynamic_resp(
+                            n_resp2d_parts,
+                            vi,
+                            combo_v,
+                            p_ij[valid],
+                            K_combo,
+                        )
+                    else:
+                        np.add.at(n_resp2d.reshape(-1), vi * K_combo + combo_v, p_ij[valid])
                 else:
                     np.add.at(n_resp, idx[valid], p_ij[valid])
             mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
             ll_term1 += float(np.log(rate).sum())
 
         if config.verbose and n_chunks > 1:
+            sparse_msg = ""
+            if use_dynamic and use_sparse_resp:
+                sparse_parts = sum(len(col) for col in n_resp2d_parts)
+                sparse_msg = f", sparse_resp_parts={sparse_parts}"
             print(
                 f"[mhp-feat]   iter={it:3d} E-step done in {_fmt_secs(time.monotonic() - _estep_t0)}, "
-                f"fitting weights (M-step) ...",
+                f"fitting weights (M-step){sparse_msg} ...",
                 flush=True,
             )
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
@@ -1545,7 +1599,18 @@ def fit_mhp_feature(
             # Bucketed M-step over (candidate, source-mark combo). Topology prior
             # is passed as combo-0 extra vectors to avoid copying the whole
             # (candidate, combo) table.
-            n2d = n_resp2d
+            if use_sparse_resp:
+                _final_t0 = time.monotonic()
+                n2d = _finalize_sparse_dynamic_resp(n_resp2d_parts, C)
+                if config.verbose:
+                    nnz_resp = sum(len(idx_col) for idx_col, _ in n2d)
+                    print(
+                        f"[mhp-feat]   iter={it:3d} sparse responsibility "
+                        f"nnz={nnz_resp} finalized in {_fmt_secs(time.monotonic() - _final_t0)}",
+                        flush=True,
+                    )
+            else:
+                n2d = n_resp2d
             # Heartbeat for the dynamic M-step (it can take tens of seconds at
             # large C — print throttled so it never looks hung). It converges
             # early (||g||→0), so the inner count is usually well below the cap.
