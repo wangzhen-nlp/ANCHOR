@@ -413,6 +413,160 @@ def fit_dynamic_weights_mstep(
     return w
 
 
+# --------------------------------------------------------------------------
+# Flat-COO dynamic M-step (source_target / large K). When BOTH responsibility N
+# and exposure E are sparse, the dense (C, K) K-loop wastes ~K× work on empty
+# (candidate, combo) buckets. Here N and E are flat COO lists (rows, combos,
+# vals); the objective Σ N·logα − E·α and the Hessian h = h_N + h_E DECOMPOSE
+# additively, so the two lists are processed independently and combined via
+# bincount into per-candidate / per-combo aggregates — no union merge needed.
+# --------------------------------------------------------------------------
+
+
+def _q_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
+    """Objective Q only (line search) over flat-COO N and E entries."""
+    F = cand_phi.shape[1]
+    z_s = cand_phi @ w[:F]
+    z_d = combo_bits @ w[F:]
+    nr, nc, nv = n_coo
+    er, ec, ev = e_coo
+    q = 0.0
+    if nr.size:
+        aN = np.maximum(softplus(z_s[nr] + z_d[nc]), _EPS)
+        q += float(np.sum(nv * np.log(aN)))
+    if er.size:
+        aE = softplus(z_s[er] + z_d[ec])
+        q -= float(np.sum(ev * aE))
+    q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    return q
+
+
+def _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
+    """Q, gradient, and full Hessian over flat-COO N and E. Per-entry 2nd
+    derivative decomposes: h_N = (N/α)σ(1−σ) − Nσ²/α² (N-entries),
+    h_E = −E·σ(1−σ) (E-entries). Aggregated to per-candidate / per-combo via
+    bincount; matmuls stay over C (not over the nnz)."""
+    C, F = cand_phi.shape
+    K, D = combo_bits.shape
+    nw = F + D
+    z_s = cand_phi @ w[:F]
+    z_d = combo_bits @ w[F:]
+    nr, nc, nv = n_coo
+    er, ec, ev = e_coo
+    coef_c = np.zeros(C)
+    coef_k = np.zeros(K)
+    h_c = np.zeros(C)
+    h_k = np.zeros(K)
+    Hsd = np.zeros((F, D))
+    q = 0.0
+    if nr.size:
+        zN = z_s[nr] + z_d[nc]
+        aN = np.maximum(softplus(zN), _EPS)
+        sN = sigmoid(zN)
+        q += float(np.sum(nv * np.log(aN)))
+        cN = (nv / aN) * sN
+        hN = (nv / aN) * sN * (1.0 - sN) - nv * (sN * sN) / (aN * aN)
+        coef_c += np.bincount(nr, cN, C)
+        coef_k += np.bincount(nc, cN, K)
+        h_c += np.bincount(nr, hN, C)
+        h_k += np.bincount(nc, hN, K)
+        for d in range(D):
+            # Avoid materializing combo_bits[nc] as (nnz, D), which is huge for
+            # source_target exposure. Build one weighted column at a time.
+            Hsd[:, d] += cand_phi.T @ np.bincount(nr, hN * combo_bits[nc, d], C)
+    if er.size:
+        zE = z_s[er] + z_d[ec]
+        aE = softplus(zE)
+        sE = sigmoid(zE)
+        q -= float(np.sum(ev * aE))
+        cE = -ev * sE
+        hE = -ev * sE * (1.0 - sE)
+        coef_c += np.bincount(er, cE, C)
+        coef_k += np.bincount(ec, cE, K)
+        h_c += np.bincount(er, hE, C)
+        h_k += np.bincount(ec, hE, K)
+        for d in range(D):
+            Hsd[:, d] += cand_phi.T @ np.bincount(er, hE * combo_bits[ec, d], C)
+    q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    grad = np.concatenate([cand_phi.T @ coef_c, combo_bits.T @ coef_k]) - 2.0 * l2 * reg_mask * (w - w0)
+    Hss = np.empty((F, F))
+    for i in range(F):
+        Hss[:, i] = cand_phi.T @ (cand_phi[:, i] * h_c)
+    Hdd = combo_bits.T @ (combo_bits * h_k[:, None])
+    H = np.empty((nw, nw))
+    H[:F, :F] = Hss
+    H[:F, F:] = Hsd
+    H[F:, :F] = Hsd.T
+    H[F:, F:] = Hdd
+    H[np.arange(nw), np.arange(nw)] -= 2.0 * l2 * reg_mask
+    return q, grad, H
+
+
+def fit_dynamic_weights_mstep_coo(
+    cand_phi: np.ndarray,
+    combo_bits: np.ndarray,
+    n_coo: tuple,
+    e_coo: tuple,
+    w_init: np.ndarray,
+    *,
+    l2: float = 1e-3,
+    w_prior_mean: np.ndarray | None = None,
+    max_iter: int = 50,
+    progress=None,
+) -> np.ndarray:
+    """Damped-Newton dynamic M-step over flat-COO N/E (see fit_dynamic_weights_mstep).
+    n_coo / e_coo : (rows int, combos int, vals float) — any combo-0 pseudo-counts
+    (topology prior) must already be appended by the caller.
+    """
+    F = cand_phi.shape[1]
+    D = combo_bits.shape[1]
+    n_w = F + D
+    w0 = np.zeros(n_w) if w_prior_mean is None else np.asarray(w_prior_mean, dtype=np.float64).reshape(-1)
+    reg_mask = np.ones(n_w)
+    reg_mask[0] = 0.0
+    w = np.asarray(w_init, dtype=np.float64).reshape(-1).copy()
+
+    def _coo(coo):
+        r, c, v = coo
+        r = np.asarray(r)
+        c = np.asarray(c)
+        v = np.asarray(v)
+        if not np.issubdtype(r.dtype, np.integer):
+            r = r.astype(np.int64)
+        if not np.issubdtype(c.dtype, np.integer):
+            c = c.astype(np.int64)
+        if not np.issubdtype(v.dtype, np.floating):
+            v = v.astype(np.float64)
+        return r, c, v
+
+    n_coo = _coo(n_coo)
+    e_coo = _coo(e_coo)
+    q, grad, H = _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
+    eye = np.eye(n_w)
+    for _it in range(max_iter):
+        if progress is not None:
+            progress(_it, q, float(np.linalg.norm(grad)))
+        direction = _newton_direction(H, grad, eye)
+        dderiv = float(grad @ direction)
+        if dderiv <= 1e-9 * max(abs(q), 1.0):
+            break
+        t = 1.0
+        c = 1e-4
+        improved = False
+        for _bt in range(40):
+            w_new = w + t * direction
+            q_new = _q_dynamic_coo(w_new, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
+            if q_new >= q + c * t * dderiv:
+                w, q = w_new, q_new
+                q, grad, H = _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
+                improved = True
+                break
+            t *= 0.5
+        if not improved:
+            break
+    return w
+
+
 def fit_weights_mstep(
     phi: np.ndarray,
     n_resp: np.ndarray,

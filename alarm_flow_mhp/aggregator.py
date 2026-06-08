@@ -649,7 +649,8 @@ def _build_source_target_dynamic_exposure(
     train_pre_combo: np.ndarray,
     state_timeline,
     verbose: bool = False,
-) -> np.ndarray:
+    as_coo: bool = False,
+) -> np.ndarray | dict:
     """B-fast source_target exposure buckets.
 
     For each source event and candidate target type, sample the target device
@@ -660,7 +661,48 @@ def _build_source_target_dynamic_exposure(
     cand_targets = np.asarray(cand_targets, dtype=np.int64)
     cand_sources = np.asarray(cand_sources, dtype=np.int64)
     C = len(cand_targets)
-    exposure = np.zeros((C, 64), dtype=np.float32)
+    exposure = None
+    row_dtype = np.int32 if C <= np.iinfo(np.int32).max else np.int64
+    coo_rows = coo_cols = coo_vals = None
+    coo_size = 0
+    coo_cap = 0
+    if as_coo:
+        # Build the exact nonzero buckets directly, avoiding the dense Cx64
+        # exposure allocation. Capacity grows geometrically; group rows are
+        # usually tiny, so append overhead stays close to the old dense fill loop.
+        coo_cap = max(1024, min(C * 2, 8_000_000))
+        coo_rows = np.empty(coo_cap, dtype=row_dtype)
+        coo_cols = np.empty(coo_cap, dtype=np.uint8)
+        coo_vals = np.empty(coo_cap, dtype=np.float32)
+    else:
+        exposure = np.zeros((C, 64), dtype=np.float32)
+
+    def append_coo(rows: np.ndarray, nz: np.ndarray, counts: np.ndarray):
+        nonlocal coo_rows, coo_cols, coo_vals, coo_size, coo_cap
+        if len(rows) == 0 or len(nz) == 0:
+            return
+        needed = int(len(rows) * len(nz))
+        end = coo_size + needed
+        if end > coo_cap:
+            while end > coo_cap:
+                coo_cap = max(end, int(coo_cap * 1.5) + 1024)
+            new_rows = np.empty(coo_cap, dtype=coo_rows.dtype)
+            new_cols = np.empty(coo_cap, dtype=coo_cols.dtype)
+            new_vals = np.empty(coo_cap, dtype=coo_vals.dtype)
+            new_rows[:coo_size] = coo_rows[:coo_size]
+            new_cols[:coo_size] = coo_cols[:coo_size]
+            new_vals[:coo_size] = coo_vals[:coo_size]
+            coo_rows, coo_cols, coo_vals = new_rows, new_cols, new_vals
+        pos = coo_size
+        rows_cast = np.asarray(rows, dtype=row_dtype)
+        for k in nz:
+            k_int = int(k)
+            nxt = pos + len(rows_cast)
+            coo_rows[pos:nxt] = rows_cast
+            coo_cols[pos:nxt] = k_int
+            coo_vals[pos:nxt] = counts[k_int]
+            pos = nxt
+        coo_size = end
 
     # Encode target NE strings as small integer ids, then lexsort candidate rows
     # by (source_type, target_ne). This avoids millions of Python list appends
@@ -678,10 +720,12 @@ def _build_source_target_dynamic_exposure(
         type_ne_ids[ti] = nid
     cand_ne_ids = type_ne_ids[cand_targets]
     if verbose:
-        gib = C * 64 * np.dtype(exposure.dtype).itemsize / (1024 ** 3)
+        gib = C * 64 * np.dtype(np.float32).itemsize / (1024 ** 3)
+        mode = "COO" if as_coo else "dense"
         print(
-            f"[train] dynamic_alpha=source_target: allocating B-fast exposure "
-            f"{C}x64 {exposure.dtype} (~{gib:.1f} GiB), grouping candidate rows ...",
+            f"[train] dynamic_alpha=source_target: building B-fast exposure "
+            f"{mode} (dense equivalent {C}x64 float32 ~{gib:.1f} GiB), "
+            f"grouping candidate rows ...",
             flush=True,
         )
     row_order = np.lexsort((cand_sources, cand_ne_ids))
@@ -740,7 +784,7 @@ def _build_source_target_dynamic_exposure(
         # the same source NE, making this an O(n_src) path once per source type.
         if tgt_ne and str(type_ne[int(src_tid)] or "") == tgt_ne:
             combo_idx = source_combo.astype(np.uint8) * np.uint8(8) + source_pre_combo
-            counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(exposure.dtype, copy=False)
+            counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(np.float32, copy=False)
         else:
             if tgt_ne not in timeline_cache:
                 timeline_cache[tgt_ne] = _combo_arrays_from_timeline(state_timeline, tgt_ne)
@@ -756,7 +800,7 @@ def _build_source_target_dynamic_exposure(
                     timeline_cache,
                 )
                 combo_idx = source_combo.astype(np.uint8) * np.uint8(8) + tgt_combo
-                counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(exposure.dtype, copy=False)
+                counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(np.float32, copy=False)
             else:
                 counts = _counts64_from_target_intervals(
                     source_times,
@@ -765,8 +809,11 @@ def _build_source_target_dynamic_exposure(
                     target_combo,
                 )
         nz = np.flatnonzero(counts > 0)
-        for k in nz:
-            exposure[rows, k] += counts[k]
+        if as_coo:
+            append_coo(rows, nz, counts)
+        else:
+            for k in nz:
+                exposure[rows, k] += counts[k]
 
         if verbose:
             now = time.monotonic()
@@ -778,6 +825,17 @@ def _build_source_target_dynamic_exposure(
                     flush=True,
                 )
                 last_beat = now
+    if as_coo:
+        coo_rows.resize(coo_size, refcheck=False)
+        coo_cols.resize(coo_size, refcheck=False)
+        coo_vals.resize(coo_size, refcheck=False)
+        return {
+            "format": "coo",
+            "shape": (int(C), 64),
+            "rows": coo_rows,
+            "combos": coo_cols,
+            "values": coo_vals,
+        }
     return exposure
 
 
@@ -1106,14 +1164,24 @@ def train_alarm_mhp(
                 train_pre_combo=train_tgt_combo,
                 state_timeline=state_timeline,
                 verbose=verbose,
+                as_coo=True,
             )
             if verbose:
-                nonzero = int((dyn_exposure_2d > 0).sum())
+                if isinstance(dyn_exposure_2d, dict) and dyn_exposure_2d.get("format") == "coo":
+                    nonzero = int(len(dyn_exposure_2d.get("values", ())))
+                    total_slots = int(dyn_exposure_2d["shape"][0] * dyn_exposure_2d["shape"][1])
+                else:
+                    nonzero = int((dyn_exposure_2d > 0).sum())
+                    total_slots = int(dyn_exposure_2d.size)
                 print(
                     f"[train] dynamic_alpha=source_target: B-fast exposure buckets "
-                    f"nonzero={nonzero}/{dyn_exposure_2d.size}",
+                    f"nonzero={nonzero}/{total_slots}",
                     flush=True,
                 )
+            if not (isinstance(dyn_exposure_2d, dict) and dyn_exposure_2d.get("format") == "coo"):
+                # Dense fallback: hand ownership to fit via a holder so it can
+                # release GiBs after converting to sparse COO.
+                dyn_exposure_2d = [dyn_exposure_2d]
         result = fit_mhp_feature(
             train_events,
             mhp_config,

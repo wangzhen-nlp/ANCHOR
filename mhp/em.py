@@ -202,6 +202,33 @@ def _finalize_sparse_dynamic_resp(parts, C: int):
     return out
 
 
+def _is_dynamic_exposure_coo(obj) -> bool:
+    return isinstance(obj, dict) and obj.get("format") == "coo"
+
+
+def _normalize_dynamic_exposure_coo(obj, C: int, K: int):
+    shape = tuple(obj.get("shape", ()))
+    if shape != (int(C), int(K)):
+        raise ValueError(f"dynamic_exposure_2d shape {shape} != {(C, K)}")
+    rows = np.asarray(obj.get("rows"))
+    combos = np.asarray(obj.get("combos", obj.get("cols")))
+    values = np.asarray(obj.get("values"))
+    if rows.shape != combos.shape or rows.shape != values.shape:
+        raise ValueError("dynamic_exposure_2d COO rows/combos/values must have the same shape")
+    if rows.size:
+        if int(rows.min()) < 0 or int(rows.max()) >= C:
+            raise ValueError("dynamic_exposure_2d COO row index out of range")
+        if int(combos.min()) < 0 or int(combos.max()) >= K:
+            raise ValueError("dynamic_exposure_2d COO combo index out of range")
+    if not np.issubdtype(rows.dtype, np.integer):
+        rows = rows.astype(np.int64)
+    if not np.issubdtype(combos.dtype, np.integer):
+        combos = combos.astype(np.int64)
+    if not np.issubdtype(values.dtype, np.floating):
+        values = values.astype(np.float32)
+    return rows, combos, values
+
+
 def _build_chunk_pair_arrays(
     times: np.ndarray,
     dims: np.ndarray,
@@ -1334,6 +1361,12 @@ def fit_mhp_feature(
     C = len(cand_targets)
     if C == 0:
         raise ValueError("feature mode requires a non-empty candidate pair set")
+    # The caller may hand the GiB-sized source_target exposure in a 1-element
+    # holder list, transferring ownership so this function can RELEASE the dense
+    # array (after building the sparse COO) without the caller's frame pinning
+    # it for the whole EM loop. None / a bare array pass through unchanged.
+    if isinstance(dynamic_exposure_2d, list):
+        dynamic_exposure_2d = dynamic_exposure_2d.pop()
     # Sort candidates by key so the E-step can binary-search. Large training
     # callers may pre-sort to avoid holding both unsorted and sorted GB-sized
     # feature/exposure tables during EM startup.
@@ -1345,7 +1378,16 @@ def fit_mhp_feature(
         cand_sources = cand_sources[order]
         cand_phi = cand_phi[order]
         if dynamic_exposure_2d is not None:
-            dynamic_exposure_2d = np.asarray(dynamic_exposure_2d)[order]
+            if _is_dynamic_exposure_coo(dynamic_exposure_2d):
+                inv_order = np.empty(C, dtype=np.int64)
+                inv_order[order] = np.arange(C, dtype=np.int64)
+                row_dtype = np.int64 if C > np.iinfo(np.int32).max else np.int32
+                dynamic_exposure_2d = dict(dynamic_exposure_2d)
+                dynamic_exposure_2d["rows"] = inv_order[
+                    np.asarray(dynamic_exposure_2d["rows"], dtype=np.int64)
+                ].astype(row_dtype, copy=False)
+            else:
+                dynamic_exposure_2d = np.asarray(dynamic_exposure_2d)[order]
         keys = keys[order]
     cand_keys = keys
 
@@ -1412,7 +1454,22 @@ def fit_mhp_feature(
                 raise ValueError("source_target dynamic mode requires 64 combo rows")
             if dynamic_exposure_2d is None:
                 raise ValueError("source_target dynamic mode requires dynamic_exposure_2d")
-        if dynamic_exposure_2d is not None:
+        exposure_2d = None
+        exposure_combo_idx = None
+        e_coo_real = None       # real exposure COO (no prior) — for the LL compensator
+        e_coo_fixed = None      # real exposure + combo-0 topology prior — for the M-step
+        slack_scale = 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
+        if dynamic_exposure_2d is not None and _is_dynamic_exposure_coo(dynamic_exposure_2d):
+            if not use_target_dynamic:
+                raise ValueError("COO dynamic_exposure_2d is only supported for source_target dynamic mode")
+            _er, _ec, _ev = _normalize_dynamic_exposure_coo(dynamic_exposure_2d, C, K_combo)
+            if config.time_slack > 0:
+                _ev = _ev.astype(np.float32, copy=False)
+                _ev *= slack_scale
+            exposure_combo_idx = np.unique(_ec) if _ec.size else np.zeros(0, dtype=np.int64)
+            e_coo_real = (_er, _ec, _ev)
+            dynamic_exposure_2d = None
+        elif dynamic_exposure_2d is not None:
             exposure_2d = np.asarray(dynamic_exposure_2d)
             if exposure_2d.shape != (C, K_combo):
                 raise ValueError(
@@ -1423,14 +1480,14 @@ def fit_mhp_feature(
             n_src_by_combo = np.zeros((M, K_combo), dtype=np.float64)
             np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
             exposure_2d = n_src_by_combo[cand_sources]            # (C, K) E_{c,k}
-        if config.time_slack > 0:
-            slack_scale = 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
+        if exposure_2d is not None and config.time_slack > 0:
             if np.issubdtype(exposure_2d.dtype, np.floating):
                 exposure_2d *= slack_scale
             else:
                 exposure_2d = exposure_2d.astype(np.float32, copy=False)
                 exposure_2d *= slack_scale
-        exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
+        if exposure_combo_idx is None:
+            exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
         dynamic_n0_extra = None
         dynamic_e0_extra = None
         # Topology pseudo-count prior: attach to the baseline combo (k=0, no
@@ -1438,6 +1495,29 @@ def fit_mhp_feature(
         if topo_prior_boost > 0.0 and cand_topo_score is not None:
             dynamic_n0_extra = prior_num
             dynamic_e0_extra = prior_exp
+        if use_target_dynamic:
+            if e_coo_real is None:
+                # Dense fallback: convert once and release the dense (C, K)
+                # exposure before the EM loop.
+                _er, _ec = np.nonzero(exposure_2d)
+                _ev = exposure_2d[_er, _ec].astype(np.float32, copy=False)
+                _er = _er.astype(np.int64)
+                _ec = _ec.astype(np.int64)
+                exposure_2d = None
+                dynamic_exposure_2d = None
+                e_coo_real = (_er, _ec, _ev)
+            else:
+                _er, _ec, _ev = e_coo_real
+            e_coo_real = (_er, _ec, _ev)            # for the LL compensator
+            if dynamic_e0_extra is not None:        # fold combo-0 topology prior for the M-step
+                _xr = np.flatnonzero(dynamic_e0_extra).astype(_er.dtype, copy=False)
+                e_coo_fixed = (
+                    np.concatenate([_er, _xr]),
+                    np.concatenate([_ec, np.zeros(len(_xr), dtype=_ec.dtype)]),
+                    np.concatenate([_ev, np.asarray(dynamic_e0_extra, dtype=np.float64)[_xr]]),
+                )
+            else:
+                e_coo_fixed = e_coo_real
         w = np.concatenate([w, np.zeros(D_dyn)])                  # static ⊕ dynamic
 
     # μ is INDUCTIVE in feature mode: μ(u) = softplus(w_μ · ψ(u)), a log-linear
@@ -1617,10 +1697,14 @@ def fit_mhp_feature(
         # below produces the NEXT parameters; their LL is evaluated by the next
         # iteration's E-step, avoiding a second full pass over the event stream.
         if use_dynamic:
-            compensator_eval = sum(
-                float((exposure_2d[:, k] * softplus(z_static_c + z_dyn_k[k])).sum())
-                for k in exposure_combo_idx
-            )
+            if use_target_dynamic:
+                _er, _ec, _ev = e_coo_real
+                compensator_eval = float(np.sum(_ev * softplus(z_static_c[_er] + z_dyn_k[_ec])))
+            else:
+                compensator_eval = sum(
+                    float((exposure_2d[:, k] * softplus(z_static_c + z_dyn_k[k])).sum())
+                    for k in exposure_combo_idx
+                )
         else:
             compensator_eval = float((alpha_cand * exposure).sum())
         ll_eval = ll_term1 - horizon * float(mu.sum()) - compensator_eval
@@ -1652,7 +1736,9 @@ def fit_mhp_feature(
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
         # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
         # parameterized (mu_phi), else per-type closed form.
-        from .feature_kernel import fit_weights_mstep, fit_dynamic_weights_mstep
+        from .feature_kernel import (
+            fit_weights_mstep, fit_dynamic_weights_mstep, fit_dynamic_weights_mstep_coo,
+        )
 
         _MSTEP_MAX = 50          # max inner gradient-ascent iters (usually fewer)
         _ms_t0 = time.monotonic()
@@ -1692,13 +1778,40 @@ def fit_mhp_feature(
                     )
                     _beat[0] = now
 
-            w_new = fit_dynamic_weights_mstep(
-                cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
-                l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
-                progress=_mstep_progress,
-                n0_extra=dynamic_n0_extra,
-                e0_extra=dynamic_e0_extra,
-            )
+            if use_target_dynamic:
+                # Flatten the sparse per-combo responsibility into one flat COO
+                # and fold the combo-0 prior; M-step then touches only nonzero
+                # (candidate, combo) buckets instead of the dense (C, K) table.
+                _nr_parts, _nc_parts, _nv_parts = [], [], []
+                _row_dtype = np.int64 if C > np.iinfo(np.int32).max else np.int32
+                for k, (idx, val) in enumerate(n2d):
+                    if len(idx):
+                        _nr_parts.append(np.asarray(idx, dtype=_row_dtype))
+                        _nc_parts.append(np.full(len(idx), k, dtype=np.uint8))
+                        _nv_parts.append(np.asarray(val, dtype=np.float32))
+                if dynamic_n0_extra is not None:
+                    _xr = np.flatnonzero(dynamic_n0_extra)
+                    _nr_parts.append(_xr.astype(_row_dtype, copy=False))
+                    _nc_parts.append(np.zeros(len(_xr), dtype=np.uint8))
+                    _nv_parts.append(np.asarray(dynamic_n0_extra, dtype=np.float32)[_xr])
+                n_coo = (
+                    np.concatenate(_nr_parts) if _nr_parts else np.zeros(0, _row_dtype),
+                    np.concatenate(_nc_parts) if _nc_parts else np.zeros(0, np.uint8),
+                    np.concatenate(_nv_parts) if _nv_parts else np.zeros(0, np.float32),
+                )
+                w_new = fit_dynamic_weights_mstep_coo(
+                    cand_phi, dynamic_combo_bits, n_coo, e_coo_fixed, w,
+                    l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
+                    progress=_mstep_progress,
+                )
+            else:
+                w_new = fit_dynamic_weights_mstep(
+                    cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
+                    l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
+                    progress=_mstep_progress,
+                    n0_extra=dynamic_n0_extra,
+                    e0_extra=dynamic_e0_extra,
+                )
             # Baseline α (combo 0) for diagnostics / materialization.
             alpha_new = softplus(cand_phi @ w_new[:F])
         else:
