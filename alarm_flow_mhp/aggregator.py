@@ -69,6 +69,16 @@ ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 DEFAULT_BUCKET_EDGES_SEC = (15.0, 60.0, 180.0, 600.0, 1800.0)
 
 
+def _fmt_secs(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - 60 * minutes
+    return f"{minutes}m{rem:04.1f}s"
+
+
 @dataclass(frozen=True)
 class AlarmMHPConfig:
     """Configuration for alarm-flow MHP aggregation."""
@@ -504,6 +514,48 @@ def _source_target_combo_bits(base_bits: np.ndarray) -> np.ndarray:
     )
 
 
+def _combo_arrays_from_timeline(state_timeline, device: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return timeline change points and packed 3-bit combos for one device."""
+    device = str(device or "")
+    times = getattr(state_timeline, "_times", {}).get(device)
+    states = getattr(state_timeline, "_states", {}).get(device)
+    if not times or not states:
+        return (
+            np.zeros(0, dtype=np.float64),
+            np.zeros(0, dtype=np.uint8),
+        )
+    times_arr = np.asarray(times, dtype=np.float64)
+    states_arr = np.asarray(states, dtype=np.uint8)
+    combos = (
+        states_arr[:, 0].astype(np.uint8)
+        + np.uint8(2) * states_arr[:, 1].astype(np.uint8)
+        + np.uint8(4) * states_arr[:, 2].astype(np.uint8)
+    )
+    return times_arr, combos.astype(np.uint8, copy=False)
+
+
+def _timeline_combos_at_many(
+    state_timeline,
+    device: str,
+    query_ts: np.ndarray,
+    cache: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    """Vectorized state_at(device, ts-) returning packed combo indices."""
+    device = str(device or "")
+    if device not in cache:
+        cache[device] = _combo_arrays_from_timeline(state_timeline, device)
+    times_arr, combos_arr = cache[device]
+    out = np.zeros(len(query_ts), dtype=np.uint8)
+    if times_arr.size == 0 or len(query_ts) == 0:
+        return out
+    query_before = np.nextafter(np.asarray(query_ts, dtype=np.float64), -np.inf)
+    idx = np.searchsorted(times_arr, query_before, side="right") - 1
+    ok = idx >= 0
+    if ok.any():
+        out[ok] = combos_arr[idx[ok]]
+    return out
+
+
 def _build_source_target_dynamic_exposure(
     train_events: EventCollection,
     cand_targets: np.ndarray,
@@ -515,6 +567,7 @@ def _build_source_target_dynamic_exposure(
     train_src_combo: np.ndarray,
     train_pre_combo: np.ndarray,
     state_timeline,
+    verbose: bool = False,
 ) -> np.ndarray:
     """B-fast source_target exposure buckets.
 
@@ -525,36 +578,90 @@ def _build_source_target_dynamic_exposure(
     """
     cand_targets = np.asarray(cand_targets, dtype=np.int64)
     cand_sources = np.asarray(cand_sources, dtype=np.int64)
-    exposure = np.zeros((len(cand_targets), 64), dtype=np.float64)
-    # Group candidate rows by source type and target NE. A source event often
-    # fans out to several target alarm types on the same NE; query that NE's
-    # state once, then update all matching candidate rows in one numpy slice.
-    by_source_ne: dict[int, dict[str, np.ndarray]] = defaultdict(dict)
-    tmp: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
-    for ci, (tgt_tid, src_tid) in enumerate(zip(cand_targets, cand_sources)):
-        tmp[int(src_tid)][str(type_ne[int(tgt_tid)] or "")].append(ci)
-    for src_tid, by_ne in tmp.items():
-        by_source_ne[src_tid] = {
-            ne: np.asarray(rows, dtype=np.int64)
-            for ne, rows in by_ne.items()
-        }
+    C = len(cand_targets)
+    exposure = np.zeros((C, 64), dtype=np.float32)
+
+    # Encode target NE strings as small integer ids, then lexsort candidate rows
+    # by (source_type, target_ne). This avoids millions of Python list appends
+    # when C is large.
+    ne_to_id: dict[str, int] = {}
+    ne_labels: list[str] = []
+    type_ne_ids = np.zeros(len(type_ne), dtype=np.int32)
+    for ti, ne in enumerate(type_ne):
+        key = str(ne or "")
+        nid = ne_to_id.get(key)
+        if nid is None:
+            nid = len(ne_labels)
+            ne_to_id[key] = nid
+            ne_labels.append(key)
+        type_ne_ids[ti] = nid
+    cand_ne_ids = type_ne_ids[cand_targets]
+    if verbose:
+        gib = C * 64 * np.dtype(exposure.dtype).itemsize / (1024 ** 3)
+        print(
+            f"[train] dynamic_alpha=source_target: allocating B-fast exposure "
+            f"{C}x64 {exposure.dtype} (~{gib:.1f} GiB), grouping candidate rows ...",
+            flush=True,
+        )
+    row_order = np.lexsort((cand_ne_ids, cand_sources))
+    src_sorted = cand_sources[row_order]
+    ne_sorted = cand_ne_ids[row_order]
+    boundary = np.flatnonzero((src_sorted[1:] != src_sorted[:-1]) | (ne_sorted[1:] != ne_sorted[:-1])) + 1
+    starts = np.concatenate(([0], boundary))
+    ends = np.concatenate((boundary, [C]))
+    group_src = src_sorted[starts]
+    group_ne = ne_sorted[starts]
 
     dims = np.asarray(train_events.dims, dtype=np.int64)
-    for ei, src_tid in enumerate(dims):
-        by_ne = by_source_ne.get(int(src_tid))
-        if not by_ne:
+    dim_order = np.argsort(dims, kind="stable")
+    dims_sorted = dims[dim_order]
+    train_event_ne_arr = np.asarray([str(ne or "") for ne in train_event_ne], dtype=object)
+    train_abs_times_arr = np.asarray(train_abs_times, dtype=np.float64)
+    train_src_combo_arr = np.asarray(train_src_combo, dtype=np.uint8)
+    train_pre_combo_arr = np.asarray(train_pre_combo, dtype=np.uint8)
+    timeline_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    n_groups = len(starts)
+    last_beat = time.monotonic()
+    t0 = last_beat
+    for gi, (start, end, src_tid, ne_id) in enumerate(zip(starts, ends, group_src, group_ne), start=1):
+        left = np.searchsorted(dims_sorted, int(src_tid), side="left")
+        right = np.searchsorted(dims_sorted, int(src_tid), side="right")
+        if right <= left:
             continue
-        src_ne = str(train_event_ne[ei] or "")
-        src_k = int(train_src_combo[ei])
-        ts = float(train_abs_times[ei])
-        for tgt_ne, rows in by_ne.items():
-            if tgt_ne and tgt_ne == src_ne:
-                tgt_k = int(train_pre_combo[ei])
-            else:
-                # Use the state just before source_ts to avoid same-timestamp
-                # raises leaking into the B-fast compensator sample.
-                tgt_k = _state_combo(state_timeline.state_at(tgt_ne, np.nextafter(ts, -np.inf)))
-            exposure[rows, src_k * 8 + int(tgt_k)] += 1.0
+        event_idx = dim_order[left:right]
+        rows = row_order[start:end]
+        tgt_ne = ne_labels[int(ne_id)]
+
+        tgt_combo = _timeline_combos_at_many(
+            state_timeline,
+            tgt_ne,
+            train_abs_times_arr[event_idx],
+            timeline_cache,
+        )
+        # Same-NE exposure uses the source event's pre-state so the source
+        # event's own raise is not included in the sampled target state.
+        if tgt_ne:
+            same_ne = train_event_ne_arr[event_idx] == tgt_ne
+            if same_ne.any():
+                tgt_combo[same_ne] = train_pre_combo_arr[event_idx[same_ne]]
+
+        combo_idx = train_src_combo_arr[event_idx].astype(np.uint8) * np.uint8(8) + tgt_combo
+        counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(exposure.dtype, copy=False)
+        nz = np.flatnonzero(counts > 0)
+        for k in nz:
+            exposure[rows, k] += counts[k]
+
+        if verbose:
+            now = time.monotonic()
+            if now - last_beat >= 10.0:
+                print(
+                    f"[train] dynamic_alpha=source_target: exposure groups "
+                    f"{gi}/{n_groups} ({100.0 * gi / max(n_groups, 1):.1f}%, "
+                    f"{_fmt_secs(now - t0)})",
+                    flush=True,
+                )
+                last_beat = now
     return exposure
 
 
@@ -874,6 +981,7 @@ def train_alarm_mhp(
                 train_src_combo=train_src_combo,
                 train_pre_combo=train_tgt_combo,
                 state_timeline=state_timeline,
+                verbose=verbose,
             )
             if verbose:
                 nonzero = int((dyn_exposure_2d > 0).sum())

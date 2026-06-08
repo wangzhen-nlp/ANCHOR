@@ -1299,7 +1299,7 @@ def fit_mhp_feature(
     cand_sources = cand_sources[order]
     cand_phi = cand_phi[order]
     if dynamic_exposure_2d is not None:
-        dynamic_exposure_2d = np.asarray(dynamic_exposure_2d, dtype=np.float64)[order]
+        dynamic_exposure_2d = np.asarray(dynamic_exposure_2d)[order]
     cand_keys = cand_targets * M + cand_sources
 
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
@@ -1364,7 +1364,7 @@ def fit_mhp_feature(
             if dynamic_exposure_2d is None:
                 raise ValueError("source_target dynamic mode requires dynamic_exposure_2d")
         if dynamic_exposure_2d is not None:
-            exposure_2d = np.asarray(dynamic_exposure_2d, dtype=np.float64)
+            exposure_2d = np.asarray(dynamic_exposure_2d)
             if exposure_2d.shape != (C, K_combo):
                 raise ValueError(
                     f"dynamic_exposure_2d shape {exposure_2d.shape} != {(C, K_combo)}"
@@ -1378,6 +1378,8 @@ def fit_mhp_feature(
             exposure_2d = exposure_2d * (
                 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
             )
+            if dynamic_exposure_2d is not None and dynamic_exposure_2d.dtype == np.float32:
+                exposure_2d = exposure_2d.astype(np.float32, copy=False)
         exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
         exposure_2d_fit = exposure_2d
         # Topology pseudo-count prior: attach to the baseline combo (k=0, no
@@ -1442,7 +1444,8 @@ def fit_mhp_feature(
             z_dyn_k = dynamic_combo_bits @ w[F:]           # (K,)
             # Baseline α (combo 0 = no active alarms) for diagnostics / materialization.
             alpha_cand = softplus(z_static_c + z_dyn_k[0])
-            n_resp2d = np.zeros((C, K_combo), dtype=np.float64)
+            stat_dtype = np.float32 if use_target_dynamic else np.float64
+            n_resp2d = np.zeros((C, K_combo), dtype=stat_dtype)
         else:
             alpha_cand = softplus(cand_phi @ w)            # (C,) current amplitudes
             n_resp = np.zeros(C, dtype=np.float64)         # N_c
