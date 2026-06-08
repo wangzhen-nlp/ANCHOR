@@ -500,14 +500,16 @@ class MissingChainSampler:
         return self._normalise_src_mark(source_mark_at(source_type, ts))
 
     def _normalise_src_mark(self, src_mark) -> tuple:
-        n_dynamic = int(getattr(self.adapter, "n_dynamic", 0) or 0)
-        if n_dynamic <= 0:
+        n_source = int(getattr(self.adapter, "source_mark_dim", 0) or 0)
+        if n_source <= 0:
+            n_source = min(int(getattr(self.adapter, "n_dynamic", 0) or 0), 3)
+        if n_source <= 0:
             return ()
         if src_mark is None:
             return self._zero_src_mark()
         vals = tuple(int(v) for v in src_mark)
-        if len(vals) != n_dynamic:
-            return tuple((vals + self._zero_src_mark())[:n_dynamic])
+        if len(vals) != n_source:
+            return tuple((vals + self._zero_src_mark())[:n_source])
         return vals
 
     def _new_event(self, *, ts, type_id, observed, meta, depth, src_mark=None) -> SamplerEvent:
@@ -547,13 +549,18 @@ class MissingChainSampler:
         if slack <= 0:
             return
         lo = bisect.bisect_left(self._order_ts, new_ev.ts - slack)
-        hi = bisect.bisect_left(self._order_ts, new_ev.ts)
+        # Include older events at the exact same timestamp: dt=0 is a valid
+        # parent/child boundary, and a later-arriving same-ts source can become
+        # their newly available parent.
+        hi = bisect.bisect_right(self._order_ts, new_ev.ts)
         limit = self.config.future_candidate_reset_limit
         if limit > 0:
             # Optional approximation: a dense slack window can hold hundreds of
             # events, so only repair the nearest affected events when configured.
             # The default (0) keeps the exact pre-optimization behaviour.
-            lo = max(lo, hi - limit)
+            # hi includes new_ev itself; do not let it consume one of the limit
+            # slots for actual affected older events.
+            lo = max(lo, hi - 1 - limit)
         for i in range(lo, hi):
             ev = self.events.get(self._order[i])
             if ev is None or ev.committed or ev.eid == new_ev.eid:
@@ -1665,9 +1672,9 @@ class FeatureKernelAdapter:
         cache_key = (source_type, mark)
         if self.n_dynamic > 3:
             # Target marks vary with source_ts, so the cached sum must include
-            # the timestamp slice. Round to microsecond precision to keep keys
-            # stable for float inputs without merging distinct event times.
-            cache_key = (source_type, source_mark_norm, round(float(source_ts), 6) if source_ts is not None else None)
+            # the exact timestamp slice. Do not round here: a target state change
+            # at t must distinguish source_ts=t- from source_ts=t.
+            cache_key = (source_type, source_mark_norm, float(source_ts) if source_ts is not None else None)
         s_sum = cache.get(cache_key)
         if s_sum is not None:
             cache.move_to_end(cache_key)          # LRU touch

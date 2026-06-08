@@ -593,6 +593,8 @@ def test_source_target_dynamic_feature_uses_target_mark():
     src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
     tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
     assert tgt.parent == src.eid
+    assert len(src.src_mark) == 3
+    assert len(tgt.src_mark) == 3
 
 
 def test_source_target_total_compensator_uses_target_timeline_mark():
@@ -617,6 +619,114 @@ def test_source_target_total_compensator_uses_target_timeline_mark():
     assert adapter.total_compensator(
         ("S", "n1"), 60.0, source_mark=(0, 0, 0), source_ts=10.0
     ) == 0
+
+
+def test_source_target_time_slack_impute_accepts_late_parent():
+    topo = _FakeTopo({"n1": {}}, max_hops=1)
+    fs = _FakeSourceTargetFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 100.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA")}, beta=1.0,
+    )
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 1e-12},
+        time_scale_sec=60.0,
+        time_slack_sec=30.0,
+        late_penalty_half_life_sec=10.0,
+        alpha_floor=0.0,
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(
+            lag_sec=1e9,
+            time_slack_sec=30.0,
+            late_penalty_half_life_sec=10.0,
+            sweeps_per_tick=0,
+            max_births_per_sweep=0,
+            seed=61,
+        ),
+    )
+    # Child arrives first with target pre-state link=1. The source arrives 20s
+    # later; time slack allows it to become the child's late parent.
+    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    s.ingest(120.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
+    tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
+    assert tgt.parent == src.eid
+    assert adapter.kernel_intensity(
+        ("S", "n1"), ("B", "n1"), -20.0,
+        source_mark=(0, 1, 0), target_mark=(1, 0, 0),
+    ) > 0.0
+    assert adapter.kernel_intensity(
+        ("S", "n1"), ("B", "n1"), -40.0,
+        source_mark=(0, 1, 0), target_mark=(1, 0, 0),
+    ) == 0.0
+
+
+def test_time_slack_rechecks_equal_timestamp_future_parent():
+    topo = _FakeTopo({"n1": {}}, max_hops=1)
+    fs = _FakeSourceTargetFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 100.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA")}, beta=1.0,
+    )
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 1e-12},
+        time_scale_sec=60.0,
+        time_slack_sec=30.0,
+        alpha_floor=0.0,
+    )
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(
+            lag_sec=1e9,
+            time_slack_sec=30.0,
+            sweeps_per_tick=0,
+            max_births_per_sweep=0,
+            future_candidate_reset_limit=1,
+            seed=62,
+        ),
+    )
+    # B is processed first and has no parent yet. S arrives later in stream order
+    # but with the same timestamp; dt=0 should be eligible after the reset pass.
+    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    s.ingest(100.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
+    tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
+    assert tgt.parent == src.eid
+
+
+def test_source_target_total_compensator_reads_target_state_before_source_ts():
+    topo = _FakeTopo({"n1": {"n2": 1}, "n2": {"n1": 1}}, max_hops=1)
+    fs = _FakeSourceTargetFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 2.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA"), "n2": _FakeNodeInfo("siteA")},
+        beta=1.0,
+    )
+    timeline = ObservedStateTimeline()
+    timeline.ingest(10.0, "n2", "link", False)
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 0.1},
+        time_scale_sec=60.0,
+        alpha_floor=0.0,
+        target_mark_at=lambda ne, ts: timeline.state_at(ne, np.nextafter(float(ts), -np.inf)),
+    )
+    # At exactly the target change point, source_ts uses target_state(ts-), so
+    # n2's link raise at 10.0 is not visible yet. Just after 10.0 it is visible.
+    assert adapter.total_compensator(
+        ("S", "n1"), 60.0, source_mark=(0, 1, 0), source_ts=10.0
+    ) == 0.0
+    assert adapter.total_compensator(
+        ("S", "n1"), 60.0, source_mark=(0, 1, 0), source_ts=np.nextafter(10.0, np.inf)
+    ) > 0.0
+
+
+def test_observed_state_timeline_source_mark_reads_before_timestamp():
+    timeline = ObservedStateTimeline()
+    timeline.ingest(10.0, "n1", "power", False)
+    assert timeline.source_mark_at(("S", "n1"), 10.0) == (0, 0, 0)
+    assert timeline.source_mark_at(("S", "n1"), np.nextafter(10.0, np.inf)) == (0, 1, 0)
 
 
 def test_observed_state_timeline_prune_keeps_baseline_state():

@@ -174,7 +174,9 @@ class ObservedStateTimeline:
             _at, ne = source_type
         except Exception:
             ne = ""
-        return self.state_at(ne, ts)
+        # Missing events read the observed state slice just before their
+        # proposed timestamp, matching read-before-write event snapshots.
+        return self.state_at(ne, np.nextafter(float(ts), -np.inf))
 
     def prune_before(self, cutoff_ts: float):
         """Drop old per-device history while preserving state continuity.
