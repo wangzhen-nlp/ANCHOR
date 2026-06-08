@@ -707,10 +707,53 @@ def fit_mhp(
         )
         t_estep_end = time.monotonic()
 
+        n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
+
+        # TRUE observed LL for the parameters used in this E-step. The M-step
+        # below produces the NEXT parameters; their LL is evaluated by the next
+        # iteration's E-step.
+        ll = _log_likelihood_global(ll_term1, mu, alpha, beta, horizon, config, n_source)
+        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
+
+        beta_is_scalar = np.ndim(beta) == 0
+        is_best = ll > best_ll
+        if is_best:
+            best_ll = ll
+            nz_t, nz_s = np.nonzero(alpha)
+            best_edge_targets = nz_t.copy()
+            best_edge_sources = nz_s.copy()
+            best_edge_alpha = alpha[nz_t, nz_s].astype(np.float64)
+            if beta_is_scalar:
+                best_beta_scalar = float(beta)
+                best_edge_beta = None
+            else:
+                best_beta_scalar = None
+                best_edge_beta = beta[nz_t, nz_s].astype(np.float64)
+            best_mu = mu.copy()
+            best_p_self = p_self
+
+        active_edges = int((alpha > 0).sum())
+        # β stats — only meaningful on active edges (β=0 where α=0)
+        if beta_is_scalar:
+            bval = float(beta)
+            beta_median_active = bval if active_edges else 0.0
+            beta_max_active = bval if active_edges else 0.0
+            beta_min_active = bval if active_edges else 0.0
+        else:
+            active_mask = alpha > 0
+            if active_mask.any():
+                beta_active = beta[active_mask]
+                beta_median_active = float(np.median(beta_active))
+                beta_max_active = float(beta_active.max())
+                beta_min_active = float(beta_active.min())
+            else:
+                beta_median_active = 0.0
+                beta_max_active = 0.0
+                beta_min_active = 0.0
+
         # M-step
         mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
 
-        n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
         K = config.alpha_prior_strength
         m = config.alpha_prior_mean
         if config.beta_mode == "per_edge":
@@ -742,58 +785,20 @@ def fit_mhp(
         n_rescaled = _apply_branching_cap(alpha_new, config.branching_cap)
         _apply_top_k_per_target(alpha_new, config.max_active_sources_per_dim, config.edge_threshold)
 
-        ll = _log_likelihood_global(ll_term1, mu_new, alpha_new, beta_new, horizon, config, n_source)
-        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
-
-        beta_is_scalar = np.ndim(beta_new) == 0
-        is_best = ll > best_ll
-        if is_best:
-            best_ll = ll
-            nz_t, nz_s = np.nonzero(alpha_new)
-            best_edge_targets = nz_t.copy()
-            best_edge_sources = nz_s.copy()
-            best_edge_alpha = alpha_new[nz_t, nz_s].astype(np.float64)
-            if beta_is_scalar:
-                best_beta_scalar = float(beta_new)
-                best_edge_beta = None
-            else:
-                best_beta_scalar = None
-                best_edge_beta = beta_new[nz_t, nz_s].astype(np.float64)
-            best_mu = mu_new.copy()
-            best_p_self = p_self
-
-        active_edges = int((alpha_new > 0).sum())
         t_iter_end = time.monotonic()
         iter_total = t_iter_end - t_iter_start
         iter_estep = t_estep_end - t_iter_start
         iter_mstep = t_iter_end - t_estep_end
-        # β stats — only meaningful on active edges (β=0 where α=0)
-        if beta_is_scalar:
-            bval = float(beta_new)
-            beta_median_active = bval if active_edges else 0.0
-            beta_max_active = bval if active_edges else 0.0
-            beta_min_active = bval if active_edges else 0.0
-        else:
-            active_mask = alpha_new > 0
-            if active_mask.any():
-                beta_active = beta_new[active_mask]
-                beta_median_active = float(np.median(beta_active))
-                beta_max_active = float(beta_active.max())
-                beta_min_active = float(beta_active.min())
-            else:
-                beta_median_active = 0.0
-                beta_max_active = 0.0
-                beta_min_active = 0.0
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
             "delta_rel": float(delta_rel),
             "branching_rescaled": n_rescaled,
             "active_edges": active_edges,
-            "mu_max": float(mu_new.max()),
-            "mu_median": float(np.median(mu_new)),
-            "alpha_max": float(alpha_new.max()),
-            "alpha_median_active": float(np.median(alpha_new[alpha_new > 0])) if active_edges else 0.0,
+            "mu_max": float(mu.max()),
+            "mu_median": float(np.median(mu)),
+            "alpha_max": float(alpha.max()),
+            "alpha_median_active": float(np.median(alpha[alpha > 0])) if active_edges else 0.0,
             "beta_min_active": beta_min_active,
             "beta_median_active": beta_median_active,
             "beta_max_active": beta_max_active,
@@ -1146,6 +1151,22 @@ def fit_mhp_piecewise(
             mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
             ll_term1 += float(np.log(rate).sum())
 
+        branching_eval = (theta * widths[None, :]).sum(axis=1)
+        compensator_eval = (theta * fit_widths[None, :]).sum(axis=1)
+        if config.time_slack > 0:
+            term3_eval = float((n_v_per_edge * compensator_eval).sum())
+        else:
+            term3_eval = float(branching_eval.sum())
+        ll = ll_term1 - horizon * float(mu.sum()) - term3_eval
+        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
+
+        is_best = ll > best_ll
+        if is_best:
+            best_ll = ll
+            best_theta = theta.copy()
+            best_mu = mu.copy()
+            best_p_self = p_self
+
         # M-step
         mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
         theta_new = (resp + K * m) / (n_v_per_edge[:, None] * fit_widths[None, :] + K)
@@ -1164,31 +1185,15 @@ def fit_mhp_piecewise(
         else:
             n_rescaled = 0
 
-        branching_per_edge = (theta_new * widths[None, :]).sum(axis=1)
-        compensator_per_edge = (theta_new * fit_widths[None, :]).sum(axis=1)
-        if config.time_slack > 0:
-            term3 = float((n_v_per_edge * compensator_per_edge).sum())
-        else:
-            term3 = float(branching_per_edge.sum())
-        ll = ll_term1 - horizon * float(mu_new.sum()) - term3
-        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
-
-        is_best = ll > best_ll
-        if is_best:
-            best_ll = ll
-            best_theta = theta_new.copy()
-            best_mu = mu_new.copy()
-            best_p_self = p_self
-
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
             "delta_rel": float(delta_rel),
             "branching_rescaled": n_rescaled,
             "active_edges": E,
-            "mu_max": float(mu_new.max()),
-            "branching_max": float(branching_per_edge.max()),
-            "branching_median": float(np.median(branching_per_edge)),
+            "mu_max": float(mu.max()),
+            "branching_max": float(branching_eval.max()),
+            "branching_median": float(np.median(branching_eval)),
             "p_self_mean": float(p_self.mean()),
             "iter_seconds": float(time.monotonic() - t_iter),
         }
@@ -1597,16 +1602,53 @@ def fit_mhp_feature(
             mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
             ll_term1 += float(np.log(rate).sum())
 
+        estep_seconds = time.monotonic() - _estep_t0
         if config.verbose and n_chunks > 1:
             sparse_msg = ""
             if use_dynamic and use_sparse_resp:
                 sparse_parts = sum(len(col) for col in n_resp2d_parts)
                 sparse_msg = f", sparse_resp_parts={sparse_parts}"
             print(
-                f"[mhp-feat]   iter={it:3d} E-step done in {_fmt_secs(time.monotonic() - _estep_t0)}, "
+                f"[mhp-feat]   iter={it:3d} E-step done in {_fmt_secs(estep_seconds)}, "
                 f"fitting weights (M-step){sparse_msg} ...",
                 flush=True,
             )
+        # TRUE observed LL for the parameters used in this E-step. The M-step
+        # below produces the NEXT parameters; their LL is evaluated by the next
+        # iteration's E-step, avoiding a second full pass over the event stream.
+        if use_dynamic:
+            compensator_eval = sum(
+                float((exposure_2d[:, k] * softplus(z_static_c + z_dyn_k[k])).sum())
+                for k in exposure_combo_idx
+            )
+        else:
+            compensator_eval = float((alpha_cand * exposure).sum())
+        ll_eval = ll_term1 - horizon * float(mu.sum()) - compensator_eval
+        delta_rel = abs(ll_eval - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
+        is_best = ll_eval > best_ll
+        if is_best:
+            best_ll = ll_eval
+            best_w = w.copy()
+            best_mu = mu.copy()
+            best_w_mu = w_mu.copy() if use_mu_features else None
+            best_p_self = p_self
+
+        active_eval = int((alpha_cand > config.edge_threshold).sum())
+        entry = {
+            "iter": it,
+            "log_likelihood": float(ll_eval),
+            "delta_rel": float(delta_rel),
+            "active_edges": active_eval,
+            "candidate_pairs": C,
+            "mu_max": float(mu.max()),
+            "alpha_max": float(alpha_cand.max()),
+            "alpha_median": float(np.median(alpha_cand)),
+            "p_self_mean": float(p_self.mean()),
+            "estep_seconds": float(estep_seconds),
+            "mstep_seconds": 0.0,
+            "iter_seconds": 0.0,
+        }
+
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
         # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
         # parameterized (mu_phi), else per-type closed form.
@@ -1667,14 +1709,6 @@ def fit_mhp_feature(
                 l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX
             )
             alpha_new = softplus(cand_phi @ w_new)
-        if config.verbose and n_chunks > 1:
-            _iters_msg = f" ({_ms_last[0] + 1} inner iters)" if use_dynamic else ""
-            print(
-                f"[mhp-feat]   iter={it:3d} M-step done in "
-                f"{_fmt_secs(time.monotonic() - _ms_t0)}{_iters_msg}",
-                flush=True,
-            )
-
         if use_mu_features:
             w_mu_new = fit_weights_mstep(
                 mu_phi, mu_num, mu_exposure, w_mu, l2=l2, max_iter=50
@@ -1684,45 +1718,13 @@ def fit_mhp_feature(
             w_mu_new = None
             mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
 
-        # Proper LL = Σ log rate − T·Σμ − Σ_c E_c·α_c. The integral term is
-        # exposure-weighted (E_c = source-type count), matching the M-step
-        # objective Σ[N_c·log α_c − E_c·α_c] — so best-iteration selection tracks
-        # the actual objective rather than an unweighted Σα that would bias
-        # toward large α on high-frequency sources.
-        if use_dynamic:
-            # Compensator Σ_{c,k} E_{c,k}·α_{c,k} (exact per (candidate, combo)).
-            z_s_new = cand_phi @ w_new[:F]
-            z_d_new = dynamic_combo_bits @ w_new[F:]
-            compensator = sum(
-                float((exposure_2d[:, k] * softplus(z_s_new + z_d_new[k])).sum())
-                for k in exposure_combo_idx
-            )
-        else:
-            compensator = float((alpha_new * exposure).sum())
-        ll = ll_term1 - horizon * float(mu_new.sum()) - compensator
-        delta_rel = abs(ll - prev_ll) / max(abs(prev_ll), 1.0) if it > 0 else np.inf
-
-        is_best = ll > best_ll
-        if is_best:
-            best_ll = ll
-            best_w = w_new.copy()
-            best_mu = mu_new.copy()
-            best_w_mu = None if w_mu_new is None else w_mu_new.copy()
-            best_p_self = p_self
-
-        active = int((alpha_new > config.edge_threshold).sum())
-        entry = {
-            "iter": it,
-            "log_likelihood": float(ll),
-            "delta_rel": float(delta_rel),
-            "active_edges": active,
-            "candidate_pairs": C,
-            "mu_max": float(mu_new.max()),
-            "alpha_max": float(alpha_new.max()),
-            "alpha_median": float(np.median(alpha_new)),
-            "p_self_mean": float(p_self.mean()),
-            "iter_seconds": float(time.monotonic() - t_iter),
-        }
+        w = w_new
+        mu = mu_new
+        if use_mu_features:
+            w_mu = w_mu_new
+        mstep_seconds = time.monotonic() - _ms_t0
+        entry["mstep_seconds"] = float(mstep_seconds)
+        entry["iter_seconds"] = float(time.monotonic() - t_iter)
         trace.append(entry)
         if iter_callback is not None:
             iter_callback(entry)
@@ -1765,26 +1767,29 @@ def fit_mhp_feature(
                 ),
                 entry,
             )
-        if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
+        if config.verbose and n_chunks > 1:
+            _iters_msg = f" ({_ms_last[0] + 1} inner iters)" if use_dynamic else ""
             print(
-                f"[mhp-feat] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
-                f"active(>thr)={active}/{C} "
-                f"α.median={entry['alpha_median']:.4f} α.max={entry['alpha_max']:.4f} "
-                f"μ.max={entry['mu_max']:.4f} p_self.mean={entry['p_self_mean']:.3f} "
-                f"t={_fmt_secs(entry['iter_seconds'])}",
+                f"[mhp-feat]   iter={it:3d} M-step done in "
+                f"{_fmt_secs(mstep_seconds)}{_iters_msg}",
                 flush=True,
             )
-
-        w = w_new
-        mu = mu_new
-        if use_mu_features:
-            w_mu = w_mu_new
+        if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
+            print(
+                f"[mhp-feat] iter={it:3d} ll={ll_eval:.2f} Δ={delta_rel:.2e} "
+                f"active(>thr)={active_eval}/{C} "
+                f"α.median={entry['alpha_median']:.4f} α.max={entry['alpha_max']:.4f} "
+                f"μ.max={entry['mu_max']:.4f} p_self.mean={entry['p_self_mean']:.3f} "
+                f"t={_fmt_secs(entry['iter_seconds'])} "
+                f"(E={_fmt_secs(entry['estep_seconds'])} M={_fmt_secs(entry['mstep_seconds'])})",
+                flush=True,
+            )
         if it > 0 and delta_rel < config.tol:
             converged = True
             if config.verbose:
                 print(f"[mhp-feat] converged at iter {it} (Δrel={delta_rel:.2e})", flush=True)
             break
-        prev_ll = ll
+        prev_ll = ll_eval
 
     # In dynamic mode the kernel carries F static ⊕ D dynamic weights; its
     # feature_names are extended so inference can append the live mark bits to φ.

@@ -490,14 +490,47 @@ class RuntimeFeatureScorer:
             return ("", "", "")
         return (info.site_id or "", info.manufacturer or "", info.ne_type or "")
 
-    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
+    def _dynamic_mark_matrix(self, n: int, src_marks=None, tgt_marks=None) -> np.ndarray:
+        if self.n_dynamic <= 0:
+            return np.zeros((n, 0), dtype=np.float64)
+        if src_marks is None:
+            src = np.zeros((n, min(self.n_dynamic, 3)), dtype=np.float64)
+        else:
+            src = np.asarray(src_marks, dtype=np.float64)
+            if src.ndim == 1:
+                src = src.reshape(1, -1)
+            if src.shape[0] != n:
+                src = np.tile(src.reshape(1, -1), (n, 1))
+        if src.shape[1] == self.n_dynamic:
+            return src.reshape(n, self.n_dynamic)
+        if self.n_dynamic <= 3:
+            out = np.zeros((n, self.n_dynamic), dtype=np.float64)
+            out[:, : min(src.shape[1], self.n_dynamic)] = src[:, : self.n_dynamic]
+            return out
+        # source_target mode: first 3 dynamic bits are source state, next 3 are
+        # target pre-state. Missing target marks default to zero for callers that
+        # use this only as an upper/lower fallback.
+        out = np.zeros((n, self.n_dynamic), dtype=np.float64)
+        out[:, : min(src.shape[1], 3)] = src[:, : min(src.shape[1], 3)]
+        if tgt_marks is not None:
+            tgt = np.asarray(tgt_marks, dtype=np.float64)
+            if tgt.ndim == 1:
+                tgt = tgt.reshape(1, -1)
+            if tgt.shape[0] != n:
+                tgt = np.tile(tgt.reshape(1, -1), (n, 1))
+            width = min(tgt.shape[1], self.n_dynamic - 3)
+            out[:, 3: 3 + width] = tgt[:, :width]
+        return out
+
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
         """Vectorized α for one target vs a batch of source candidates.
 
         target_at/target_ne : scalars (alarm_type str, ne str)
         src_ats / src_nes   : lists of source alarm_type / ne
-        src_marks : (n, n_dynamic) per-candidate source-mark bits (dynamic mode),
-                    each row the source device's frozen uncleared-state booleans
-                    at the candidate parent's fire time. Required iff n_dynamic>0.
+        src_marks : source-mark bits; in source_target mode this may either be
+                    the full dynamic row or just the source 3-bit mark.
+        tgt_marks : optional target pre-state bits, used when n_dynamic has
+                    source+target state features.
         Returns (n,) α array.
         """
         n = len(src_nes)
@@ -522,7 +555,7 @@ class RuntimeFeatureScorer:
         if self.n_dynamic > 0:
             if src_marks is None:
                 raise ValueError("src_marks is required when RuntimeFeatureScorer.n_dynamic > 0")
-            marks = np.asarray(src_marks, dtype=np.float64).reshape(n, self.n_dynamic)
+            marks = self._dynamic_mark_matrix(n, src_marks=src_marks, tgt_marks=tgt_marks)
             phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)
 
@@ -535,7 +568,7 @@ class RuntimeFeatureScorer:
         w_dyn = np.asarray(self.kernel.weights, dtype=np.float64)[-self.n_dynamic:]
         return (w_dyn > 0).astype(np.float64)
 
-    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None):
+    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None, tgt_marks=None):
         """Vectorized α for ONE source vs a batch of targets — the transpose of
         alpha_for_target (the compensator hot path: one source excites many
         targets). The source mark is fixed (one row, broadcast to all targets).
@@ -561,7 +594,6 @@ class RuntimeFeatureScorer:
             same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
         phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype)
         if self.n_dynamic > 0:
-            row = (np.zeros(self.n_dynamic, dtype=np.float64) if src_mark is None
-                   else np.asarray(src_mark, dtype=np.float64).reshape(self.n_dynamic))
-            phi = np.concatenate([phi, np.tile(row, (n, 1))], axis=1)
+            marks = self._dynamic_mark_matrix(n, src_marks=src_mark, tgt_marks=tgt_marks)
+            phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)

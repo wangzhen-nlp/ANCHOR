@@ -235,9 +235,9 @@ class StreamMHPAssigner:
         self._state_tracker = None
         self.n_dynamic = 0
         if self.dynamic_mode:
-            from alarm_flow_mhp.dynamic_state import DeviceStateTracker, STATE_DIM
+            from alarm_flow_mhp.dynamic_state import DeviceStateTracker
             self._state_tracker = DeviceStateTracker()
-            self.n_dynamic = STATE_DIM
+            self.n_dynamic = int(getattr(self.feature_scorer, "n_dynamic", 0) or 0)
         # Sliding window of recent events kept as parallel arrays with a head
         # pointer (amortized O(1) append + eviction, O(cap) tail slice for
         # vectorized scoring). `_buf_events` holds the OnlineEvent objects;
@@ -451,8 +451,17 @@ class StreamMHPAssigner:
             np.array([e.src_mark for e in src_events], dtype=np.float64)
             if self.n_dynamic > 0 else None
         )
+        tgt_marks = (
+            np.tile(np.asarray(target_event.src_mark, dtype=np.float64).reshape(1, -1), (len(src_events), 1))
+            if self.n_dynamic > 3 else None
+        )
         alpha = self.feature_scorer.alpha_for_target(
-            target_event.alarm_type, target_event.ne, src_ats, src_nes, src_marks=src_marks
+            target_event.alarm_type,
+            target_event.ne,
+            src_ats,
+            src_nes,
+            src_marks=src_marks,
+            tgt_marks=tgt_marks,
         )
         # α floor: treat too-weak edges as non-edges (inference analog of
         # device-mode edge_threshold) — guards the soft model against linking
@@ -905,6 +914,10 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             late_penalty_half_life_sec=stream_config.late_penalty_half_life_sec,
             source_mark_at=(
                 state_timeline.source_mark_at if state_timeline is not None else None
+            ),
+            target_mark_at=(
+                (lambda ne, ts: state_timeline.state_at(ne, np.nextafter(float(ts), -np.inf)))
+                if state_timeline is not None else None
             ),
             cache_max_entries=int(getattr(args, "impute_cache_max", 200_000)),
         )
@@ -1496,9 +1509,9 @@ def main():
         topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
         if not args.quiet:
             print(f"[stream] topology index max_hops={infer_hops} (from artifact.config)", flush=True)
-        # Dynamic α: kernel carries STATE_DIM extra weights (source mark bits).
-        dyn_mode = getattr(artifact.config, "dynamic_alpha", "off") != "off"
-        n_dynamic = 3 if dyn_mode else 0
+        # Dynamic α: source = 3 bits; source_target = source 3 + target 3.
+        dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
+        n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
         feature_scorer = RuntimeFeatureScorer(
             kernel=FeatureKernel.from_dict(fk),
             at_vocab=rt.get("at_vocab", []),
@@ -1510,7 +1523,7 @@ def main():
         if not args.quiet:
             print(
                 f"[stream] feature scorer: {feature_scorer.layout.n_features} features"
-                f"{f' + {n_dynamic} dynamic (source state)' if n_dynamic else ''}, "
+                f"{f' + {n_dynamic} dynamic ({dyn_mode} state)' if n_dynamic else ''}, "
                 f"device-OPEN (new devices accepted)",
                 flush=True,
             )

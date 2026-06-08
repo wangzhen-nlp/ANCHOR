@@ -96,6 +96,28 @@ class _FakeDynamicFeatureScorer(_FakeFeatureScorer):
         return base * m[1]
 
 
+class _FakeSourceTargetFeatureScorer(_FakeFeatureScorer):
+    """Requires source power AND target link to activate the edge."""
+
+    n_dynamic = 6
+
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
+        base = super().alpha_for_target(target_at, target_ne, src_ats, src_nes)
+        marks = np.zeros((len(src_nes), self.n_dynamic), dtype=np.float64)
+        if src_marks is not None:
+            marks = np.asarray(src_marks, dtype=np.float64).reshape(len(src_nes), self.n_dynamic)
+        return base * marks[:, 1] * marks[:, 3]
+
+    def alpha_for_source(self, source_at, source_ne, tgt_ats, tgt_nes, src_mark=None, tgt_marks=None):
+        base = super().alpha_for_source(source_at, source_ne, tgt_ats, tgt_nes)
+        src = np.zeros(3) if src_mark is None else np.asarray(src_mark, dtype=np.float64).reshape(-1)[:3]
+        if tgt_marks is None:
+            tgt = np.zeros((len(tgt_nes), 3), dtype=np.float64)
+        else:
+            tgt = np.asarray(tgt_marks, dtype=np.float64).reshape(len(tgt_nes), -1)[:, :3]
+        return base * src[1] * tgt[:, 0]
+
+
 class _FakeMuScorer:
     def __init__(self, mu_by_at):
         self.mu_by_at = mu_by_at
@@ -538,6 +560,63 @@ def test_dynamic_feature_missing_sources_use_timeline_mark():
     missing = [e for e in s.events.values() if e.is_missing()]
     assert missing, "expected timeline-backed dynamic missing parent"
     assert any(e.type_id == ("S", "n1") and e.src_mark == (0, 1, 0) for e in missing)
+
+
+def test_source_target_dynamic_feature_uses_target_mark():
+    topo = _FakeTopo({"n1": {}}, max_hops=1)
+    fs = _FakeSourceTargetFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 5.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA")}, beta=1.0,
+    )
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 1e-6},
+        time_scale_sec=60.0,
+        alpha_floor=0.0,
+    )
+    assert adapter.source_mark_dim == 3
+    assert adapter.n_dynamic == 6
+    assert adapter.kernel_intensity(
+        ("S", "n1"), ("B", "n1"), 10.0,
+        source_mark=(0, 1, 0), target_mark=(1, 0, 0),
+    ) > 0
+    assert adapter.kernel_intensity(
+        ("S", "n1"), ("B", "n1"), 10.0,
+        source_mark=(0, 1, 0), target_mark=(0, 0, 0),
+    ) == 0
+    s = MissingChainSampler(
+        adapter,
+        SamplerConfig(lag_sec=1e9, sweeps_per_tick=3, max_births_per_sweep=0, seed=51),
+    )
+    s.ingest(0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    s.ingest(20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
+    tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
+    assert tgt.parent == src.eid
+
+
+def test_source_target_total_compensator_uses_target_timeline_mark():
+    topo = _FakeTopo({"n1": {"n2": 1}, "n2": {"n1": 1}}, max_hops=1)
+    fs = _FakeSourceTargetFeatureScorer(
+        at_vocab=["S", "B"], trigger={("S", "B"): 2.0},
+        topo=topo, node_infos={"n1": _FakeNodeInfo("siteA"), "n2": _FakeNodeInfo("siteA")},
+        beta=1.0,
+    )
+    timeline = ObservedStateTimeline()
+    timeline.ingest(0.0, "n2", "link", False)
+    adapter = FeatureKernelAdapter(
+        fs,
+        mu_by_alarm_type={"S": 0.1, "B": 0.1},
+        time_scale_sec=60.0,
+        alpha_floor=0.0,
+        target_mark_at=lambda ne, ts: timeline.state_at(ne, ts),
+    )
+    assert adapter.total_compensator(
+        ("S", "n1"), 60.0, source_mark=(0, 1, 0), source_ts=10.0
+    ) > 0
+    assert adapter.total_compensator(
+        ("S", "n1"), 60.0, source_mark=(0, 0, 0), source_ts=10.0
+    ) == 0
 
 
 def test_observed_state_timeline_prune_keeps_baseline_state():

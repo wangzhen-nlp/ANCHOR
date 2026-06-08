@@ -94,6 +94,7 @@ class ModelAdapter(Protocol):
         dt_sec: float,
         *,
         source_mark=None,
+        target_mark=None,
     ) -> float:
         """Triggering intensity α·φ(dt) of one ``source_type`` event on a
         ``target_type`` event ``dt_sec`` later. Returns 0 for non-edges."""
@@ -105,6 +106,7 @@ class ModelAdapter(Protocol):
         dt_sec: float,
         *,
         source_mark=None,
+        target_mark=None,
     ) -> float:
         """∫_0^{dt} α·φ(u) du — expected number of ``target_type`` children a
         single ``source_type`` event triggers within ``dt_sec``. Used for the
@@ -175,6 +177,7 @@ class ExpKernelAdapter:
         dt_sec: float,
         *,
         source_mark=None,
+        target_mark=None,
     ) -> float:
         dt_eff_sec, late_weight = self._signed_dt(dt_sec)
         if late_weight <= 0:
@@ -193,6 +196,7 @@ class ExpKernelAdapter:
         dt_sec: float,
         *,
         source_mark=None,
+        target_mark=None,
     ) -> float:
         edge = self.edges.get((int(target_type), int(source_type)))
         if edge is None:
@@ -484,7 +488,9 @@ class MissingChainSampler:
             self._orphan_idx[last] = i
 
     def _zero_src_mark(self) -> tuple:
-        n_dynamic = int(getattr(self.adapter, "n_dynamic", 0) or 0)
+        n_dynamic = int(getattr(self.adapter, "source_mark_dim", 0) or 0)
+        if n_dynamic <= 0:
+            n_dynamic = min(int(getattr(self.adapter, "n_dynamic", 0) or 0), 3)
         return tuple(0 for _ in range(n_dynamic))
 
     def _source_mark_for_missing(self, source_type, ts: float) -> tuple:
@@ -688,7 +694,7 @@ class MissingChainSampler:
             return
         eids, src_types, dts = self._candidate_parents(ev)
         src_marks = [self.events[pid].src_mark for pid in eids]
-        intens = self._batch_intensity(ev.type_id, src_types, dts, src_marks=src_marks)
+        intens = self._batch_intensity(ev.type_id, src_types, dts, src_marks=src_marks, target_mark=ev.src_mark)
         mu = self.adapter.mu(ev.type_id)
         weights = [mu]
         choices = [-1]
@@ -713,7 +719,7 @@ class MissingChainSampler:
         ev.parent_votes[ev.parent] += 1
         ev.sweep_count += 1
 
-    def _batch_intensity(self, target_type, src_types: list, dts: list, *, src_marks=None):
+    def _batch_intensity(self, target_type, src_types: list, dts: list, *, src_marks=None, target_mark=None):
         """Triggering intensities for a batch of candidate parents. Uses the
         adapter's vectorised path when available (essential for feature mode,
         where each α is a feature build) and falls back to per-pair otherwise."""
@@ -721,9 +727,9 @@ class MissingChainSampler:
             return []
         batch = getattr(self.adapter, "kernel_intensity_batch", None)
         if batch is not None:
-            return batch(target_type, src_types, dts, src_marks=src_marks)
+            return batch(target_type, src_types, dts, src_marks=src_marks, target_mark=target_mark)
         src_marks = src_marks or [None] * len(src_types)
-        return [self.adapter.kernel_intensity(s, target_type, dt, source_mark=mark)
+        return [self.adapter.kernel_intensity(s, target_type, dt, source_mark=mark, target_mark=target_mark)
                 for s, dt, mark in zip(src_types, dts, src_marks)]
 
     # ---- Move B: birth / death of missing events ------------------------
@@ -768,7 +774,7 @@ class MissingChainSampler:
 
         source_mark = self._source_mark_for_missing(s_type, t_prime)
         inten = self.adapter.kernel_intensity(
-            s_type, orphan.type_id, dt, source_mark=source_mark
+            s_type, orphan.type_id, dt, source_mark=source_mark, target_mark=orphan.src_mark
         )
         if inten <= EPS:
             return False
@@ -824,7 +830,7 @@ class MissingChainSampler:
         if par is None:
             return self.adapter.mu(ev.type_id)
         return self.adapter.kernel_intensity(
-            par.type_id, ev.type_id, ev.ts - par.ts, source_mark=par.src_mark
+            par.type_id, ev.type_id, ev.ts - par.ts, source_mark=par.src_mark, target_mark=ev.src_mark
         )
 
     def _try_death(self, ev: SamplerEvent) -> bool:
@@ -867,7 +873,7 @@ class MissingChainSampler:
         horizon = min(max(self.now - ts, 0.0), self.config.history_window_sec)
         batched = getattr(self.adapter, "total_compensator", None)
         if batched is not None:
-            return float(batched(source_type, horizon, source_mark=source_mark))
+            return float(batched(source_type, horizon, source_mark=source_mark, source_ts=ts))
         outgoing = getattr(self.adapter, "outgoing_targets", None)
         if outgoing is None:
             return 0.0
@@ -912,10 +918,10 @@ class MissingChainSampler:
             # instead of 32 scalar kernel_intensity calls.
             dts = [orphan.ts - t for t in grid]
             ws = [max(float(w), 0.0)
-                  for w in batch(orphan.type_id, [s_type] * n, dts, src_marks=marks)]
+                  for w in batch(orphan.type_id, [s_type] * n, dts, src_marks=marks, target_mark=orphan.src_mark)]
         else:
             ws = [max(self.adapter.kernel_intensity(s_type, orphan.type_id, orphan.ts - t,
-                                                    source_mark=m), 0.0)
+                                                    source_mark=m, target_mark=orphan.src_mark), 0.0)
                   for t, m in zip(grid, marks)]
         total = float(sum(ws))
         if total <= 0:
@@ -1336,6 +1342,7 @@ class FeatureKernelAdapter:
         max_candidates: int = 256,
         cache_max_entries: int = 200_000,
         source_mark_at=None,
+        target_mark_at=None,
     ):
         if time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
@@ -1354,12 +1361,14 @@ class FeatureKernelAdapter:
         self.beta = float(getattr(feature_scorer, "beta", 1.0))
         self.max_candidates = int(max_candidates)
         self._source_mark_at = source_mark_at
+        self._target_mark_at = target_mark_at
         # alarm-type vocabulary, id-ordered for deterministic enumeration
         at_to_id = getattr(feature_scorer, "at_to_id", {}) or {}
         self._at_vocab = [a for a, _ in sorted(at_to_id.items(), key=lambda kv: kv[1])]
         self._topo = getattr(feature_scorer, "topology_index", None)
         self._node_infos = getattr(feature_scorer, "node_infos", {}) or {}
         self.n_dynamic = int(getattr(feature_scorer, "n_dynamic", 0) or 0)
+        self.source_mark_dim = min(self.n_dynamic, 3)
         if candidate_max_hops is not None:
             self._max_hops = int(candidate_max_hops)
         else:
@@ -1376,31 +1385,63 @@ class FeatureKernelAdapter:
         self._envelope_mark = None        # cached α-maximizing source mark
 
     # ---- helpers ----
-    def _mark_tuple(self, source_mark=None) -> tuple:
-        if self.n_dynamic <= 0:
+    def _source_mark_tuple(self, source_mark=None) -> tuple:
+        if self.source_mark_dim <= 0:
             return ()
         if source_mark is None:
-            return tuple(0.0 for _ in range(self.n_dynamic))
+            return tuple(0.0 for _ in range(self.source_mark_dim))
         vals = tuple(float(v) for v in source_mark)
-        if len(vals) != self.n_dynamic:
-            return tuple((vals + tuple(0.0 for _ in range(self.n_dynamic)))[: self.n_dynamic])
-        return vals
+        return tuple((vals + tuple(0.0 for _ in range(self.source_mark_dim)))[: self.source_mark_dim])
 
-    def _mark_matrix(self, n: int, src_marks=None):
+    def _target_mark_tuple(self, target_mark=None) -> tuple:
+        if self.n_dynamic <= 3:
+            return ()
+        if target_mark is None:
+            return tuple(0.0 for _ in range(self.n_dynamic - 3))
+        vals = tuple(float(v) for v in target_mark)
+        return tuple((vals + tuple(0.0 for _ in range(self.n_dynamic - 3)))[: self.n_dynamic - 3])
+
+    def _mark_tuple(self, source_mark=None, target_mark=None) -> tuple:
+        if self.n_dynamic <= 0:
+            return ()
+        src = self._source_mark_tuple(source_mark)
+        if self.n_dynamic <= 3:
+            return src
+        return src + self._target_mark_tuple(target_mark)
+
+    def _mark_matrix(self, n: int, src_marks=None, target_mark=None, tgt_marks=None):
         if self.n_dynamic <= 0:
             return None
         import numpy as np
 
         if src_marks is None:
-            return np.zeros((n, self.n_dynamic), dtype=np.float64)
-        return np.asarray([self._mark_tuple(mark) for mark in src_marks], dtype=np.float64)
+            src_marks = [None] * n
+        if tgt_marks is not None:
+            return np.asarray(
+                [self._mark_tuple(sm, tm) for sm, tm in zip(src_marks, tgt_marks)],
+                dtype=np.float64,
+            )
+        return np.asarray([self._mark_tuple(mark, target_mark) for mark in src_marks], dtype=np.float64)
 
     def source_mark_at(self, source_type, ts: float) -> tuple:
-        if self.n_dynamic <= 0:
+        if self.source_mark_dim <= 0:
             return ()
         if self._source_mark_at is None:
-            return self._mark_tuple()
-        return self._mark_tuple(self._source_mark_at(source_type, ts))
+            return self._source_mark_tuple()
+        return self._source_mark_tuple(self._source_mark_at(source_type, ts))
+
+    def _target_mark_for(self, target_type, source_ts: Optional[float], source_ne: str, source_mark=None) -> tuple:
+        if self.n_dynamic <= 3:
+            return ()
+        try:
+            _at, target_ne = target_type
+        except Exception:
+            target_ne = ""
+        if target_ne and target_ne == source_ne:
+            return self._target_mark_tuple(source_mark)
+        if self._target_mark_at is None or source_ts is None:
+            return self._target_mark_tuple()
+        return self._target_mark_tuple(self._target_mark_at(target_ne, source_ts))
 
     def _envelope_mark_matrix(self, n: int):
         """Upper-envelope source mark for candidate enumeration: the mark that
@@ -1435,8 +1476,8 @@ class FeatureKernelAdapter:
     def _candidate_nes(self, ne: str) -> list:
         return [ne] + self._neighbors(ne)
 
-    def _alpha(self, src_key, tgt_key, source_mark=None) -> float:
-        mark = self._mark_tuple(source_mark)
+    def _alpha(self, src_key, tgt_key, source_mark=None, target_mark=None) -> float:
+        mark = self._mark_tuple(source_mark, target_mark)
         ck = (src_key, tgt_key, mark)
         cache = self._pair_alpha
         a = cache.get(ck)
@@ -1446,7 +1487,7 @@ class FeatureKernelAdapter:
         (s_at, s_ne) = src_key
         (t_at, t_ne) = tgt_key
         arr = self.fs.alpha_for_target(
-            t_at, t_ne, [s_at], [s_ne], src_marks=self._mark_matrix(1, [mark])
+            t_at, t_ne, [s_at], [s_ne], src_marks=self._mark_matrix(1, [source_mark], target_mark=target_mark)
         )
         val = float(arr[0]) if len(arr) else 0.0
         if val < self.alpha_floor:
@@ -1463,17 +1504,17 @@ class FeatureKernelAdapter:
             return float(self.mu_scorer.mu_for(at, ne))
         return float(self.mu_by_alarm_type.get(at, self.mu_default))
 
-    def kernel_intensity(self, source_type, target_type, dt_sec: float, *, source_mark=None) -> float:
+    def kernel_intensity(self, source_type, target_type, dt_sec: float, *, source_mark=None, target_mark=None) -> float:
         dt_eff_sec, late_weight = self._signed_dt(dt_sec)
         if late_weight <= 0:
             return 0.0
-        a = self._alpha(source_type, target_type, source_mark)
+        a = self._alpha(source_type, target_type, source_mark, target_mark)
         if a <= 0:
             return 0.0
         dt = dt_eff_sec / self.time_scale_sec
         return float(a * self.beta * math.exp(-self.beta * dt) * late_weight)
 
-    def _alpha_batch_cached(self, target_type, source_types, marks_norm):
+    def _alpha_batch_cached(self, target_type, source_types, marks_norm, target_mark=None):
         """Floored α for (each source, fixed target, its mark), served from the
         shared _pair_alpha LRU. Only cache MISSES go through alpha_for_target
         (one batched feature build) — the win for Gibbs, which re-scores the same
@@ -1490,7 +1531,8 @@ class FeatureKernelAdapter:
         miss_mk: list = []
         for i in range(n):
             s = source_types[i]
-            ck = (s, target_type, marks_norm[i])
+            full_mark = self._mark_tuple(marks_norm[i], target_mark)
+            ck = (s, target_type, full_mark)
             v = cache.get(ck)
             if v is None:
                 miss_i.append(i)
@@ -1503,9 +1545,9 @@ class FeatureKernelAdapter:
         if miss_i:
             (t_at, t_ne) = target_type
             ma = np.asarray(
-                self.fs.alpha_for_target(
-                    t_at, t_ne, miss_at, miss_ne,
-                    src_marks=self._mark_matrix(len(miss_i), miss_mk),
+                    self.fs.alpha_for_target(
+                        t_at, t_ne, miss_at, miss_ne,
+                    src_marks=self._mark_matrix(len(miss_i), miss_mk, target_mark=target_mark),
                 ),
                 dtype=np.float64,
             )
@@ -1514,12 +1556,12 @@ class FeatureKernelAdapter:
             for j, i in enumerate(miss_i):
                 val = float(ma[j])
                 alphas[i] = val
-                cache[(source_types[i], target_type, marks_norm[i])] = val
+                cache[(source_types[i], target_type, self._mark_tuple(marks_norm[i], target_mark))] = val
             while len(cache) > self._cache_max:
                 cache.popitem(last=False)
         return alphas
 
-    def kernel_intensity_batch(self, target_type, source_types: list, dts: list, *, src_marks=None):
+    def kernel_intensity_batch(self, target_type, source_types: list, dts: list, *, src_marks=None, target_mark=None):
         """Vectorised intensities for many candidate sources vs one target — the
         feature-mode hot path. α is served from the shared LRU cache (only misses
         rebuild features), then the kernel/decay factor is applied vectorised."""
@@ -1529,15 +1571,15 @@ class FeatureKernelAdapter:
         if n == 0:
             return np.zeros(0, dtype=np.float64)
         marks_in = src_marks if src_marks is not None else [None] * n
-        marks_norm = [self._mark_tuple(m) for m in marks_in]
-        alphas = self._alpha_batch_cached(target_type, source_types, marks_norm)
+        marks_norm = [self._source_mark_tuple(m) for m in marks_in]
+        alphas = self._alpha_batch_cached(target_type, source_types, marks_norm, target_mark=target_mark)
         dt_sec = np.asarray(dts, dtype=np.float64)
         dt_eff_sec, late_weight = self._signed_dt_vec(dt_sec)
         dt = dt_eff_sec / self.time_scale_sec
         return alphas * self.beta * np.exp(-self.beta * dt) * late_weight
 
-    def compensator(self, source_type, target_type, dt_sec: float, *, source_mark=None) -> float:
-        a = self._alpha(source_type, target_type, source_mark)
+    def compensator(self, source_type, target_type, dt_sec: float, *, source_mark=None, target_mark=None) -> float:
+        a = self._alpha(source_type, target_type, source_mark, target_mark)
         if a <= 0:
             return 0.0
         pos = 0.0
@@ -1615,11 +1657,17 @@ class FeatureKernelAdapter:
             self._candidate_source_cache.popitem(last=False)
         return out
 
-    def total_compensator(self, source_type, horizon_sec: float, *, source_mark=None) -> float:
+    def total_compensator(self, source_type, horizon_sec: float, *, source_mark=None, source_ts=None) -> float:
         horizon_sec = max(float(horizon_sec), 0.0)
         cache = self._alpha_out_sum
-        mark = self._mark_tuple(source_mark)
+        source_mark_norm = self._source_mark_tuple(source_mark)
+        mark = self._mark_tuple(source_mark_norm)
         cache_key = (source_type, mark)
+        if self.n_dynamic > 3:
+            # Target marks vary with source_ts, so the cached sum must include
+            # the timestamp slice. Round to microsecond precision to keep keys
+            # stable for float inputs without merging distinct event times.
+            cache_key = (source_type, source_mark_norm, round(float(source_ts), 6) if source_ts is not None else None)
         s_sum = cache.get(cache_key)
         if s_sum is not None:
             cache.move_to_end(cache_key)          # LRU touch
@@ -1636,8 +1684,23 @@ class FeatureKernelAdapter:
                     tgt_ats.append(at)
                     tgt_nes.append(ne)
             if tgt_ats:
+                tgt_marks = None
+                alpha_kwargs = {}
+                if self.n_dynamic > 3:
+                    tgt_marks = [
+                        self._target_mark_for((at, ne), source_ts, s_ne, source_mark_norm)
+                        for at, ne in zip(tgt_ats, tgt_nes)
+                    ]
+                    alpha_kwargs["tgt_marks"] = tgt_marks
                 a = np.asarray(
-                    self.fs.alpha_for_source(s_at, s_ne, tgt_ats, tgt_nes, src_mark=mark),
+                    self.fs.alpha_for_source(
+                        s_at,
+                        s_ne,
+                        tgt_ats,
+                        tgt_nes,
+                        src_mark=source_mark_norm,
+                        **alpha_kwargs,
+                    ),
                     dtype=np.float64,
                 )
                 a = a[a >= self.alpha_floor]
@@ -1668,6 +1731,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
                                   candidate_max_hops=None, time_slack_sec=None,
                                   late_penalty_half_life_sec=None,
                                   source_mark_at=None,
+                                  target_mark_at=None,
                                   cache_max_entries=200_000) -> FeatureKernelAdapter:
     """Build a :class:`FeatureKernelAdapter` from a feature-mode artifact.
 
@@ -1679,7 +1743,6 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         raise ValueError("feature_adapter_from_artifact requires edge_mode='feature'")
     from mhp.feature_kernel import FeatureKernel
     from alarm_flow_mhp.feature_spec import MuFeatureSpec, RuntimeFeatureScorer, RuntimeMuScorer
-    from alarm_flow_mhp.dynamic_state import STATE_DIM
     from alarm_flow_isahp.ne_topology import NETopologyIndex
     from ne_link_learning.core import build_graph_context
     from topology_tools.region_utils import load_ne_graph
@@ -1693,13 +1756,15 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
     graph_ctx = build_graph_context(ne_graph_data)
     infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
     topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
+    dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
+    n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
     feature_scorer = RuntimeFeatureScorer(
         kernel=FeatureKernel.from_dict(fk),
         at_vocab=rt.get("at_vocab", []),
         graph_context=graph_ctx,
         topology_index=topo_idx,
         beta=float(rt.get("beta", 1.0)),
-        n_dynamic=STATE_DIM if getattr(artifact.config, "dynamic_alpha", "off") != "off" else 0,
+        n_dynamic=n_dynamic,
     )
     mu_scorer = None
     mu_fk = rt.get("mu_kernel")
@@ -1730,6 +1795,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         alpha_floor=float(floor),
         candidate_max_hops=candidate_max_hops,
         source_mark_at=source_mark_at,
+        target_mark_at=target_mark_at,
         cache_max_entries=int(cache_max_entries),
     )
 
