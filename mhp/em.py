@@ -1329,15 +1329,20 @@ def fit_mhp_feature(
     C = len(cand_targets)
     if C == 0:
         raise ValueError("feature mode requires a non-empty candidate pair set")
-    # Sort candidates by key so the E-step can binary-search.
+    # Sort candidates by key so the E-step can binary-search. Large training
+    # callers may pre-sort to avoid holding both unsorted and sorted GB-sized
+    # feature/exposure tables during EM startup.
     keys = cand_targets * M + cand_sources
-    order = np.argsort(keys, kind="stable")
-    cand_targets = cand_targets[order]
-    cand_sources = cand_sources[order]
-    cand_phi = cand_phi[order]
-    if dynamic_exposure_2d is not None:
-        dynamic_exposure_2d = np.asarray(dynamic_exposure_2d)[order]
-    cand_keys = cand_targets * M + cand_sources
+    order = None
+    if C > 1 and not bool(np.all(keys[1:] >= keys[:-1])):
+        order = np.argsort(keys, kind="stable")
+        cand_targets = cand_targets[order]
+        cand_sources = cand_sources[order]
+        cand_phi = cand_phi[order]
+        if dynamic_exposure_2d is not None:
+            dynamic_exposure_2d = np.asarray(dynamic_exposure_2d)[order]
+        keys = keys[order]
+    cand_keys = keys
 
     n_source = np.bincount(events.dims, minlength=M).astype(np.float64)
     exposure = n_source[cand_sources]                      # E_c
@@ -1357,7 +1362,9 @@ def fit_mhp_feature(
     prior_num = np.zeros(C, dtype=np.float64)
     prior_exp = np.zeros(C, dtype=np.float64)
     if topo_prior_boost > 0.0 and cand_topo_score is not None:
-        topo_score_sorted = np.asarray(cand_topo_score, dtype=np.float64)[order]
+        topo_score_sorted = np.asarray(cand_topo_score, dtype=np.float64)
+        if order is not None:
+            topo_score_sorted = topo_score_sorted[order]
         K_topo = float(config.alpha_prior_strength)
         prior_num = K_topo * float(topo_prior_boost) * np.maximum(topo_score_sorted, 0.0)
         prior_exp = np.where(topo_score_sorted > 0.0, K_topo, 0.0)
@@ -1412,11 +1419,12 @@ def fit_mhp_feature(
             np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
             exposure_2d = n_src_by_combo[cand_sources]            # (C, K) E_{c,k}
         if config.time_slack > 0:
-            exposure_2d = exposure_2d * (
-                1.0 + float(beta_scalar) * _negative_penalty_integral(config)
-            )
-            if dynamic_exposure_2d is not None and dynamic_exposure_2d.dtype == np.float32:
+            slack_scale = 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
+            if np.issubdtype(exposure_2d.dtype, np.floating):
+                exposure_2d *= slack_scale
+            else:
                 exposure_2d = exposure_2d.astype(np.float32, copy=False)
+                exposure_2d *= slack_scale
         exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
         dynamic_n0_extra = None
         dynamic_e0_extra = None

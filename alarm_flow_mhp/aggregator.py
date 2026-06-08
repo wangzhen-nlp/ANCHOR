@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
+import gc
 import json
 import os
 import time
@@ -605,6 +606,37 @@ def _counts64_from_target_intervals(
     return counts64
 
 
+def _presort_feature_candidates_for_em(
+    cand_t: np.ndarray,
+    cand_s: np.ndarray,
+    phi: np.ndarray,
+    cand_topo_score: Optional[np.ndarray],
+    M: int,
+    *,
+    verbose: bool = False,
+):
+    """Sort candidate feature rows by EM lookup key before large exposure build.
+
+    Doing this before source_target exposure exists avoids EM startup holding
+    both unsorted and sorted copies of the GB-scale feature and exposure tables.
+    """
+    keys = np.asarray(cand_t, dtype=np.int64) * int(M) + np.asarray(cand_s, dtype=np.int64)
+    if len(keys) <= 1 or bool(np.all(keys[1:] >= keys[:-1])):
+        return cand_t, cand_s, phi, cand_topo_score
+    if verbose:
+        print("[train] feature mode: sorting candidate rows for EM lookup ...", flush=True)
+    order = np.argsort(keys, kind="stable")
+    cand_t_sorted = np.asarray(cand_t, dtype=np.int64)[order]
+    cand_s_sorted = np.asarray(cand_s, dtype=np.int64)[order]
+    phi_sorted = np.asarray(phi, dtype=np.float64)[order]
+    topo_sorted = None
+    if cand_topo_score is not None:
+        topo_sorted = np.asarray(cand_topo_score)[order]
+    del order, keys
+    gc.collect()
+    return cand_t_sorted, cand_s_sorted, phi_sorted, topo_sorted
+
+
 def _build_source_target_dynamic_exposure(
     train_events: EventCollection,
     cand_targets: np.ndarray,
@@ -1034,6 +1066,14 @@ def train_alarm_mhp(
                 f"{feat_names}",
                 flush=True,
             )
+        cand_t, cand_s, phi, cand_topo_score = _presort_feature_candidates_for_em(
+            cand_t,
+            cand_s,
+            phi,
+            cand_topo_score,
+            M,
+            verbose=verbose,
+        )
         if config.dynamic_alpha == "source_target":
             state_timeline = ObservedStateTimeline()
             for ev in sorted(sorted_alarm_events, key=lambda e: float(e.get("ts", 0.0))):
