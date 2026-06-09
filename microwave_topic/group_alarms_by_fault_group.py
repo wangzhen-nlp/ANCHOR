@@ -6,13 +6,14 @@ import argparse
 import json
 import sys
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alarm_tools.alarm_inputs import list_alarm_filepaths, stream_alarm_file
-from topology_resources import NE_GRAPH_JSON, resource_display
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
 DEFAULT_GROUP_FIELD = "故障组ID"
@@ -52,18 +53,30 @@ def _parse_device_fields(raw_fields):
 
 
 def _load_ne_domain_map(ne_graph_path):
-    if not ne_graph_path:
+    ne_graph = _load_json_object(ne_graph_path, "ne_graph", warn_if_missing=True)
+    return _build_ne_domain_map(ne_graph)
+
+
+def _load_json_object(path, label, warn_if_missing=False):
+    if not path:
         return {}
 
-    if not Path(ne_graph_path).exists():
-        print(f"⚠️ ne_graph 文件不存在，回退到告警字段判断设备类型: {ne_graph_path}", file=sys.stderr)
+    if not Path(path).exists():
+        if warn_if_missing:
+            print(f"⚠️ {label} 文件不存在，跳过对应补充信息: {path}", file=sys.stderr)
         return {}
 
-    with open(ne_graph_path, "r", encoding="utf-8") as fr:
-        ne_graph = json.load(fr)
+    with open(path, "r", encoding="utf-8") as fr:
+        data = json.load(fr)
 
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} 顶层必须是对象: {path}")
+    return data
+
+
+def _build_ne_domain_map(ne_graph):
     if not isinstance(ne_graph, dict):
-        raise ValueError(f"ne_graph 顶层必须是对象: {ne_graph_path}")
+        return {}
 
     domain_map = {}
     for ne_id, ne_info in ne_graph.items():
@@ -114,6 +127,20 @@ def _get_alarm_source(alarm, wrapper):
     return ""
 
 
+def _get_site_id(alarm, wrapper, alarm_source, ne_graph_data):
+    site_id = _normalize_text(alarm.get("站点ID", "")) if isinstance(alarm, dict) else ""
+    if site_id:
+        return site_id
+    if isinstance(wrapper, dict):
+        site_id = _normalize_text(wrapper.get("site_id", ""))
+        if site_id:
+            return site_id
+    ne_info = ne_graph_data.get(alarm_source, {}) if alarm_source and isinstance(ne_graph_data, dict) else {}
+    if isinstance(ne_info, dict):
+        return _normalize_text(ne_info.get("site_id", ""))
+    return ""
+
+
 def _get_device_type(alarm, wrapper, device_fields, ne_domain_map):
     alarm_source = _get_alarm_source(alarm, wrapper)
     if alarm_source and ne_domain_map:
@@ -141,6 +168,7 @@ def _build_group_record(group_id):
     return {
         "故障组ID": group_id,
         "alarms": [],
+        "_events": [],
         "_device_type_keys": set(),
         "_device_types": [],
         "_site_ids": [],
@@ -158,13 +186,21 @@ def group_alarms(
     min_device_count=0,
     min_site_count=0,
     ne_graph=NE_GRAPH_JSON,
+    site_graph=SITE_GRAPH_JSON,
+    visual_output=True,
     show_progress=False,
 ):
     device_fields = list(device_fields or DEFAULT_DEVICE_FIELDS)
     excluded_device_type_keys = {
         _normalize_key(value) for value in (excluded_device_types or []) if _normalize_text(value)
     }
-    ne_domain_map = _load_ne_domain_map(ne_graph)
+    ne_graph_data = _load_json_object(ne_graph, "ne_graph", warn_if_missing=True)
+    ne_domain_map = _build_ne_domain_map(ne_graph_data)
+    site_graph_data = (
+        _load_json_object(site_graph, "site_graph", warn_if_missing=True)
+        if visual_output
+        else {}
+    )
 
     groups = OrderedDict()
     stats = {
@@ -205,6 +241,7 @@ def group_alarms(
 
             group = groups.setdefault(group_id, _build_group_record(group_id))
             group["alarms"].append(alarm)
+            group["_events"].append({"alarm": alarm, "wrapper": wrapper})
             stats["grouped_alarm_count"] += 1
 
             device_type = _get_device_type(alarm, wrapper, device_fields, ne_domain_map)
@@ -212,12 +249,10 @@ def group_alarms(
                 group["_device_type_keys"].add(_normalize_key(device_type))
                 _append_unique(group["_device_types"], device_type)
 
-            site_id = _normalize_text(alarm.get("站点ID", ""))
-            if not site_id and isinstance(wrapper, dict):
-                site_id = _normalize_text(wrapper.get("site_id", ""))
+            alarm_source = _get_alarm_source(alarm, wrapper)
+            site_id = _get_site_id(alarm, wrapper, alarm_source, ne_graph_data)
             _append_unique(group["_site_ids"], site_id)
 
-            alarm_source = _get_alarm_source(alarm, wrapper)
             _append_unique(group["_alarm_sources"], alarm_source)
 
         if show_progress:
@@ -272,10 +307,223 @@ def group_alarms(
             record["site_ids"] = group["_site_ids"]
         if group["_alarm_sources"]:
             record["alarm_sources"] = group["_alarm_sources"]
+        if visual_output:
+            record.update(_build_visual_fields(group, ne_graph_data, ne_domain_map, site_graph_data))
         output_groups.append(record)
 
     stats["output_group_count"] = len(output_groups)
     return output_groups, stats
+
+
+def _parse_datetime_ts(value):
+    text = _normalize_text(value)
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("T", " ")).timestamp()
+    except ValueError:
+        return None
+
+
+def _format_ts(ts):
+    if ts is None:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_alarm_ts(alarm, wrapper):
+    if isinstance(wrapper, dict):
+        raw_ts = wrapper.get("ts")
+        if raw_ts not in (None, ""):
+            try:
+                return float(raw_ts)
+            except (TypeError, ValueError):
+                pass
+    for field_name in (
+        "告警首次发生时间",
+        "告警发生时间",
+        "发生时间",
+        "首次发生时间",
+        "alarm_time",
+        "time",
+    ):
+        ts = _parse_datetime_ts(alarm.get(field_name, ""))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _first_alarm_field(alarm, fields):
+    for field_name in fields:
+        value = _normalize_text(alarm.get(field_name, ""))
+        if value:
+            return value
+    return ""
+
+
+def _get_site_context(site_id, ne_info, site_graph_data):
+    site_info = site_graph_data.get(site_id, {}) if site_id and isinstance(site_graph_data, dict) else {}
+    if not isinstance(site_info, dict):
+        site_info = {}
+    return {
+        "site_name": (
+            _normalize_text(ne_info.get("site_name", ""))
+            or _normalize_text(site_info.get("site_name", ""))
+            or _normalize_text(site_info.get("name", ""))
+        ),
+        "site_type": _normalize_text(ne_info.get("site_type", "")) or _normalize_text(site_info.get("site_type", "")),
+        "region_id": _normalize_text(ne_info.get("region_id", "")) or _normalize_text(site_info.get("region_id", "")),
+        "longitude": ne_info.get("longitude", site_info.get("longitude", site_info.get("lon", site_info.get("lng", "")))),
+        "latitude": ne_info.get("latitude", site_info.get("latitude", site_info.get("lat", ""))),
+    }
+
+
+def _build_visual_link_info(ne_id, group_ne_ids, ne_graph_data):
+    raw_ne_info = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+    raw_links = raw_ne_info.get("link", {}) if isinstance(raw_ne_info, dict) else {}
+    if not isinstance(raw_links, dict):
+        return {}
+
+    group_ne_id_set = set(group_ne_ids)
+    links = {}
+    for target_ne_id, link_meta in raw_links.items():
+        if target_ne_id == ne_id or target_ne_id not in group_ne_id_set:
+            continue
+        if isinstance(link_meta, dict):
+            connection_types = sorted(str(key) for key in link_meta.keys())
+            topologies = sorted({str(value) for value in link_meta.values() if value})
+        else:
+            connection_types = [str(link_meta)]
+            topologies = []
+        links[target_ne_id] = {
+            "connection_type": ",".join(connection_types),
+            "distance": "",
+            "topology": ",".join(topologies),
+            "time_window": "",
+            "left_alarm": {},
+            "right_alarm": {},
+        }
+    return links
+
+
+def _build_visual_fields(group, ne_graph_data, ne_domain_map, site_graph_data):
+    group_id = group["故障组ID"]
+    symptoms = []
+    ne_alarms = OrderedDict()
+    site_ids = []
+    ne_ids = []
+
+    for index, event in enumerate(group.get("_events", []), start=1):
+        alarm = event.get("alarm", {})
+        wrapper = event.get("wrapper")
+        alarm_source = _get_alarm_source(alarm, wrapper)
+        site_id = _get_site_id(alarm, wrapper, alarm_source, ne_graph_data)
+        ts = _get_alarm_ts(alarm, wrapper)
+        alarm_title = _first_alarm_field(alarm, ("告警标题", "alarm_title", "alarm_type", "title"))
+        alarm_id = _first_alarm_field(alarm, ("告警编码ID", "告警ID", "alarm_id", "id")) or f"{group_id}-{index}"
+        device_type = _get_device_type(alarm, wrapper, DEFAULT_DEVICE_FIELDS, ne_domain_map)
+
+        symptom = {
+            "node": site_id,
+            "alarm": alarm_title,
+            "alarm_source": alarm_source,
+            "ts": ts,
+            "eid": alarm_id,
+            "matched_role": "alarm_group",
+            "matched_rule": "alarm_group_id_rule",
+            "matched_role_key": "alarm_group",
+            "故障组ID": group_id,
+            "工单号": _normalize_text(alarm.get("工单号", "")),
+            "告警清除时间": _normalize_text(alarm.get("告警清除时间", "")),
+            "domain": device_type,
+        }
+        symptoms.append(symptom)
+
+        if site_id:
+            _append_unique(site_ids, site_id)
+        if alarm_source:
+            _append_unique(ne_ids, alarm_source)
+            node_alarm = {
+                "alarm_id": alarm_id,
+                "alarm_type": alarm_title,
+                "alarm_time": _format_ts(ts),
+                "alarm_clear_time": symptom["告警清除时间"],
+                "domain": device_type,
+                "site_id": site_id,
+                "matched_role": "alarm_group",
+                "matched_rule": "alarm_group_id_rule",
+                "matched_role_key": "alarm_group",
+                "工单号": symptom["工单号"],
+                "故障组ID": group_id,
+                "ts": ts,
+            }
+            ne_alarms.setdefault(alarm_source, []).append(node_alarm)
+
+    ne_info_output = OrderedDict()
+    for ne_id in ne_ids:
+        raw_ne_info = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+        if not isinstance(raw_ne_info, dict):
+            raw_ne_info = {}
+        alarms = ne_alarms.get(ne_id, [])
+        site_id = (
+            _normalize_text(raw_ne_info.get("site_id", ""))
+            or (_normalize_text(alarms[0].get("site_id", "")) if alarms else "")
+        )
+        site_context = _get_site_context(site_id, raw_ne_info, site_graph_data)
+        ne_info_output[ne_id] = {
+            "link": _build_visual_link_info(ne_id, ne_ids, ne_graph_data),
+            "group": group_id,
+            "name": raw_ne_info.get("name", ne_id),
+            "site_id": site_id,
+            "site_name": site_context["site_name"],
+            "site_type": site_context["site_type"],
+            "type": str(raw_ne_info.get("type", "")).upper(),
+            "network_type": str(raw_ne_info.get("network_type", "")).upper(),
+            "manufacturer": str(raw_ne_info.get("manufacturer", "")).upper(),
+            "running_status": raw_ne_info.get("running_status", raw_ne_info.get("status", "")),
+            "domain": str(raw_ne_info.get("domain", "") or (alarms[0].get("domain", "") if alarms else "")).upper(),
+            "region_id": site_context["region_id"],
+            "longitude": site_context["longitude"],
+            "latitude": site_context["latitude"],
+            "alarm": alarms,
+        }
+
+    timestamps = [symptom["ts"] for symptom in symptoms if symptom.get("ts") is not None]
+    group_anchor_ts = min(timestamps) if timestamps else None
+    role_mapping = {"associated_site": sorted(site_ids)}
+    match_info = {
+        "uuid": group_id,
+        "rule": "alarm_group_id_rule",
+        "merged_rules": ["alarm_group_id_rule"],
+        "related_group_uuids": [],
+        "inferred_roots": {},
+        "role_mapping": role_mapping,
+        "uses_missing_topology": False,
+        "missing_topology_edges": [],
+    }
+    return {
+        "uuid": group_id,
+        "rule": "alarm_group_id_rule",
+        "merged_rules": ["alarm_group_id_rule"],
+        "related_group_uuids": [],
+        "role_mapping": role_mapping,
+        "symptoms": symptoms,
+        "match_info": match_info,
+        "ne_info": ne_info_output,
+        "group_info": {
+            group_id: {
+                "ne_list": sorted(ne_ids),
+                "site_list": sorted(site_ids),
+            }
+        },
+        "group_anchor_ts": group_anchor_ts,
+        "group_anchor_time": _format_ts(group_anchor_ts),
+    }
 
 
 def write_jsonl(groups, output_path):
@@ -348,6 +596,19 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
+        "--site-graph",
+        default=SITE_GRAPH_JSON,
+        help=(
+            "site_graph.json 文件；默认: "
+            f"{resource_display('site_graph.json')}。用于补充可视化输出中的站点名称和经纬度"
+        ),
+    )
+    parser.add_argument(
+        "--no-visual-output",
+        action="store_true",
+        help="不追加故障组总览页和 NE 传播图可识别的可视化字段",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="关闭读取输入时的进度显示",
@@ -377,6 +638,8 @@ def main():
         min_device_count=args.min_device_count,
         min_site_count=args.min_site_count,
         ne_graph=args.ne_graph,
+        site_graph=args.site_graph,
+        visual_output=not args.no_visual_output,
         show_progress=not args.no_progress,
     )
     write_jsonl(groups, args.output)
@@ -384,6 +647,8 @@ def main():
     stats["output"] = args.output
     stats["group_field"] = args.group_field
     stats["ne_graph"] = args.ne_graph
+    stats["site_graph"] = args.site_graph
+    stats["visual_output"] = not args.no_visual_output
     stats["device_fields"] = device_fields
     stats["excluded_device_types"] = excluded_device_types
     stats["min_alarm_count"] = args.min_alarm_count
