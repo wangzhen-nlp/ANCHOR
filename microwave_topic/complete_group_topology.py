@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import sys
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -45,6 +46,15 @@ def _iter_jsonl(path):
                 raise ValueError(f"{path} 第 {line_num} 行 JSON 解析失败: {exc}") from exc
             if isinstance(record, dict):
                 yield record
+
+
+def _count_jsonl_records(path):
+    count = 0
+    with open(path, "r", encoding="utf-8") as fr:
+        for raw_line in fr:
+            if raw_line.strip():
+                count += 1
+    return count
 
 
 def _write_jsonl(path, records):
@@ -497,6 +507,96 @@ def _site_context(site_id, site_graph_data, ne_info):
     }
 
 
+class _NullProgress:
+    def update(self, _stats):
+        pass
+
+    def close(self):
+        pass
+
+
+class _TqdmGroupProgress:
+    def __init__(self, total):
+        from tqdm import tqdm
+
+        self._bar = tqdm(
+            total=total,
+            desc="补齐拓扑",
+            unit="组",
+            dynamic_ncols=True,
+            file=sys.stderr,
+        )
+
+    def update(self, stats):
+        self._bar.update(1)
+        self._bar.set_postfix({
+            "新增设备": stats["added_ne_count"],
+            "NE联通": stats["ne_level_connected_group_count"],
+        })
+
+    def close(self):
+        self._bar.close()
+
+
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class _StderrGroupProgress:
+    def __init__(self, total):
+        self.total = max(int(total), 0)
+        self.current = 0
+        self.start_time = time.time()
+        self._render({"added_ne_count": 0, "ne_level_connected_group_count": 0}, force=True)
+
+    def update(self, stats):
+        self.current += 1
+        self._render(stats)
+
+    def close(self):
+        self._render({"added_ne_count": "", "ne_level_connected_group_count": ""}, force=True)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    def _render(self, stats, force=False):
+        elapsed = max(time.time() - self.start_time, 1e-6)
+        rate = self.current / elapsed
+        if self.total > 0:
+            percent = min(self.current / self.total, 1.0) * 100
+            remaining = max(self.total - self.current, 0)
+            eta = _format_duration(remaining / rate) if rate > 0 else "00:00"
+            message = (
+                f"\r补齐拓扑: {self.current}/{self.total} "
+                f"{percent:6.2f}% ({rate:.1f}组/s, ETA {eta})"
+            )
+        else:
+            message = f"\r补齐拓扑: {self.current} ({rate:.1f}组/s)"
+
+        added_ne_count = stats.get("added_ne_count", "")
+        ne_connected_count = stats.get("ne_level_connected_group_count", "")
+        if added_ne_count != "" or ne_connected_count != "":
+            message += f" | 新增设备 {added_ne_count}，NE联通 {ne_connected_count}"
+
+        sys.stderr.write(message)
+        sys.stderr.flush()
+
+
+def _build_group_progress(input_path, enabled):
+    if not enabled:
+        return _NullProgress()
+
+    total = _count_jsonl_records(input_path)
+    try:
+        return _TqdmGroupProgress(total)
+    except ImportError:
+        return _StderrGroupProgress(total)
+
+
 def _build_filtered_link_info(ne_id, included_ne_ids, ne_graph_data):
     ne_info = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
     raw_links = ne_info.get("link", {}) if isinstance(ne_info, dict) else {}
@@ -704,31 +804,29 @@ def complete_groups(input_path, output_path, ne_graph_path, site_graph_path, sho
         "ne_level_unconnected_group_count": 0,
         "added_ne_count": 0,
     }
-    output_records = []
-    for group in _iter_jsonl(input_path):
-        stats["input_group_count"] += 1
-        completed = complete_group_topology(group, ne_graph_data, site_graph_data, topo_index)
-        completion = completed.get("topology_completion", {})
-        if completion.get("site_level_connected"):
-            stats["site_level_connected_group_count"] += 1
-        else:
-            stats["site_level_unconnected_group_count"] += 1
-        if completion.get("ne_level_connected"):
-            stats["ne_level_connected_group_count"] += 1
-        else:
-            stats["ne_level_unconnected_group_count"] += 1
-        stats["added_ne_count"] += len(completion.get("added_ne_ids", []))
-        output_records.append(completed)
-        if show_progress:
-            print(
-                f"已处理故障组 {stats['input_group_count']} 个，"
-                f"累计新增设备 {stats['added_ne_count']} 个",
-                file=sys.stderr,
-                flush=True,
-            )
+    progress = _build_group_progress(input_path, show_progress)
+    with open(output_path, "w", encoding="utf-8") as fw:
+        try:
+            for group in _iter_jsonl(input_path):
+                stats["input_group_count"] += 1
+                completed = complete_group_topology(group, ne_graph_data, site_graph_data, topo_index)
+                completion = completed.get("topology_completion", {})
+                if completion.get("site_level_connected"):
+                    stats["site_level_connected_group_count"] += 1
+                else:
+                    stats["site_level_unconnected_group_count"] += 1
+                if completion.get("ne_level_connected"):
+                    stats["ne_level_connected_group_count"] += 1
+                else:
+                    stats["ne_level_unconnected_group_count"] += 1
+                stats["added_ne_count"] += len(completion.get("added_ne_ids", []))
+                fw.write(json.dumps(completed, ensure_ascii=False, separators=(",", ":")))
+                fw.write("\n")
+                stats["output_group_count"] += 1
+                progress.update(stats)
+        finally:
+            progress.close()
 
-    _write_jsonl(output_path, output_records)
-    stats["output_group_count"] = len(output_records)
     stats["input"] = input_path
     stats["output"] = output_path
     stats["ne_graph"] = ne_graph_path
