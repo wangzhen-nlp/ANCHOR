@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>第二节：弱拓扑关联</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #335c81;
+      --accent-soft: #e8f1f8;
+      --card: #fbfdff;
+      --green-soft: #ecf8f1;
+      --orange-soft: #fff4e6;
+      --purple-soft: #f3effc;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.75;
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 40px auto;
+      padding: 0 24px 48px;
+    }
+
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(31, 41, 51, 0.08);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 34px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+      color: #102a43;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      color: #243b53;
+      border-left: 5px solid var(--accent);
+      padding-left: 12px;
+    }
+
+    p { margin: 12px 0; }
+
+    .lead {
+      font-size: 18px;
+      color: #334e68;
+      background: var(--accent-soft);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin: 18px 0 28px;
+    }
+
+    .block {
+      margin: 28px 0;
+      padding: 24px 26px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .block h2 {
+      margin: 0 0 12px;
+      font-size: 21px;
+      color: var(--accent);
+      border-left: none;
+      padding-left: 0;
+    }
+
+    .formula {
+      overflow-x: auto;
+      white-space: normal;
+      margin: 16px 0;
+      padding: 18px 20px;
+      background: #f9fafb;
+      border-radius: 14px;
+      border: 1px dashed #d1d5db;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f8fafc;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin: 18px 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--card);
+    }
+
+    .card.orange { background: var(--orange-soft); }
+    .card.purple { background: var(--purple-soft); }
+    .card-title { font-weight: 700; color: #243b53; margin-bottom: 6px; }
+
+    ul { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .step {
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      min-height: 118px;
+    }
+
+    .step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .step-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .step-text {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .summary {
+      margin-top: 30px;
+      padding: 22px 26px;
+      border-left: 5px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 16px;
+      font-weight: 600;
+    }
+
+    .footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 800px) {
+      .section { padding: 32px 24px; }
+      .flow { grid-template-columns: 1fr; }
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="section">
+      <div class="eyebrow">Section 02</div>
+      <h1>第二节：弱拓扑关联</h1>
+
+      <p class="lead">
+        当前算法并不把拓扑关系当作绝对可靠的硬规则，而是采用“弱拓扑”思路：拓扑信息不会直接规定某条关系一定成立，而是作为可学习的结构信号进入触发强度，并在数据稀疏时提供轻量先验；最终是否形成强触发关系，仍由事件数据和学习到的参数共同决定。
+      </p>
+
+      <h2>2.1 为什么是弱拓扑</h2>
+      <p>
+        在多维时序点过程里，历史事件是否会影响当前事件，取决于二者之间的触发强度。若完全不使用结构信息，模型只能依赖时间共现来解释事件间关系，容易受到偶然共现和样本稀疏的影响；若完全依赖结构信息，又会受到结构缺失、方向错误或粒度不一致的影响。
+      </p>
+      <p>
+        因此当前算法采用折中方式：拓扑只提供“哪些关系更可能有影响”的软信号，而不是直接规定某条边一定存在或一定不存在。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">触发特征</div>
+          <p>拓扑强弱被编码成特征，进入触发强度函数，由数据学习其权重。</p>
+        </div>
+        <div class="card purple">
+          <div class="card-title">轻量先验</div>
+          <p>对结构相关的类型对加入 pseudo-count，在样本稀疏时提供温和支持。</p>
+        </div>
+      </div>
+
+      <h2>2.2 触发强度：先定义要学习的关系强度</h2>
+      <p>
+        对来源类型 \(v\) 和目标类型 \(u\)，当前算法首先把二者之间的影响表示为触发强度：
+      </p>
+
+      <div class="formula">
+        \[
+        \alpha_{u,v}=\operatorname{softplus}\!\left(w_{\alpha}^{\top}\phi(u,v)\right)
+        \]
+      </div>
+
+      <p>
+        这里 \(\phi(u,v)\) 是来源—目标类型对的特征，\(w_{\alpha}\) 是需要学习的参数。这个公式表达的是：
+        模型不直接为每一对类型记忆一个固定强度，而是通过一组可解释特征共同计算触发强度。
+      </p>
+
+      <p>
+        因此，拓扑信息和其它属性信息都不是单独决定关系是否成立，而是共同进入 \(\phi(u,v)\)，再由学习到的权重决定它们对触发强度的贡献。
+      </p>
+
+      <h2>2.3 拓扑特征：把结构关系转成连续信号</h2>
+      <p>
+        在定义触发强度之后，拓扑信息以特征的形式进入 \(\phi(u,v)\)。对来源类型 \(v\) 和目标类型 \(u\)，算法会计算一个有方向的拓扑分数：
+      </p>
+
+      <div class="formula">
+        \[
+        r_{\mathrm{topo}}(v\rightarrow u)\in[0,1]
+        \]
+      </div>
+
+      <p>
+        它表示来源类型 \(v\) 所属实体到目标类型 \(u\) 所属实体之间的结构接近度或可达强度。例如，同一实体、直接相连、多跳可达、反向可达、无向可达等关系会被压缩成不同强度的分数。
+      </p>
+
+      <p>
+        于是，触发强度中会出现如下项：
+      </p>
+
+      <div class="formula">
+        \[
+        w_{\mathrm{topo}}\,r_{\mathrm{topo}}(v\rightarrow u)
+        \]
+      </div>
+
+      <p>
+        如果学习到 \(w_{\mathrm{topo}}>0\)，说明结构更接近的类型对更容易形成触发；如果 \(w_{\mathrm{topo}}\) 较小甚至为负，说明仅靠拓扑并不能解释数据中的触发关系。
+      </p>
+
+      <div class="note">
+        这就是“弱拓扑”的关键：拓扑以连续特征形式进入模型，但拓扑特征的权重由数据学习，而不是由人工固定。
+      </div>
+
+      <h2>2.4 其它静态特征：补充拓扑之外的归纳信号</h2>
+      <p>
+        除了拓扑关系，算法还利用类型关系、位置代理和实体属性来增强泛化能力。
+      </p>
+      <p>
+        当前其它静态特征可以概括为：
+      </p>
+
+      <ul>
+        <li><strong>类型对：</strong>通过 \(\mathbf{1}_{\mathrm{type}_u, \mathrm{type}_v}\) 学习不同事件类型之间的方向性触发模式。</li>
+        <li><strong>同类事件：</strong>通过 \(\mathbf{1}_{\mathrm{sameType}}\) 表示来源与目标是否属于相同事件类型。</li>
+        <li><strong>同实体：</strong>通过 \(\mathbf{1}_{\mathrm{sameEntity}}\) 表示来源与目标是否属于同一实体。</li>
+        <li><strong>同站点 / 位置代理：</strong>通过 \(\mathbf{1}_{\mathrm{sameSite}}\) 表示二者是否处于相同位置范围。</li>
+        <li><strong>同厂家：</strong>通过 \(\mathbf{1}_{\mathrm{sameVendor}}\) 捕捉相同来源系统或实体属性带来的相似模式。</li>
+        <li><strong>同实体类型：</strong>通过 \(\mathbf{1}_{\mathrm{sameEntityType}}\) 表示来源与目标是否属于相同类别。</li>
+        <li><strong>交叉特征：</strong>例如 \(r_{\mathrm{topo}}\mathbf{1}_{\mathrm{sameSite}}\)，表达“结构相关且位置相近”是否具有额外增强作用。</li>
+      </ul>
+
+      <p>
+        因此，最终触发强度不是由单一拓扑信息决定，而是由拓扑、类型关系、位置代理和实体属性等多种信号共同决定。
+      </p>
+
+      <h2>2.5 动态状态特征：上下文感知的触发</h2>
+      <p>
+        除了静态属性，真实网络中一个事件是否会引发级联告警，往往还取决于设备<strong>当前的运行状态</strong>。为此，算法在静态关联之上引入了动态状态特征（Dynamic State Features）。
+      </p>
+      <p>
+        在任意时刻 \(t\)，算法不仅会追踪来源实体 \(v\) 在触发发生时的未恢复告警状态，还会同时观测目标实体 \(u\) 受波及前夕的运行状态（例如：当前是否处于断电、脱网、链路中断等），将二者拼接为联合动态特征向量 \(\mathbf{m}_{u,v}(t)\)。此时，触发强度的计算升级为全量上下文感知模式：
+      </p>
+
+      <div class="formula">
+        \[
+        \alpha_{u,v}(t)=\operatorname{softplus}\!\left(w_{\mathrm{static}}^{\top}\phi_{\mathrm{static}}(u,v) + w_{\mathrm{dyn}}^{\top}\mathbf{m}_{u,v}(t)\right)
+        \]
+      </div>
+
+      <p>
+        动态特征使得模型能够学习到极度复杂的条件触发逻辑。它不仅能学到“源设备处于断电状态时发出的告警破坏力更大”，还能学到“当目标设备自身已经存在未恢复的脱网或性能问题时，它更容易被相邻设备的告警所触发（即目标设备的脆弱性）”。源和目标的实时状态在这里实现了完美的双向协同。
+      </p>
+
+      <h2>2.6 拓扑先验：用 pseudo-count 提供弱结构偏置</h2>
+      <p>
+        在训练中，E-step 会得到每个来源—目标类型对的期望触发次数。记：
+      </p>
+
+      <div class="formula">
+        \[
+        N_{u,v}=\sum_i\sum_{j:u_i=u,\,u_j=v}q(z_i=j)
+        \]
+      </div>
+
+      <p>
+        其中 \(q(z_i=j)\) 是事件 \(i\) 由历史事件 \(j\) 解释的软责任。为了让结构相关但样本较少的关系不被完全忽略，算法可以加入拓扑 pseudo-count：
+      </p>
+
+      <div class="formula">
+        \[
+        \widetilde{N}_{u,v}=N_{u,v}+\rho\,r_{\mathrm{topo}}(v\rightarrow u)
+        \]
+      </div>
+
+      <p>
+        其中 \(\rho\) 是拓扑先验强度超参数。它不是要强迫拓扑关系一定成立，而是在数据不足时给予结构相关关系一个温和的初始支持；当真实事件数据足够多时，数据项 \(N_{u,v}\) 会主导学习结果。
+      </p>
+
+      <h2>2.7 小结</h2>
+      <p>
+        当前算法中的弱拓扑关联可以概括为两层：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakTopologyAssociation}
+        =
+        \mathrm{TopologyFeatureScoring}
+        +
+        \mathrm{Static/DynamicContext}
+        +
+        \mathrm{TopologyPseudoCountPrior}
+        \]
+      </div>
+
+      <p>
+        它既避免了完全忽略结构信息带来的偶然共现问题，也避免了完全相信结构信息带来的脆弱性。最终，拓扑只是提供可学习的归纳偏置，真正的触发强度仍由事件数据和学习参数共同确定。
+      </p>
+
+      <div class="footer">
+        本节为“弱拓扑关联”的独立说明，保持通用事件建模表述；后续章节可继续展开 feature 模式、动态状态特征或在线推理机制。
+      </div>
+    </section>
+  </main>
+</body>
+</html>

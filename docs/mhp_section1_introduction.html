@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>第一节：多维时序点过程</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #335c81;
+      --accent-soft: #e8f1f8;
+      --card: #fbfdff;
+      --green-soft: #ecf8f1;
+      --orange-soft: #fff4e6;
+      --purple-soft: #f3effc;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.75;
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 40px auto;
+      padding: 0 24px 48px;
+    }
+
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(31, 41, 51, 0.08);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0 0 16px;
+      font-size: 34px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+      color: #102a43;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      color: #243b53;
+      border-left: 5px solid var(--accent);
+      padding-left: 12px;
+    }
+
+    p { margin: 12px 0; }
+
+    .lead {
+      font-size: 18px;
+      color: #334e68;
+      background: var(--accent-soft);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin: 18px 0 28px;
+    }
+
+    .block {
+      margin: 28px 0;
+      padding: 24px 26px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .block h2 {
+      margin: 0 0 12px;
+      font-size: 21px;
+      color: var(--accent);
+      border-left: none;
+      padding-left: 0;
+    }
+
+    .formula {
+      overflow-x: auto;
+      white-space: normal;
+      margin: 16px 0;
+      padding: 18px 20px;
+      background: #f9fafb;
+      border-radius: 14px;
+      border: 1px dashed #d1d5db;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f8fafc;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin: 18px 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--card);
+    }
+
+    .card.orange { background: var(--orange-soft); }
+    .card.purple { background: var(--purple-soft); }
+    .card-title { font-weight: 700; color: #243b53; margin-bottom: 6px; }
+
+    ul { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .step {
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      min-height: 118px;
+    }
+
+    .step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .step-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .step-text {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .summary {
+      margin-top: 30px;
+      padding: 22px 26px;
+      border-left: 5px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 16px;
+      font-weight: 600;
+    }
+
+    .footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 800px) {
+      .section { padding: 32px 24px; }
+      .flow { grid-template-columns: 1fr; }
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="section">
+      <div class="eyebrow">Section 1 · Multivariate Temporal Point Process</div>
+      <h1>第一节：多维时序点过程</h1>
+      <p class="lead">
+        我们将一段连续发生的事件序列建模为一个多维连续时间点过程。模型的核心问题是：当一个新事件出现时，它究竟是独立产生的，还是受到了历史事件的触发。
+      </p>
+
+      <div class="block">
+        <h2>1. 事件流表示</h2>
+        <p>
+          给定一段观测到的事件流：
+        </p>
+        <div class="formula">
+          \[\mathcal{D}=\{e_i=(t_i,u_i,m_i)\}_{i=1}^{N}\]
+        </div>
+        <p>
+          其中，\(t_i\) 表示事件发生时间，\(u_i\) 表示事件所属类型，\(m_i\) 表示事件的附加属性或上下文信息。
+          从建模角度看，\(u_i\) 决定了事件属于哪一个维度，\(t_i\) 决定了事件之间可能存在的时序影响。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>2. 发生强度：背景项 + 历史触发项</h2>
+        <p>
+          对任意事件类型 \(u\)，模型用一个时间相关的强度函数 \(\lambda_u(t)\) 描述该类型事件在时刻 \(t\) 发生的倾向：
+        </p>
+        <div class="formula">
+          \[\lambda_u(t)=\mu_u+\sum_{j:t_j\lt t}\alpha_{u,u_j}\,g_{u,u_j}(t-t_j)\]
+        </div>
+        <p>
+          第一项 \(\mu_u\) 表示该类型事件的背景发生倾向，也就是不依赖历史事件时自身出现的基础强度。
+          第二项表示历史事件对当前类型的触发作用：历史事件越相关、时间越接近，对当前事件的影响通常越强。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>3. 学习目标：解释已发生事件，同时避免过度预测</h2>
+        <p>
+          在强度函数定义好之后，模型训练的目标是最大化观测事件流的似然：
+        </p>
+        <div class="formula">
+          \[\log p(\mathcal{D})=\sum_{i=1}^{N}\log\lambda_{u_i}(t_i)-\sum_{u}\int_{0}^{T}\lambda_u(t)\,dt\]
+        </div>
+        <p>
+          第一项鼓励模型在真实事件发生的时刻给出较高强度；第二项是积分惩罚，避免模型在大量没有事件发生的时间段也给出过高强度。
+          因此，模型不仅要解释已经发生的事件，还要控制整体预测不要过度扩散。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>4. 学习方法：EM 算法与隐含父变量</h2>
+        <p>
+          直接优化上述似然并不方便，因为每个事件的来源并没有被观测到。为此，学习过程中引入隐含父变量 \(z_i\)，它不是最终建模目标，
+          而是 EM 算法中的中间推断量，用来辅助估计参数。
+        </p>
+        <div class="formula">
+          \[z_i=0 \quad \text{表示事件 } e_i \text{ 由背景项解释}\]
+          \[z_i=j \quad \text{表示事件 } e_i \text{ 由历史事件 } e_j \text{ 触发}\]
+        </div>
+        <p>
+          在 E-step 中，模型根据当前参数计算不同来源解释当前事件的相对责任：
+        </p>
+        <div class="formula">
+          \[P(z_i=0\mid\mathcal{D})=\frac{\mu_{u_i}}{\lambda_{u_i}(t_i)}\]
+          \[P(z_i=j\mid\mathcal{D})=\frac{\alpha_{u_i,u_j}g_{u_i,u_j}(t_i-t_j)}{\lambda_{u_i}(t_i)}\]
+        </div>
+        <p>
+          在 M-step 中，模型固定这些软责任，重新最大化上一节的学习目标：背景项会吸收被分配给 \(z_i=0\) 的期望计数，触发项会吸收被分配给 \(z_i=j\) 的期望触发计数；同时，积分惩罚项会约束背景强度和触发强度不要无限增大。宏观上，M-step 就是在用 E-step 得到的软分配结果，更新 \(\mu\)、\(\alpha\) 以及时间衰减相关参数。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>5. 宏观流程</h2>
+        <div class="flow">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-title">输入事件流</div>
+            <div class="step-text">将事件按时间排列，每个事件包含时间、类型和上下文信息。</div>
+          </div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-title">定义强度</div>
+            <div class="step-text">用背景项和历史触发项描述不同类型事件在连续时间上的发生倾向。</div>
+          </div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-title">优化似然</div>
+            <div class="step-text">通过似然目标同时解释已发生事件，并惩罚过度预测。</div>
+          </div>
+          <div class="step">
+            <div class="step-num">4</div>
+            <div class="step-title">EM 学习</div>
+            <div class="step-text">将隐含父变量作为中间产物，在软分配和参数更新之间迭代。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="summary">
+        本节只介绍多维时序点过程的宏观思想：先用背景强度、触发强度和时间衰减函数定义事件发生强度，再通过似然目标学习参数；隐含父变量只是 EM 学习过程中的中间推断量，用于辅助判断每个事件更可能由背景项还是历史事件解释。
+      </div>
+    </section>
+  </main>
+</body>
+</html>

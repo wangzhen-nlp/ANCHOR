@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>第四节：弱时序关联</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #0f766e;
+      --accent-soft: #e6fffb;
+      --card: #fbfdff;
+      --green-soft: #ecfdf5;
+      --orange-soft: #fff7ed;
+      --blue-soft: #eff6ff;
+      --purple-soft: #f5f3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.75;
+    }
+    .page { max-width: 980px; margin: 40px auto; padding: 0 24px 48px; }
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(31, 41, 51, 0.08);
+    }
+    .eyebrow {
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 34px;
+      line-height: 1.25;
+      margin: 0 0 18px;
+      color: #134e4a;
+    }
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      color: #115e59;
+      border-left: 5px solid var(--accent);
+      padding-left: 12px;
+    }
+    p { margin: 12px 0; }
+    .lead {
+      font-size: 18px;
+      color: #134e4a;
+      background: var(--accent-soft);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin: 18px 0 28px;
+    }
+    .formula {
+      background: #fbfdff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px 18px;
+      margin: 16px 0;
+      overflow-x: auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--card);
+    }
+    .card.green { background: var(--green-soft); }
+    .card.orange { background: var(--orange-soft); }
+    .card.blue { background: var(--blue-soft); }
+    .card.purple { background: var(--purple-soft); }
+    .card-title { font-weight: 700; color: #243b53; margin-bottom: 6px; }
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f0fdfa;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin: 18px 0;
+    }
+    ul { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    .footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+    @media (max-width: 760px) {
+      .section { padding: 28px 22px; }
+      h1 { font-size: 28px; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="section">
+      <div class="eyebrow">Section 04</div>
+      <h1>第四节：弱时序关联</h1>
+
+      <p class="lead">
+        当前算法中的“弱时序”体现在两个方面：第一，事件之间的影响不是依赖固定长度的离散时间窗口，而是通过连续时间自激发核函数随时间衰减；
+        第二，训练与推理阶段都允许小范围时间乱序，在时间戳存在抖动或到达顺序不完全可靠时，仍然可以建立合理的关联解释；在线推理进一步延迟提交，以等待松弛范围内可能到达的候选事件。
+      </p>
+
+      <h2>4.1 为什么需要弱时序</h2>
+      <p>
+        在真实事件流中，事件之间的关系通常不是严格发生在某个固定窗口内，也不是一定完全按照真实发生顺序被观测到。
+        如果使用硬窗口规则，例如“只要 5 分钟内发生就相关，超过 5 分钟就无关”，会带来两个问题：
+      </p>
+
+      <ul>
+        <li>窗口内的偶然共现可能被误认为相关。</li>
+        <li>窗口外但仍有影响的历史事件会被直接忽略。</li>
+      </ul>
+
+      <p>
+        当前算法使用连续时间点过程来表达这种弱时序关系：历史事件的影响随时间间隔平滑衰减，而不是在某个窗口边界处突然消失。
+      </p>
+
+      <h2>4.2 自激发不依赖固定时间窗口</h2>
+      <p>
+        对目标类型 \(u\)，时间 \(t\) 的强度由背景项和历史事件触发项共同组成：
+      </p>
+
+      <div class="formula">
+        \[
+        \lambda_u(t)
+        =
+        \mu_u
+        +
+        \sum_{j:t_j \lt t}
+        \alpha_{u,u_j}\,g(t-t_j)
+        \]
+      </div>
+
+      <p>
+        其中 \(g(\Delta t)\) 是时间衰减核函数，表示历史事件 \(j\) 对当前时刻的影响如何随时间间隔 \(\Delta t=t-t_j\) 变化。
+        在指数核下：
+      </p>
+
+      <div class="formula">
+        \[
+        g(\Delta t)=\beta\exp(-\beta\Delta t)
+        \]
+      </div>
+
+      <p>
+        因此，历史事件的影响不是“窗口内有效、窗口外无效”，而是：
+      </p>
+
+      <div class="formula">
+        \[
+        s(j\rightarrow i)
+        =
+        \alpha_{u_i,u_j}\,\beta\exp\left(-\beta(t_i-t_j)\right)
+        \]
+      </div>
+
+      <p>
+        时间间隔越小，触发分数越高；时间间隔越大，触发分数逐渐降低。这样可以避免固定窗口边界带来的突变。
+      </p>
+
+      <div class="grid">
+        <div class="card green">
+          <div class="card-title">固定窗口规则</div>
+          <p>在窗口边界前后，关系会突然从“可关联”变成“不可关联”。</p>
+        </div>
+        <div class="card blue">
+          <div class="card-title">连续衰减建模</div>
+          <p>历史影响随时间平滑减弱，关联强度由学习到的触发强度和衰减核共同决定。</p>
+        </div>
+      </div>
+
+      <h2>4.3 训练与推理都允许时间乱序下的关联</h2>
+      <p>
+        标准时序触发通常要求父事件先于子事件：
+      </p>
+
+      <div class="formula">
+        \[
+        t_j \lt t_i
+        \]
+      </div>
+
+      <p>
+        但在实际观测中，时间戳可能存在抖动，或者事件到达顺序与真实发生顺序不完全一致。当前算法在训练和推理两端都引入时间松弛量 \(\epsilon\)：训练阶段允许 EM 在构造候选父事件和计算责任时考虑小范围乱序；推理阶段则允许尚未提交的事件等待松弛范围内的候选父事件。
+      </p>
+
+      <div class="formula">
+        \[
+        t_i-t_j\ge -\epsilon
+        \]
+      </div>
+
+      <p>
+        其中 \(\epsilon\) 是允许的最大乱序范围。若 \(t_j\) 比 \(t_i\) 稍晚，但仍在 \(\epsilon\) 范围内，模型仍允许 \(j\) 作为 \(i\) 的候选父事件。
+        这不是在线推理独有的规则，而是训练和推理共享的弱时序假设。
+      </p>
+
+      <div class="grid">
+        <div class="card blue">
+          <div class="card-title">训练阶段</div>
+          <p>在候选父事件构造和 EM 责任分配中，允许小范围负时间差，并对其触发分数进行折扣。</p>
+        </div>
+        <div class="card green">
+          <div class="card-title">推理阶段</div>
+          <p>在流式场景中维护 pending 区域，等待松弛范围内的候选事件，再提交最终父事件关系。</p>
+        </div>
+      </div>
+
+      <h2>4.4 乱序关联的衰减机制</h2>
+      <p>
+        允许乱序并不意味着完全忽略时间顺序。对于负时间差：
+      </p>
+
+      <div class="formula">
+        \[
+        \Delta t_{ij}=t_i-t_j \lt 0
+        \]
+      </div>
+
+      <p>
+        算法将核函数的时间差截断到峰值附近，同时对乱序程度施加额外衰减：
+      </p>
+
+      <div class="formula">
+        \[
+        g_{\mathrm{slack}}(\Delta t)
+        =
+        g(\max(\Delta t,0))\,\ell(\Delta t)
+        \]
+      </div>
+
+      <div class="formula">
+        \[
+        \ell(\Delta t)
+        =
+        \begin{cases}
+        1, & \Delta t\ge 0,\\
+        \exp\left(-\dfrac{\log 2}{h_{\mathrm{late}}}|\Delta t|\right), & -\epsilon\le \Delta t \lt 0.
+        \end{cases}
+        \]
+      </div>
+
+      <p>
+        其中 \(h_{\mathrm{late}}\) 是乱序衰减的半衰期。乱序越严重，\(\ell(\Delta t)\) 越小；超过 \(\epsilon\) 的事件不再作为候选父事件。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">小范围乱序</div>
+          <p>仍可建立关联，但触发分数会被折扣。</p>
+        </div>
+        <div class="card purple">
+          <div class="card-title">超过松弛范围</div>
+          <p>不再作为候选父事件，避免把明显反向的事件强行连接。</p>
+        </div>
+      </div>
+
+      <h2>4.5 在线推理中的时间松弛</h2>
+      <p>
+        在线推理中，模型不会在事件刚到达时立即固定其父事件，而是维护一个 pending 区域。只有当当前时间推进到足以覆盖松弛范围后，事件才会被提交。
+      </p>
+
+      <div class="formula">
+        \[
+        \operatorname{watermark}(t)=t-\epsilon
+        \]
+      </div>
+
+      <p>
+        对于尚未越过 watermark 的事件，模型会暂缓最终决策，以等待可能稍晚到达、但时间上仍可作为父事件的候选事件。
+        这样可以在在线场景中兼顾实时性和乱序鲁棒性。
+      </p>
+
+      <h2>4.6 小结</h2>
+      <p>
+        当前弱时序建模可以概括为：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakTemporalModeling}
+        =
+        \mathrm{ContinuousSelfExcitation}
+        +
+        \mathrm{TimeSlackAssociation}
+        \]
+      </div>
+
+      <p>
+        第一部分用连续时间自激发核函数代替固定窗口规则，使历史影响随时间平滑衰减；
+        第二部分在训练和推理两端使用时间松弛和乱序衰减处理观测时间不准的问题，使小范围乱序事件仍有机会被关联，但不会无衰减地破坏时间方向；在线推理中的 watermark 只是这一机制在流式提交时的实现方式。
+      </p>
+
+      <div class="footer">
+        本节为“弱时序建模”的独立说明，聚焦连续时间自激发与时间乱序鲁棒性；后续章节可继续展开参数学习、动态状态特征或推理输出。
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>多维时序点过程 · 弱关联故障建模</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #335c81;
+      --accent-soft: #e8f1f8;
+      --card: #fbfdff;
+      --green-soft: #ecf8f1;
+      --orange-soft: #fff4e6;
+      --purple-soft: #f3effc;
+      --red-soft: #fdecec;
+      --blue-soft: #e8f1fb;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.75;
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 40px auto;
+      padding: 0 24px 48px;
+    }
+
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(31, 41, 51, 0.08);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0 0 16px;
+      font-size: 34px;
+      line-height: 1.25;
+      letter-spacing: -0.02em;
+      color: #102a43;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      color: #243b53;
+      border-left: 5px solid var(--accent);
+      padding-left: 12px;
+    }
+
+    p { margin: 12px 0; }
+
+    .lead {
+      font-size: 18px;
+      color: #334e68;
+      background: var(--accent-soft);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin: 18px 0 28px;
+    }
+
+    .block {
+      margin: 28px 0;
+      padding: 24px 26px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+    }
+
+    .block h2 {
+      margin: 0 0 12px;
+      font-size: 21px;
+      color: var(--accent);
+      border-left: none;
+      padding-left: 0;
+    }
+
+    .formula {
+      overflow-x: auto;
+      white-space: normal;
+      margin: 16px 0;
+      padding: 18px 20px;
+      background: #f9fafb;
+      border-radius: 14px;
+      border: 1px dashed #d1d5db;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f8fafc;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin: 18px 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--card);
+    }
+
+    .card.orange { background: var(--orange-soft); }
+    .card.purple { background: var(--purple-soft); }
+    .card-title { font-weight: 700; color: #243b53; margin-bottom: 6px; }
+
+    ul { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .step {
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      min-height: 118px;
+    }
+
+    .step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent);
+      color: white;
+      font-weight: 700;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    .step-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .step-text {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .summary {
+      margin-top: 30px;
+      padding: 22px 26px;
+      border-left: 5px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 16px;
+      font-weight: 600;
+    }
+
+    .footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .card.red { background: var(--red-soft); }
+    .card.green { background: var(--green-soft); }
+    .card.blue { background: var(--blue-soft); }
+
+    .section { scroll-margin-top: 92px; margin-bottom: 26px; border-top: 4px solid var(--accent); }
+    .section.s1 { --accent: #335c81; --accent-soft: #e8f1f8; }
+    .section.s2 { --accent: #1f7a6d; --accent-soft: #e3f3ef; }
+    .section.s3 { --accent: #6d4bb0; --accent-soft: #efe9fb; }
+    .section.s4 { --accent: #b9701a; --accent-soft: #fbeeda; }
+
+    .hero {
+      background: linear-gradient(120deg, #1f3550 0%, #2f6d8f 55%, #2f8f83 100%);
+      color: #f7fbff; border-radius: 24px; padding: 40px 46px;
+      box-shadow: 0 14px 34px rgba(31,41,51,0.16); margin-bottom: 18px;
+    }
+    .hero .eyebrow { background: rgba(255,255,255,0.18); color: #eef6fb; }
+    .hero h1 { color: #fff; font-size: 36px; margin: 6px 0 12px; }
+    .hero p { color: #dceaf3; font-size: 16.5px; max-width: 780px; margin: 0; }
+
+    .toc {
+      position: sticky; top: 12px; z-index: 5;
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+      background: rgba(255,255,255,0.92); backdrop-filter: blur(6px);
+      border: 1px solid var(--line); border-radius: 16px;
+      padding: 11px 14px; margin-bottom: 24px; box-shadow: 0 6px 18px rgba(31,41,51,0.06);
+    }
+    .toc .toc-label { font-size: 12px; font-weight: 700; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; margin-right: 4px; }
+    .toc a { text-decoration: none; font-weight: 600; font-size: 14px; padding: 6px 13px; border-radius: 999px; color: var(--p); background: var(--ps); transition: background .15s, color .15s; }
+    .toc a:hover { background: var(--p); color: #fff; }
+    .toc a .n { opacity: .55; margin-right: 6px; font-variant-numeric: tabular-nums; }
+
+    @media (max-width: 800px) {
+      .section { padding: 32px 24px; }
+      .flow { grid-template-columns: 1fr; }
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div class="eyebrow">MHP · 3W Weak-Association Framework</div>
+      <h1>多维时序点过程 · 弱关联故障建模</h1>
+      <p>以多维时序点过程为骨架，提出弱拓扑、弱因果、弱时序三类「弱关联」建模。拓扑、结构与时序都不作硬规则，而是作为可学习的归纳偏置进入触发强度——真正的关系，由事件数据与学习到的参数共同决定。</p>
+    </header>
+    <nav class="toc">
+      <span class="toc-label">目录</span>
+      <a href="#sec1" style="--p:#335c81;--ps:#e8f1f8"><span class="n">01</span>时序点过程</a>
+      <a href="#sec2" style="--p:#1f7a6d;--ps:#e3f3ef"><span class="n">02</span>弱拓扑</a>
+      <a href="#sec3" style="--p:#6d4bb0;--ps:#efe9fb"><span class="n">03</span>弱因果</a>
+      <a href="#sec4" style="--p:#b9701a;--ps:#fbeeda"><span class="n">04</span>弱时序</a>
+    </nav>
+    <section class="section s1" id="sec1">
+      <div class="eyebrow">Section 01 · Multivariate Temporal Point Process</div>
+      <h1>第一节：多维时序点过程</h1>
+
+      <p class="lead">
+        我们将一段连续发生的事件序列建模为一个多维连续时间点过程。模型的核心问题是：当一个新事件出现时，它究竟是独立产生的，还是受到了历史事件的触发。
+      </p>
+
+      <h2>1.1 事件流表示</h2>
+      <p>给定一段观测到的事件流：</p>
+      <div class="formula">\[\mathcal{D}=\{e_i=(t_i,u_i,m_i)\}_{i=1}^{N}\]</div>
+      <p>
+        其中，\(t_i\) 表示事件发生时间，\(u_i\) 表示事件所属类型，\(m_i\) 表示事件的附加属性或上下文信息。
+        从建模角度看，\(u_i\) 决定了事件属于哪一个维度，\(t_i\) 决定了事件之间可能存在的时序影响。
+      </p>
+
+      <h2>1.2 发生强度：背景项 + 历史触发项</h2>
+      <p>对任意事件类型 \(u\)，模型用一个时间相关的强度函数 \(\lambda_u(t)\) 描述该类型事件在时刻 \(t\) 发生的倾向：</p>
+      <div class="formula">\[\lambda_u(t)=\mu_u+\sum_{j:t_j\lt t}\alpha_{u,u_j}\,g_{u,u_j}(t-t_j)\]</div>
+      <p>
+        第一项 \(\mu_u\) 表示该类型事件的背景发生倾向，也就是不依赖历史事件时自身出现的基础强度。
+        第二项表示历史事件对当前类型的触发作用：历史事件越相关、时间越接近，对当前事件的影响通常越强。
+      </p>
+
+      <h2>1.3 学习目标：解释已发生事件，同时避免过度预测</h2>
+      <p>在强度函数定义好之后，模型训练的目标是最大化观测事件流的似然：</p>
+      <div class="formula">\[\log p(\mathcal{D})=\sum_{i=1}^{N}\log\lambda_{u_i}(t_i)-\sum_{u}\int_{0}^{T}\lambda_u(t)\,dt\]</div>
+      <p>
+        第一项鼓励模型在真实事件发生的时刻给出较高强度；第二项是积分惩罚，避免模型在大量没有事件发生的时间段也给出过高强度。
+        因此，模型不仅要解释已经发生的事件，还要控制整体预测不要过度扩散。
+      </p>
+
+      <h2>1.4 学习方法：EM 算法与隐含父变量</h2>
+      <p>
+        直接优化上述似然并不方便，因为每个事件的来源并没有被观测到。为此，学习过程中引入隐含父变量 \(z_i\)，它不是最终建模目标，
+        而是 EM 算法中的中间推断量，用来辅助估计参数。
+      </p>
+      <div class="formula">
+        \[z_i=0 \quad \text{表示事件 } e_i \text{ 由背景项解释}\]
+        \[z_i=j \quad \text{表示事件 } e_i \text{ 由历史事件 } e_j \text{ 触发}\]
+      </div>
+      <p>在 E-step 中，模型根据当前参数计算不同来源解释当前事件的相对责任：</p>
+      <div class="formula">
+        \[P(z_i=0\mid\mathcal{D})=\frac{\mu_{u_i}}{\lambda_{u_i}(t_i)}\]
+        \[P(z_i=j\mid\mathcal{D})=\frac{\alpha_{u_i,u_j}g_{u_i,u_j}(t_i-t_j)}{\lambda_{u_i}(t_i)}\]
+      </div>
+      <p>
+        在 M-step 中，模型固定这些软责任，重新最大化上一节的学习目标：背景项会吸收被分配给 \(z_i=0\) 的期望计数，触发项会吸收被分配给 \(z_i=j\) 的期望触发计数；同时，积分惩罚项会约束背景强度和触发强度不要无限增大。宏观上，M-step 就是在用 E-step 得到的软分配结果，更新 \(\mu\)、\(\alpha\) 以及时间衰减相关参数。
+      </p>
+
+      <h2>1.5 宏观流程</h2>
+      <div class="flow">
+        <div class="step"><div class="step-num">1</div><div class="step-title">输入事件流</div><div class="step-text">将事件按时间排列，每个事件包含时间、类型和上下文信息。</div></div>
+        <div class="step"><div class="step-num">2</div><div class="step-title">定义强度</div><div class="step-text">用背景项和历史触发项描述不同类型事件在连续时间上的发生倾向。</div></div>
+        <div class="step"><div class="step-num">3</div><div class="step-title">优化似然</div><div class="step-text">通过似然目标同时解释已发生事件，并惩罚过度预测。</div></div>
+        <div class="step"><div class="step-num">4</div><div class="step-title">EM 学习</div><div class="step-text">将隐含父变量作为中间产物，在软分配和参数更新之间迭代。</div></div>
+      </div>
+
+      <h2>1.6 小结</h2>
+      <p>
+        本节只介绍多维时序点过程的宏观思想：先用背景强度、触发强度和时间衰减函数定义事件发生强度，再通过似然目标学习参数；隐含父变量只是 EM 学习过程中的中间推断量，用于辅助判断每个事件更可能由背景项还是历史事件解释。
+      </p>
+
+      <div class="footer">
+        本节给出多维时序点过程的总体框架；后续三节在此基础上展开弱拓扑、弱因果与弱时序三类「弱关联」建模。
+      </div>
+    </section>
+    <section class="section s2" id="sec2">
+      <div class="eyebrow">Section 02 · Weak Topology Association</div>
+      <h1>第二节：弱拓扑关联</h1>
+
+      <p class="lead">
+        当前算法并不把拓扑关系当作绝对可靠的硬规则，而是采用“弱拓扑”思路：拓扑信息不会直接规定某条关系一定成立，而是作为可学习的结构信号进入触发强度，并在数据稀疏时提供轻量先验；最终是否形成强触发关系，仍由事件数据和学习到的参数共同决定。
+      </p>
+
+      <h2>2.1 为什么是弱拓扑</h2>
+      <p>
+        在多维时序点过程里，历史事件是否会影响当前事件，取决于二者之间的触发强度。若完全不使用结构信息，模型只能依赖时间共现来解释事件间关系，容易受到偶然共现和样本稀疏的影响；若完全依赖结构信息，又会受到结构缺失、方向错误或粒度不一致的影响。
+      </p>
+      <p>
+        因此当前算法采用折中方式：拓扑只提供“哪些关系更可能有影响”的软信号，而不是直接规定某条边一定存在或一定不存在。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">触发特征</div>
+          <p>拓扑强弱被编码成特征，进入触发强度函数，由数据学习其权重。</p>
+        </div>
+        <div class="card purple">
+          <div class="card-title">轻量先验</div>
+          <p>对结构相关的类型对加入 pseudo-count，在样本稀疏时提供温和支持。</p>
+        </div>
+      </div>
+
+      <h2>2.2 触发强度：先定义要学习的关系强度</h2>
+      <p>
+        对来源类型 \(v\) 和目标类型 \(u\)，当前算法首先把二者之间的影响表示为触发强度：
+      </p>
+
+      <div class="formula">
+        \[
+        \alpha_{u,v}=\operatorname{softplus}\!\left(w_{\alpha}^{\top}\phi(u,v)\right)
+        \]
+      </div>
+
+      <p>
+        这里 \(\phi(u,v)\) 是来源—目标类型对的特征，\(w_{\alpha}\) 是需要学习的参数。这个公式表达的是：
+        模型不直接为每一对类型记忆一个固定强度，而是通过一组可解释特征共同计算触发强度。
+      </p>
+
+      <p>
+        因此，拓扑信息和其它属性信息都不是单独决定关系是否成立，而是共同进入 \(\phi(u,v)\)，再由学习到的权重决定它们对触发强度的贡献。
+      </p>
+
+      <h2>2.3 拓扑特征：把结构关系转成连续信号</h2>
+      <p>
+        在定义触发强度之后，拓扑信息以特征的形式进入 \(\phi(u,v)\)。对来源类型 \(v\) 和目标类型 \(u\)，算法会计算一个有方向的拓扑分数：
+      </p>
+
+      <div class="formula">
+        \[
+        r_{\mathrm{topo}}(v\rightarrow u)\in[0,1]
+        \]
+      </div>
+
+      <p>
+        它表示来源类型 \(v\) 所属实体到目标类型 \(u\) 所属实体之间的结构接近度或可达强度。例如，同一实体、直接相连、多跳可达、反向可达、无向可达等关系会被压缩成不同强度的分数。
+      </p>
+
+      <p>
+        于是，触发强度中会出现如下项：
+      </p>
+
+      <div class="formula">
+        \[
+        w_{\mathrm{topo}}\,r_{\mathrm{topo}}(v\rightarrow u)
+        \]
+      </div>
+
+      <p>
+        如果学习到 \(w_{\mathrm{topo}}>0\)，说明结构更接近的类型对更容易形成触发；如果 \(w_{\mathrm{topo}}\) 较小甚至为负，说明仅靠拓扑并不能解释数据中的触发关系。
+      </p>
+
+      <div class="note">
+        这就是“弱拓扑”的关键：拓扑以连续特征形式进入模型，但拓扑特征的权重由数据学习，而不是由人工固定。
+      </div>
+
+      <h2>2.4 其它静态特征：补充拓扑之外的归纳信号</h2>
+      <p>
+        除了拓扑关系，算法还利用类型关系、位置代理和实体属性来增强泛化能力。
+      </p>
+      <p>
+        当前其它静态特征可以概括为：
+      </p>
+
+      <ul>
+        <li><strong>类型对：</strong>不同事件类型之间的方向性触发模式。</li>
+        <li><strong>同类事件：</strong>来源与目标是否属于相同事件类型。</li>
+        <li><strong>同实体：</strong>来源与目标是否属于同一实体。</li>
+        <li><strong>同站点 / 位置代理：</strong>二者是否处于相同位置范围。</li>
+        <li><strong>同厂家：</strong>相同来源系统或实体属性带来的相似模式。</li>
+        <li><strong>同实体类型：</strong>来源与目标是否属于相同类别。</li>
+        <li><strong>交叉特征：</strong>“结构相关且位置相近”是否具有额外增强作用。</li>
+      </ul>
+
+      <p>
+        因此，最终触发强度不是由单一拓扑信息决定，而是由拓扑、类型关系、位置代理和实体属性等多种信号共同决定。
+      </p>
+
+      <h2>2.5 动态状态特征：上下文感知的触发</h2>
+      <p>
+        除了静态属性，真实网络中一个事件是否会引发级联告警，往往还取决于设备<strong>当前的运行状态</strong>。为此，算法在静态关联之上引入了动态状态特征（Dynamic State Features）。
+      </p>
+      <p>
+        在任意时刻 \(t\)，算法不仅会追踪来源实体 \(v\) 在触发发生时的未恢复告警状态，还会同时观测目标实体 \(u\) 受波及前夕的运行状态（例如：当前是否处于断电、脱网、链路中断等），将二者拼接为联合动态特征向量 \(\mathbf{m}_{u,v}(t)\)。此时，触发强度的计算升级为全量上下文感知模式：
+      </p>
+
+      <div class="formula">
+        \[
+        \alpha_{u,v}(t)=\operatorname{softplus}\!\left(w_{\mathrm{static}}^{\top}\phi_{\mathrm{static}}(u,v) + w_{\mathrm{dyn}}^{\top}\mathbf{m}_{u,v}(t)\right)
+        \]
+      </div>
+
+      <p>
+        动态特征使得模型能够学习到极度复杂的条件触发逻辑。它不仅能学到“源设备处于断电状态时发出的告警破坏力更大”，还能学到“当目标设备自身已经存在未恢复的脱网或性能问题时，它更容易被相邻设备的告警所触发（即目标设备的脆弱性）”。源和目标的实时状态在这里实现了完美的双向协同。
+      </p>
+
+      <h2>2.6 拓扑先验：用 pseudo-count 提供弱结构偏置</h2>
+      <p>
+        在训练中，E-step 会得到每个来源—目标类型对的期望触发次数。记：
+      </p>
+
+      <div class="formula">
+        \[
+        N_{u,v}=\sum_i\sum_{j:u_i=u,\,u_j=v}q(z_i=j)
+        \]
+      </div>
+
+      <p>
+        其中 \(q(z_i=j)\) 是事件 \(i\) 由历史事件 \(j\) 解释的软责任。为了让结构相关但样本较少的关系不被完全忽略，算法可以加入拓扑 pseudo-count：
+      </p>
+
+      <div class="formula">
+        \[
+        \widetilde{N}_{u,v}=N_{u,v}+\rho\,r_{\mathrm{topo}}(v\rightarrow u)
+        \]
+      </div>
+
+      <p>
+        其中 \(\rho\) 是拓扑先验强度超参数。它不是要强迫拓扑关系一定成立，而是在数据不足时给予结构相关关系一个温和的初始支持；当真实事件数据足够多时，数据项 \(N_{u,v}\) 会主导学习结果。
+      </p>
+
+      <h2>2.7 小结</h2>
+      <p>
+        当前算法中的弱拓扑关联可以概括为两层：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakTopologyAssociation}
+        =
+        \mathrm{TopologyFeatureScoring}
+        +
+        \mathrm{Static/DynamicContext}
+        +
+        \mathrm{TopologyPseudoCountPrior}
+        \]
+      </div>
+
+      <p>
+        它既避免了完全忽略结构信息带来的偶然共现问题，也避免了完全相信结构信息带来的脆弱性。最终，拓扑只是提供可学习的归纳偏置，真正的触发强度仍由事件数据和学习参数共同确定。
+      </p>
+
+      <div class="footer">
+        本节为“弱拓扑关联”的独立说明，保持通用事件建模表述；后续章节可继续展开 feature 模式、动态状态特征或在线推理机制。
+      </div>
+    </section>
+    <section class="section s3" id="sec3">
+      <div class="eyebrow">Section 03 · Weak Causal Association</div>
+      <h1>第三节：弱因果关联</h1>
+
+      <p class="lead">
+        当前算法中的“因果”不是严格实验意义上的因果关系，而是基于时序触发强度得到的弱因果解释：
+        一个事件可以被背景项解释，也可以被历史事件解释；当直接解释不足时，在线推理还允许在固定滞后窗口内插入未观测事件，
+        用来补全更连贯的触发链。
+      </p>
+
+      <h2>3.1 在线推理：先在观测事件之间建立弱父子关系</h2>
+      <p>
+        普通在线推理阶段，算法对每个新到达事件维护历史事件集合，只在候选集合里寻找候选父事件。推理决策可以写成：
+      </p>
+
+      <div class="formula">
+        \[
+        \widehat{z}_i
+        =
+        \arg\max_{z\in\{0\}\cup\mathcal{H}_i}
+        s_z(i)
+        \]
+      </div>
+
+      <p>
+        其中 \(\mathcal{H}_i\) 是事件 \(i\) 的历史候选集合，\(s_z(i)\) 表示不同候选解释的得分：
+      </p>
+
+      <div class="formula">
+        \[
+        s_z(i) = 
+        \begin{cases} 
+        \mu_{u_i}, & z = 0 \\
+        \alpha_{u_i,u_j} \, g(t_i - t_j), & z = j \in \mathcal{H}_i
+        \end{cases}
+        \]
+      </div>
+
+      <p>
+        即 \(z=0\) 表示事件 \(i\) 依靠自身背景强度（\(\mu\)）独立发生；\(z=j\) 表示它由历史事件 \(j\) 触发，得分取决于两者的触发强度（\(\alpha\)）与时间衰减（\(g\)）。
+      </p>
+
+      <div class="grid">
+        <div class="card blue">
+          <div class="card-title">背景解释</div>
+          <p>若 \(\mu_{u_i}\) 占优，事件 \(i\) 被视为新链起点。</p>
+        </div>
+        <div class="card green">
+          <div class="card-title">触发解释</div>
+          <p>若某个 \(s_j(i)\) 占优，事件 \(i\) 被合并到父事件 \(j\) 所在链路。</p>
+        </div>
+      </div>
+
+      <h2>3.2 为什么需要数据插补</h2>
+      <p>
+        单次前向分配有一个局限：如果真实触发链中间存在未观测事件，那么目标事件可能无法被任何已观测历史事件很好解释。
+        这时，模型不应只能在“强行连接到某个观测事件”和“直接开新链”之间二选一，而应该允许一种中间解释：
+      </p>
+
+      <div class="formula">
+        \[
+        e_a \rightarrow m \rightarrow e_i
+        \]
+      </div>
+
+      <p>
+        其中 \(m\) 是一个未观测到的中间事件。它不是新的未知类型，而是已有事件类型中的一个潜在发生实例。
+        当前算法的数据插补就是假设这类 \(m\) 的存在，从而让原本不连贯的链条变得更合理。
+      </p>
+
+      <h2>3.3 插补目标：联合解释观测事件、缺失事件与父子关系</h2>
+      <p>
+        记观测事件集合为 \(\mathcal{O}\)，插补出的缺失事件集合为 \(\mathcal{M}\)，父事件关系为 \(Z\)。
+        在线插补的目标可以抽象为：
+      </p>
+
+      <div class="formula">
+        \[
+        p(\mathcal{M},Z\mid\mathcal{O},\Theta)
+        \propto
+        p(\mathcal{O},\mathcal{M},Z\mid\Theta)\,p(\mathcal{M})
+        \]
+      </div>
+
+      <p>
+        其中 \(\Theta\) 是已经训练好的模型参数，\(p(\mathcal{O},\mathcal{M},Z\mid\Theta)\) 衡量插补后的整条链能否被模型解释，
+        \(p(\mathcal{M})\) 则控制不要无限制地补充缺失事件。
+      </p>
+
+      <div class="formula">
+        \[
+        p(\mathcal{M})\propto\exp\left(\kappa|\mathcal{M}|\right)
+        \]
+      </div>
+
+      <p>
+        这里 \(\kappa\) 是每个缺失事件的先验惩罚。通常 \(\kappa\) 越负，模型越保守，补出的缺失事件越少；\(\kappa\) 越大，模型越容易插入中间事件。
+      </p>
+
+      <h2>3.4 固定滞后窗口：持续观测、动态重采样、延后提交</h2>
+      <p>
+        数据插补不是在全量序列上离线重算，而是在一个固定滞后窗口中进行。窗口内的事件结构暂时保持可修改：
+        父事件可以被重采样，缺失事件可以被新增或删除；当事件超过滞后时间后，其结构被提交并输出。
+      </p>
+
+      <div class="formula">
+        \[
+        \mathcal{W}(t)=\{e:\,t_e\ge t-L\}
+        \]
+      </div>
+
+      <p>
+        其中 \(L\) 是固定滞后长度。窗口越长，模型越有机会发现缺失中间事件，但在线延迟也越高；窗口越短，响应更快，但补链能力更弱。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">窗口内</div>
+          <p>持续重采样父事件与缺失事件，保留多种可能解释。</p>
+        </div>
+        <div class="card red">
+          <div class="card-title">窗口外</div>
+          <p>事件结构被冻结，作为当前最可信的弱因果解释输出。</p>
+        </div>
+      </div>
+
+      <h2>3.5 插补采样：新增、删除与重采样</h2>
+      <p>
+        在窗口内，算法通过局部采样不断调整解释结构。主要包括三类动作：
+      </p>
+
+      <ul>
+        <li><strong>父事件重采样：</strong>在背景项和候选历史事件之间重新选择当前事件的解释来源。</li>
+        <li><strong>缺失事件新增：</strong>当某个观测事件缺少合适父事件时，提议插入一个已知类型的缺失事件作为中间父节点。</li>
+        <li><strong>缺失事件删除：</strong>如果某个缺失事件对整体解释贡献不足，或者带来过多额外预测惩罚，则将其移除。</li>
+      </ul>
+
+      <p>
+        对一次新增缺失事件 \(m\) 的提议，可以宏观理解为比较新增前后的解释收益：
+      </p>
+
+      <div class="formula">
+        \[
+        \Delta
+        \approx
+        \underbrace{\log s(m\rightarrow i)-\log s_{\mathrm{old}}(i)}_{\text{目标事件解释收益}}
+        +
+        \underbrace{\log s(\operatorname{pa}(m)\rightarrow m)}_{\text{缺失事件自身可解释性}}
+        -
+        \underbrace{C(m)}_{\text{额外预测惩罚}}
+        +
+        \underbrace{\kappa}_{\text{缺失先验惩罚}}
+        \]
+      </div>
+
+      <p>
+        这四项精确映射为：
+      </p>
+      <ul>
+        <li>目标收益：即缺失事件触发目标事件的强度，减去目标事件原有的孤儿背景强度。</li>
+        <li>自身解释：在提议阶段缺失事件暂视作由背景强度产生（随后通过 Gibbs 采样为其寻找父节点）。</li>
+        <li>额外惩罚：表示新增 \(m\) 以后预期会引发但实际未观测到的事件所带来的生存积分惩罚。</li>
+        <li>先验惩罚：表示模型对引入虚拟事件的固定惩罚代价（通常为负值），用以约束插补的保守性。</li>
+      </ul>
+
+      <p>
+        因此，模型不会只因为某个缺失事件能解释一个目标事件就无条件保留它；这个缺失事件自身也必须合理，并且不能带来无法兑现的额外级联预测惩罚。
+      </p>
+
+      <h2>3.6 输出：带不确定性的弱因果链</h2>
+      <p>
+        窗口内的采样会为每个事件积累父事件投票。当事件被提交时，模型输出当前最可信的父事件关系以及对应置信度。
+        因此，插补结果最好理解为“概率性弱因果解释”，而不是确定事实。
+      </p>
+
+      <div class="formula">
+        \[
+        \widehat{p}(\operatorname{pa}(i)=j)
+        =
+        \frac{\operatorname{votes}_{i,j}}{\operatorname{sweeps}_i}
+        \]
+      </div>
+
+      <p>
+        真实观测事件和插补事件在输出中应被区分：观测事件是输入证据，插补事件是模型为了让触发链更连贯而提出的潜在中间节点。
+      </p>
+
+      <h2>3.7 小结</h2>
+      <p>
+        当前弱因果建模可以概括为：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakCausalModeling}
+        =
+        \mathrm{ParentAssignment}
+        +
+        \mathrm{LagImputation}
+        +
+        \mathrm{PosteriorSummary}
+        \]
+      </div>
+
+      <p>
+        它的核心思想是：先用学习到的触发强度解释观测事件之间的弱父子关系；当观测链不完整时，在固定滞后窗口内插入少量已知类型的缺失事件；
+        最后输出带有置信度的弱因果链，而不是声称恢复了唯一真实因果结构。
+      </p>
+
+      <div class="footer">
+        本节为“弱因果建模”的独立说明，聚焦在线推理中的数据插补；后续章节可继续展开动态状态特征、插补参数配置或可视化输出。
+      </div>
+    </section>
+    <section class="section s4" id="sec4">
+      <div class="eyebrow">Section 04 · Weak Temporal Association</div>
+      <h1>第四节：弱时序关联</h1>
+
+      <p class="lead">
+        当前算法中的“弱时序”体现在两个方面：第一，事件之间的影响不是依赖固定长度的离散时间窗口，而是通过连续时间自激发核函数随时间衰减；
+        第二，训练与推理阶段都允许小范围时间乱序，在时间戳存在抖动或到达顺序不完全可靠时，仍然可以建立合理的关联解释；在线推理进一步延迟提交，以等待松弛范围内可能到达的候选事件。
+      </p>
+
+      <h2>4.1 为什么需要弱时序</h2>
+      <p>
+        在真实事件流中，事件之间的关系通常不是严格发生在某个固定窗口内，也不是一定完全按照真实发生顺序被观测到。
+        如果使用硬窗口规则，例如“只要 5 分钟内发生就相关，超过 5 分钟就无关”，会带来两个问题：
+      </p>
+
+      <ul>
+        <li>窗口内的偶然共现可能被误认为相关。</li>
+        <li>窗口外但仍有影响的历史事件会被直接忽略。</li>
+      </ul>
+
+      <p>
+        当前算法使用连续时间点过程来表达这种弱时序关系：历史事件的影响随时间间隔平滑衰减，而不是在某个窗口边界处突然消失。
+      </p>
+
+      <h2>4.2 自激发不依赖固定时间窗口</h2>
+      <p>
+        对目标类型 \(u\)，时间 \(t\) 的强度由背景项和历史事件触发项共同组成：
+      </p>
+
+      <div class="formula">
+        \[
+        \lambda_u(t)
+        =
+        \mu_u
+        +
+        \sum_{j:t_j \lt t}
+        \alpha_{u,u_j}\,g(t-t_j)
+        \]
+      </div>
+
+      <p>
+        其中 \(g(\Delta t)\) 是时间衰减核函数，表示历史事件 \(j\) 对当前时刻的影响如何随时间间隔 \(\Delta t=t-t_j\) 变化。
+        在指数核下：
+      </p>
+
+      <div class="formula">
+        \[
+        g(\Delta t)=\beta\exp(-\beta\Delta t)
+        \]
+      </div>
+
+      <p>
+        因此，历史事件的影响不是“窗口内有效、窗口外无效”，而是：
+      </p>
+
+      <div class="formula">
+        \[
+        s(j\rightarrow i)
+        =
+        \alpha_{u_i,u_j}\,\beta\exp\left(-\beta(t_i-t_j)\right)
+        \]
+      </div>
+
+      <p>
+        时间间隔越小，触发分数越高；时间间隔越大，触发分数逐渐降低。这样可以避免固定窗口边界带来的突变。
+      </p>
+
+      <div class="grid">
+        <div class="card green">
+          <div class="card-title">固定窗口规则</div>
+          <p>在窗口边界前后，关系会突然从“可关联”变成“不可关联”。</p>
+        </div>
+        <div class="card blue">
+          <div class="card-title">连续衰减建模</div>
+          <p>历史影响随时间平滑减弱，关联强度由学习到的触发强度和衰减核共同决定。</p>
+        </div>
+      </div>
+
+      <h2>4.3 训练与推理都允许时间乱序下的关联</h2>
+      <p>
+        标准时序触发通常要求父事件先于子事件：
+      </p>
+
+      <div class="formula">
+        \[
+        t_j \lt t_i
+        \]
+      </div>
+
+      <p>
+        但在实际观测中，时间戳可能存在抖动，或者事件到达顺序与真实发生顺序不完全一致。当前算法在训练和推理两端都引入时间松弛量 \(\epsilon\)：训练阶段允许 EM 在构造候选父事件和计算责任时考虑小范围乱序；推理阶段则允许尚未提交的事件等待松弛范围内的候选父事件。
+      </p>
+
+      <div class="formula">
+        \[
+        t_i-t_j\ge -\epsilon
+        \]
+      </div>
+
+      <p>
+        其中 \(\epsilon\) 是允许的最大乱序范围。若 \(t_j\) 比 \(t_i\) 稍晚，但仍在 \(\epsilon\) 范围内，模型仍允许 \(j\) 作为 \(i\) 的候选父事件。
+        这不是在线推理独有的规则，而是训练和推理共享的弱时序假设。
+      </p>
+
+      <div class="grid">
+        <div class="card blue">
+          <div class="card-title">训练阶段</div>
+          <p>在候选父事件构造和 EM 责任分配中，允许小范围负时间差，并对其触发分数进行折扣。</p>
+        </div>
+        <div class="card green">
+          <div class="card-title">推理阶段</div>
+          <p>在流式场景中维护 pending 区域，等待松弛范围内的候选事件，再提交最终父事件关系。</p>
+        </div>
+      </div>
+
+      <h2>4.4 乱序关联的衰减机制</h2>
+      <p>
+        允许乱序并不意味着完全忽略时间顺序。对于负时间差：
+      </p>
+
+      <div class="formula">
+        \[
+        \Delta t_{ij}=t_i-t_j \lt 0
+        \]
+      </div>
+
+      <p>
+        算法将核函数的时间差截断到峰值附近，同时对乱序程度施加额外衰减：
+      </p>
+
+      <div class="formula">
+        \[
+        g_{\mathrm{slack}}(\Delta t)
+        =
+        g(\max(\Delta t,0))\,\ell(\Delta t)
+        \]
+      </div>
+
+      <div class="formula">
+        \[
+        \ell(\Delta t)
+        =
+        \begin{cases}
+        1, & \Delta t\ge 0,\\
+        \exp\left(-\dfrac{\log 2}{h_{\mathrm{late}}}|\Delta t|\right), & -\epsilon\le \Delta t \lt 0.
+        \end{cases}
+        \]
+      </div>
+
+      <p>
+        其中 \(h_{\mathrm{late}}\) 是乱序衰减的半衰期。乱序越严重，\(\ell(\Delta t)\) 越小；超过 \(\epsilon\) 的事件不再作为候选父事件。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">小范围乱序</div>
+          <p>仍可建立关联，但触发分数会被折扣。</p>
+        </div>
+        <div class="card purple">
+          <div class="card-title">超过松弛范围</div>
+          <p>不再作为候选父事件，避免把明显反向的事件强行连接。</p>
+        </div>
+      </div>
+
+      <h2>4.5 在线推理中的时间松弛</h2>
+      <p>
+        在线推理中，模型不会在事件刚到达时立即固定其父事件，而是维护一个 pending 区域。只有当当前时间推进到足以覆盖松弛范围后，事件才会被提交。
+      </p>
+
+      <div class="formula">
+        \[
+        \operatorname{watermark}(t)=t-\epsilon
+        \]
+      </div>
+
+      <p>
+        对于尚未越过 watermark 的事件，模型会暂缓最终决策，以等待可能稍晚到达、但时间上仍可作为父事件的候选事件。
+        这样可以在在线场景中兼顾实时性和乱序鲁棒性。
+      </p>
+
+      <h2>4.6 小结</h2>
+      <p>
+        当前弱时序建模可以概括为：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakTemporalModeling}
+        =
+        \mathrm{ContinuousSelfExcitation}
+        +
+        \mathrm{TimeSlackAssociation}
+        \]
+      </div>
+
+      <p>
+        第一部分用连续时间自激发核函数代替固定窗口规则，使历史影响随时间平滑衰减；
+        第二部分在训练和推理两端使用时间松弛和乱序衰减处理观测时间不准的问题，使小范围乱序事件仍有机会被关联，但不会无衰减地破坏时间方向；在线推理中的 watermark 只是这一机制在流式提交时的实现方式。
+      </p>
+
+      <div class="footer">
+        本节为“弱时序建模”的独立说明，聚焦连续时间自激发与时间乱序鲁棒性；后续章节可继续展开参数学习、动态状态特征或推理输出。
+      </div>
+    </section>
+  </main>
+</body>
+</html>

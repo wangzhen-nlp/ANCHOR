@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>第三节：弱因果关联</title>
+  <script>
+    window.MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['\\[', '\\]']],
+        processEscapes: true
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+  <style>
+    :root {
+      --bg: #f7f4ef;
+      --paper: #ffffff;
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #7c3aed;
+      --accent-soft: #f3effc;
+      --card: #fbfdff;
+      --green-soft: #ecf8f1;
+      --orange-soft: #fff4e6;
+      --blue-soft: #e8f1f8;
+      --red-soft: #fff1f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.75;
+    }
+    .page { max-width: 980px; margin: 40px auto; padding: 0 24px 48px; }
+    .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 42px 48px;
+      box-shadow: 0 12px 30px rgba(31, 41, 51, 0.08);
+    }
+    .eyebrow {
+      color: var(--accent);
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    h1 {
+      font-size: 34px;
+      line-height: 1.25;
+      margin: 0 0 18px;
+      color: #2e1065;
+    }
+    h2 {
+      font-size: 22px;
+      margin: 34px 0 12px;
+      color: #3b0764;
+      border-left: 5px solid var(--accent);
+      padding-left: 12px;
+    }
+    p { margin: 12px 0; }
+    .lead {
+      font-size: 18px;
+      color: #3b0764;
+      background: var(--accent-soft);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin: 18px 0 28px;
+    }
+    .formula {
+      background: #fbfdff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px 18px;
+      margin: 16px 0;
+      overflow-x: auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--card);
+    }
+    .card.green { background: var(--green-soft); }
+    .card.orange { background: var(--orange-soft); }
+    .card.blue { background: var(--blue-soft); }
+    .card.red { background: var(--red-soft); }
+    .card-title { font-weight: 700; color: #243b53; margin-bottom: 6px; }
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #faf7ff;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin: 18px 0;
+    }
+    ul { padding-left: 24px; }
+    li { margin: 8px 0; }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    .footer {
+      margin-top: 34px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+    @media (max-width: 760px) {
+      .section { padding: 28px 22px; }
+      h1 { font-size: 28px; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="section">
+      <div class="eyebrow">Section 03</div>
+      <h1>第三节：弱因果关联</h1>
+
+      <p class="lead">
+        当前算法中的“因果”不是严格实验意义上的因果关系，而是基于时序触发强度得到的弱因果解释：
+        一个事件可以被背景项解释，也可以被历史事件解释；当直接解释不足时，在线推理还允许在固定滞后窗口内插入未观测事件，
+        用来补全更连贯的触发链。
+      </p>
+
+      <h2>3.1 在线推理：先在观测事件之间建立弱父子关系</h2>
+      <p>
+        普通在线推理阶段，算法对每个新到达事件维护历史事件集合，只在候选集合里寻找候选父事件。推理决策可以写成：
+      </p>
+
+      <div class="formula">
+        \[
+        \widehat{z}_i
+        =
+        \arg\max_{z\in\{0\}\cup\mathcal{H}_i}
+        s_z(i)
+        \]
+      </div>
+
+      <p>
+        其中 \(\mathcal{H}_i\) 是事件 \(i\) 的历史候选集合，\(s_z(i)\) 表示不同候选解释的得分：
+      </p>
+
+      <div class="formula">
+        \[
+        s_z(i) = 
+        \begin{cases} 
+        \mu_{u_i}, & z = 0 \\
+        \alpha_{u_i,u_j} \, g(t_i - t_j), & z = j \in \mathcal{H}_i
+        \end{cases}
+        \]
+      </div>
+
+      <p>
+        即 \(z=0\) 表示事件 \(i\) 依靠自身背景强度（\(\mu\)）独立发生；\(z=j\) 表示它由历史事件 \(j\) 触发，得分取决于两者的触发强度（\(\alpha\)）与时间衰减（\(g\)）。
+      </p>
+
+      <div class="grid">
+        <div class="card blue">
+          <div class="card-title">背景解释</div>
+          <p>若 \(\mu_{u_i}\) 占优，事件 \(i\) 被视为新链起点。</p>
+        </div>
+        <div class="card green">
+          <div class="card-title">触发解释</div>
+          <p>若某个 \(s_j(i)\) 占优，事件 \(i\) 被合并到父事件 \(j\) 所在链路。</p>
+        </div>
+      </div>
+
+      <h2>3.2 为什么需要数据插补</h2>
+      <p>
+        单次前向分配有一个局限：如果真实触发链中间存在未观测事件，那么目标事件可能无法被任何已观测历史事件很好解释。
+        这时，模型不应只能在“强行连接到某个观测事件”和“直接开新链”之间二选一，而应该允许一种中间解释：
+      </p>
+
+      <div class="formula">
+        \[
+        e_a \rightarrow m \rightarrow e_i
+        \]
+      </div>
+
+      <p>
+        其中 \(m\) 是一个未观测到的中间事件。它不是新的未知类型，而是已有事件类型中的一个潜在发生实例。
+        当前算法的数据插补就是假设这类 \(m\) 的存在，从而让原本不连贯的链条变得更合理。
+      </p>
+
+      <h2>3.3 插补目标：联合解释观测事件、缺失事件与父子关系</h2>
+      <p>
+        记观测事件集合为 \(\mathcal{O}\)，插补出的缺失事件集合为 \(\mathcal{M}\)，父事件关系为 \(Z\)。
+        在线插补的目标可以抽象为：
+      </p>
+
+      <div class="formula">
+        \[
+        p(\mathcal{M},Z\mid\mathcal{O},\Theta)
+        \propto
+        p(\mathcal{O},\mathcal{M},Z\mid\Theta)\,p(\mathcal{M})
+        \]
+      </div>
+
+      <p>
+        其中 \(\Theta\) 是已经训练好的模型参数，\(p(\mathcal{O},\mathcal{M},Z\mid\Theta)\) 衡量插补后的整条链能否被模型解释，
+        \(p(\mathcal{M})\) 则控制不要无限制地补充缺失事件。
+      </p>
+
+      <div class="formula">
+        \[
+        p(\mathcal{M})\propto\exp\left(\kappa|\mathcal{M}|\right)
+        \]
+      </div>
+
+      <p>
+        这里 \(\kappa\) 是每个缺失事件的先验惩罚。通常 \(\kappa\) 越负，模型越保守，补出的缺失事件越少；\(\kappa\) 越大，模型越容易插入中间事件。
+      </p>
+
+      <h2>3.4 固定滞后窗口：持续观测、动态重采样、延后提交</h2>
+      <p>
+        数据插补不是在全量序列上离线重算，而是在一个固定滞后窗口中进行。窗口内的事件结构暂时保持可修改：
+        父事件可以被重采样，缺失事件可以被新增或删除；当事件超过滞后时间后，其结构被提交并输出。
+      </p>
+
+      <div class="formula">
+        \[
+        \mathcal{W}(t)=\{e:\,t_e\ge t-L\}
+        \]
+      </div>
+
+      <p>
+        其中 \(L\) 是固定滞后长度。窗口越长，模型越有机会发现缺失中间事件，但在线延迟也越高；窗口越短，响应更快，但补链能力更弱。
+      </p>
+
+      <div class="grid">
+        <div class="card orange">
+          <div class="card-title">窗口内</div>
+          <p>持续重采样父事件与缺失事件，保留多种可能解释。</p>
+        </div>
+        <div class="card red">
+          <div class="card-title">窗口外</div>
+          <p>事件结构被冻结，作为当前最可信的弱因果解释输出。</p>
+        </div>
+      </div>
+
+      <h2>3.5 插补采样：新增、删除与重采样</h2>
+      <p>
+        在窗口内，算法通过局部采样不断调整解释结构。主要包括三类动作：
+      </p>
+
+      <ul>
+        <li><strong>父事件重采样：</strong>在背景项和候选历史事件之间重新选择当前事件的解释来源。</li>
+        <li><strong>缺失事件新增：</strong>当某个观测事件缺少合适父事件时，提议插入一个已知类型的缺失事件作为中间父节点。</li>
+        <li><strong>缺失事件删除：</strong>如果某个缺失事件对整体解释贡献不足，或者带来过多额外预测惩罚，则将其移除。</li>
+      </ul>
+
+      <p>
+        对一次新增缺失事件 \(m\) 的提议，可以宏观理解为比较新增前后的解释收益：
+      </p>
+
+      <div class="formula">
+        \[
+        \Delta
+        \approx
+        \underbrace{\log s(m\rightarrow i)-\log s_{\mathrm{old}}(i)}_{\text{目标事件解释收益}}
+        +
+        \underbrace{\log s(\operatorname{pa}(m)\rightarrow m)}_{\text{缺失事件自身可解释性}}
+        -
+        \underbrace{C(m)}_{\text{额外预测惩罚}}
+        +
+        \underbrace{\kappa}_{\text{缺失先验惩罚}}
+        \]
+      </div>
+
+      <p>
+        这四项精确映射为：
+      </p>
+      <ul>
+        <li>目标收益：即缺失事件触发目标事件的强度，减去目标事件原有的孤儿背景强度。</li>
+        <li>自身解释：在提议阶段缺失事件暂视作由背景强度产生（随后通过 Gibbs 采样为其寻找父节点）。</li>
+        <li>额外惩罚：表示新增 \(m\) 以后预期会引发但实际未观测到的事件所带来的生存积分惩罚。</li>
+        <li>先验惩罚：即 \(\kappa\)，表示模型对引入虚拟事件的固定惩罚代价（通常为负值），用以约束插补的保守性，防止模型为了微小的解释收益而过度“脑补”出虚假的冗长链路。</li>
+      </ul>
+
+      <p>
+        因此，模型不会只因为某个缺失事件能解释一个目标事件就无条件保留它；这个缺失事件自身也必须合理，并且不能带来无法兑现的额外级联预测惩罚。
+      </p>
+
+      <h2>3.6 输出：带不确定性的弱因果链</h2>
+      <p>
+        窗口内的采样会为每个事件积累父事件投票。当事件被提交时，模型输出当前最可信的父事件关系以及对应置信度。
+        因此，插补结果最好理解为“概率性弱因果解释”，而不是确定事实。
+      </p>
+
+      <div class="formula">
+        \[
+        \widehat{p}(\operatorname{pa}(i)=j)
+        =
+        \frac{\operatorname{votes}_{i,j}}{\operatorname{sweeps}_i}
+        \]
+      </div>
+
+      <p>
+        真实观测事件和插补事件在输出中应被区分：观测事件是输入证据，插补事件是模型为了让触发链更连贯而提出的潜在中间节点。
+      </p>
+
+      <h2>3.7 小结</h2>
+      <p>
+        当前弱因果建模可以概括为：
+      </p>
+
+      <div class="formula">
+        \[
+        \mathrm{WeakCausalModeling}
+        =
+        \mathrm{ParentAssignment}
+        +
+        \mathrm{LagImputation}
+        +
+        \mathrm{PosteriorSummary}
+        \]
+      </div>
+
+      <p>
+        它的核心思想是：先用学习到的触发强度解释观测事件之间的弱父子关系；当观测链不完整时，在固定滞后窗口内插入少量已知类型的缺失事件；
+        最后输出带有置信度的弱因果链，而不是声称恢复了唯一真实因果结构。
+      </p>
+
+      <div class="footer">
+        本节为“弱因果建模”的独立说明，聚焦在线推理中的数据插补；后续章节可继续展开动态状态特征、插补参数配置或可视化输出。
+      </div>
+    </section>
+  </main>
+</body>
+</html>
