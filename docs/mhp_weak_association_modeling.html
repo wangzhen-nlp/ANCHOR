@@ -330,6 +330,175 @@
         本节只介绍多维时序点过程的宏观思想：先用背景强度、触发强度和时间衰减函数定义事件发生强度，再通过似然目标学习参数；隐含父变量只是 EM 学习过程中的中间推断量，用于辅助判断每个事件更可能由背景项还是历史事件解释。
       </p>
 
+      <h2>1.7 参考文献：相关论文的核心思想</h2>
+      <p>
+        本节的多维时序点过程建模思路，主要借鉴了四类相关工作：ISAHP 强调在实例级别解释“哪个历史事件影响了当前事件”，BRUNCH 强调从点过程里恢复分支结构，DHP 强调用 Hawkes 强度驱动连续时间流式聚类，Latent Network Hawkes 强调从事件流中发现隐含网络。它们共同指向一个核心思想：点过程不仅能建模事件发生强度，还能进一步解释事件之间的弱关联结构。
+      </p>
+
+
+
+      <div class="block">
+        <h2>参考一：ISAHP——实例级 Granger 因果解释</h2>
+        <p>
+          <strong>出处：</strong>Dongxia Wu、Yi-An Ma、Rose Yu（University of California, San Diego）；Tsuyoshi Idé、Aurélie Lozano、Georgios Kollias、Jiří Navrátil、Naoki Abe（IBM T. J. Watson Research Center）. <em>Learning Granger Causality from Instance-wise Self-attentive Hawkes Processes</em>, AISTATS 2024。
+        </p>
+        <p>
+          该工作关注异步、多类型事件序列中的实例级 Granger 因果发现。传统 Hawkes 过程通常得到类型级因果矩阵，而 ISAHP 希望直接解释具体事件实例之间的影响关系。
+        </p>
+        <div class="formula">
+          \[
+          \lambda(x\mid H_t)
+          =
+          \mu(x\mid H_t)
+          +
+          \sum_{j:t_j\lt t}\alpha(x,x_j)\,\phi(t-t_j\mid x,x_j)
+          \]
+        </div>
+        <p>
+          ISAHP 的关键是保留 Hawkes 强度函数的逐项加和结构：每个历史事件仍然单独贡献一项影响，因此实例级影响 \(\alpha(x,x_j)\) 可以直接作为事件 \(j\) 对当前事件的因果强度解释。
+        </p>
+        <div class="formula">
+          \[
+          A(x,x_j)=
+          \frac{\exp(x^{\top}Kx_j)\,\mathbf{1}(t>t_j)}
+          {\sum_{l:t_l\lt t}\exp(x^{\top}Kx_l)}
+          \]
+        </div>
+        <div class="formula">
+          \[
+          \alpha(x,x_j)=\sigma_{+}\!\bigl(A(x,x_j)\,(w_k^{\alpha})^{\top}v_j\bigr)
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先把事件类型和时间差编码为事件 embedding；再通过 self-attention 计算当前事件与历史事件之间的相关权重；随后用注意力加权后的历史事件表示参数化背景强度、实例级影响强度和时间衰减率；最后通过最大似然训练，使 \(\alpha(x,x_j)\) 成为可直接读取的实例级影响分数。
+        </p>
+        <p>
+          <strong>对当前方法的启发：</strong>当前方法虽然没有采用神经自注意力，但同样保留了“当前事件由多个历史事件逐项贡献强度”的可解释结构；这使得在线推理中的父事件选择、插补链路和弱因果解释都有明确的实例级含义。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考二：BRUNCH——分支结构推断</h2>
+        <p>
+          <strong>出处：</strong>Hui Li、Sourav S. Bhowmick（Nanyang Technological University, Singapore）；Hui Li（Xidian University, China）. <em>BRUNCH: Branching Structure Inference of Hybrid Multivariate Hawkes Processes with Application to Social Media</em>, PAKDD 2020。
+        </p>
+        <p>
+          该工作关注 Hybrid Multivariate Hawkes Processes 中的 branching structure 推断。论文认为，多维点过程中的事件可以分为 immigrant 与 offspring：immigrant 表示独立产生的根事件，offspring 表示由历史事件触发的后继事件；把这些父子触发关系连接起来，就得到一条或多条 cascade。
+        </p>
+        <ul>
+          <li>\(Z_{ik}=t_{ik}\)：表示事件 \(t_{ik}\) 是 immigrant（独立产生的根事件）。</li>
+          <li>\(Z_{ik}=t_{jl}\)：表示事件 \(t_{jl}\) 触发了事件 \(t_{ik}\)（父子触发关系）。</li>
+        </ul>
+        <p>
+          BRUNCH 的关键做法是使用 intensity-driven Chinese Restaurant Process（intCRP）对分支结构建模：先在单个维度内部构造 event links，再在不同维度形成的 cluster 之间构造 cluster links。
+        </p>
+        <div class="formula">
+          \[
+          \Pr(t_{il}\rightarrow t_{ik}\mid \rho_i,A_i)
+          \propto
+          \begin{cases}
+          A^{i}_{lk}, & t_{ik}>t_{il},\\
+          \rho_i, & t_{ik}=t_{il}.
+          \end{cases}
+          \]
+        </div>
+        <p>
+          这里 \(\rho_i\) 表示 self-affinity，对应产生新 immigrant 的倾向；\(A^{i}_{lk}\) 表示历史事件触发当前事件的亲和度，通常由时间窗口项和触发核项共同决定。跨维度时，BRUNCH 再根据 cluster 间最强的触发核响应决定 cluster link。
+        </p>
+        <div class="formula">
+          \[
+          \Pr(s\rightarrow g\mid B)
+          \propto
+          \max_{\substack{t_{ik}\in s,\;t_{jl}\in g\\ t_{ik}\lt t_{jl}}}
+          \left|\alpha_{ij}\right|\,\phi_{ij}(t_{jl}-t_{ik})
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先根据单维事件之间的触发强度采样 event links，形成局部 cluster；再根据跨维 cluster 之间的最大触发响应采样 cluster links；最后通过 Monte Carlo 推断方法 MEDIA 在 event links 与 cluster links 之间交替采样，得到最可能的 branching structure。
+        </p>
+        <p>
+          <strong>对当前方法的启发：</strong>当前建模中的父事件变量 \(z_i\)、级联链路和弱因果解释，都可以看作是对 BRUNCH 分支结构思想的简化吸收：不只是预测事件是否会发生，还要解释事件之间可能的父子触发关系。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考三：DHP——连续时间流式聚类</h2>
+        <p>
+          <strong>出处：</strong>Nan Du、Mehrdad Farajtabar、Le Song（Georgia Institute of Technology）；Amr Ahmed（Google Strategic Technologies）；Alexander J. Smola（Carnegie Mellon University）. <em>Dirichlet-Hawkes Processes with Applications to Clustering Continuous-Time Document Streams</em>, KDD 2015。
+        </p>
+        <p>
+          DHP 将 Dirichlet Process 的“自适应生成新簇”能力和 Hawkes Process 的“历史事件自激发”能力结合起来，用于连续时间事件流聚类。与需要把时间离散成 episode 的 RCRP 不同，DHP 直接在连续时间上建模，不需要预先设定固定时间片。
+        </p>
+        <div class="formula">
+          \[
+          \bar{\lambda}(t)=\lambda_0+\sum_{d=1}^{D}\lambda_{\theta_d}(t)
+          \]
+        </div>
+        <p>
+          其中 \(\lambda_0\) 是产生新簇的背景强度，\(\lambda_{\theta_d}(t)\) 是已有簇 \(d\) 的 Hawkes 自激发强度。新事件既可能开启一个新簇，也可能加入某个已有簇：
+        </p>
+        <div class="formula">
+          \[
+          P(s_n=k\mid t_n,\mathrm{rest})=
+          \frac{\lambda_{\theta_k}(t_n)}{\lambda_0+\sum_{i=1}^{n-1}\gamma_{\theta_i}(t_n,t_i)}
+          \]
+          \[
+          P(s_n=\mathrm{new}\mid t_n,\mathrm{rest})=
+          \frac{\lambda_0}{\lambda_0+\sum_{i=1}^{n-1}\gamma_{\theta_i}(t_n,t_i)}
+          \]
+        </div>
+        <p>
+          DHP 的核心思想是：簇大小不再只由历史计数决定，而是由簇级 Hawkes 强度决定。一个已有簇如果近期有较强自激发，就更容易吸收新事件；同时，\(\lambda_0\) 保证模型仍然可以产生新簇。
+        </p>
+        <p>
+          <strong>算法流程：</strong>对每个新到达事件，先根据内容似然与 DHP 时间先验采样簇标签；随后更新该簇的触发核参数；若同一时间戳存在多个事件，则进一步用 Gibbs / Metropolis 采样补充精确时间。整体使用 Sequential Monte Carlo 维护多个粒子，使流式聚类可以在线更新。
+        </p>
+        <p>
+          <strong>对当前方法的启发：</strong>DHP 说明 Hawkes 强度不仅可以解释事件触发，还可以作为连续时间聚类的动态先验：已有链路的近期活跃度越高，后续事件越容易被吸收到该链路中；同时背景强度保留新链产生的可能性。这与当前方法中“背景项开新链、触发项吸收历史链”的推理逻辑高度一致。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考四：Latent Network Hawkes——从事件流发现隐含网络</h2>
+        <p>
+          <strong>出处：</strong>Scott W. Linderman、Ryan P. Adams（Harvard University）. <em>Discovering Latent Network Structure in Point Process Data</em>, ICML 2014。
+        </p>
+        <p>
+          该工作关注这样一个问题：很多系统的网络边并不能直接观测，只能看到节点上的事件流。论文将 Hawkes 过程与随机图模型结合，通过事件之间的相互激发来反推潜在网络结构。
+        </p>
+        <div class="formula">
+          \[
+          h_{k,k'}(\Delta t)=A_{k,k'}\,W_{k,k'}\,g_{\theta_{k,k'}}(\Delta t)
+          \]
+        </div>
+        <p>
+          其中 \(A_{k,k'}\in\{0,1\}\) 表示潜在边是否存在，\(W_{k,k'}\ge 0\) 表示边强度，\(g_{\theta}\) 表示时间响应函数。这个分解把“有没有关系”和“关系有多强”分开建模。
+        </p>
+        <div class="formula">
+          \[
+          \lambda_k(t)=\lambda_{0,k}(t)+\sum_{n:s_n\lt t}A_{c_n,k}\,W_{c_n,k}\,g_{\theta_{c_n,k}}(t-s_n)
+          \]
+        </div>
+        <p>
+          为了便于推断，论文利用 Poisson superposition 思想，为每个事件引入 parent variable：事件要么来自背景过程，要么来自某个历史事件产生的 impulse response。
+        </p>
+        <div class="formula">
+          \[
+          \Pr(z_n=m)\propto \lambda_m(s_n)
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先用随机图先验描述潜在邻接矩阵 \(A\)，用权重矩阵 \(W\) 描述相互激发强度；再为每个事件采样父事件 \(z_n\)，把观测事件分解为背景事件和触发事件；最后通过 Gibbs sampling 交替更新 \(A,W,\theta,\lambda_0,z\)，从事件流中恢复潜在网络。
+        </p>
+        <p>
+          <strong>对当前方法的启发：</strong>当前方法中的弱拓扑建模与它思想相近：结构关系不一定完全可靠，也不一定完全可观测；可以把结构信息作为软先验或特征，让事件数据来修正和学习最终的触发强度。
+        </p>
+      </div>
+
+      <div class="note">
+        归纳来看，ISAHP 强调“实例级因果强度可以从逐项加和的强度函数中读取”，BRUNCH 强调“从点过程恢复分支结构”，DHP 强调“用连续时间 Hawkes 强度驱动流式聚类”，Latent Network Hawkes 强调“从事件流发现隐含网络”。当前方法将这四类思想统一为：用多维点过程描述事件发生，用父事件变量解释弱因果，用背景项与触发项支持在线分组，用结构特征和先验表达弱拓扑，用连续时间核函数表达弱时序。
+      </div>
+
       <div class="footer">
         本节给出多维时序点过程的总体框架；后续三节在此基础上展开弱拓扑、弱因果与弱时序三类「弱关联」建模。
       </div>
@@ -499,6 +668,101 @@
       <p>
         它既避免了完全忽略结构信息带来的偶然共现问题，也避免了完全相信结构信息带来的脆弱性。最终，拓扑只是提供可学习的归纳偏置，真正的触发强度仍由事件数据和学习参数共同确定。
       </p>
+
+
+      <h2>2.8 参考文献：弱拓扑相关工作</h2>
+      <p>
+        与第二节“弱拓扑关联”最相关的工作，主要体现为两条思路：一类是把已有结构网络和潜在扩散网络分开建模，说明已有拓扑不是唯一可信的传播通道；另一类是直接利用社交网络中的 follow 关系作为传播网络骨架，再在该骨架上学习不同 aspect 下的传播强度。前者对应 Cross-layer Cascades，后者对应 MMRate。
+      </p>
+
+      <div class="block">
+        <h2>参考一：Diffusion Network Inference for Cross-layer Cascades——观测拓扑与潜在拓扑的联合推断</h2>
+        <p>
+          <strong>出处：</strong>Siyu Huang、Yubai Yuan、Abdul Basit Adeel（The Pennsylvania State University）. <em>Diffusion Network Inference for Cross-layer Cascades</em>, NeurIPS 2025。
+        </p>
+        <p>
+          该工作关注 cross-layer cascade 场景：一个级联并不一定只沿着单一观测网络传播，而可能在观测网络和潜在网络之间交替传播。论文用 double network mixture model 同时刻画两类扩散通道：\(\Theta\) 表示受观测网络约束的扩散网络，\(\Psi\) 表示未被观测拓扑捕获的潜在扩散网络。
+        </p>
+        <div class="formula">
+          \[
+          \Theta^{c}
+          =
+          \bigl(
+          Z^{c}_{1}\Theta_{\cdot 1}+(1-Z^{c}_{1})\Psi_{\cdot 1},
+          \ldots,
+          Z^{c}_{N}\Theta_{\cdot N}+(1-Z^{c}_{N})\Psi_{\cdot N}
+          \bigr)
+          \]
+        </div>
+        <p>
+          其中 \(Z_i^c\in\{0,1\}\) 表示在第 \(c\) 条级联中，节点 \(i\) 的激活更像是通过观测网络 \(\Theta\) 解释，还是通过潜在网络 \(\Psi\) 解释。也就是说，同一条级联内部，不同节点可以选择不同传播层。
+        </p>
+        <div class="formula">
+          \[
+          \widehat{\pi}^{c}_{i}
+          =
+          P(Z_i^c=1\mid t^{(c)})
+          =
+          \frac{\pi_i P_I(t_i^c;\Theta_{\cdot i})}
+          {\pi_i P_I(t_i^c;\Theta_{\cdot i})+(1-\pi_i)P_I(t_i^c;\Psi_{\cdot i})}
+          \]
+        </div>
+        <p>
+          这个后验概率可以理解为“当前节点的激活有多大概率由观测拓扑层解释”。当 \(\widehat{\pi}^{c}_{i}\) 高时，观测拓扑更能解释该传播；当它低时，模型更倾向于认为存在未观测的潜在传播关系。
+        </p>
+        <p>
+          该工作还对两类网络施加不同结构约束：\(\Theta\) 受观测网络 \(A\) 的 support 约束，\(\Psi\) 用低秩结构刻画潜在社会距离或隐含关系。
+        </p>
+        <div class="formula">
+          \[
+          \Theta\odot(1-A)=0,
+          \qquad
+          \operatorname{rank}(\Psi)\le r
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先根据级联时间记录构造连续时间扩散似然；再在 E-step 中估计每个节点激活属于观测网络层还是潜在网络层的后验概率；随后在 M-step 中分别更新观测网络扩散强度 \(\Theta\)、潜在网络扩散强度 \(\Psi\) 和层选择概率 \(\pi\)。为了保证可优化性，论文将低秩约束放松为 nuclear norm，并把 M-step 分解成一组凸优化问题。
+        </p>
+        <p>
+          <strong>与当前弱拓扑建模的关系：</strong>当前算法同样不把已有拓扑当作硬事实，而是把拓扑作为可学习的弱信号。Cross-layer Cascades 的启发在于：观测拓扑可以看作一层可靠但不完整的结构，潜在关系可以看作另一层对观测拓扑的补充；因此，弱拓扑不只是“拓扑特征打分”，还可以进一步扩展为“观测拓扑层 + 潜在拓扑层”的联合解释框架。对应到当前方法中，\(r_{\mathrm{topo}}(v\rightarrow u)\) 和拓扑 pseudo-count 类似于观测拓扑层的软偏置，而由事件数据学习出的非拓扑触发强度则承担了部分潜在关系补偿作用。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考二：MMRate——基于 follow 关系的多方面传播网络推断</h2>
+        <p>
+          <strong>出处：</strong>Senzhang Wang、Zhoujun Li（Beihang University）；Xia Hu（Arizona State University）；Philip S. Yu（University of Illinois at Chicago）. <em>MMRate: Inferring Multi-aspect Diffusion Networks with Multi-pattern Cascades</em>, KDD 2014。
+        </p>
+        <p>
+          该工作关注社交媒体中的 multi-aspect diffusion network inference。与完全从事件数据中无约束学习传播关系不同，MMRate 在真实微博实验中直接使用社交网络中的 following relationships 构造传播网络骨架：用户是节点，follow 关系提供可能的传播边；模型再在这些边上学习不同 aspect 下的传播速率。
+        </p>
+        <div class="formula">
+          \[
+          G=\bigcup_{k=1}^{K}G_k,\qquad
+          G_k=(N,E_k),\qquad
+          E_k=\bigcup_{i,j}\{\alpha^{k}_{ij}\}
+          \]
+        </div>
+        <p>
+          其中 \(K\) 是预设的 aspect 数量，\(\alpha^{k}_{ij}\) 表示节点 \(i\) 到节点 \(j\) 在第 \(k\) 个 aspect 下的传播速率。同一对用户可以在不同 aspect 下具有不同传播强度，因此传播网络不是单一同质图，而是多个 aspect-sensitive 子图的组合。
+        </p>
+        <p>
+          MMRate 同时考虑 cascade 自身的扩散模式。对 cascade \(t^c\)，节点 \(i\) 感染节点 \(j\) 的概率由两部分共同决定：一部分是 aspect-sensitive transmission rate \(\alpha^k_{ij}\)，另一部分是 cascade pattern 参数 \(\delta^c\)。
+        </p>
+        <div class="formula">
+          \[
+          f(\Delta t^c_{ij};k,\delta^c)
+          =
+          g_1\left(\Delta t^c_{ij};g_2(\alpha^k_{ij},\delta^c)\right)
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先从微博数据中抽取用户节点和 follow 关系，形成候选传播网络；再为每条 cascade 引入隐含 aspect 变量 \(z_{ik}\)，表示该 cascade 更可能属于哪个传播方面；随后用 EM 交替更新 cascade 的 aspect 分配、aspect 分布 \(\pi_k\)，以及每条 follow 边在不同 aspect 下的传播速率 \(\alpha^k_{ij}\)。
+        </p>
+        <p>
+          <strong>与当前弱拓扑建模的关系：</strong>MMRate 的核心启发是：已有社交拓扑可以作为传播关系的骨架，但不能直接等同于最终传播强度。follow 边只是说明“可能有传播通道”，真正的传播能力还要根据 cascade 数据学习，并且同一条边在不同 aspect 下可能具有不同强度。对应到当前方法，设备拓扑、同站点、同厂家等关系也更适合作为弱拓扑信号进入触发强度，而不是作为硬因果边直接使用。
+        </p>
+      </div>
 
       <div class="footer">
         本节为“弱拓扑关联”的独立说明，保持通用事件建模表述；后续章节可继续展开 feature 模式、动态状态特征或在线推理机制。
@@ -713,6 +977,92 @@
         最后输出带有置信度的弱因果链，而不是声称恢复了唯一真实因果结构。
       </p>
 
+      <h2>3.8 参考文献：缺失事件插补相关工作</h2>
+      <p>
+        第三节“弱因果关联”中的数据插补，主要借鉴了两类相关工作：一类是在传统多维 Hawkes 过程中显式对未观测事件进行后验采样，另一类是在神经点过程框架下用 particle smoothing 从未来观测中反推缺失事件。它们共同说明：缺失事件不只是噪声或异常值，而可以作为解释观测事件之间弱因果链条的潜在中间节点。
+      </p>
+
+      <div class="block">
+        <h2>参考一：Hawkes Process Inference with Missing Data——多维 Hawkes 中的未观测事件后验采样</h2>
+        <p>
+          <strong>出处：</strong>Christian R. Shelton、Zhen Qin、Chandini Shetty（University of California, Riverside）. <em>Hawkes Process Inference with Missing Data</em>, AAAI 2018。
+        </p>
+        <p>
+          该工作关注多维 Hawkes 过程中的缺失事件推断：事件类型集合是已知的，但某些类型在某些时间区间内不可观测，甚至可以存在完全隐藏的事件类型。模型的目标是在给定部分观测事件的情况下，对未观测事件集合进行后验推断。
+        </p>
+        <div class="formula">
+          \[
+          p(x)=
+          \exp\left(-\sum_i \Phi_{l_i,?}(T-t_i)\right)
+          \prod_i \sum_{j\in I^0_{t_i}}\phi_{l_j,l_i}(t_i-t_j)
+          \]
+        </div>
+        <p>
+          为了高效采样缺失事件，论文利用 Hawkes 过程的 branching / parent 表示，为每个事件引入父事件辅助变量；同时引入 virtual events 作为“潜在但尚未实现”的候选事件。由于采样过程中会把 virtual event 变成 real event，或者把 real event 删除回 virtual event，事件数量本身会变化，因此这里不是固定维度空间上的普通 MCMC，而是带有维度跳转思想的 Reversible Jump MCMC（RJMCMC）。
+        </p>
+        <div class="formula">
+          \[
+          p(x,a,\widetilde{x},\widetilde{a})
+          =
+          \prod_i \exp\left[-(\kappa+1)\Phi_{l_i,?}(T-t_i)\right]
+          \prod_i \phi_{l_{a_i},l_i}(t_i-t_{a_i})
+          \prod_i \kappa\,\phi_{l_{\widetilde{a}_i},\widetilde{l}_i}(\widetilde{t}_i-t_{\widetilde{a}_i})
+          \]
+        </div>
+        <p>
+          与传统 MCMC 相比，RJMCMC 的关键差别在于：传统 MCMC 通常在固定维度状态空间内更新变量，例如只改变某个事件的父节点；而 RJMCMC 允许在不同维度的状态空间之间跳转，例如新增一个缺失事件会增加状态维度，删除一个缺失事件会降低状态维度。论文中的 virtualness move 和 parent move 都具有这种跨维度特征：当一个 virtual event 被接受为 real event 时，模型相当于向当前解释链中新增了一个未观测事件；当某个 real event 被移回 virtual event 时，模型相当于删除了一个缺失事件。
+        </p>
+        <p>
+          <strong>算法流程：</strong>先固定观测事件和观测区间；再维护一个包含真实事件、缺失事件、虚拟事件和父事件指针的状态；随后通过三类 RJMCMC move 更新状态：重采样 virtual children、在 virtual / real event 之间切换、重采样 parent。第一类 move 主要刷新候选虚拟事件；第二类 move 显式改变缺失事件个数；第三类 move 在重采样父节点时也可能把某个 virtual parent 提升为 real parent。这样可以在连续时间空间中搜索可能的缺失事件，而不需要枚举无限多个候选时间点。
+        </p>
+        <p>
+          <strong>与当前弱因果建模的关系：</strong>当前方法中的缺失事件插补也把未观测事件看作潜在中间节点，用来解释观测事件之间无法直接连通的弱因果链。该工作提供的启发是：缺失事件应该和父事件结构一起被推断，而不是先独立补点、再事后连边；并且一旦允许“新增 / 删除缺失事件”，推理本质上就不再只是固定维度的父节点重采样，而更接近 RJMCMC 式的跨维度结构搜索。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考二：Imputing Missing Events in Continuous-Time Event Streams——基于粒子平滑的缺失事件插补</h2>
+        <p>
+          <strong>出处：</strong>Hongyuan Mei、Jason Eisner（Johns Hopkins University）；Guanghui Qin（Peking University）. <em>Imputing Missing Events in Continuous-Time Event Streams</em>, ICML 2019。
+        </p>
+        <p>
+          该工作关注连续时间事件流中的缺失事件插补。给定完整事件流模型 \(p_{\mathrm{model}}\) 和缺失机制 \(p_{\mathrm{miss}}\)，目标是根据观测事件 \(x\) 推断缺失事件 \(z\) 的后验分布。
+        </p>
+        <div class="formula">
+          \[
+          p(z\mid x)
+          \propto
+          p_{\mathrm{model}}(x\uplus z)\,p_{\mathrm{miss}}(z\mid x\uplus z)
+          \]
+        </div>
+        <p>
+          论文首先给出 particle filtering：按时间顺序从模型强度中采样缺失事件，并在遇到观测事件时强制将其加入序列；如果当前粒子的历史无法很好解释未来观测，就会被降低权重。为了利用未来观测信息，论文进一步提出 particle smoothing：用一个从右到左读取未来观测的 continuous-time LSTM 修正 proposal intensity。
+        </p>
+        <div class="formula">
+          \[
+          \lambda^{q}_{k}(t\mid H(t),F(t))
+          =
+          f_k\left(v_k^{\top}\bigl(h(t)+B\overline{h}(t)\bigr)\right)
+          \]
+        </div>
+        <p>
+          其中 \(h(t)\) 来自从左到右读取历史事件的模型状态，\(\overline{h}(t)\) 来自从右到左读取未来观测的平滑状态。这样，提议分布不仅看过去，也看未来，从而更容易在两个观测事件之间提出合理的缺失事件。
+        </p>
+        <div class="formula">
+          \[
+          w_m
+          \propto
+          \frac{p_{\mathrm{model}}(x\uplus z_m)\,p_{\mathrm{miss}}(z_m\mid x\uplus z_m)}{q(z_m\mid x)}
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先从 proposal distribution 中顺序采样多个缺失事件序列粒子；再用 importance weight 修正 proposal 与真实后验之间的偏差；最后对带权粒子集合做 consensus decoding，得到单个低风险的缺失事件预测结果。
+        </p>
+        <p>
+          <strong>与当前弱因果建模的关系：</strong>当前方法的 fixed-lag 插补也是在观测事件之间提出潜在中间事件，并用模型似然和缺失先验共同决定是否保留。该工作的启发是：插补不应只依赖过去事件，未来观测也能反向约束中间缺失事件；对应到在线场景，就是通过固定滞后窗口在提交前保留一段可回看范围，从而提升弱因果链补全的可靠性。
+        </p>
+      </div>
+
       <div class="footer">
         本节为“弱因果建模”的独立说明，聚焦在线推理中的数据插补；后续章节可继续展开动态状态特征、插补参数配置或可视化输出。
       </div>
@@ -916,6 +1266,111 @@
         第一部分用连续时间自激发核函数代替固定窗口规则，使历史影响随时间平滑衰减；
         第二部分在训练和推理两端使用时间松弛和乱序衰减处理观测时间不准的问题，使小范围乱序事件仍有机会被关联，但不会无衰减地破坏时间方向；在线推理中的 watermark 只是这一机制在流式提交时的实现方式。
       </p>
+
+
+      <h2>4.7 参考文献：弱时序与时间不确定性相关工作</h2>
+      <p>
+        第四节“弱时序关联”主要对应三类相关工作：第一类处理只有区间聚合计数、没有精确事件时间的 interval-censored Hawkes；第二类直接建模事件发生时间存在不确定窗口的 point process；第三类将缺失事件和带噪时间戳统一看成 data distortion，并用 likelihood-free 的 ABC 方法学习 Hawkes 参数。它们共同说明：事件时间不一定要被当作完全精确的硬输入，而可以通过区间、窗口、扰动函数或离散化核函数进行弱时序建模。
+      </p>
+
+      <div class="block">
+        <h2>参考一：Interval-censored Hawkes Processes——只有区间计数时的 Hawkes 拟合</h2>
+        <p>
+          <strong>出处：</strong>Marian-Andrei Rizoiu、Pio Calderon（University of Technology Sydney）；Alexander Soen、Shidi Li、Lexing Xie（The Australian National University）；Leanne J. Dong（Concordia University）；Aditya Krishna Menon（Google Research）. <em>Interval-censored Hawkes Processes</em>, JMLR 2022。
+        </p>
+        <p>
+          该工作关注 interval-censored data：数据只记录每个时间区间内的事件数量，而不记录每个事件的精确发生时间。由于 Hawkes 过程的标准点过程似然需要精确事件时间，并且 Hawkes 不具备 Poisson 过程那样的独立增量性质，不能直接把区间计数当作普通 Poisson likelihood 来拟合。
+        </p>
+        <div class="formula">
+          \[
+          C(a,b]\sim \operatorname{Poisson}\bigl(\Xi(b)-\Xi(a)\bigr)
+          \]
+        </div>
+        <p>
+          论文提出 Mean Behavior Poisson Process（MBPP）：用一个非齐次 Poisson 过程的确定性强度 \(\xi(t)\) 去对应 Hawkes 强度的期望行为，并建立 MBPP 参数与 Hawkes 参数之间的对应关系。其平均强度满足类似 Hawkes 自激发的卷积方程：
+        </p>
+        <div class="formula">
+          \[
+          \xi(t)=s(t)+\int_0^t \phi(t-\tau)\,\xi(\tau)\,d\tau
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先把原始连续事件时间退化为区间计数 \(C(o_{i-1},o_i]\)；再用 MBPP 的区间补偿量 \(\Xi(o_i)-\Xi(o_{i-1})\) 构造 interval-censored log-likelihood；随后通过解析解或数值近似估计 \(\xi(t)\) 与 \(\Xi(t)\)，最终恢复对应 Hawkes 参数。
+        </p>
+        <p>
+          <strong>与当前弱时序建模的关系：</strong>当前方法并不把固定窗口当作硬关联规则，而是把时间窗口更多视为计算或观测分辨率约束。Interval-censored Hawkes 的启发在于：当精确时间不可得时，仍可以在区间层面保留自激发建模，而不是退化为简单窗口计数规则。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考二：Point Processes with Event Time Uncertainty——事件时间不确定窗口下的点过程建模</h2>
+        <p>
+          <strong>出处：</strong>Xiuyuan Cheng（Duke University）；Tingnan Gong、Yao Xie（Georgia Institute of Technology）. <em>Point Processes with Event Time Uncertainty</em>, arXiv 2026。
+        </p>
+        <p>
+          该工作直接考虑事件时间不确定：模型不再假设事件精确发生在某个时间点 \(t_i\)，而是假设只能知道事件落在一个不确定窗口内。
+        </p>
+        <div class="formula">
+          \[
+          t_i\in \Delta_i=(\Delta_i^l,\Delta_i^r]
+          \]
+        </div>
+        <p>
+          在连续时间层面，模型仍然保留 Hawkes / self-exciting point process 的思想：当前事件强度由背景项和历史影响核共同决定。
+        </p>
+        <div class="formula">
+          \[
+          \lambda[k](t)=\mu+\sum_{i:t_i \lt t}k(t_i,t)
+          \]
+        </div>
+        <p>
+          当不确定窗口与规则时间网格对齐时，论文进一步将连续时间影响核量化成离散矩阵；每个矩阵元素表示一个时间格内的历史事件对另一个时间格内事件概率的平均影响。
+        </p>
+        <div class="formula">
+          \[
+          K_{p,q}=\frac{1}{h^2}\int_{I_p}\int_{I_q}k(t',t)\,dt'\,dt
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先用不确定窗口描述事件时间观测；再在连续时间上写出带时间不确定性的点过程似然；随后把窗口对齐到时间网格，将连续影响核转化为可学习的矩阵或网络张量；最后用梯度下降或 variational inequality 进行参数估计，并给出收敛保证。
+        </p>
+        <p>
+          <strong>与当前弱时序建模的关系：</strong>当前方法中的 time slack 本质上也是承认“观测时间不是绝对精确”的弱时序假设。该工作的启发是：时间不确定性可以被显式建模为窗口，并进一步转化为可学习的离散影响矩阵；这比简单地随机扰动时间戳或固定窗口匹配更原则化。
+        </p>
+      </div>
+
+      <div class="block">
+        <h2>参考三：ABC Learning of Hawkes Processes with Missing or Noisy Event Times——缺失或带噪时间戳下的似然自由学习</h2>
+        <p>
+          <strong>出处：</strong>Isabella Deutsch、Gordon J. Ross（University of Edinburgh）. <em>ABC Learning of Hawkes Processes with Missing or Noisy Event Times</em>, arXiv 2021。
+        </p>
+        <p>
+          该工作把缺失事件和带噪事件时间统一称为 data distortion。其核心观点是：如果直接用失真后的观测事件学习 Hawkes 参数，强度函数估计会产生明显偏差；因此需要显式建模 distortion function \(h(\cdot)\)。
+        </p>
+        <div class="formula">
+          \[
+          \lambda(t\mid H_t,\theta)=\lambda_0(t\mid\theta)+\sum_{i:t>t_i}\nu(t-t_i\mid\theta)
+          \]
+        </div>
+        <p>
+          对缺失数据，\(h(t)\) 可以表示事件在时刻 \(t\) 被成功观测到的概率；对带噪时间戳，\(h(t)\) 可以表示真实发生时间到观测时间的扰动机制。由于未观测事件或真实事件时间需要被积分掉，观测似然通常不可解析：
+        </p>
+        <div class="formula">
+          \[
+          p(Y\mid\theta)
+          \propto
+          \int p(Y,Y_u\mid\theta)
+          \prod_{t_i\in Y}h(t_i)
+          \prod_{t_l\in Y_u}\bigl(1-h(t_l)\bigr)\,dY_u
+          \]
+        </div>
+        <p>
+          <strong>算法流程：</strong>先从先验或 proposal 中采样 Hawkes 参数；再根据这些参数模拟完整 Hawkes 事件流；随后通过 distortion function 生成带缺失或带噪的观测事件；最后比较模拟观测与真实观测的 summary statistics，若距离足够小则接受参数。ABC-Hawkes 因而不需要直接计算不可解析似然。
+        </p>
+        <p>
+          <strong>与当前弱时序建模的关系：</strong>当前方法用 time slack 和 late penalty 处理小范围时间乱序，本质上是对 noisy event time 的工程化建模。ABC-Hawkes 的启发在于：如果时间噪声或缺失机制更复杂，可以显式定义 distortion function，并通过模拟—比较的方式学习参数，而不是强行相信原始时间戳完全准确。
+        </p>
+      </div>
 
       <div class="footer">
         本节为“弱时序建模”的独立说明，聚焦连续时间自激发与时间乱序鲁棒性；后续章节可继续展开参数学习、动态状态特征或推理输出。
