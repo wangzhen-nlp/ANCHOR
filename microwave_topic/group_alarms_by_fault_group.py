@@ -5,6 +5,7 @@
 import argparse
 import json
 import sys
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -156,6 +157,7 @@ def group_alarms(
     excluded_device_types=None,
     ne_graph=NE_GRAPH_JSON,
     show_progress=False,
+    progress_interval=100000,
 ):
     device_fields = list(device_fields or DEFAULT_DEVICE_FIELDS)
     excluded_device_type_keys = {
@@ -166,29 +168,57 @@ def group_alarms(
     groups = OrderedDict()
     stats = {
         "input_count": 0,
+        "grouped_alarm_count": 0,
         "skipped_no_group_id": 0,
         "group_count": 0,
         "excluded_group_count": 0,
         "output_group_count": 0,
     }
+    progress_interval = max(int(progress_interval or 0), 0)
+    last_progress_time = time.time()
+    if show_progress:
+        print(f"⏳ 开始读取告警输入: {alarms_input}", file=sys.stderr, flush=True)
+
+    def _maybe_print_progress():
+        nonlocal last_progress_time
+        if not show_progress:
+            return
+
+        now = time.time()
+        should_print_by_count = progress_interval > 0 and stats["input_count"] % progress_interval == 0
+        should_print_by_time = now - last_progress_time >= 5.0
+        if should_print_by_count or should_print_by_time:
+            print(
+                "  已读取 "
+                f"{stats['input_count']} 条，"
+                f"有效分组告警 {stats['grouped_alarm_count']} 条，"
+                f"当前故障组 {len(groups)} 个",
+                file=sys.stderr,
+                flush=True,
+            )
+            last_progress_time = now
 
     for record in stream_alarm_inputs(alarms_input, show_progress=show_progress):
         stats["input_count"] += 1
         if _is_sorted_alarm_cache_header(record):
+            _maybe_print_progress()
             continue
 
         alarm, wrapper = _unwrap_alarm(record)
         if not isinstance(alarm, dict):
             stats["skipped_no_group_id"] += 1
+            _maybe_print_progress()
             continue
 
         group_id = _get_group_id(alarm, wrapper, group_field)
         if not group_id:
             stats["skipped_no_group_id"] += 1
+            _maybe_print_progress()
             continue
 
         group = groups.setdefault(group_id, _build_group_record(group_id))
         group["alarms"].append(alarm)
+        stats["grouped_alarm_count"] += 1
 
         device_type = _get_device_type(alarm, wrapper, device_fields, ne_domain_map)
         if device_type:
@@ -203,7 +233,19 @@ def group_alarms(
         alarm_source = _get_alarm_source(alarm, wrapper)
         _append_unique(group["_alarm_sources"], alarm_source)
 
+        _maybe_print_progress()
+
     stats["group_count"] = len(groups)
+    if show_progress:
+        print(
+            "✅ 告警读取完成: "
+            f"读取 {stats['input_count']} 条，"
+            f"有效分组告警 {stats['grouped_alarm_count']} 条，"
+            f"跳过无故障组ID {stats['skipped_no_group_id']} 条，"
+            f"形成故障组 {stats['group_count']} 个",
+            file=sys.stderr,
+            flush=True,
+        )
 
     output_groups = []
     for group in groups.values():
@@ -272,7 +314,17 @@ def build_arg_parser():
             f"{resource_display('ne_graph.json')}。优先用 告警源 -> domain 判断设备类型，找不到再回退到告警字段"
         ),
     )
-    parser.add_argument("--show-progress", action="store_true", help="读取输入时显示进度")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="关闭读取输入时的进度显示",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=100000,
+        help="进度日志按读取条数输出的间隔，默认 100000；设为 0 表示只按时间输出",
+    )
     return parser
 
 
@@ -289,7 +341,8 @@ def main():
         device_fields=device_fields,
         excluded_device_types=excluded_device_types,
         ne_graph=args.ne_graph,
-        show_progress=args.show_progress,
+        show_progress=not args.no_progress,
+        progress_interval=args.progress_interval,
     )
     write_jsonl(groups, args.output)
 
