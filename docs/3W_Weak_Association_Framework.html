@@ -4,6 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>3W Weak Association Framework</title>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']], processEscapes: true },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
   <style>
     :root {
       --blue: #1f5fbf;
@@ -148,6 +155,16 @@
     .method h4 { margin: 0 0 8px; font-size: 19px; color: #132b65; }
     .method p { margin: 0; color: #475467; }
 
+    .tech-block { margin-top: 20px; padding: 24px 26px; border-radius: 22px; border: 1px solid #cfe0f7; background: rgba(255,255,255,0.92); box-shadow: 0 14px 34px rgba(22, 44, 78, 0.06); }
+    .tech-block h3 { margin-bottom: 12px; }
+    .tech-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 16px; }
+    .tech-card { border: 1px solid #dfeaf7; background: #fbfdff; border-radius: 18px; padding: 18px; }
+    .tech-card h4 { margin: 0 0 8px; color: #132b65; font-size: 18px; }
+    .tech-card p { margin: 0; color: #475467; }
+    .equation { margin: 12px 0; padding: 14px 16px; border-radius: 14px; background: #f7faff; border: 1px dashed #cbdaf0; font-family: Georgia, "Times New Roman", serif; font-size: 18px; color: #172033; overflow-x: auto; }
+    .compact-list { margin: 10px 0 0; padding-left: 20px; color: #344054; }
+    .compact-list li { margin: 7px 0; }
+
     .flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; align-items: stretch; }
     .flow-step { position: relative; background: #fff; border: 1px solid var(--line); border-radius: 18px; padding: 18px 14px; text-align: center; box-shadow: 0 10px 24px rgba(22, 44, 78, 0.06); }
     .flow-step:not(:last-child):after { content: "→"; position: absolute; right: -13px; top: 50%; transform: translateY(-50%); color: var(--blue); font-size: 25px; font-weight: 900; z-index: 2; }
@@ -161,7 +178,7 @@
     code { background: #f2f6fb; padding: 2px 6px; border-radius: 6px; color: #19366d; }
 
     @media (max-width: 960px) {
-      .hero-grid, .cards-3, .relationship, .method-grid, .flow, .name-grid { grid-template-columns: 1fr; }
+      .hero-grid, .cards-3, .relationship, .method-grid, .flow, .name-grid, .tech-grid { grid-template-columns: 1fr; }
       .flow-step:not(:last-child):after { content: "↓"; right: 50%; top: auto; bottom: -22px; transform: translateX(50%); }
       .flow { gap: 26px; }
       .logic-list li { grid-template-columns: 1fr; gap: 4px; }
@@ -182,7 +199,7 @@
       <div class="hero-grid">
         <div class="definition">
           <div class="label">◎ 核心定义</div>
-          <p>3W 的本质，是用 <strong>Where、Why、When</strong> 三类弱证据，把离散事件恢复成可解释的事件演化链。</p>
+          <p>3W 的本质，是以多维时序点过程为技术底座，用 <strong>Where、Why、When</strong> 三类弱证据，把离散事件恢复成可解释的事件演化链。</p>
         </div>
         <div class="mini">
           <div class="label">▣ 英文统一口径</div>
@@ -229,9 +246,9 @@
     <section>
       <div class="section-title"><h2>三、3W 的三个核心维度</h2><span class="hint">Where / Why / When</span></div>
       <div class="cards-3">
-        <article class="card"><div class="icon">W</div><h3>Where：弱拓扑关联</h3><div class="en">Weak Topological Association<br/>Learning Event Evolution over Weak Topology</div><ul><li>判断事件是否处于同一影响域。</li><li>学习弱拓扑上的事件演化关系。</li><li>补充纯拓扑无法解释的异常联动逻辑。</li><li>回答：<strong>事件在哪里关联？</strong></li></ul><span class="tag">Method: Diffusion</span></article>
-        <article class="card purple"><div class="icon">W</div><h3>Why：弱因果关联</h3><div class="en">Weak Causal Association<br/>Completing Missing Events in the Evolution Chain</div><ul><li>探索事件链中的缺失环节。</li><li>区分关键事件与噪声事件。</li><li>搜索更合理的根因—中间事件—影响结果解释。</li><li>回答：<strong>事件为什么关联？</strong></li></ul><span class="tag">Method: Reversible MCMC</span></article>
-        <article class="card teal"><div class="icon">W</div><h3>When：弱时序关联</h3><div class="en">Weak Temporal Association<br/>Learning Temporal Event Triggering Patterns</div><ul><li>学习事件之间的时间触发关系。</li><li>刻画影响强度、延迟分布和方向性。</li><li>避免只依赖固定时间窗口。</li><li>回答：<strong>事件何时联动？</strong></li></ul><span class="tag">Method: Point Process / K Matrix</span></article>
+        <article class="card"><div class="icon">W</div><h3>Where：弱拓扑关联</h3><div class="en">Weak Topological Association<br/>Learning Event Evolution over Weak Topology</div><ul><li>判断事件是否处于同一影响域。</li><li>把同实体、直连、多跳可达、反向可达等关系压缩为 \(r_{\mathrm{topo}}(v\rightarrow u)\)。</li><li>拓扑作为可学习特征和 pseudo-count 先验进入触发强度。</li><li>回答：<strong>事件在哪里关联？</strong></li></ul><span class="tag">Method: Diffusion / Feature Prior</span></article>
+        <article class="card purple"><div class="icon">W</div><h3>Why：弱因果关联</h3><div class="en">Weak Causal Association<br/>Completing Missing Events in the Evolution Chain</div><ul><li>用父事件变量 \(z_i\) 区分背景事件与历史触发事件。</li><li>在固定滞后窗口内新增、删除、重采样潜在缺失事件。</li><li>输出带置信度的根因—中间事件—影响结果解释。</li><li>回答：<strong>事件为什么关联？</strong></li></ul><span class="tag">Method: Reversible MCMC / Imputation</span></article>
+        <article class="card teal"><div class="icon">W</div><h3>When：弱时序关联</h3><div class="en">Weak Temporal Association<br/>Learning Temporal Event Triggering Patterns</div><ul><li>学习事件之间的连续时间触发关系。</li><li>用衰减核 \(g(\Delta t)\) 刻画影响强度、延迟分布和方向性。</li><li>引入 time slack 处理小范围延迟、乱序和时间戳抖动。</li><li>回答：<strong>事件何时联动？</strong></li></ul><span class="tag">Method: Point Process / K Matrix</span></article>
       </div>
     </section>
 
@@ -243,32 +260,86 @@
         <tr><td><strong>When</strong><br/>弱时序</td><td>Weak Temporal Association</td><td>事件之间是否存在时间触发关系？</td><td>离散事件流、时间间隔、触发强度、延迟分布</td><td>Point Process / K Matrix</td><td>时间触发矩阵 K、事件先后激发模式、时序置信度</td><td>验证 Why 的解释链是否具备时间合理性，并为 Where 的异常联动提供时间证据。</td></tr>
         <tr><td><strong>Context</strong><br/>上下文</td><td>Contextual Constraints</td><td>这个关联放在工程场景里是否合理？</td><td>设备角色、链路方向、业务承载、历史模式、专家规则、故障基因库</td><td>Rule / Knowledge / Feature Constraint</td><td>工程合理性校正、场景约束、专家知识增强</td><td>校正 Where / Why / When 的判断，减少过度汇聚和误关联。</td></tr>
       </tbody></table></div>
+      <div class="tech-block">
+        <h3>技术底座：多维时序点过程把 3W 统一到同一个强度函数中</h3>
+        <p>参考 MHP 建模页的表述，一段事件流可以写成 \(\mathcal{D}=\{e_i=(t_i,u_i,m_i)\}\)：\(t_i\) 是时间，\(u_i\) 是事件类型，\(m_i\) 是设备、位置、业务、状态等上下文。3W 的三个 W 不是三套割裂规则，而是共同影响目标类型 \(u\) 在时刻 \(t\) 的发生强度。</p>
+        <div class="equation">\[ \lambda_u(t) = \mu_u + \sum_{j:t_j\lt t} \alpha_{u,u_j}(t) \cdot g_{u,u_j}(t - t_j) \]</div>
+        <div class="tech-grid">
+          <div class="tech-card">
+            <h4>Where 进入 α</h4>
+            <p>拓扑、位置、实体属性、业务承载被编码为 \(\phi_{\mathrm{static}}(u,v)\)，并通过 \(r_{\mathrm{topo}}(v\rightarrow u)\) 与结构先验影响触发强度。</p>
+          </div>
+          <div class="tech-card">
+            <h4>Why 解释父子关系</h4>
+            <p>每个事件要么由背景强度 \(\mu\) 解释，要么由历史事件触发；父事件变量 \(z_i\) 把“谁影响了谁”显式化。</p>
+          </div>
+          <div class="tech-card">
+            <h4>When 进入 g</h4>
+            <p>时间衰减核 \(g(\Delta t)\) 让历史影响随时间平滑减弱，并用 time slack 对小范围乱序进行折扣关联。</p>
+          </div>
+          <div class="tech-card">
+            <h4>Context 动态修正</h4>
+            <p>源设备未恢复告警、目标设备脆弱状态、链路方向和专家知识共同组成动态上下文 \(\mathbf{m}_{u,v}(t)\)。</p>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section>
       <div class="section-title"><h2>五、3W 融合推理公式</h2><span class="hint">统一关联置信度</span></div>
-      <div class="formula"><div class="section-label">◇ Association Score</div><div class="math">S(e<sub>i</sub>, e<sub>j</sub>) = α·S<sub>where</sub> + β·S<sub>why</sub> + γ·S<sub>when</sub> + δ·S<sub>context</sub></div><p class="formula-note">单一弱证据不可靠，多维弱证据融合形成稳定解释。</p></div>
+      <div class="formula"><div class="section-label">◇ Association Score</div><div class="math">\[ S(e_i, e_j) = \alpha S_{\mathrm{where}} + \beta S_{\mathrm{why}} + \gamma S_{\mathrm{when}} + \delta S_{\mathrm{context}} \]</div><p class="formula-note">单一弱证据不可靠，多维弱证据融合形成稳定解释。</p></div>
       <div class="relationship" style="margin-top:20px;">
-        <div class="panel"><h3>公式中的四个分量</h3><ul class="logic-list"><li><span class="key">S_where</span><span>弱拓扑关联分：事件在空间、拓扑、业务承载上的影响域相关性。</span></li><li><span class="key">S_why</span><span>弱因果解释分：事件是否可以被组织成合理的解释链。</span></li><li><span class="key">S_when</span><span>弱时序触发分：事件之间是否存在稳定的时间触发关系。</span></li><li><span class="key">S_context</span><span>场景上下文分：设备角色、链路方向、专家知识是否支持当前关联。</span></li></ul></div>
+        <div class="panel"><h3>公式中的四个分量</h3><ul class="logic-list"><li><span class="key">\(S_{\mathrm{where}}\)</span><span>弱拓扑关联分：来自 \(r_{\mathrm{topo}}(v\rightarrow u)\)、同站点/同实体/业务承载特征，以及拓扑 pseudo-count 对稀疏样本的温和支持。</span></li><li><span class="key">\(S_{\mathrm{why}}\)</span><span>弱因果解释分：来自父事件分配 \(z_i\)、缺失事件插补收益、解释链完整性和后验置信度。</span></li><li><span class="key">\(S_{\mathrm{when}}\)</span><span>弱时序触发分：来自 \(\alpha\cdot g(\Delta t)\)、延迟分布、时间方向和乱序松弛折扣。</span></li><li><span class="key">\(S_{\mathrm{context}}\)</span><span>场景上下文分：设备角色、链路方向、运行状态、专家知识是否支持当前关联。</span></li></ul></div>
         <div class="panel"><h3>Context 是什么？</h3><p><strong>Context 就是场景背景和工程约束。</strong></p><p>Where / Why / When 判断“像不像相关”，Context 判断“放在这个场景里合不合理”。</p><ul><li>设备角色：核心、汇聚、接入、传输等。</li><li>链路方向：上行、下行、主备链路、保护路径。</li><li>业务承载：同一客户、同一区域、同一专线或同一业务域。</li><li>知识约束：专家规则、历史模式、故障基因库、典型场景库。</li></ul></div>
+      </div>
+      <div class="tech-block">
+        <h3>从强度函数到关联分数</h3>
+        <p>在实现层面，关联分数可以看作对点过程触发项的工程化归一：先学习 \(\alpha_{u,v}(t)\)，再用时间核计算实例级触发分数，最后叠加弱拓扑、弱因果和上下文校正。</p>
+        <div class="equation">\[ s(j\rightarrow i) = \alpha_{u_i,u_j}(t_i) \cdot g(t_i - t_j) \]</div>
+        <ul class="compact-list">
+          <li><strong>训练目标：</strong>最大化观测事件的发生强度，同时通过积分惩罚避免模型在无事件区间过度预测。</li>
+          <li><strong>软责任：</strong>\(P(z_i=j)\) 可由候选父事件触发项占总强度的比例得到，用于统计类型对触发次数。</li>
+          <li><strong>稀疏校正：</strong>\(\widetilde{N}_{u,v}=N_{u,v}+\rho\cdot r_{\mathrm{topo}}(v\rightarrow u)\) 让弱拓扑只提供软偏置，不变成硬规则。</li>
+        </ul>
       </div>
     </section>
 
     <section>
       <div class="section-title"><h2>六、为什么不同问题选择不同方法？</h2><span class="hint">方法要匹配问题形态</span></div>
-      <div class="method-grid"><div class="method"><h4>Where 用 Diffusion</h4><p>弱拓扑本质是大规模影响域和关联强度学习问题。Diffusion 更适合学习稳定、可泛化的事件演化关系，而不是在全图上频繁加边、删边。</p></div><div class="method"><h4>Why 用可逆 MCMC</h4><p>弱因果本质是少量关键隐变量的结构补全问题。可逆 MCMC 适合在可变长度、可变结构的事件链中增加、删除、替换潜在事件。</p></div><div class="method"><h4>When 用点过程</h4><p>弱时序本质是离散事件流中的时间触发关系学习。点过程关注一个事件出现后，另一个事件未来发生概率是否升高。</p></div></div>
+      <div class="method-grid"><div class="method"><h4>Where 用 Diffusion</h4><p>弱拓扑本质是大规模影响域和关联强度学习问题。拓扑不直接决定因果边，而是转为可学习的结构特征、候选空间和先验强度。</p></div><div class="method"><h4>Why 用可逆 MCMC</h4><p>弱因果本质是少量关键隐变量的结构补全问题。可逆 MCMC 适合在固定滞后窗口内增加、删除、替换潜在事件，并同步重采样父子关系。</p></div><div class="method"><h4>When 用点过程</h4><p>弱时序本质是离散事件流中的时间触发关系学习。点过程关注背景强度、历史触发强度、连续时间衰减和小范围乱序鲁棒性。</p></div></div>
+      <div class="tech-block">
+        <h3>三类方法在在线推理中的协作</h3>
+        <div class="tech-grid">
+          <div class="tech-card">
+            <h4>候选父事件选择</h4>
+            <p>新事件到达后，系统在 Where 限定的候选集合中比较 \(\mu\) 与各个 \(\alpha \cdot g\)，决定它是开新链还是并入已有链。</p>
+          </div>
+          <div class="tech-card">
+            <h4>缺失事件插补</h4>
+            <p>当目标事件无法被已观测父事件合理解释时，Why 在窗口内提出潜在中间事件，并用解释收益、额外预测惩罚和缺失先验共同决定是否保留。</p>
+          </div>
+          <div class="tech-card">
+            <h4>时间松弛提交</h4>
+            <p>When 维护 pending 区域和 watermark，只在超过松弛范围后提交父子关系，避免因采集延迟或乱序到达过早定案。</p>
+          </div>
+          <div class="tech-card">
+            <h4>置信度汇总</h4>
+            <p>窗口内多轮采样会形成父事件投票；提交时输出最可信父节点、是否插补、链路置信度和工程上下文解释。</p>
+          </div>
+        </div>
+      </div>
       <div class="callout"><strong>核心判断：</strong>弱拓扑不是“修几条边”，而是学习影响域如何扩展；弱因果不是“调几个参数”，而是补全事件链中的缺失环节；弱时序不是“看谁先出现”，而是学习事件之间的时间触发模式。</div>
     </section>
 
     <section>
       <div class="section-title"><h2>七、理论闭环与应用价值</h2><span class="hint">从离散事件到可解释运维能力</span></div>
       <div class="flow"><div class="flow-step"><div class="flow-icon">◇</div><strong>离散事件</strong><span class="small">告警 / 性能 / 状态 / 工单</span></div><div class="flow-step"><div class="flow-icon">◎</div><strong>3W弱关联</strong><span class="small">Where / Why / When / Context</span></div><div class="flow-step"><div class="flow-icon">⛓</div><strong>事件演化链</strong><span class="small">可解释结构化链路</span></div><div class="flow-step"><div class="flow-icon">⌖</div><strong>影响域识别 / 根因解释</strong><span class="small">范围、源头、中间环节</span></div><div class="flow-step"><div class="flow-icon">▦</div><strong>场景归类 / 故障汇聚</strong><span class="small">典型场景与故障组</span></div></div>
-      <div class="panel" style="margin-top:22px;"><h3>持续优化闭环</h3><p>历史事件和专家反馈会反哺故障基因库与典型场景库，进而更新 3W 的弱证据模型，使事件演化链的恢复能力持续增强。</p><p><strong>闭环：</strong>历史事件 → 3W弱关联学习 → 事件演化链 → 影响域识别 / 根因解释 / 场景归类 / 故障汇聚 → 专家反馈 / 故障基因库更新 → 模型持续优化。</p></div>
+      <div class="panel" style="margin-top:22px;"><h3>持续优化闭环</h3><p>历史事件和专家反馈会反哺故障基因库与典型场景库，进而更新 3W 的弱证据模型，使事件演化链的恢复能力持续增强。</p><p><strong>闭环：</strong>历史事件 → 事件流建模 / EM 学习 → 3W弱关联学习 → 事件演化链 → 影响域识别 / 根因解释 / 场景归类 / 故障汇聚 → 专家反馈 / 故障基因库更新 → 模型持续优化。</p><p>其中，EM 学习负责把观测事件分解为背景项和触发项；在线推理负责在固定滞后窗口内做父事件选择、缺失事件插补和时间松弛提交；专家反馈则用于校正拓扑先验、缺失事件惩罚、时间松弛范围和典型场景约束。</p></div>
     </section>
 
     <section>
       <div class="section-title"><h2>八、对外汇报口径</h2><span class="hint">可直接用于客户材料</span></div>
-      <div class="panel"><p>We propose a <strong>3W Weak Association Framework</strong> to understand event association in complex network operations from three weak-evidence dimensions.</p><ul><li><strong>Where — Weak Topological Association:</strong> identifies whether events belong to the same impact domain.</li><li><strong>Why — Weak Causal Association:</strong> completes missing events in the event evolution chain.</li><li><strong>When — Weak Temporal Association:</strong> learns temporal triggering patterns between events.</li><li><strong>Context:</strong> uses device roles, service context, expert knowledge, and the fault gene library to calibrate association decisions.</li></ul><p>Together, these dimensions organize isolated alarms into explainable event evolution chains, supporting fault grouping, impact domain identification, root cause reasoning, and scenario classification.</p></div>
+      <div class="panel"><p>We propose a <strong>3W Weak Association Framework</strong> to understand event association in complex network operations from three weak-evidence dimensions, using a multivariate temporal point process as the modeling backbone.</p><ul><li><strong>Where — Weak Topological Association:</strong> identifies whether events belong to the same impact domain by using topology as learnable features and soft priors.</li><li><strong>Why — Weak Causal Association:</strong> assigns parent events, completes missing events in the event evolution chain, and outputs probabilistic causal explanations.</li><li><strong>When — Weak Temporal Association:</strong> learns continuous-time triggering patterns, delay decay, and time-slack associations between events.</li><li><strong>Context:</strong> uses device roles, service context, dynamic states, expert knowledge, and the fault gene library to calibrate association decisions.</li></ul><p>Together, these dimensions organize isolated alarms into explainable event evolution chains, supporting fault grouping, impact domain identification, root cause reasoning, and scenario classification.</p></div>
       <div class="quote">中文一句话：3W 的本质，是用 Where、Why、When 三类弱证据，结合场景上下文，把离散告警恢复成可解释的事件演化链。</div>
     </section>
 
