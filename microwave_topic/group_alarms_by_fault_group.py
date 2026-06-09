@@ -154,6 +154,9 @@ def group_alarms(
     group_field=DEFAULT_GROUP_FIELD,
     device_fields=None,
     excluded_device_types=None,
+    min_alarm_count=1,
+    min_device_count=0,
+    min_site_count=0,
     ne_graph=NE_GRAPH_JSON,
     show_progress=False,
 ):
@@ -170,6 +173,9 @@ def group_alarms(
         "skipped_no_group_id": 0,
         "group_count": 0,
         "excluded_group_count": 0,
+        "below_min_alarm_count_group_count": 0,
+        "below_min_device_count_group_count": 0,
+        "below_min_site_count_group_count": 0,
         "output_group_count": 0,
     }
 
@@ -243,6 +249,18 @@ def group_alarms(
             stats["excluded_group_count"] += 1
             continue
 
+        if len(group["alarms"]) < min_alarm_count:
+            stats["below_min_alarm_count_group_count"] += 1
+            continue
+
+        if min_device_count > 0 and len(group["_alarm_sources"]) < min_device_count:
+            stats["below_min_device_count_group_count"] += 1
+            continue
+
+        if min_site_count > 0 and len(group["_site_ids"]) < min_site_count:
+            stats["below_min_site_count_group_count"] += 1
+            continue
+
         record = {
             "故障组ID": group["故障组ID"],
             "alarm_count": len(group["alarms"]),
@@ -297,6 +315,31 @@ def build_arg_parser():
         help="如果故障组中出现该设备类型则不输出；可重复传入，也支持逗号分隔，如 Data,Ran,Microwave",
     )
     parser.add_argument(
+        "--min-alarm-count",
+        dest="min_alarm_count",
+        type=int,
+        default=1,
+        help="故障组内告警数量至少达到该值才输出，默认 1；--min-count 是兼容旧参数的别名",
+    )
+    parser.add_argument(
+        "--min-device-count",
+        type=int,
+        default=0,
+        help="故障组内非空唯一告警源数量至少达到该值才输出，默认 0 表示不限制",
+    )
+    parser.add_argument(
+        "--min-site-count",
+        type=int,
+        default=0,
+        help="故障组内非空唯一站点数量至少达到该值才输出，默认 0 表示不限制",
+    )
+    parser.add_argument(
+        "--min-count",
+        dest="min_alarm_count",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--ne-graph",
         default=NE_GRAPH_JSON,
         help=(
@@ -318,12 +361,21 @@ def main():
 
     device_fields = _parse_device_fields(args.device_field)
     excluded_device_types = _split_csv_values(args.exclude_device_types)
+    if args.min_alarm_count < 1:
+        parser.error("--min-alarm-count 必须大于等于 1")
+    if args.min_device_count < 0:
+        parser.error("--min-device-count 不能小于 0")
+    if args.min_site_count < 0:
+        parser.error("--min-site-count 不能小于 0")
 
     groups, stats = group_alarms(
         args.alarms,
         group_field=args.group_field,
         device_fields=device_fields,
         excluded_device_types=excluded_device_types,
+        min_alarm_count=args.min_alarm_count,
+        min_device_count=args.min_device_count,
+        min_site_count=args.min_site_count,
         ne_graph=args.ne_graph,
         show_progress=not args.no_progress,
     )
@@ -334,6 +386,9 @@ def main():
     stats["ne_graph"] = args.ne_graph
     stats["device_fields"] = device_fields
     stats["excluded_device_types"] = excluded_device_types
+    stats["min_alarm_count"] = args.min_alarm_count
+    stats["min_device_count"] = args.min_device_count
+    stats["min_site_count"] = args.min_site_count
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 
