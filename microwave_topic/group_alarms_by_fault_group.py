@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from topology_resources import NE_GRAPH_JSON, resource_display
 
 
 DEFAULT_GROUP_FIELD = "故障组ID"
@@ -52,6 +53,10 @@ def _parse_device_fields(raw_fields):
 
 def _load_ne_domain_map(ne_graph_path):
     if not ne_graph_path:
+        return {}
+
+    if not Path(ne_graph_path).exists():
+        print(f"⚠️ ne_graph 文件不存在，回退到告警字段判断设备类型: {ne_graph_path}", file=sys.stderr)
         return {}
 
     with open(ne_graph_path, "r", encoding="utf-8") as fr:
@@ -110,18 +115,20 @@ def _get_alarm_source(alarm, wrapper):
 
 
 def _get_device_type(alarm, wrapper, device_fields, ne_domain_map):
+    alarm_source = _get_alarm_source(alarm, wrapper)
+    if alarm_source and ne_domain_map:
+        device_type = ne_domain_map.get(alarm_source, "")
+        if device_type:
+            return device_type
+
     device_type = _first_non_empty(alarm, device_fields)
     if device_type:
         return device_type
-
     if isinstance(wrapper, dict):
         device_type = _first_non_empty(wrapper, device_fields)
         if device_type:
             return device_type
 
-    alarm_source = _get_alarm_source(alarm, wrapper)
-    if alarm_source and ne_domain_map:
-        return ne_domain_map.get(alarm_source, "")
     return ""
 
 
@@ -147,7 +154,7 @@ def group_alarms(
     group_field=DEFAULT_GROUP_FIELD,
     device_fields=None,
     excluded_device_types=None,
-    ne_graph=None,
+    ne_graph=NE_GRAPH_JSON,
     show_progress=False,
 ):
     device_fields = list(device_fields or DEFAULT_DEVICE_FIELDS)
@@ -244,8 +251,9 @@ def build_arg_parser():
         action="append",
         default=None,
         help=(
-            "设备类型字段名；可重复传入，也支持逗号分隔。"
-            "默认自动尝试 domain/专业/设备类型/网络类型/网元类型等字段"
+            "告警字段兜底用的设备类型字段名；可重复传入，也支持逗号分隔。"
+            "默认自动尝试 domain/专业/设备类型/网络类型/网元类型等字段。"
+            "脚本会优先使用 ne_graph 中 告警源 -> domain 的结果"
         ),
     )
     parser.add_argument(
@@ -258,8 +266,11 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--ne-graph",
-        default="",
-        help="可选 ne_graph.json；当告警本身没有设备类型字段时，用 告警源 -> domain 补齐过滤依据",
+        default=NE_GRAPH_JSON,
+        help=(
+            "ne_graph.json 文件；默认: "
+            f"{resource_display('ne_graph.json')}。优先用 告警源 -> domain 判断设备类型，找不到再回退到告警字段"
+        ),
     )
     parser.add_argument("--show-progress", action="store_true", help="读取输入时显示进度")
     return parser
@@ -284,6 +295,7 @@ def main():
 
     stats["output"] = args.output
     stats["group_field"] = args.group_field
+    stats["ne_graph"] = args.ne_graph
     stats["device_fields"] = device_fields
     stats["excluded_device_types"] = excluded_device_types
     print(json.dumps(stats, ensure_ascii=False, indent=2))
