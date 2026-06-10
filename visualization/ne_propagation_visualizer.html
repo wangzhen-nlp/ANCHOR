@@ -804,18 +804,6 @@
             box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
         }
 
-        .node-item.has-topology-common-upstream {
-            border-left-color: #7c3aed;
-            border-color: #7c3aed;
-            box-shadow: inset 0 0 0 1px rgba(124, 58, 237, 0.18);
-        }
-
-        .node-item.has-topology-farthest-upstream {
-            border-left-color: #dc2626;
-            border-color: #dc2626;
-            box-shadow: inset 0 0 0 1px rgba(220, 38, 38, 0.16);
-        }
-
         .node-item.supplemental-context {
             border-color: #8c959f;
             border-left-color: #8c959f;
@@ -2402,8 +2390,6 @@
             associated_site: { color: '#16a34a', width: 3.5, label: '关联站点告警设备' },
             missing_site: { color: '#f59e0b', width: 3.5, label: '缺失站点告警设备' },
             context_site: { color: '#0891b2', width: 3.5, label: '上下文站点告警设备' },
-            common_upstream_site: { color: '#7c3aed', width: 4.5, label: '最低公共祖先站点设备' },
-            farthest_upstream_site: { color: '#dc2626', width: 4.5, label: '最远 upstream 站点设备' },
             alarm_other: { color: '#0891b2', width: 3.5, label: '其它有告警设备' },
             default: { color: '#ffffff', width: 2, label: '普通设备' }
         };
@@ -3038,11 +3024,10 @@
         let roleSiteSets = {
             associated_site: new Set(),
             missing_site: new Set(),
-            context_site: new Set(),
-            common_upstream_site: new Set(),
-            farthest_upstream_site: new Set()
+            context_site: new Set()
         };
         let faultPatternManagedSites = new Set();
+        let topologyHighlightSites = new Set();
         let siteNeighborModeEnabled = false;
         let siteNeighborHopCount = 1;
 
@@ -3086,6 +3071,40 @@
             return faultPatternManagedSites.has(normalizeSiteId(siteId));
         }
 
+        function updateTopologyHighlightSites(data) {
+            const nextSites = new Set();
+            if (data && typeof data === 'object') {
+                const completion = data.topology_completion && typeof data.topology_completion === 'object'
+                    ? data.topology_completion
+                    : {};
+                addSiteValuesToSet(nextSites, completion.highlight_site_ids);
+
+                const highlightSites = Array.isArray(completion.highlight_sites)
+                    ? completion.highlight_sites
+                    : [];
+                highlightSites.forEach(function(item) {
+                    if (item && typeof item === 'object') {
+                        addSiteValuesToSet(nextSites, [item.site_id]);
+                    }
+                });
+
+                const rootRoleMapping = data.role_mapping && typeof data.role_mapping === 'object' ? data.role_mapping : {};
+                const matchInfoRoleMapping = data.match_info && typeof data.match_info === 'object'
+                    ? (data.match_info.role_mapping || {})
+                    : {};
+                [rootRoleMapping, matchInfoRoleMapping].forEach(function(roleMapping) {
+                    if (!roleMapping || typeof roleMapping !== 'object') return;
+                    addSiteValuesToSet(nextSites, roleMapping.common_upstream_site);
+                    addSiteValuesToSet(nextSites, roleMapping.farthest_upstream_site);
+                });
+            }
+            topologyHighlightSites = nextSites;
+        }
+
+        function isTopologyHighlightSite(siteId) {
+            return topologyHighlightSites.has(normalizeSiteId(siteId));
+        }
+
         function updateRoleSiteSets(data) {
             const rootRoleMapping = (data && data.role_mapping && typeof data.role_mapping === 'object') ? data.role_mapping : {};
             const matchInfoRoleMapping = data && data.match_info && typeof data.match_info === 'object'
@@ -3096,23 +3115,11 @@
             roleSiteSets = {
                 associated_site: new Set((roleMapping.associated_site || []).map(function(siteId) { return String(siteId); })),
                 missing_site: new Set((roleMapping.missing_site || []).map(function(siteId) { return String(siteId); })),
-                context_site: new Set((roleMapping.context_site || []).map(function(siteId) { return String(siteId); })),
-                common_upstream_site: new Set((roleMapping.common_upstream_site || []).map(function(siteId) { return String(siteId); })),
-                farthest_upstream_site: new Set((roleMapping.farthest_upstream_site || []).map(function(siteId) { return String(siteId); }))
+                context_site: new Set((roleMapping.context_site || []).map(function(siteId) { return String(siteId); }))
             };
         }
 
-        function getNodeTopologyRole(node) {
-            const siteId = String((node && node.site_id) || '');
-            if (!siteId) return '';
-            if (roleSiteSets.common_upstream_site.has(siteId)) return 'common_upstream_site';
-            if (roleSiteSets.farthest_upstream_site.has(siteId)) return 'farthest_upstream_site';
-            return '';
-        }
-
         function getNodeAlarmRole(node) {
-            const topologyRole = getNodeTopologyRole(node);
-            if (topologyRole) return topologyRole;
             if (!nodeHasAlarm(node)) return '';
             const siteId = String((node && node.site_id) || '');
             if (!siteId) return 'alarm_other';
@@ -3127,8 +3134,6 @@
             if (role === 'associated_site') return 'has-alarm-associated';
             if (role === 'missing_site') return 'has-alarm-missing';
             if (role === 'context_site') return 'has-alarm-context';
-            if (role === 'common_upstream_site') return 'has-topology-common-upstream';
-            if (role === 'farthest_upstream_site') return 'has-topology-farthest-upstream';
             return nodeHasAlarm(node) ? 'has-alarm' : '';
         }
 
@@ -4018,6 +4023,7 @@
                     existing.hasExpandedNode = existing.hasExpandedNode || !!node.isNeighborExpanded;
                     existing.hasBaseNode = existing.hasBaseNode || !node.isNeighborExpanded;
                     existing.isFaultPatternSite = existing.isFaultPatternSite || isFaultPatternManagedSite(siteId);
+                    existing.isTopologyHighlightSite = existing.isTopologyHighlightSite || isTopologyHighlightSite(siteId);
                 } else {
                     siteMap.set(siteKey, {
                         siteId: siteId,
@@ -4027,7 +4033,8 @@
                         count: 1,
                         hasExpandedNode: !!node.isNeighborExpanded,
                         hasBaseNode: !node.isNeighborExpanded,
-                        isFaultPatternSite: isFaultPatternManagedSite(siteId)
+                        isFaultPatternSite: isFaultPatternManagedSite(siteId),
+                        isTopologyHighlightSite: isTopologyHighlightSite(siteId)
                     });
                 }
             });
@@ -4043,7 +4050,8 @@
                     isExpandedSite: !!site.hasExpandedNode && !site.hasBaseNode,
                     hasExpandedNode: !!site.hasExpandedNode,
                     hasBaseNode: !!site.hasBaseNode,
-                    isFaultPatternSite: !!site.isFaultPatternSite
+                    isFaultPatternSite: !!site.isFaultPatternSite,
+                    isTopologyHighlightSite: !!site.isTopologyHighlightSite
                 };
             });
         }
@@ -4506,9 +4514,11 @@
                 const radius = Math.min(36, 18 + Math.max(0, site.deviceCount - 1) * 2);
                 const isExpandedSite = !!site.isExpandedSite;
                 const isFaultPatternSite = !!site.isFaultPatternSite;
-                const overlayColor = isFaultPatternSite ? '#cf222e' : (isExpandedSite ? '#f59e0b' : '#0969da');
+                const isTopologyHighlightSite = !!site.isTopologyHighlightSite;
+                const isRedSite = isFaultPatternSite || isTopologyHighlightSite;
+                const overlayColor = isRedSite ? '#cf222e' : (isExpandedSite ? '#f59e0b' : '#0969da');
                 const fillOpacity = isExpandedSite ? 0.12 : 0.07;
-                const haloOpacity = isFaultPatternSite ? 0.5 : (isExpandedSite ? 0.4 : 0.28);
+                const haloOpacity = isRedSite ? 0.5 : (isExpandedSite ? 0.4 : 0.28);
 
                 const halo = L.circleMarker(latlng, {
                     pane: 'siteOverlayPane',
@@ -4540,7 +4550,7 @@
                     zIndexOffset: -1000,
                     icon: L.divIcon({
                         className: 'site-label-container',
-                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site ' : '') + (isFaultPatternSite ? 'fault-pattern-site' : '') + '">' + escapeHtml(site.label || site.siteId || site.siteName || '未知站点') + '</div>',
+                        html: '<div class="site-label-map ' + (isExpandedSite ? 'expanded-site ' : '') + (isRedSite ? 'fault-pattern-site' : '') + '">' + escapeHtml(site.label || site.siteId || site.siteName || '未知站点') + '</div>',
                         iconSize: null,
                         iconAnchor: [-8, 14]
                     })
@@ -5826,6 +5836,7 @@
             graphData = data;
             updateRoleSiteSets(data);
             updateFaultPatternManagedSites(data);
+            updateTopologyHighlightSites(data);
             allNodes = [];
             const hiddenSiteIds = getVisualizationExcludedSiteIds(data);
             const hiddenNeIds = new Set();
@@ -5859,7 +5870,6 @@
                     alarm_types: alarmTypes,
                     name: neInfo.name || neId,
                     alarm: nodeAlarms,
-                    topology_highlight: neInfo.topology_highlight || null,
                     supplemental_fault_pattern_context: !!neInfo.supplemental_fault_pattern_context,
                     latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
                     longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined))
@@ -6236,10 +6246,6 @@
                 const isSelected = (n.id === highlightId) || (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id));
                 const isFaultPatternSite = isFaultPatternManagedSite(n.site_id);
                 const isSupplementalContext = !!n.supplemental_fault_pattern_context;
-                const topologyRole = getNodeTopologyRole(n);
-                const topologyLabel = topologyRole && NODE_ROLE_BORDER_STYLE[topologyRole]
-                    ? NODE_ROLE_BORDER_STYLE[topologyRole].label.replace('设备', '')
-                    : '';
                 const siteIdHtml = isFaultPatternSite
                     ? '<span class="fault-pattern-site-id">' + escapeHtml(n.site_id || '-') + '</span>'
                     : escapeHtml(n.site_id || '-');
@@ -6258,7 +6264,7 @@
                     '<div class="domain-icon" style="color: ' + style.color + ';">' + style.symbol + '</div>' +
                     '<div class="node-info">' +
                         '<div class="ne-id">' + escapeHtml(getRawNodeId(n)) + '</div>' +
-                        '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (topologyLabel ? ' | ' + escapeHtml(topologyLabel) : '') + (isSupplementalContext ? ' | 补全上下文' : '') + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
+                        '<div class="site-name">' + siteIdHtml + ' | ' + escapeHtml(style.label) + (isSupplementalContext ? ' | 补全上下文' : '') + (siteNeighborModeEnabled && siteNeighborAnchorNodes.has(n.id) ? ' | 锚点' : '') + (n.isNeighborExpanded ? ' | 邻居扩展' : '') + '</div>' +
                         (n.alarm_count > 0 ? '<div class="alarm-badge ' + (n.alarm_count > 3 ? 'high' : n.alarm_count > 0 ? 'medium' : 'low') + '">' + n.alarm_count + ' 个告警</div>' : '') +
                         alarmGroupBadges +
                     '</div>' +

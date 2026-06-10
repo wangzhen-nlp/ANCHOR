@@ -300,7 +300,6 @@ def _build_ne_info_entry(
     ne_graph_data,
     site_graph_data,
     group_site_by_ne,
-    topology_highlights_by_site,
 ):
     existing = {}
     if isinstance(group.get("ne_info"), dict) and isinstance(group["ne_info"].get(ne_id), dict):
@@ -330,9 +329,6 @@ def _build_ne_info_entry(
     }
     if not is_alarm_ne:
         entry["topology_added"] = True
-    topology_highlight = topology_highlights_by_site.get(site_id)
-    if topology_highlight:
-        entry["topology_highlight"] = copy.deepcopy(topology_highlight)
     return entry
 
 
@@ -424,11 +420,11 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
     completion = _build_site_completion(alarm_sites, site_chain_index)
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
-    topology_highlights_by_site = {
-        item["site_id"]: item
+    topology_highlight_site_ids = sorted(
+        item["site_id"]
         for item in topology_highlight_sites
         if item.get("site_id")
-    }
+    )
 
     included_ne_ids = set()
     for site_id in selected_sites:
@@ -449,7 +445,6 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
             ne_graph_data,
             site_graph_data,
             group_site_by_ne,
-            topology_highlights_by_site,
         )
         for ne_id in sorted(included_ne_ids)
     }
@@ -468,6 +463,8 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
     match_info = group.get("match_info") if isinstance(group.get("match_info"), dict) else {}
     if isinstance(match_info.get("role_mapping"), dict):
         existing_role_mapping.update(copy.deepcopy(match_info["role_mapping"]))
+    for derived_role in ("context_site", "common_upstream_site", "farthest_upstream_site"):
+        existing_role_mapping.pop(derived_role, None)
     alarm_site_set = set(alarm_sites)
     existing_role_mapping["associated_site"] = sorted(alarm_site_set)
     context_sites = sorted(set(all_site_ids) - alarm_site_set)
@@ -507,7 +504,7 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
         "common_upstream_hops": completion["common_upstream_hops"],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
-        "highlight_site_ids": sorted(topology_highlights_by_site),
+        "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(alarm_sites) <= 1,
     }
