@@ -144,6 +144,52 @@ def _site_of_ne(ne_id, ne_graph_data, group_site_by_ne=None):
     return _normalize_text((group_site_by_ne or {}).get(ne_id, ""))
 
 
+def _is_data_ne(ne_info):
+    if not isinstance(ne_info, dict):
+        return False
+    data_tokens = ("DATA", "IP", "ROUTER", "METRO")
+    for field_name in ("domain", "Domain", "DOMAIN", "network_type", "type"):
+        value = _normalize_text(ne_info.get(field_name, "")).upper()
+        if any(token in value for token in data_tokens):
+            return True
+    return False
+
+
+def _build_site_data_and_link_index(ne_graph_data):
+    site_has_data = set()
+    site_links = defaultdict(set)
+    ne_to_site = {}
+
+    if not isinstance(ne_graph_data, dict):
+        return site_has_data, site_links
+
+    for ne_id, ne_info in ne_graph_data.items():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            continue
+        ne_to_site[ne_id] = site_id
+        if _is_data_ne(ne_info):
+            site_has_data.add(site_id)
+
+    for source_ne, source_info in ne_graph_data.items():
+        if not isinstance(source_info, dict):
+            continue
+        source_site = ne_to_site.get(source_ne, "")
+        links = source_info.get("link", {})
+        if not source_site or not isinstance(links, dict):
+            continue
+        for target_ne in links:
+            target_site = ne_to_site.get(target_ne, "")
+            if not target_site or target_site == source_site:
+                continue
+            site_links[source_site].add(target_site)
+            site_links[target_site].add(source_site)
+
+    return site_has_data, site_links
+
+
 def _group_site_by_ne(group):
     mapping = {}
     ne_info = group.get("ne_info", {})
@@ -387,6 +433,41 @@ def _build_topology_highlight_sites(completion):
     return result
 
 
+def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site_links):
+    if len(highlight_sites or []) <= 1:
+        return list(highlight_sites or []), []
+
+    highlight_site_ids = {
+        _normalize_text(item.get("site_id", ""))
+        for item in highlight_sites
+        if isinstance(item, dict) and _normalize_text(item.get("site_id", ""))
+    }
+    if len(highlight_site_ids) <= 1:
+        return list(highlight_sites or []), []
+
+    removed_site_ids = set()
+    for site_id in sorted(highlight_site_ids):
+        if site_id in removed_site_ids:
+            continue
+        site_is_data = site_id in site_has_data
+        for peer_site in sorted(site_links.get(site_id, ())):
+            if peer_site not in highlight_site_ids or peer_site in removed_site_ids:
+                continue
+            peer_is_data = peer_site in site_has_data
+            if site_is_data == peer_is_data:
+                continue
+            removed_site_ids.add(peer_site if site_is_data else site_id)
+            break
+
+    if not removed_site_ids:
+        return list(highlight_sites or []), []
+
+    return [
+        item for item in highlight_sites
+        if _normalize_text(item.get("site_id", "")) not in removed_site_ids
+    ], sorted(removed_site_ids)
+
+
 def _ancestor_highlight_count(completion):
     highlight_sites = completion.get("highlight_sites") or []
     ancestor_roles = {"common_upstream_site", "farthest_upstream_site", "no_upstream_site"}
@@ -545,6 +626,8 @@ def complete_group_topology(
     site_chain_index,
     restrict_relation=False,
     upstream_adjacency=None,
+    site_has_data=None,
+    site_links=None,
 ):
     group = copy.deepcopy(group)
     group_id = group.get("uuid") or group.get("故障组ID") or group.get("match_info", {}).get("uuid", "")
@@ -562,6 +645,13 @@ def complete_group_topology(
     )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
+    if site_has_data is None or site_links is None:
+        site_has_data, site_links = _build_site_data_and_link_index(ne_graph_data)
+    topology_highlight_sites, data_link_pruned_ancestor_site_ids = _postprocess_data_linked_ancestor_sites(
+        topology_highlight_sites,
+        site_has_data,
+        site_links,
+    )
     topology_highlight_site_ids = sorted(
         item["site_id"]
         for item in topology_highlight_sites
@@ -656,6 +746,7 @@ def complete_group_topology(
         "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
+        "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(alarm_sites) <= 1,
@@ -676,6 +767,7 @@ def complete_groups(
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
     site_chain_index, restrict_relation = _load_site_chain_index(site_chains_path)
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
+    site_has_data, site_links = _build_site_data_and_link_index(ne_graph_data)
     # 带权上游邻接只依赖 site_chain_index，与故障组无关，预先构建一次复用，避免逐组重建。
     upstream_adjacency = (
         _build_weighted_upstream_adjacency(site_chain_index) if restrict_relation else None
@@ -705,6 +797,8 @@ def complete_groups(
                     site_chain_index,
                     restrict_relation,
                     upstream_adjacency,
+                    site_has_data,
+                    site_links,
                 )
                 completion = completed.get("topology_completion", {})
                 if completion.get("common_upstream_site"):
