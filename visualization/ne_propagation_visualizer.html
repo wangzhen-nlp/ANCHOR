@@ -6512,6 +6512,20 @@
                     }),
                 edge_details: (window.edgeDetails && typeof window.edgeDetails === 'object') ? window.edgeDetails : {},
                 site_order_data: (siteOrderData && typeof siteOrderData === 'object') ? siteOrderData : null,
+                neighbor_expansion: (function() {
+                    const hasExpansion = currentNodes.some(function(n) { return n && n.isNeighborExpanded; });
+                    const state = {
+                        mode_enabled: !!siteNeighborModeEnabled,
+                        hop_count: siteNeighborHopCount,
+                        anchor_node_ids: Array.from(siteNeighborAnchorNodes)
+                    };
+                    // 只有真正存在邻居扩展时才额外保存扩展前的基础图，避免普通导出体积翻倍
+                    if (hasExpansion) {
+                        state.base_nodes = baseCurrentNodes.map(normalizeNodeForExport);
+                        state.base_links = baseCurrentLinks.map(normalizeLinkForExport);
+                    }
+                    return state;
+                })(),
                 graph_meta: {
                     match_info: graphData ? (graphData.match_info || null) : null,
                     role_mapping: graphData ? (graphData.role_mapping || null) : null,
@@ -6556,8 +6570,27 @@
                 '      currentNodes = allNodes.map(function(n){ return Object.assign({}, n); });',
                 '      currentLinks = allLinks.map(function(l){ return Object.assign({}, l); });',
                 '      filteredLinks = currentLinks.slice();',
-                '      baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
-                '      baseCurrentLinks = currentLinks.map(function(l){ return Object.assign({}, l); });',
+                '      const neState = SNAPSHOT.neighbor_expansion || null;',
+                '      if (neState && Array.isArray(neState.base_nodes) && neState.base_nodes.length) {',
+                '        baseCurrentNodes = neState.base_nodes.map(function(n){ return Object.assign({}, n, { domainStyle: getDomainStyle(n.domain || "") }); });',
+                '        baseCurrentLinks = (neState.base_links || []).map(function(l){ return Object.assign({}, l); });',
+                '      } else {',
+                '        baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
+                '        baseCurrentLinks = currentLinks.map(function(l){ return Object.assign({}, l); });',
+                '      }',
+                '      if (neState) {',
+                '        siteNeighborHopCount = Math.max(1, Number(neState.hop_count) || 1);',
+                '        siteNeighborAnchorNodes = new Set(Array.isArray(neState.anchor_node_ids) ? neState.anchor_node_ids : []);',
+                '        siteNeighborModeEnabled = !!neState.mode_enabled;',
+                '        const hopInput = document.getElementById("siteNeighborHopInput");',
+                '        if (hopInput) hopInput.value = siteNeighborHopCount;',
+                '        const modeCheckbox = document.getElementById("siteNeighborModeCheckbox");',
+                '        if (modeCheckbox) modeCheckbox.checked = siteNeighborModeEnabled;',
+                '        const neMapBtn = document.getElementById("mapSiteNeighborBtn");',
+                '        if (neMapBtn) { neMapBtn.classList.toggle("active", siteNeighborModeEnabled); neMapBtn.classList.toggle("warning", !siteNeighborModeEnabled); }',
+                '        if (typeof updateSiteNeighborSelectionUI === "function") updateSiteNeighborSelectionUI();',
+                '        if (typeof updateMapModeIndicator === "function") updateMapModeIndicator();',
+                '      }',
                 '      activeGroups = new Set(SNAPSHOT.active_groups || []);',
                 '      currentNote = SNAPSHOT.note || "";',
                 '      const fileStatus = document.getElementById("fileStatus");',
