@@ -3096,6 +3096,7 @@
                     if (!roleMapping || typeof roleMapping !== 'object') return;
                     addSiteValuesToSet(nextSites, roleMapping.common_upstream_site);
                     addSiteValuesToSet(nextSites, roleMapping.farthest_upstream_site);
+                    addSiteValuesToSet(nextSites, roleMapping.no_upstream_site);
                 });
             }
             topologyHighlightSites = nextSites;

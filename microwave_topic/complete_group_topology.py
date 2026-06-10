@@ -289,6 +289,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
     common_upstream_site = None
     common_upstream_hops = {}
     farthest_upstream_sites = {}
+    no_upstream_sites = []
     intermediate_site_chains = {}
 
     def _select_path(site_id, target_site):
@@ -323,6 +324,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
                 if upstream_site != site_id
             }
             if not hops:
+                no_upstream_sites.append(site_id)
                 continue
             max_hop = max(hops.values())
             farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
@@ -334,6 +336,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
         "common_upstream_site": common_upstream_site,
         "common_upstream_hops": common_upstream_hops,
         "farthest_upstream_sites": farthest_upstream_sites,
+        "no_upstream_sites": sorted(no_upstream_sites),
         "upstream_site_hops": reach_by_site,
         "intermediate_site_chains": intermediate_site_chains,
         "restrict_relation": restrict_relation,
@@ -372,7 +375,27 @@ def _build_topology_highlight_sites(completion):
         item = farthest_by_target[site_id]
         item["source_sites"] = sorted(set(item["source_sites"]))
         result.append(item)
+    for site_id in completion.get("no_upstream_sites") or []:
+        site_id = _normalize_text(site_id)
+        if not site_id:
+            continue
+        result.append({
+            "site_id": site_id,
+            "role": "no_upstream_site",
+            "label": "无可用 upstream 站点",
+        })
     return result
+
+
+def _ancestor_highlight_count(completion):
+    highlight_sites = completion.get("highlight_sites") or []
+    ancestor_roles = {"common_upstream_site", "farthest_upstream_site", "no_upstream_site"}
+    ancestor_site_ids = {
+        _normalize_text(item.get("site_id", ""))
+        for item in highlight_sites
+        if isinstance(item, dict) and item.get("role") in ancestor_roles and _normalize_text(item.get("site_id", ""))
+    }
+    return len(ancestor_site_ids)
 
 
 def _build_filtered_link_info(ne_id, included_ne_ids, ne_graph_data):
@@ -506,7 +529,7 @@ def _should_output_by_ancestor_count(completion, ancestor_output):
     if ancestor_output == "all":
         return True
 
-    ancestor_count = len(completion.get("highlight_site_ids") or [])
+    ancestor_count = _ancestor_highlight_count(completion)
     if ancestor_output == "one":
         return ancestor_count == 1
     if ancestor_output == "multiple":
@@ -582,7 +605,7 @@ def complete_group_topology(
     match_info = group.get("match_info") if isinstance(group.get("match_info"), dict) else {}
     if isinstance(match_info.get("role_mapping"), dict):
         existing_role_mapping.update(copy.deepcopy(match_info["role_mapping"]))
-    for derived_role in ("context_site", "common_upstream_site", "farthest_upstream_site"):
+    for derived_role in ("context_site", "common_upstream_site", "farthest_upstream_site", "no_upstream_site"):
         existing_role_mapping.pop(derived_role, None)
     alarm_site_set = set(alarm_sites)
     existing_role_mapping["associated_site"] = sorted(alarm_site_set)
@@ -599,10 +622,17 @@ def complete_group_topology(
         for item in topology_highlight_sites
         if item.get("role") == "farthest_upstream_site"
     ]
+    no_upstream_sites = [
+        item["site_id"]
+        for item in topology_highlight_sites
+        if item.get("role") == "no_upstream_site"
+    ]
     if common_upstream_sites:
         existing_role_mapping["common_upstream_site"] = sorted(common_upstream_sites)
     if farthest_upstream_sites:
         existing_role_mapping["farthest_upstream_site"] = sorted(farthest_upstream_sites)
+    if no_upstream_sites:
+        existing_role_mapping["no_upstream_site"] = sorted(no_upstream_sites)
     group["role_mapping"] = existing_role_mapping
 
     match_info = copy.deepcopy(match_info)
@@ -623,6 +653,7 @@ def complete_group_topology(
         "common_upstream_site": completion["common_upstream_site"],
         "common_upstream_hops": completion["common_upstream_hops"],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
+        "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
         "highlight_site_ids": topology_highlight_site_ids,
@@ -680,7 +711,7 @@ def complete_groups(
                     stats["common_upstream_group_count"] += 1
                 elif len(completion.get("original_alarm_site_ids") or []) > 1:
                     stats["fallback_upstream_group_count"] += 1
-                ancestor_count = len(completion.get("highlight_site_ids") or [])
+                ancestor_count = _ancestor_highlight_count(completion)
                 if ancestor_count == 1:
                     stats["one_ancestor_group_count"] += 1
                 elif ancestor_count > 1:
