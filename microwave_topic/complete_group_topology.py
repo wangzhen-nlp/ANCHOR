@@ -405,6 +405,19 @@ def _build_group_progress(input_path, enabled):
         return _StderrGroupProgress(total)
 
 
+def _should_output_by_ancestor_count(completion, ancestor_output):
+    ancestor_output = _normalize_text(ancestor_output).lower() or "all"
+    if ancestor_output == "all":
+        return True
+
+    ancestor_count = len(completion.get("highlight_site_ids") or [])
+    if ancestor_output == "one":
+        return ancestor_count == 1
+    if ancestor_output == "multiple":
+        return ancestor_count > 1
+    raise ValueError(f"未知 ancestor_output: {ancestor_output}")
+
+
 def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_ids, site_chain_index):
     group = copy.deepcopy(group)
     group_id = group.get("uuid") or group.get("故障组ID") or group.get("match_info", {}).get("uuid", "")
@@ -511,7 +524,15 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
     return group
 
 
-def complete_groups(input_path, output_path, ne_graph_path, site_graph_path, site_chains_path, show_progress=True):
+def complete_groups(
+    input_path,
+    output_path,
+    ne_graph_path,
+    site_graph_path,
+    site_chains_path,
+    show_progress=True,
+    ancestor_output="all",
+):
     ne_graph_data = _load_json_object(ne_graph_path, "ne_graph", warn_if_missing=True)
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
     site_chain_index = _load_site_chain_index(site_chains_path)
@@ -522,6 +543,9 @@ def complete_groups(input_path, output_path, ne_graph_path, site_graph_path, sit
         "output_group_count": 0,
         "common_upstream_group_count": 0,
         "fallback_upstream_group_count": 0,
+        "one_ancestor_group_count": 0,
+        "multiple_ancestor_group_count": 0,
+        "skipped_by_ancestor_output_group_count": 0,
         "added_site_count": 0,
         "added_ne_count": 0,
     }
@@ -542,6 +566,15 @@ def complete_groups(input_path, output_path, ne_graph_path, site_graph_path, sit
                     stats["common_upstream_group_count"] += 1
                 elif len(completion.get("original_alarm_site_ids") or []) > 1:
                     stats["fallback_upstream_group_count"] += 1
+                ancestor_count = len(completion.get("highlight_site_ids") or [])
+                if ancestor_count == 1:
+                    stats["one_ancestor_group_count"] += 1
+                elif ancestor_count > 1:
+                    stats["multiple_ancestor_group_count"] += 1
+                if not _should_output_by_ancestor_count(completion, ancestor_output):
+                    stats["skipped_by_ancestor_output_group_count"] += 1
+                    progress.update(stats)
+                    continue
                 stats["added_site_count"] += len(completion.get("added_site_ids", []))
                 stats["added_ne_count"] += len(completion.get("added_ne_ids", []))
                 fw.write(json.dumps(completed, ensure_ascii=False, separators=(",", ":")))
@@ -556,6 +589,7 @@ def complete_groups(input_path, output_path, ne_graph_path, site_graph_path, sit
     stats["ne_graph"] = ne_graph_path
     stats["site_graph"] = site_graph_path
     stats["site_chains"] = site_chains_path
+    stats["ancestor_output"] = ancestor_output
     return stats
 
 
@@ -580,6 +614,16 @@ def build_arg_parser():
         default=SITE_CHAINS_JSON,
         help=f"site_chains.json 文件，默认: {resource_display('site_chains.json')}",
     )
+    parser.add_argument(
+        "--ancestor-output",
+        choices=("all", "one", "multiple"),
+        default="all",
+        help=(
+            "按补出的祖先站点数量筛选输出："
+            "all 输出全部；one 只输出 1 个祖先站点的故障组；"
+            "multiple 只输出多个祖先站点的故障组。默认 all"
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true", help="关闭处理进度输出")
     return parser
 
@@ -594,6 +638,7 @@ def main():
         args.site_graph,
         args.site_chains,
         show_progress=not args.no_progress,
+        ancestor_output=args.ancestor_output,
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
