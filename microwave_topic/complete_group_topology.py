@@ -4,15 +4,17 @@
 
 import argparse
 import copy
+import heapq
 import json
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fault_grouping.site_topology import build_site_to_ne_ids, load_site_chain_index
+from fault_grouping.site_topology import build_site_to_ne_ids, normalize_site_chain_hops
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_CHAINS_JSON,
@@ -79,12 +81,41 @@ def _format_link_meta(link_meta):
     }
 
 
+def _detect_restrict_relation(meta):
+    """从 site_chains 的 meta 判断是否由 --restrict-relation 生成。"""
+    if not isinstance(meta, dict):
+        return False
+    relation_options = meta.get("relation_options")
+    if isinstance(relation_options, dict) and "restrict_relation_effective" in relation_options:
+        return bool(relation_options.get("restrict_relation_effective"))
+    input_config = meta.get("input_config")
+    if isinstance(input_config, dict):
+        return bool(input_config.get("restrict_relation"))
+    return False
+
+
 def _load_site_chain_index(site_chains_path):
-    if site_chains_path and Path(site_chains_path).exists():
-        return load_site_chain_index(site_chains_path)[0]
-    if site_chains_path:
-        print(f"⚠️ site_chains 文件不存在，将只保留原始告警站点: {site_chains_path}", file=sys.stderr)
-    return {}
+    if not site_chains_path or not Path(site_chains_path).exists():
+        if site_chains_path:
+            print(f"⚠️ site_chains 文件不存在，将只保留原始告警站点: {site_chains_path}", file=sys.stderr)
+        return {}, False
+    with open(site_chains_path, "r", encoding="utf-8") as fr:
+        data = json.load(fr)
+    if not isinstance(data, dict):
+        raise ValueError(f"site_chains 顶层必须是对象: {site_chains_path}")
+    restrict_relation = _detect_restrict_relation(data.get("meta", {}))
+    raw_sites = data.get("sites", {})
+    site_chain_index = {}
+    if isinstance(raw_sites, dict):
+        for raw_site_id, raw_info in raw_sites.items():
+            site_id = _normalize_text(raw_site_id)
+            if not site_id or not isinstance(raw_info, dict):
+                continue
+            site_chain_index[site_id] = {
+                "upstream_site_hops": normalize_site_chain_hops(raw_info.get("upstream_site_hops")),
+                "downstream_site_hops": normalize_site_chain_hops(raw_info.get("downstream_site_hops")),
+            }
+    return site_chain_index, restrict_relation
 
 
 def _site_context(site_id, site_graph_data, ne_info):
@@ -158,89 +189,154 @@ def _extract_alarm_ne_ids(group):
     return ne_ids
 
 
-def _safe_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+def _build_weighted_upstream_adjacency(site_chain_index):
+    """构建 站点 -> {上游站点: 权重} 的带权邻接，权重取 upstream_site_hops 里存的跳数。
+
+    restrict-relation 生成的 site_chains 把 upstream_site_hops 裁成了“与本站点有 ne_graph 直连边
+    的站点”，但每条仍保留其原始链路跳数。沿这些带权边累加（取最小）即可还原完整上游闭包与正确
+    跳数，例如 a:{b:1,c:3} + b:{d:2} + c:{d:2} 合并得 a:{b:1,c:3,d:3}（d 经 b 是 1+2=3）。
+    """
+    adjacency = defaultdict(dict)
+    for site_id, info in site_chain_index.items():
+        upstream_hops = info.get("upstream_site_hops", {}) if isinstance(info, dict) else {}
+        for upstream_site, hop in upstream_hops.items():
+            upstream_site = _normalize_text(upstream_site)
+            if not upstream_site or upstream_site == site_id:
+                continue
+            hop = int(hop)
+            if hop <= 0:
+                continue
+            existing = adjacency[site_id].get(upstream_site)
+            if existing is None or hop < existing:
+                adjacency[site_id][upstream_site] = hop
+    return adjacency
 
 
-def _upstream_site_hops(site_id, site_chain_index, include_self=False):
+def _reachable_upstream_sites(start_site, upstream_adjacency):
+    """沿带权(=stored hop) 上游边做 Dijkstra 累加，得到到各祖先的最小跳数。
+
+    跳数相同时偏向“边数更多”的路径（best 元组的第二维 -edges），以尽量保留物理链路上的中间站点，
+    避免被跨站长跳捷径吞掉。返回 {祖先站点: 累计跳数} 与 {站点: 前驱站点}。
+    """
+    start_site = _normalize_text(start_site)
+    best = {start_site: (0, 0)}  # site -> (累计跳数, -经过的边数)，按字典序取最小
+    parents = {start_site: None}
+    heap = [(0, 0, start_site)]
+    while heap:
+        dist, neg_edges, current = heapq.heappop(heap)
+        if (dist, neg_edges) != best.get(current):
+            continue
+        for upstream_site, weight in sorted(upstream_adjacency.get(current, {}).items()):
+            candidate = (dist + weight, neg_edges - 1)
+            if upstream_site not in best or candidate < best[upstream_site]:
+                best[upstream_site] = candidate
+                parents[upstream_site] = current
+                heapq.heappush(heap, (candidate[0], candidate[1], upstream_site))
+    hops = {site_id: value[0] for site_id, value in best.items()}
+    return hops, parents
+
+
+def _chain_sites(start_site, target_site, parents):
+    """根据 Dijkstra 前驱还原 start_site -> target_site 链路上经过的全部站点。"""
+    chain = []
+    current = target_site
+    while current is not None:
+        chain.append(current)
+        if current == start_site:
+            break
+        current = parents.get(current)
+    return list(reversed(chain))
+
+
+def _closure_upstream_hops(site_id, site_chain_index):
+    """非 restrict 模式下 upstream_site_hops 已是传递闭包，直接读取（含自身 hop 0）。"""
     site_id = _normalize_text(site_id)
-    hops = {site_id: 0} if include_self and site_id else {}
+    hops = {site_id: 0}
     info = site_chain_index.get(site_id, {}) if isinstance(site_chain_index, dict) else {}
-    if not isinstance(info, dict):
-        return hops
     for upstream_site, hop in (info.get("upstream_site_hops") or {}).items():
         upstream_site = _normalize_text(upstream_site)
-        hop = _safe_int(hop)
-        if upstream_site and hop is not None:
+        if upstream_site:
             hops[upstream_site] = min(hop, hops.get(upstream_site, hop))
     return hops
 
 
-def _select_nearest_common_upstream(alarm_sites, site_chain_index):
-    hops_by_site = {
-        site_id: _upstream_site_hops(site_id, site_chain_index, include_self=True)
-        for site_id in alarm_sites
-    }
+def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, upstream_adjacency=None):
+    alarm_sites = sorted({_normalize_text(site) for site in alarm_sites if _normalize_text(site)})
+    selected_sites = set(alarm_sites)
+
+    # restrict-relation 把 upstream_site_hops 裁成了直接邻居，需要沿带权边累加还原完整上游链
+    # （并补全中间站点）；非 restrict 模式下闭包已完整，保持原有“只取最低公共祖先”的行为不变。
+    reach_by_site = {}
+    parents_by_site = {}
+    if restrict_relation:
+        if upstream_adjacency is None:
+            upstream_adjacency = _build_weighted_upstream_adjacency(site_chain_index)
+        for site_id in alarm_sites:
+            reach_by_site[site_id], parents_by_site[site_id] = _reachable_upstream_sites(
+                site_id, upstream_adjacency
+            )
+    else:
+        for site_id in alarm_sites:
+            reach_by_site[site_id] = _closure_upstream_hops(site_id, site_chain_index)
+            parents_by_site[site_id] = None
+
     common_candidates = None
     for site_id in alarm_sites:
-        candidates = set(hops_by_site.get(site_id, {}))
+        candidates = set(reach_by_site[site_id])
         common_candidates = candidates if common_candidates is None else common_candidates & candidates
-    if not common_candidates:
-        return None, hops_by_site, {}
+    common_candidates = common_candidates or set()
 
-    common_upstream_site = min(
-        common_candidates,
-        key=lambda candidate: (
-            sum(hops_by_site[site_id][candidate] for site_id in alarm_sites),
-            max(hops_by_site[site_id][candidate] for site_id in alarm_sites),
-            candidate,
-        ),
-    )
-    return common_upstream_site, hops_by_site, {
-        site_id: hops_by_site[site_id][common_upstream_site]
-        for site_id in alarm_sites
-    }
-
-
-def _select_farthest_upstreams(alarm_sites, site_chain_index):
-    farthest_by_site = {}
-    for site_id in alarm_sites:
-        hops = _upstream_site_hops(site_id, site_chain_index, include_self=False)
-        if not hops:
-            continue
-        max_hop = max(hops.values())
-        farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
-        farthest_by_site[site_id] = {
-            "site_id": farthest_site,
-            "hop": max_hop,
-        }
-    return farthest_by_site
-
-
-def _build_site_completion(alarm_sites, site_chain_index):
-    alarm_sites = sorted(set(site for site in alarm_sites if site))
-    selected_sites = set(alarm_sites)
-    common_upstream_site, hops_by_site, common_upstream_hops = _select_nearest_common_upstream(
-        alarm_sites,
-        site_chain_index,
-    )
+    common_upstream_site = None
+    common_upstream_hops = {}
     farthest_upstream_sites = {}
-    if common_upstream_site:
-        selected_sites.add(common_upstream_site)
+    intermediate_site_chains = {}
+
+    def _select_path(site_id, target_site):
+        # restrict 模式沿直接边补全中间站点；非 restrict 模式维持原行为，只纳入目标祖先站点。
+        if restrict_relation:
+            chain = _chain_sites(site_id, target_site, parents_by_site[site_id])
+            intermediate_site_chains[site_id] = chain
+            selected_sites.update(chain)
+        else:
+            selected_sites.add(target_site)
+
+    if common_candidates:
+        common_upstream_site = min(
+            common_candidates,
+            key=lambda candidate: (
+                sum(reach_by_site[site_id][candidate] for site_id in alarm_sites),
+                max(reach_by_site[site_id][candidate] for site_id in alarm_sites),
+                candidate,
+            ),
+        )
+        common_upstream_hops = {
+            site_id: reach_by_site[site_id][common_upstream_site]
+            for site_id in alarm_sites
+        }
+        for site_id in alarm_sites:
+            _select_path(site_id, common_upstream_site)
     else:
-        farthest_upstream_sites = _select_farthest_upstreams(alarm_sites, site_chain_index)
-        for selected in farthest_upstream_sites.values():
-            selected_sites.add(selected["site_id"])
+        for site_id in alarm_sites:
+            hops = {
+                upstream_site: hop
+                for upstream_site, hop in reach_by_site[site_id].items()
+                if upstream_site != site_id
+            }
+            if not hops:
+                continue
+            max_hop = max(hops.values())
+            farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
+            farthest_upstream_sites[site_id] = {"site_id": farthest_site, "hop": max_hop}
+            _select_path(site_id, farthest_site)
 
     return {
         "selected_sites": selected_sites,
         "common_upstream_site": common_upstream_site,
         "common_upstream_hops": common_upstream_hops,
         "farthest_upstream_sites": farthest_upstream_sites,
-        "upstream_site_hops": hops_by_site,
+        "upstream_site_hops": reach_by_site,
+        "intermediate_site_chains": intermediate_site_chains,
+        "restrict_relation": restrict_relation,
     }
 
 
@@ -418,7 +514,15 @@ def _should_output_by_ancestor_count(completion, ancestor_output):
     raise ValueError(f"未知 ancestor_output: {ancestor_output}")
 
 
-def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_ids, site_chain_index):
+def complete_group_topology(
+    group,
+    ne_graph_data,
+    site_graph_data,
+    site_to_ne_ids,
+    site_chain_index,
+    restrict_relation=False,
+    upstream_adjacency=None,
+):
     group = copy.deepcopy(group)
     group_id = group.get("uuid") or group.get("故障组ID") or group.get("match_info", {}).get("uuid", "")
     group["uuid"] = group_id
@@ -430,7 +534,9 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
         for ne_id in alarm_ne_ids
         if _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
     })
-    completion = _build_site_completion(alarm_sites, site_chain_index)
+    completion = _build_site_completion(
+        alarm_sites, site_chain_index, restrict_relation, upstream_adjacency
+    )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
     topology_highlight_site_ids = sorted(
@@ -508,6 +614,7 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
 
     group["topology_completion"] = {
         "mode": "site_upstream_hops",
+        "restrict_relation": restrict_relation,
         "original_alarm_ne_ids": sorted(alarm_ne_ids),
         "original_alarm_site_ids": alarm_sites,
         "selected_site_ids": all_site_ids,
@@ -517,6 +624,7 @@ def complete_group_topology(group, ne_graph_data, site_graph_data, site_to_ne_id
         "common_upstream_hops": completion["common_upstream_hops"],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
+        "intermediate_site_chains": completion["intermediate_site_chains"],
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(alarm_sites) <= 1,
@@ -535,8 +643,12 @@ def complete_groups(
 ):
     ne_graph_data = _load_json_object(ne_graph_path, "ne_graph", warn_if_missing=True)
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
-    site_chain_index = _load_site_chain_index(site_chains_path)
+    site_chain_index, restrict_relation = _load_site_chain_index(site_chains_path)
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
+    # 带权上游邻接只依赖 site_chain_index，与故障组无关，预先构建一次复用，避免逐组重建。
+    upstream_adjacency = (
+        _build_weighted_upstream_adjacency(site_chain_index) if restrict_relation else None
+    )
 
     stats = {
         "input_group_count": 0,
@@ -560,6 +672,8 @@ def complete_groups(
                     site_graph_data,
                     site_to_ne_ids,
                     site_chain_index,
+                    restrict_relation,
+                    upstream_adjacency,
                 )
                 completion = completed.get("topology_completion", {})
                 if completion.get("common_upstream_site"):
@@ -589,6 +703,7 @@ def complete_groups(
     stats["ne_graph"] = ne_graph_path
     stats["site_graph"] = site_graph_path
     stats["site_chains"] = site_chains_path
+    stats["restrict_relation"] = restrict_relation
     stats["ancestor_output"] = ancestor_output
     return stats
 
