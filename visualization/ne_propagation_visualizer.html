@@ -6514,6 +6514,7 @@
                 graph_meta: {
                     match_info: graphData ? (graphData.match_info || null) : null,
                     role_mapping: graphData ? (graphData.role_mapping || null) : null,
+                    topology_completion: graphData ? (graphData.topology_completion || null) : null,
                     fault_pattern_managed_sites: graphData ? (graphData.fault_pattern_managed_sites || null) : null,
                     fault_pattern_analysis: graphData ? (graphData.fault_pattern_analysis || null) : null,
                     fault_patterns: graphData ? (graphData.fault_patterns || null) : null
@@ -6537,6 +6538,7 @@
                 '        group_info: {},',
                 '        match_info: meta.match_info || null,',
                 '        role_mapping: meta.role_mapping || null,',
+                '        topology_completion: meta.topology_completion || null,',
                 '        fault_pattern_managed_sites: meta.fault_pattern_managed_sites || null,',
                 '        fault_pattern_analysis: meta.fault_pattern_analysis || null,',
                 '        fault_patterns: meta.fault_patterns || null',
@@ -6547,6 +6549,7 @@
                 '      if (SNAPSHOT.site_order_data) { siteOrderData = SNAPSHOT.site_order_data; }',
                 '      if (typeof updateRoleSiteSets === "function") updateRoleSiteSets(graphData);',
                 '      if (typeof updateFaultPatternManagedSites === "function") updateFaultPatternManagedSites(graphData);',
+                '      if (typeof updateTopologyHighlightSites === "function") updateTopologyHighlightSites(graphData);',
                 '      allNodes = (SNAPSHOT.nodes || []).map(function(n){ const style = getDomainStyle(n.domain || ""); return Object.assign({}, n, { domainStyle: style }); });',
                 '      allLinks = (SNAPSHOT.links || []).map(function(l){ return Object.assign({}, l); });',
                 '      currentNodes = allNodes.map(function(n){ return Object.assign({}, n); });',

@@ -486,12 +486,17 @@ def build_site_chains(
 
     edge_stats = edge_stats or {}
     meta = {
-        "prediction_json": str(prediction_path),
+        "input_config": {
+            "prediction_json": str(prediction_path),
+            "ne_graph": str(ne_graph_path) if ne_graph_path else None,
+            "max_depth": max_depth,
+            "directed_only": directed_only,
+            "enrich_relation": enrich_relation,
+            "restrict_relation": restrict_relation,
+        },
         "adjacency_source": adjacency_source,
         "bidirectional_source": bidirectional_source,
-        "directed_only": directed_only,
         "first_hop_downstream_only": True,
-        "max_depth": max_depth,
         "site_count": len(sorted_sites),
         "warning_count": len(warnings),
         "warnings": warnings,
@@ -592,13 +597,14 @@ def parse_args():
 
 def print_summary(result, output_path):
     meta = result["meta"]
-    print(f"输入文件: {meta['prediction_json']}")
+    input_config = meta.get("input_config", {})
+    print(f"输入文件: {input_config.get('prediction_json')}")
     print(f"输出文件: {output_path}")
     print(f"站点数: {meta['site_count']}")
     print(f"邻接来源: {meta['adjacency_source']}")
     print(f"双向边来源: {meta['bidirectional_source']}")
     print("第一跳约束: 必须走显式下游边")
-    print(f"后续遍历模式: {'只走显式有向边' if meta['directed_only'] else '按 downstream_map/双向边可双向传播'}")
+    print(f"后续遍历模式: {'只走显式有向边' if input_config.get('directed_only') else '按 downstream_map/双向边可双向传播'}")
     print(f"双向直接边数: {meta['total_bidirectional_edges']}")
     print(f"下游可达关系数: {meta['total_downstream_relations']}")
     print(f"上游可达关系数: {meta['total_upstream_relations']}")
