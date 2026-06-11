@@ -1311,6 +1311,14 @@ def train_alarm_mhp(
         "val_event_count": (val_events.n if val_events else 0),
         "type_count": M,
         "active_edge_count": len(result.params.edge_alpha),
+        # Stationarity: spectral radius of the learned α matrix (ρ<1 stationary,
+        # ρ≥1 over-excitation). Persisted so it is readable from the artifact
+        # without re-running or scraping the training log.
+        "spectral_radius": (
+            float(result.params.spectral_radius())
+            if len(result.params.edge_alpha) else None
+        ),
+        "stability_radius": float(config.stability_radius),
         "best_log_likelihood": result.log_likelihood,
         "best_val_log_likelihood": final_val_ll,
         "iterations_run": result.iterations_run,

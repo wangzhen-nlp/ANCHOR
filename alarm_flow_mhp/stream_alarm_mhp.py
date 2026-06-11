@@ -750,11 +750,23 @@ class StreamMHPAssigner:
 # --------------------------------------------------------------------------
 
 
+def _summary_of(e) -> dict:
+    """Per-event symptom. In feature mode, override alarm_source with the
+    canonical device id the model/topology keyed on (``e.ne`` from
+    runtime_ne_at) — summarize_alarm_event reads the raw, unstripped field,
+    which can diverge from the NE-graph keys and mis-classify topology edges.
+    Mirrors the impute path's `if ne: meta["alarm_source"] = ne`."""
+    s = summarize_alarm_event(e.alarm, e.index)
+    if e.ne:
+        s["alarm_source"] = e.ne
+    return s
+
+
 def _cascade_to_group(cascade: Cascade) -> dict:
-    summaries = [summarize_alarm_event(e.alarm, e.index) for e in cascade.events]
+    summaries = [_summary_of(e) for e in cascade.events]
     # Root is the event whose parent_index == -1 (immigrant), or the earliest by ts
     root = next((e for e in cascade.events if e.parent_index == -1), cascade.events[0])
-    root_summary = summarize_alarm_event(root.alarm, root.index)
+    root_summary = _summary_of(root)
     timestamps = [s["ts"] for s in summaries]
     # Within-group parent→child edges
     idx_set = {e.index for e in cascade.events}

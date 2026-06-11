@@ -165,6 +165,31 @@ def _segment_sum(values: np.ndarray, segment_ids: np.ndarray, n_segments: int) -
     return out
 
 
+def _spectral_radius_edges(edge_targets, edge_sources, edge_alpha, M, power_iter: int = 80) -> float:
+    """Spectral radius ρ of the branching matrix A[target, source]=|α| via power
+    iteration — identical to MHPParams.spectral_radius, but callable on raw edge
+    arrays so the EM loop can report ρ each iteration without materializing the
+    full MHPParams. ρ<1 ⇒ stationary/subcritical; ρ≥1 ⇒ over-excitation."""
+    et = np.asarray(edge_targets, dtype=np.int64)
+    if et.size == 0 or M <= 0:
+        return 0.0
+    es = np.asarray(edge_sources, dtype=np.int64)
+    a = np.abs(np.asarray(edge_alpha, dtype=np.float64))
+    v = np.ones(M, dtype=np.float64) / np.sqrt(M)
+    prev = 0.0
+    for _ in range(power_iter):
+        y = np.zeros(M, dtype=np.float64)
+        np.add.at(y, et, a * v[es])               # y[target] = Σ α · v[source]
+        nrm = float(np.linalg.norm(y))
+        if nrm <= 1e-20:
+            return 0.0
+        v = y / nrm
+        if abs(nrm - prev) / max(nrm, 1e-12) < 1e-6:
+            break
+        prev = nrm
+    return float(prev)
+
+
 def _append_sparse_dynamic_resp(parts, cand_idx: np.ndarray, combo_idx: np.ndarray, values: np.ndarray, K: int):
     """Append chunk-level sparse responsibility sums by dynamic combo."""
     if len(cand_idx) == 0:
@@ -1717,7 +1742,16 @@ def fit_mhp_feature(
             best_w_mu = w_mu.copy() if use_mu_features else None
             best_p_self = p_self
 
-        active_eval = int((alpha_cand > config.edge_threshold).sum())
+        active_mask = alpha_cand > config.edge_threshold
+        active_eval = int(active_mask.sum())
+        # Spectral radius ρ of the active α matrix (combo-0 baseline) — the
+        # stationarity indicator. Reported each iter so over-excitation (ρ≥1)
+        # is visible during training, not only at the end.
+        _ai = np.flatnonzero(active_mask)
+        rho_eval = (
+            _spectral_radius_edges(cand_targets[_ai], cand_sources[_ai], alpha_cand[_ai], M)
+            if _ai.size else 0.0
+        )
         entry = {
             "iter": it,
             "log_likelihood": float(ll_eval),
@@ -1727,6 +1761,7 @@ def fit_mhp_feature(
             "mu_max": float(mu.max()),
             "alpha_max": float(alpha_cand.max()),
             "alpha_median": float(np.median(alpha_cand)),
+            "spectral_radius": float(rho_eval),
             "p_self_mean": float(p_self.mean()),
             "estep_seconds": float(estep_seconds),
             "mstep_seconds": 0.0,
@@ -1892,6 +1927,7 @@ def fit_mhp_feature(
                 f"[mhp-feat] iter={it:3d} ll={ll_eval:.2f} Δ={delta_rel:.2e} "
                 f"active(>thr)={active_eval}/{C} "
                 f"α.median={entry['alpha_median']:.4f} α.max={entry['alpha_max']:.4f} "
+                f"ρ={entry['spectral_radius']:.3f} "
                 f"μ.max={entry['mu_max']:.4f} p_self.mean={entry['p_self_mean']:.3f} "
                 f"t={_fmt_secs(entry['iter_seconds'])} "
                 f"(E={_fmt_secs(entry['estep_seconds'])} M={_fmt_secs(entry['mstep_seconds'])})",
