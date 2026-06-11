@@ -24,6 +24,9 @@ from topology_resources import (
 )
 
 
+BLOCKED_ANCESTOR_SITE_IDS = {"13PWK0024"}
+
+
 def _normalize_text(value):
     return str(value or "").strip()
 
@@ -143,6 +146,17 @@ def _site_of_ne(ne_id, ne_graph_data, group_site_by_ne=None):
         if site_id:
             return site_id
     return _normalize_text((group_site_by_ne or {}).get(ne_id, ""))
+
+
+def _site_is_hub(site_id, site_graph_data):
+    site_id = _normalize_text(site_id)
+    site_info = site_graph_data.get(site_id, {}) if isinstance(site_graph_data, dict) else {}
+    if not isinstance(site_info, dict) or "is_hub" not in site_info:
+        return True
+    value = site_info.get("is_hub")
+    if isinstance(value, bool):
+        return value
+    return _normalize_text(value).lower() in {"1", "true", "t", "yes", "y", "是"}
 
 
 def _text_has_token(text, token):
@@ -339,9 +353,11 @@ def _closure_upstream_hops(site_id, site_chain_index):
     return hops
 
 
-def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, upstream_adjacency=None):
+def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, upstream_adjacency=None, site_graph_data=None):
     alarm_sites = sorted({_normalize_text(site) for site in alarm_sites if _normalize_text(site)})
+    alarm_site_set = set(alarm_sites)
     selected_sites = set(alarm_sites)
+    hub_filtered_site_ids = set()
 
     # restrict-relation 把 upstream_site_hops 裁成了直接邻居，需要沿带权边累加还原完整上游链
     # （并补全中间站点）；非 restrict 模式下闭包已完整，保持原有“只取最低公共祖先”的行为不变。
@@ -359,6 +375,15 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
             reach_by_site[site_id] = _closure_upstream_hops(site_id, site_chain_index)
             parents_by_site[site_id] = None
 
+    for site_id, hops in list(reach_by_site.items()):
+        filtered_hops = {}
+        for candidate, hop in hops.items():
+            if candidate in alarm_site_set or _site_is_hub(candidate, site_graph_data):
+                filtered_hops[candidate] = hop
+            else:
+                hub_filtered_site_ids.add(candidate)
+        reach_by_site[site_id] = filtered_hops
+
     common_candidates = None
     for site_id in alarm_sites:
         candidates = set(reach_by_site[site_id])
@@ -375,8 +400,14 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
         # restrict 模式沿直接边补全中间站点；非 restrict 模式维持原行为，只纳入目标祖先站点。
         if restrict_relation:
             chain = _chain_sites(site_id, target_site, parents_by_site[site_id])
-            intermediate_site_chains[site_id] = chain
-            selected_sites.update(chain)
+            filtered_chain = []
+            for chain_site in chain:
+                if chain_site in alarm_site_set or _site_is_hub(chain_site, site_graph_data):
+                    filtered_chain.append(chain_site)
+                    selected_sites.add(chain_site)
+                else:
+                    hub_filtered_site_ids.add(chain_site)
+            intermediate_site_chains[site_id] = filtered_chain
         else:
             selected_sites.add(target_site)
 
@@ -418,6 +449,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
         "no_upstream_sites": sorted(no_upstream_sites),
         "upstream_site_hops": reach_by_site,
         "intermediate_site_chains": intermediate_site_chains,
+        "hub_filtered_site_ids": sorted(hub_filtered_site_ids - alarm_site_set),
         "restrict_relation": restrict_relation,
     }
 
@@ -570,6 +602,39 @@ def _ancestor_highlight_count(completion):
         if isinstance(item, dict) and item.get("role") in ancestor_roles and _normalize_text(item.get("site_id", ""))
     }
     return len(ancestor_site_ids)
+
+
+def _blocked_ancestor_site_ids(completion):
+    blocked_site_ids = {_normalize_text(site_id) for site_id in BLOCKED_ANCESTOR_SITE_IDS}
+    ancestor_site_ids = set()
+
+    common_upstream_site = _normalize_text(completion.get("common_upstream_site", ""))
+    if common_upstream_site:
+        ancestor_site_ids.add(common_upstream_site)
+
+    farthest_upstream_sites = completion.get("farthest_upstream_sites") or {}
+    if isinstance(farthest_upstream_sites, dict):
+        for item in farthest_upstream_sites.values():
+            if not isinstance(item, dict):
+                continue
+            site_id = _normalize_text(item.get("site_id", ""))
+            if site_id:
+                ancestor_site_ids.add(site_id)
+
+    for site_id in completion.get("no_upstream_sites") or []:
+        site_id = _normalize_text(site_id)
+        if site_id:
+            ancestor_site_ids.add(site_id)
+
+    ancestor_roles = {"common_upstream_site", "farthest_upstream_site", "no_upstream_site"}
+    for item in completion.get("highlight_sites") or []:
+        if not isinstance(item, dict) or item.get("role") not in ancestor_roles:
+            continue
+        site_id = _normalize_text(item.get("site_id", ""))
+        if site_id:
+            ancestor_site_ids.add(site_id)
+
+    return sorted(ancestor_site_ids & blocked_site_ids)
 
 
 def _build_filtered_link_info(ne_id, included_ne_ids, ne_graph_data):
@@ -735,7 +800,7 @@ def complete_group_topology(
         if _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
     })
     completion = _build_site_completion(
-        alarm_sites, site_chain_index, restrict_relation, upstream_adjacency
+        alarm_sites, site_chain_index, restrict_relation, upstream_adjacency, site_graph_data
     )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
@@ -851,6 +916,7 @@ def complete_group_topology(
         "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
+        "hub_filtered_site_ids": completion["hub_filtered_site_ids"],
         "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
         "shared_data_link_pruned_ancestor_site_ids": shared_data_link_pruned_ancestor_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
@@ -887,6 +953,7 @@ def complete_groups(
         "one_ancestor_group_count": 0,
         "multiple_ancestor_group_count": 0,
         "skipped_by_ancestor_output_group_count": 0,
+        "skipped_by_blocked_ancestor_site_group_count": 0,
         "added_site_count": 0,
         "added_ne_count": 0,
     }
@@ -919,6 +986,10 @@ def complete_groups(
                     stats["multiple_ancestor_group_count"] += 1
                 if not _should_output_by_ancestor_count(completion, ancestor_output):
                     stats["skipped_by_ancestor_output_group_count"] += 1
+                    progress.update(stats)
+                    continue
+                if _blocked_ancestor_site_ids(completion):
+                    stats["skipped_by_blocked_ancestor_site_group_count"] += 1
                     progress.update(stats)
                     continue
                 stats["added_site_count"] += len(completion.get("added_site_ids", []))
