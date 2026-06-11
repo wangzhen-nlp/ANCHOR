@@ -6,6 +6,7 @@ import argparse
 import copy
 import heapq
 import json
+import re
 import sys
 import time
 from collections import defaultdict
@@ -144,29 +145,38 @@ def _site_of_ne(ne_id, ne_graph_data, group_site_by_ne=None):
     return _normalize_text((group_site_by_ne or {}).get(ne_id, ""))
 
 
+def _text_has_token(text, token):
+    # 短 token（IP/MW）必须独立成词，否则 EQU"IP"MENT 这类子串会误判设备角色。
+    if len(token) <= 2:
+        return re.search(rf"(?<![A-Z0-9]){token}(?![A-Z0-9])", text) is not None
+    return token in text
+
+
+def _ne_domain_text(ne_info):
+    # 设备角色判定只看 domain 字段，不引入 network_type/type 等其他字段。
+    for field_name in ("domain", "Domain", "DOMAIN"):
+        value = _normalize_text(ne_info.get(field_name, ""))
+        if value:
+            return value.upper()
+    return ""
+
+
 def _is_data_ne(ne_info):
     if not isinstance(ne_info, dict):
         return False
-    data_tokens = ("DATA", "IP", "ROUTER", "METRO")
-    for field_name in ("domain", "Domain", "DOMAIN", "network_type", "type"):
-        value = _normalize_text(ne_info.get(field_name, "")).upper()
-        if any(token in value for token in data_tokens):
-            return True
-    return False
+    text = _ne_domain_text(ne_info)
+    return any(_text_has_token(text, token) for token in ("DATA", "IP", "ROUTER", "METRO"))
 
 
 def _device_role(ne_info):
     if not isinstance(ne_info, dict):
         return "Other"
-    text = " ".join(
-        _normalize_text(ne_info.get(field_name, ""))
-        for field_name in ("domain", "Domain", "DOMAIN", "network_type", "type")
-    ).upper()
-    if any(token in text for token in ("DATA", "IP", "ROUTER", "METRO")):
+    text = _ne_domain_text(ne_info)
+    if any(_text_has_token(text, token) for token in ("DATA", "IP", "ROUTER", "METRO")):
         return "Data"
-    if any(token in text for token in ("MICROWAVE", "MW", "RTN", "TRANSMISSION", "DWDM", "OTN", "OPTICAL", "WDM")):
+    if any(_text_has_token(text, token) for token in ("MICROWAVE", "MW", "RTN", "TRANSMISSION", "DWDM", "OTN", "OPTICAL", "WDM")):
         return "Microwave"
-    if any(token in text for token in ("RAN", "WIRELESS", "NODEB", "BTS", "LTE")):
+    if any(_text_has_token(text, token) for token in ("RAN", "WIRELESS", "NODEB", "BTS", "LTE")):
         return "Ran"
     return "Other"
 
@@ -467,6 +477,7 @@ def _data_to_ancestor_edge_score(data_site, ancestor_site, directed_edge_types):
         if "Other" not in edge_type
     }
     ranked_types = tuple(sorted((_edge_type_rank(edge_type) for edge_type in edge_types), reverse=True))
+    # 连边种类数优先（与共享 Data 邻站的连接种类越多越紧密），强度排序作平手破除。
     return (len(edge_types), ranked_types)
 
 
@@ -510,6 +521,7 @@ def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site
             break
 
     shared_data_removed_site_ids = set()
+    # 含 Data 设备的 highlight 站点视为高一级，不参与共享 Data 邻站比较、也不会被剪。
     remaining_site_ids = highlight_site_ids - removed_site_ids
     remaining_non_data_sites = sorted(site_id for site_id in remaining_site_ids if site_id not in site_has_data)
     for index, left_site in enumerate(remaining_non_data_sites):
@@ -532,8 +544,12 @@ def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site
             )
             if not winner_site:
                 continue
-            shared_data_removed_site_ids.add(right_site if winner_site == left_site else left_site)
-            break
+            if winner_site == left_site:
+                # left 胜出时继续与其余站点比较，否则后续较弱站点会因提前 break 漏剪。
+                shared_data_removed_site_ids.add(right_site)
+            else:
+                shared_data_removed_site_ids.add(left_site)
+                break
 
     all_removed_site_ids = removed_site_ids | shared_data_removed_site_ids
     if not all_removed_site_ids:

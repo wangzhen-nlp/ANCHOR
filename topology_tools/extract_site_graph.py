@@ -63,6 +63,11 @@ def _merge_scalar_preserve_first(mapping: dict, key: str, value: str, entity_lab
             mapping[key] = value
 
 
+def _parse_bool(value) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "t", "yes", "y", "是"}
+
+
 def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
     """
     从SYS_NE_0306中加载nativeId -> ne_site_id的映射
@@ -99,7 +104,7 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
     从SYS_SITE_0306中加载站点信息
 
     Returns:
-        {site_id: {longitude, latitude, site_type, region_id}}
+        {site_id: {longitude, latitude, site_type, region_id, is_hub}}
     """
     site_info = {}
 
@@ -119,6 +124,7 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
                     'longitude': row.get('longitude', '').strip(),
                     'latitude': row.get('latitude', '').strip(),
                     'region_id': row.get('region_id', '').strip(),
+                    'is_hub': _parse_bool(row.get('is_hub', '')),
                 }
                 site_info[site_id] = _merge_fields_preserve_first(
                     site_info.get(site_id, {}),
@@ -236,7 +242,8 @@ def main():
             'site_type': '',
             'longitude': '',
             'latitude': '',
-            'region_id': ''
+            'region_id': '',
+            'is_hub': False,
         })
         site_data['link'] = {}
         for neighbor_id, links in neighbors.items():
