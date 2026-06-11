@@ -54,6 +54,12 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Protocol, runtime_checkable
 
+from alarm_flow_mhp.topology_relation_prior import (
+    classify_topology_relation,
+    relation_weight,
+    topology_relation_weights,
+)
+
 
 NEG_INF = float("-inf")
 EPS = 1e-12
@@ -1350,6 +1356,7 @@ class FeatureKernelAdapter:
         cache_max_entries: int = 200_000,
         source_mark_at=None,
         target_mark_at=None,
+        topology_relation_prior: Optional[dict] = None,
     ):
         if time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
@@ -1369,6 +1376,7 @@ class FeatureKernelAdapter:
         self.max_candidates = int(max_candidates)
         self._source_mark_at = source_mark_at
         self._target_mark_at = target_mark_at
+        self.topology_relation_prior = dict(topology_relation_prior or {})
         # alarm-type vocabulary, id-ordered for deterministic enumeration
         at_to_id = getattr(feature_scorer, "at_to_id", {}) or {}
         self._at_vocab = [a for a, _ in sorted(at_to_id.items(), key=lambda kv: kv[1])]
@@ -1390,6 +1398,49 @@ class FeatureKernelAdapter:
         self._candidate_source_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._neighbor_cache: dict[str, list] = {}
         self._envelope_mark = None        # cached α-maximizing source mark
+
+    def _relation_weight(self, src_key, tgt_key) -> float:
+        if not self.topology_relation_prior:
+            return 1.0
+        try:
+            _s_at, s_ne = src_key
+            _t_at, t_ne = tgt_key
+        except Exception:
+            return 1.0
+        relation = classify_topology_relation(s_ne, t_ne, self._topo, self._node_infos)
+        return relation_weight(self.topology_relation_prior, relation)
+
+    def _relation_weights_for_target(self, source_types, target_type):
+        if not self.topology_relation_prior:
+            return None
+        try:
+            _t_at, t_ne = target_type
+        except Exception:
+            return None
+        source_nes = [s[1] for s in source_types]
+        return topology_relation_weights(
+            source_nes, t_ne, self._topo, self._node_infos, self.topology_relation_prior
+        )
+
+    def _relation_weights_for_source(self, source_type, target_nes):
+        if not self.topology_relation_prior:
+            return None
+        try:
+            _s_at, s_ne = source_type
+        except Exception:
+            return None
+        import numpy as np
+
+        return np.asarray(
+            [
+                relation_weight(
+                    self.topology_relation_prior,
+                    classify_topology_relation(s_ne, t_ne, self._topo, self._node_infos),
+                )
+                for t_ne in target_nes
+            ],
+            dtype=np.float64,
+        )
 
     # ---- helpers ----
     def _source_mark_tuple(self, source_mark=None) -> tuple:
@@ -1518,8 +1569,11 @@ class FeatureKernelAdapter:
         a = self._alpha(source_type, target_type, source_mark, target_mark)
         if a <= 0:
             return 0.0
+        rel_w = self._relation_weight(source_type, target_type)
+        if rel_w <= 0:
+            return 0.0
         dt = dt_eff_sec / self.time_scale_sec
-        return float(a * self.beta * math.exp(-self.beta * dt) * late_weight)
+        return float(a * rel_w * self.beta * math.exp(-self.beta * dt) * late_weight)
 
     def _alpha_batch_cached(self, target_type, source_types, marks_norm, target_mark=None):
         """Floored α for (each source, fixed target, its mark), served from the
@@ -1580,6 +1634,9 @@ class FeatureKernelAdapter:
         marks_in = src_marks if src_marks is not None else [None] * n
         marks_norm = [self._source_mark_tuple(m) for m in marks_in]
         alphas = self._alpha_batch_cached(target_type, source_types, marks_norm, target_mark=target_mark)
+        rel_w = self._relation_weights_for_target(source_types, target_type)
+        if rel_w is not None:
+            alphas = alphas * rel_w
         dt_sec = np.asarray(dts, dtype=np.float64)
         dt_eff_sec, late_weight = self._signed_dt_vec(dt_sec)
         dt = dt_eff_sec / self.time_scale_sec
@@ -1589,6 +1646,10 @@ class FeatureKernelAdapter:
         a = self._alpha(source_type, target_type, source_mark, target_mark)
         if a <= 0:
             return 0.0
+        rel_w = self._relation_weight(source_type, target_type)
+        if rel_w <= 0:
+            return 0.0
+        a *= rel_w
         pos = 0.0
         if dt_sec > 0:
             dt = dt_sec / self.time_scale_sec
@@ -1655,6 +1716,8 @@ class FeatureKernelAdapter:
         for at, ne, a in zip(src_ats, src_nes, alphas):
             av = float(a)
             if av >= self.alpha_floor and av > 0:
+                av *= self._relation_weight((at, ne), target_type)
+            if av > 0:
                 out.append(((at, ne), av))
         if len(out) > self.max_candidates:
             out.sort(key=lambda ka: -ka[1])
@@ -1710,7 +1773,12 @@ class FeatureKernelAdapter:
                     ),
                     dtype=np.float64,
                 )
-                a = a[a >= self.alpha_floor]
+                keep = a >= self.alpha_floor
+                a = a[keep]
+                if a.size:
+                    rel_w = self._relation_weights_for_source(source_type, tgt_nes)
+                    if rel_w is not None:
+                        a = a * rel_w[keep]
                 s_sum = float(a[a > 0].sum())
             else:
                 s_sum = 0.0
@@ -1739,7 +1807,8 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
                                   late_penalty_half_life_sec=None,
                                   source_mark_at=None,
                                   target_mark_at=None,
-                                  cache_max_entries=200_000) -> FeatureKernelAdapter:
+                                  cache_max_entries=200_000,
+                                  topology_relation_prior=None) -> FeatureKernelAdapter:
     """Build a :class:`FeatureKernelAdapter` from a feature-mode artifact.
 
     Mirrors the scorer construction in ``stream_alarm_mhp.main`` so the imputed
@@ -1804,6 +1873,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         source_mark_at=source_mark_at,
         target_mark_at=target_mark_at,
         cache_max_entries=int(cache_max_entries),
+        topology_relation_prior=topology_relation_prior,
     )
 
 

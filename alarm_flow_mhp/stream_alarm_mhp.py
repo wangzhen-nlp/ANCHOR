@@ -45,6 +45,11 @@ from alarm_flow_mhp.aggregator import (
     load_alarm_mhp_artifact,
     summarize_alarm_event,
 )
+from alarm_flow_mhp.topology_relation_prior import (
+    format_topology_relation_prior,
+    parse_topology_relation_prior,
+    topology_relation_weights,
+)
 from fault_grouping.alarm_events.io import is_clear_alarm
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON, resource_display
 
@@ -143,6 +148,7 @@ class StreamConfig:
                                             # non-edges (score 0) — the inference
                                             # analog of device-mode edge_threshold,
                                             # guards against soft over-connection.
+    topology_relation_prior: dict = field(default_factory=dict)
 
     @classmethod
     def from_artifact_config(cls, cfg: AlarmMHPConfig, **overrides):
@@ -179,6 +185,10 @@ class StreamConfig:
             raise ValueError("immigrant_bias must be >= 0")
         if self.feature_alpha_floor < 0:
             raise ValueError("feature_alpha_floor must be >= 0")
+        for key, value in (self.topology_relation_prior or {}).items():
+            val = float(value)
+            if not np.isfinite(val) or val < 0:
+                raise ValueError(f"topology relation prior {key} must be finite and >= 0")
 
 
 class StreamMHPAssigner:
@@ -224,6 +234,9 @@ class StreamMHPAssigner:
             if floor <= 0:
                 floor = float(getattr(artifact.config, "edge_threshold", 0.0))
             self._feat_alpha_floor = float(floor)
+            self._topology_relation_prior = dict(config.topology_relation_prior or {})
+            self._topology_index = getattr(self.feature_scorer, "topology_index", None)
+            self._node_infos = getattr(self.feature_scorer, "node_infos", {}) or {}
         # Dynamic (stateful) α: track per-device uncleared-alarm state (clear-
         # aware), snapshotting each event's source mark at fire time. Same state
         # machine as training (keyed on parsed feature NE + alarm_type_from_title),
@@ -470,6 +483,14 @@ class StreamMHPAssigner:
             alpha = np.where(alpha >= self._feat_alpha_floor, alpha, 0.0)
         b = self._feat_beta
         scores = alpha * b * np.exp(-b * dts_eff) * late_weight
+        if self._topology_relation_prior:
+            scores *= topology_relation_weights(
+                src_nes,
+                target_event.ne,
+                self._topology_index,
+                self._node_infos,
+                self._topology_relation_prior,
+            )
         return positions, scores
 
     def _new_cascade(self) -> Cascade:
@@ -932,6 +953,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
                 if state_timeline is not None else None
             ),
             cache_max_entries=int(getattr(args, "impute_cache_max", 200_000)),
+            topology_relation_prior=stream_config.topology_relation_prior,
         )
     else:
         if getattr(artifact.params, "kernel_type", "exp") != "exp":
@@ -1216,6 +1238,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--topology-relation-prior",
+        default="",
+        help=(
+            "Feature mode only: comma-separated inference-time multipliers by "
+            "topology relation, e.g. "
+            "'same_device=1,direct=1,same_site=0.8,indirect=0.5,cross_site=0.2,unknown=0.05'. "
+            "Missing keys default to 1.0; empty string preserves current behavior."
+        ),
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=50_000,
@@ -1323,6 +1355,10 @@ def main():
         parser.error("--visual-snapshot-age-sec must be >= 0")
     if args.visual_snapshot_check_interval_sec is not None and args.visual_snapshot_check_interval_sec < 0:
         parser.error("--visual-snapshot-check-interval-sec must be >= 0")
+    try:
+        topology_relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Visual output is a required artifact: if not given, derive a default path
     # from the groups-output (or the input cache) so it is always produced.
@@ -1375,6 +1411,7 @@ def main():
         immigrant_bias=args.immigrant_bias,
         max_history_events=args.max_history_events,
         feature_alpha_floor=args.feature_alpha_floor,
+        topology_relation_prior=topology_relation_prior,
         time_slack_sec=args.time_slack_sec,
         late_penalty_half_life_sec=args.late_penalty_half_life_sec,
     )
@@ -1391,6 +1428,7 @@ def main():
             f"close_inactive={stream_config.close_inactive_sec:.0f}s "
             f"min_group_events={stream_config.min_group_events} "
             f"immigrant_bias={stream_config.immigrant_bias} "
+            f"topology_relation_prior={format_topology_relation_prior(stream_config.topology_relation_prior)} "
             f"visual_snapshot_age={args.visual_snapshot_age_sec:.0f}s "
             f"visual_snapshot_check_interval={visual_snapshot_check_interval_sec:.0f}s",
             flush=True,
@@ -1451,6 +1489,7 @@ def main():
                 "impute_sweep_recent": args.impute_sweep_recent,
                 "impute_future_candidate_reset_limit": args.impute_future_candidate_reset_limit,
                 "impute_max_birth_attempts": args.impute_max_birth_attempts,
+                "topology_relation_prior": dict(stream_config.topology_relation_prior or {}),
                 "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
                 "visual_snapshot_check_interval_sec": _resolve_visual_snapshot_check_interval(
                     float(args.visual_snapshot_age_sec or 0.0),
@@ -1663,6 +1702,7 @@ def main():
             "min_group_events": stream_config.min_group_events,
             "immigrant_bias": stream_config.immigrant_bias,
             "time_scale_sec": stream_config.time_scale_sec,
+            "topology_relation_prior": dict(stream_config.topology_relation_prior or {}),
             "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
             "visual_snapshot_check_interval_sec": visual_snapshot_check_interval_sec,
         },
