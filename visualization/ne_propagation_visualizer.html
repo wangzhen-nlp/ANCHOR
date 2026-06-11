@@ -6066,7 +6066,29 @@
                 if (offline && offline.hasExpansion) {
                     if (siteNeighborAnchorNodes.size === 0) {
                         restoreBaseCurrentGraph();
+                    } else if (offline.contributions && Object.keys(offline.contributions).length) {
+                        // 按当前选中的锚点动态求并集：base ∪ 各选中锚点带来的扩展 NE
+                        const activeIds = new Set(offline.baseNodeIds || []);
+                        siteNeighborAnchorNodes.forEach(function(anchorId) {
+                            activeIds.add(anchorId);
+                            const contrib = offline.contributions[anchorId];
+                            if (Array.isArray(contrib)) {
+                                contrib.forEach(function(neId) { activeIds.add(neId); });
+                            }
+                        });
+                        currentNodes = offline.expandedNodes
+                            .filter(function(n) { return activeIds.has(n.id); })
+                            .map(function(n) { return Object.assign({}, n); });
+                        currentLinks = offline.expandedLinks.filter(function(l) {
+                            const s = typeof l.source === 'object' ? l.source.id : l.source;
+                            const t = typeof l.target === 'object' ? l.target.id : l.target;
+                            return activeIds.has(s) && activeIds.has(t);
+                        }).map(function(l) { return Object.assign({}, l); });
+                        filteredLinks = currentLinks.slice();
+                        document.getElementById('currentNodes').textContent = currentNodes.length;
+                        renderAlarmGroupPartitionSummary();
                     } else {
+                        // 旧快照没有按锚点拆分的数据，退回整体恢复
                         currentNodes = offline.expandedNodes.map(function(n) { return Object.assign({}, n); });
                         currentLinks = offline.expandedLinks.map(function(l) { return Object.assign({}, l); });
                         filteredLinks = currentLinks.slice();
@@ -6478,6 +6500,35 @@
             });
         }
 
+        // 为每个锚点单独计算它带来的扩展 NE（按站点 N 跳）。
+        // 导出时 ne_graph 还在，把这份映射存进快照后，离线页面就能按选中的锚点
+        // 动态地增删邻居，而不是一把全部恢复。
+        function buildAnchorContributionsForExport() {
+            const contributions = {};
+            if (!neGraphData || typeof neGraphData !== 'object') return contributions;
+            const neEntries = Object.entries(neGraphData);
+            siteNeighborAnchorNodes.forEach(function(anchorId) {
+                const anchorNode = resolveNodeInfoForNeighborExpansion(anchorId);
+                const anchorSiteId = anchorNode && anchorNode.site_id ? String(anchorNode.site_id) : '';
+                if (!anchorSiteId) {
+                    contributions[anchorId] = [];
+                    return;
+                }
+                const expandedSites = getNthOrderNeighborSites(anchorSiteId, siteNeighborHopCount);
+                const neIds = [];
+                neEntries.forEach(function(entry) {
+                    const neId = entry[0];
+                    const info = entry[1] || {};
+                    const siteId = info && info.site_id ? String(info.site_id) : '';
+                    if (siteId && expandedSites.has(siteId)) {
+                        neIds.push(neId);
+                    }
+                });
+                contributions[anchorId] = neIds;
+            });
+            return contributions;
+        }
+
         function buildCurrentGroupsExportPayload() {
             const exportTime = new Date();
             const activeGroupIds = Array.from(activeGroups).sort(function(a, b) {
@@ -6539,6 +6590,8 @@
                     if (hasExpansion) {
                         state.base_nodes = baseCurrentNodes.map(normalizeNodeForExport);
                         state.base_links = baseCurrentLinks.map(normalizeLinkForExport);
+                        // 每个锚点各自带来的扩展 NE，离线时据此按锚点动态增删
+                        state.anchor_contributions = buildAnchorContributionsForExport();
                     }
                     return state;
                 })(),
@@ -6590,12 +6643,14 @@
                 '      if (neState && Array.isArray(neState.base_nodes) && neState.base_nodes.length) {',
                 '        baseCurrentNodes = neState.base_nodes.map(function(n){ return Object.assign({}, n, { domainStyle: getDomainStyle(n.domain || "") }); });',
                 '        baseCurrentLinks = (neState.base_links || []).map(function(l){ return Object.assign({}, l); });',
-                '        // 离线快照同时保存了扩展前(base)与扩展后(current)两份图，',
-                '        // 没有 ne_graph.json 时也能在两者之间来回切换',
+                '        // 离线快照保存了扩展前(base)、扩展后(current)两份图，',
+                '        // 以及每个锚点各自的扩展 NE；没有 ne_graph.json 时也能按锚点动态增删邻居',
                 '        window.__offlineNeighborExpansion = {',
                 '          hasExpansion: true,',
                 '          expandedNodes: currentNodes.map(function(n){ return Object.assign({}, n); }),',
-                '          expandedLinks: currentLinks.map(function(l){ return Object.assign({}, l); })',
+                '          expandedLinks: currentLinks.map(function(l){ return Object.assign({}, l); }),',
+                '          baseNodeIds: baseCurrentNodes.map(function(n){ return n.id; }),',
+                '          contributions: (neState.anchor_contributions && typeof neState.anchor_contributions === "object") ? neState.anchor_contributions : {}',
                 '        };',
                 '      } else {',
                 '        baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
