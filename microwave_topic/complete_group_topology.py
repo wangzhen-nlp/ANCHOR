@@ -197,13 +197,14 @@ def _device_role(ne_info):
 
 def _build_site_data_and_link_index(ne_graph_data):
     site_has_data = set()
+    site_has_ran = set()
     site_links = defaultdict(set)
     directed_edge_types = defaultdict(set)
     ne_to_site = {}
     ne_roles = {}
 
     if not isinstance(ne_graph_data, dict):
-        return site_has_data, site_links, directed_edge_types
+        return site_has_data, site_has_ran, site_links, directed_edge_types
 
     for ne_id, ne_info in ne_graph_data.items():
         if not isinstance(ne_info, dict):
@@ -212,9 +213,12 @@ def _build_site_data_and_link_index(ne_graph_data):
         if not site_id:
             continue
         ne_to_site[ne_id] = site_id
-        ne_roles[ne_id] = _device_role(ne_info)
-        if _is_data_ne(ne_info):
+        role = _device_role(ne_info)
+        ne_roles[ne_id] = role
+        if role == "Data":
             site_has_data.add(site_id)
+        elif role == "Ran":
+            site_has_ran.add(site_id)
 
     for source_ne, source_info in ne_graph_data.items():
         if not isinstance(source_info, dict):
@@ -234,7 +238,7 @@ def _build_site_data_and_link_index(ne_graph_data):
             directed_edge_types[(source_site, target_site)].add((source_role, target_role))
             directed_edge_types[(target_site, source_site)].add((target_role, source_role))
 
-    return site_has_data, site_links, directed_edge_types
+    return site_has_data, site_has_ran, site_links, directed_edge_types
 
 
 def _group_site_by_ne(group):
@@ -488,6 +492,27 @@ def _filter_hub_highlight_sites(highlight_sites, site_graph_data):
             continue
         site_id = _normalize_text(item.get("site_id", ""))
         if site_id and not _site_is_hub(site_id, site_graph_data):
+            removed_site_ids.append(site_id)
+            continue
+        kept.append(item)
+    return kept, sorted(set(removed_site_ids))
+
+
+def _filter_ran_without_data_link_highlight_sites(highlight_sites, site_has_data, site_has_ran, site_links):
+    kept = []
+    removed_site_ids = []
+    site_has_data = set(site_has_data or ())
+    site_has_ran = set(site_has_ran or ())
+    for item in highlight_sites or []:
+        if not isinstance(item, dict):
+            continue
+        site_id = _normalize_text(item.get("site_id", ""))
+        if (
+            site_id
+            and site_id not in site_has_data
+            and site_id in site_has_ran
+            and not (set(site_links.get(site_id, ())) & site_has_data)
+        ):
             removed_site_ids.append(site_id)
             continue
         kept.append(item)
@@ -762,6 +787,7 @@ def complete_group_topology(
     restrict_relation=False,
     upstream_adjacency=None,
     site_has_data=None,
+    site_has_ran=None,
     site_links=None,
     directed_edge_types=None,
 ):
@@ -785,8 +811,17 @@ def complete_group_topology(
         topology_highlight_sites,
         site_graph_data,
     )
-    if site_has_data is None or site_links is None or directed_edge_types is None:
-        site_has_data, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
+    if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
+        site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
+    (
+        topology_highlight_sites,
+        ran_without_data_link_filtered_ancestor_site_ids,
+    ) = _filter_ran_without_data_link_highlight_sites(
+        topology_highlight_sites,
+        site_has_data,
+        site_has_ran,
+        site_links,
+    )
     (
         topology_highlight_sites,
         data_link_pruned_ancestor_site_ids,
@@ -898,6 +933,7 @@ def complete_group_topology(
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
         "hub_filtered_ancestor_site_ids": hub_filtered_ancestor_site_ids,
+        "ran_without_data_link_filtered_ancestor_site_ids": ran_without_data_link_filtered_ancestor_site_ids,
         "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
         "shared_data_link_pruned_ancestor_site_ids": shared_data_link_pruned_ancestor_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
@@ -920,7 +956,7 @@ def complete_groups(
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
     site_chain_index, restrict_relation = _load_site_chain_index(site_chains_path)
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
-    site_has_data, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
+    site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
     # 带权上游邻接只依赖 site_chain_index，与故障组无关，预先构建一次复用，避免逐组重建。
     upstream_adjacency = (
         _build_weighted_upstream_adjacency(site_chain_index) if restrict_relation else None
@@ -952,6 +988,7 @@ def complete_groups(
                     restrict_relation,
                     upstream_adjacency,
                     site_has_data,
+                    site_has_ran,
                     site_links,
                     directed_edge_types,
                 )
