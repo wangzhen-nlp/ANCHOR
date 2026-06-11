@@ -853,6 +853,7 @@ def train_alarm_mhp(
     topology_index: Optional[NETopologyIndex] = None,
     ne_graph_data=None,
     best_checkpoint_path: Optional[str] = None,
+    run_args: Optional[dict] = None,
 ) -> AlarmMHPArtifact:
     """Fit alarm-flow MHP parameters via windowed sparse MAP EM.
 
@@ -1037,6 +1038,12 @@ def train_alarm_mhp(
             "val_event_count": (val_events.n if val_events else 0),
             "type_count": M,
             "active_edge_count": len(best_result.params.edge_alpha),
+            "spectral_radius": (
+                float(best_result.params.spectral_radius())
+                if len(best_result.params.edge_alpha) else None
+            ),
+            "stability_radius": float(config.stability_radius),
+            "run_args": dict(run_args) if run_args else None,
             "best_log_likelihood": float(best_result.log_likelihood),
             "best_val_log_likelihood": None,
             "iterations_run": int(best_result.iterations_run),
@@ -1319,6 +1326,7 @@ def train_alarm_mhp(
             if len(result.params.edge_alpha) else None
         ),
         "stability_radius": float(config.stability_radius),
+        "run_args": dict(run_args) if run_args else None,
         "best_log_likelihood": result.log_likelihood,
         "best_val_log_likelihood": final_val_ll,
         "iterations_run": result.iterations_run,

@@ -163,6 +163,15 @@ def _default_best_output(path: str) -> str:
     return f"{path}.best.json"
 
 
+def _json_safe(v):
+    """Coerce a CLI arg value to a JSON-serializable form for the run_args snapshot."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    return str(v)
+
+
 def main():
     parser = ArgumentParser(description="Train alarm-flow MHP via MAP EM.")
     parser.add_argument("alarms", help="Raw alarms or prepare_sorted_alarms cache.")
@@ -464,6 +473,10 @@ def main():
         topology_index=topology_index,
         ne_graph_data=ne_graph_data,
         best_checkpoint_path=best_output,
+        # Full CLI argument snapshot (incl. args not in AlarmMHPConfig, e.g.
+        # early-stop-patience / ne-graph / output paths) — persisted to both the
+        # final artifact and best checkpoints so a run is exactly reproducible.
+        run_args={k: _json_safe(v) for k, v in vars(args).items()},
     )
     artifact.training_metadata["input"] = os.path.abspath(args.alarms)
     artifact.training_metadata["alarm_metadata"] = alarm_metadata
