@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>导出传播图总览</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            background: #f5f7fb;
+            color: #1f2937;
+        }
+        .page {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .hero {
+            background: linear-gradient(135deg, #ffffff 0%, #eef6ff 100%);
+            border: 1px solid #dbe4f0;
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+        }
+        h1 {
+            margin: 0 0 10px;
+            font-size: 28px;
+        }
+        .sub {
+            color: #5b6472;
+            margin-bottom: 18px;
+        }
+        .toolbar {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            border: none;
+            border-radius: 10px;
+            padding: 10px 16px;
+            background: #0969da;
+            color: #fff;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .btn:hover { background: #0858b8; }
+        .btn.secondary {
+            background: #fff;
+            color: #344054;
+            border: 1px solid #d0d5dd;
+        }
+        .btn.secondary:hover { background: #f8fafc; }
+        .hint {
+            color: #667085;
+            font-size: 13px;
+        }
+        .dropzone {
+            margin-top: 16px;
+            border: 1.5px dashed #b6c2d4;
+            border-radius: 14px;
+            padding: 18px;
+            text-align: center;
+            color: #667085;
+            font-size: 13px;
+            background: rgba(255, 255, 255, 0.5);
+            transition: border-color .15s, background .15s;
+        }
+        .dropzone.dragover {
+            border-color: #0969da;
+            background: rgba(9, 105, 218, 0.06);
+            color: #0858b8;
+        }
+        .filters {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+        .filter-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 14px;
+        }
+        .filter-chip {
+            border: 1px solid #d0d5dd;
+            background: #fff;
+            color: #344054;
+            border-radius: 999px;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .filter-chip.active {
+            background: #111827;
+            border-color: #111827;
+            color: #fff;
+        }
+        .site-filter-label {
+            color: #475467;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .site-filter-input {
+            min-width: 240px;
+            padding: 10px 14px;
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+            background: #fff;
+            color: #1f2937;
+            font-size: 14px;
+        }
+        .site-filter-input:focus {
+            outline: none;
+            border-color: #0969da;
+            box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
+        }
+        .sort-select {
+            padding: 10px 12px;
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+            background: #fff;
+            color: #1f2937;
+            font-size: 14px;
+        }
+        .status {
+            margin-top: 14px;
+            color: #475467;
+            font-size: 14px;
+        }
+        .filter-summary {
+            margin-top: 8px;
+            color: #667085;
+            font-size: 13px;
+        }
+        .list {
+            margin-top: 22px;
+            display: grid;
+            gap: 14px;
+        }
+        .card {
+            background: #fff;
+            border: 1px solid #e4e7ec;
+            border-radius: 16px;
+            padding: 18px;
+            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
+        }
+        .card-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 12px;
+        }
+        .title {
+            font-size: 18px;
+            font-weight: 700;
+            word-break: break-word;
+        }
+        .time {
+            color: #475467;
+            font-size: 13px;
+            margin-top: 6px;
+        }
+        .filename {
+            color: #98a2b3;
+            font-size: 12px;
+            margin-top: 4px;
+            word-break: break-all;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        }
+        .open-btn {
+            flex-shrink: 0;
+            border: none;
+            border-radius: 10px;
+            padding: 10px 14px;
+            background: #111827;
+            color: #fff;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .open-btn:hover { background: #0b1220; }
+        .meta {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px 18px;
+        }
+        .meta-item {
+            background: #f8fafc;
+            border-radius: 12px;
+            padding: 10px 12px;
+            min-height: 60px;
+        }
+        .meta-item--wide { grid-column: 1 / -1; }
+        @media (max-width: 960px) {
+            .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 640px) {
+            .meta { grid-template-columns: 1fr; }
+        }
+        .meta-label {
+            font-size: 12px;
+            color: #667085;
+            margin-bottom: 6px;
+        }
+        .meta-value {
+            font-size: 14px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 9px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            margin-right: 6px;
+        }
+        .badge-expand {
+            background: #fef3c7;
+            color: #92400e;
+            border: 1px solid #fcd34d;
+        }
+        .badge-note {
+            background: #ecfdf5;
+            color: #047857;
+            border: 1px solid #6ee7b7;
+        }
+        .group-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 9px;
+            border-radius: 999px;
+            background: #eff6ff;
+            border: 1px solid #b6d4fe;
+            color: #0969da;
+            font-size: 12px;
+            font-weight: 600;
+            margin: 2px 4px 2px 0;
+        }
+        .note-box {
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+        }
+        .note-box .meta-label { color: #b45309; }
+        .note-box .meta-value { color: #92400e; white-space: pre-wrap; }
+        .empty {
+            margin-top: 24px;
+            text-align: center;
+            padding: 40px 24px;
+            color: #667085;
+            background: #fff;
+            border: 1px dashed #d0d5dd;
+            border-radius: 18px;
+        }
+        .parse-error {
+            color: #b42318;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+        input[type="file"] { display: none; }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="hero">
+            <h1>导出传播图总览</h1>
+            <div class="sub">导入由「传播图可视化」导出的 HTML 文件（可多选文件或选择整个文件夹），页面会读取每个文件内嵌的快照，展示故障组、规模、邻居扩展与备注；点击任意条目直接打开对应网页。</div>
+            <div class="toolbar">
+                <input id="fileInput" type="file" accept=".html,.htm" multiple>
+                <input id="dirInput" type="file" webkitdirectory directory multiple>
+                <button class="btn" onclick="document.getElementById('fileInput').click()">选择 HTML 文件</button>
+                <button class="btn secondary" onclick="document.getElementById('dirInput').click()">选择文件夹</button>
+                <button class="btn secondary" onclick="clearAll()">清空</button>
+                <div class="hint">支持导出页的单文件或整文件夹</div>
+            </div>
+            <div class="dropzone" id="dropzone">把导出的 HTML 文件或文件夹拖到这里</div>
+
+            <div class="filters" id="filters">
+                <button class="filter-chip active" data-filter="all">全部</button>
+                <button class="filter-chip" data-filter="with-note">有备注</button>
+                <button class="filter-chip" data-filter="with-expansion">有邻居扩展</button>
+            </div>
+            <div class="filter-row">
+                <span class="site-filter-label">备注关键词</span>
+                <input id="noteFilterInput" class="site-filter-input" type="text" placeholder="输入备注关键词，包含匹配">
+            </div>
+            <div class="filter-row">
+                <span class="site-filter-label">故障组ID</span>
+                <input id="groupFilterInput" class="site-filter-input" type="text" placeholder="输入故障组ID，包含匹配">
+            </div>
+            <div class="filter-row">
+                <span class="site-filter-label">站点ID</span>
+                <input id="siteFilterInput" class="site-filter-input" type="text" placeholder="输入站点ID，包含匹配">
+            </div>
+            <div class="filter-row">
+                <span class="site-filter-label">排序</span>
+                <select id="sortSelect" class="sort-select">
+                    <option value="time-desc">导出时间（新→旧）</option>
+                    <option value="time-asc">导出时间（旧→新）</option>
+                    <option value="name-asc">文件名（A→Z）</option>
+                    <option value="nodes-desc">设备数（多→少）</option>
+                    <option value="alarms-desc">告警数（多→少）</option>
+                </select>
+            </div>
+
+            <div class="status" id="status">尚未导入文件</div>
+            <div class="filter-summary" id="filterSummary">过滤后 0 条</div>
+        </div>
+
+        <div class="list" id="cardList"></div>
+        <div class="empty" id="emptyState">请选择导出的 HTML 文件或文件夹</div>
+    </div>
+
+    <script>
+        let items = [];                 // { id, fileName, relativePath, html, snapshot, blobUrl }
+        let activeFilters = new Set(['all']);
+        let noteFilterQuery = '';
+        let groupFilterQuery = '';
+        let siteFilterQuery = '';
+        let sortMode = 'time-desc';
+        let nextId = 1;
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // 从导出的 HTML 文本中提取内嵌快照
+        function extractSnapshot(htmlText) {
+            const match = htmlText.match(/const SNAPSHOT = JSON\.parse\(decodeURIComponent\("([^"]*)"\)\)/);
+            if (!match) return null;
+            try {
+                return JSON.parse(decodeURIComponent(match[1]));
+            } catch (error) {
+                console.warn('解析快照失败:', error);
+                return null;
+            }
+        }
+
+        function readFileText(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+                reader.readAsText(file, 'utf-8');
+            });
+        }
+
+        function getSnapshotNote(snapshot) {
+            return (snapshot && typeof snapshot.note === 'string') ? snapshot.note.trim() : '';
+        }
+
+        function getExpandedCount(snapshot) {
+            const nodes = (snapshot && Array.isArray(snapshot.nodes)) ? snapshot.nodes : [];
+            return nodes.filter(n => n && n.isNeighborExpanded).length;
+        }
+
+        function getAnchorCount(snapshot) {
+            const ne = snapshot && snapshot.neighbor_expansion;
+            return (ne && Array.isArray(ne.anchor_node_ids)) ? ne.anchor_node_ids.length : 0;
+        }
+
+        function getHopCount(snapshot) {
+            const ne = snapshot && snapshot.neighbor_expansion;
+            return ne && ne.hop_count ? ne.hop_count : 1;
+        }
+
+        function getActiveGroups(snapshot) {
+            return (snapshot && Array.isArray(snapshot.active_groups)) ? snapshot.active_groups.map(String) : [];
+        }
+
+        function getSiteIds(snapshot) {
+            const sites = (snapshot && Array.isArray(snapshot.sites)) ? snapshot.sites : [];
+            return sites.map(s => String((s && s.site_id) || '')).filter(Boolean);
+        }
+
+        function getExportTimeMs(snapshot) {
+            const iso = snapshot && snapshot.exported_at;
+            const t = iso ? Date.parse(iso) : NaN;
+            return Number.isNaN(t) ? 0 : t;
+        }
+
+        function getSummary(snapshot) {
+            const s = (snapshot && snapshot.summary) || {};
+            return {
+                groups: s.active_group_count ?? getActiveGroups(snapshot).length,
+                sites: s.site_count ?? 0,
+                nodes: s.node_count ?? 0,
+                links: s.link_count ?? 0,
+                alarms: s.alarm_count ?? 0,
+                missingLinks: s.missing_topology_link_count ?? 0
+            };
+        }
+
+        function getItemTitle(item) {
+            const groups = getActiveGroups(item.snapshot);
+            if (groups.length) {
+                return '故障组 ' + groups.slice(0, 4).join('、') + (groups.length > 4 ? ` 等 ${groups.length} 组` : '');
+            }
+            return item.fileName || '导出传播图';
+        }
+
+        // 导入一批文件（来自多选 / 文件夹 / 拖拽）
+        async function ingestFiles(fileList) {
+            const files = Array.from(fileList || []).filter(f => /\.(html?|HTML?)$/.test(f.name));
+            if (files.length === 0) {
+                document.getElementById('status').textContent = '未发现 HTML 文件';
+                return;
+            }
+            let added = 0;
+            let skipped = 0;
+            for (const file of files) {
+                try {
+                    const html = await readFileText(file);
+                    const snapshot = extractSnapshot(html);
+                    if (!snapshot) {
+                        skipped++;
+                        continue;
+                    }
+                    items.push({
+                        id: nextId++,
+                        fileName: file.name,
+                        relativePath: file.webkitRelativePath || file.name,
+                        html,
+                        snapshot,
+                        blobUrl: null
+                    });
+                    added++;
+                } catch (error) {
+                    console.warn('导入失败:', file.name, error);
+                    skipped++;
+                }
+            }
+            const parts = [`已导入 ${items.length} 个导出页`];
+            if (added) parts.push(`本次新增 ${added}`);
+            if (skipped) parts.push(`跳过 ${skipped}（无可识别快照）`);
+            document.getElementById('status').textContent = parts.join('，');
+            renderCards();
+        }
+
+        function clearAll() {
+            items.forEach(item => { if (item.blobUrl) URL.revokeObjectURL(item.blobUrl); });
+            items = [];
+            document.getElementById('status').textContent = '尚未导入文件';
+            renderCards();
+        }
+
+        function openItem(id) {
+            const item = items.find(it => it.id === id);
+            if (!item) return;
+            if (!item.blobUrl) {
+                item.blobUrl = URL.createObjectURL(new Blob([item.html], { type: 'text/html;charset=utf-8' }));
+            }
+            window.open(item.blobUrl, '_blank');
+        }
+
+        function filterItems(list) {
+            return list.filter(item => {
+                const snapshot = item.snapshot;
+                const note = getSnapshotNote(snapshot);
+                const expandedCount = getExpandedCount(snapshot);
+
+                if (!activeFilters.has('all') && activeFilters.size > 0) {
+                    for (const filter of activeFilters) {
+                        if (filter === 'with-note' && !note) return false;
+                        if (filter === 'with-expansion' && expandedCount === 0) return false;
+                    }
+                }
+                if (noteFilterQuery && !note.toLowerCase().includes(noteFilterQuery.toLowerCase())) {
+                    return false;
+                }
+                if (groupFilterQuery) {
+                    const q = groupFilterQuery.toLowerCase();
+                    if (!getActiveGroups(snapshot).some(g => g.toLowerCase().includes(q))) return false;
+                }
+                if (siteFilterQuery) {
+                    const q = siteFilterQuery.toLowerCase();
+                    if (!getSiteIds(snapshot).some(s => s.toLowerCase().includes(q))) return false;
+                }
+                return true;
+            });
+        }
+
+        function sortItems(list) {
+            const sorted = list.slice();
+            sorted.sort((a, b) => {
+                switch (sortMode) {
+                    case 'time-asc':   return getExportTimeMs(a.snapshot) - getExportTimeMs(b.snapshot);
+                    case 'name-asc':   return String(a.fileName).localeCompare(String(b.fileName), 'zh-CN', { numeric: true });
+                    case 'nodes-desc': return getSummary(b.snapshot).nodes - getSummary(a.snapshot).nodes;
+                    case 'alarms-desc':return getSummary(b.snapshot).alarms - getSummary(a.snapshot).alarms;
+                    case 'time-desc':
+                    default:           return getExportTimeMs(b.snapshot) - getExportTimeMs(a.snapshot);
+                }
+            });
+            return sorted;
+        }
+
+        function renderGroupChips(snapshot) {
+            const groups = getActiveGroups(snapshot);
+            if (groups.length === 0) return '<span class="hint">（无指定故障组）</span>';
+            return groups.map(g => `<span class="group-chip">${escapeHtml(g)}</span>`).join('');
+        }
+
+        function renderBadges(snapshot) {
+            const badges = [];
+            const expandedCount = getExpandedCount(snapshot);
+            if (expandedCount > 0) {
+                badges.push(`<span class="badge badge-expand">🧭 邻居扩展 ${expandedCount} 设备 · ${getAnchorCount(snapshot)} 锚点 · ${getHopCount(snapshot)} 跳</span>`);
+            }
+            if (getSnapshotNote(snapshot)) {
+                badges.push('<span class="badge badge-note">📝 有备注</span>');
+            }
+            return badges.join('');
+        }
+
+        function renderCards() {
+            const list = document.getElementById('cardList');
+            const emptyState = document.getElementById('emptyState');
+            const filterSummary = document.getElementById('filterSummary');
+
+            const visible = sortItems(filterItems(items));
+            filterSummary.textContent = `共 ${items.length} 个，过滤后 ${visible.length} 条`;
+
+            if (visible.length === 0) {
+                list.innerHTML = '';
+                emptyState.textContent = items.length === 0
+                    ? '请选择导出的 HTML 文件或文件夹'
+                    : '当前筛选条件下没有匹配的导出页';
+                emptyState.style.display = 'block';
+                return;
+            }
+            emptyState.style.display = 'none';
+
+            list.innerHTML = visible.map(item => {
+                const snapshot = item.snapshot;
+                const summary = getSummary(snapshot);
+                const note = getSnapshotNote(snapshot);
+                const exportedLocal = (snapshot && snapshot.exported_at_local) || '-';
+                return `
+                <div class="card">
+                    <div class="card-head">
+                        <div>
+                            <div class="title">${escapeHtml(getItemTitle(item))}</div>
+                            <div class="time">导出时间：${escapeHtml(exportedLocal)}</div>
+                            <div class="filename">${escapeHtml(item.relativePath)}</div>
+                            <div style="margin-top:8px;">${renderBadges(snapshot)}</div>
+                        </div>
+                        <button class="open-btn" onclick="openItem(${item.id})">打开页面</button>
+                    </div>
+                    <div class="meta">
+                        <div class="meta-item meta-item--wide">
+                            <div class="meta-label">故障组</div>
+                            <div class="meta-value">${renderGroupChips(snapshot)}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">站点数 / 设备数</div>
+                            <div class="meta-value">${summary.sites} / ${summary.nodes}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">连线数 / 缺失拓扑</div>
+                            <div class="meta-value">${summary.links} / ${summary.missingLinks}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">告警数</div>
+                            <div class="meta-value">${summary.alarms}</div>
+                        </div>
+                        ${note ? `
+                        <div class="meta-item meta-item--wide note-box">
+                            <div class="meta-label">📝 备注</div>
+                            <div class="meta-value">${escapeHtml(note)}</div>
+                        </div>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // ===== 事件绑定 =====
+        document.getElementById('fileInput').addEventListener('change', function(event) {
+            ingestFiles(event.target.files);
+            event.target.value = '';
+        });
+        document.getElementById('dirInput').addEventListener('change', function(event) {
+            ingestFiles(event.target.files);
+            event.target.value = '';
+        });
+
+        document.getElementById('filters').addEventListener('click', function(event) {
+            const btn = event.target.closest('.filter-chip');
+            if (!btn) return;
+            const filter = btn.dataset.filter || 'all';
+            if (filter === 'all') {
+                activeFilters = new Set(['all']);
+            } else {
+                activeFilters.delete('all');
+                if (activeFilters.has(filter)) activeFilters.delete(filter);
+                else activeFilters.add(filter);
+                if (activeFilters.size === 0) activeFilters.add('all');
+            }
+            document.querySelectorAll('.filter-chip').forEach(chip => {
+                chip.classList.toggle('active', activeFilters.has(chip.dataset.filter || 'all'));
+            });
+            renderCards();
+        });
+
+        document.getElementById('noteFilterInput').addEventListener('input', function(e) {
+            noteFilterQuery = e.target.value.trim();
+            renderCards();
+        });
+        document.getElementById('groupFilterInput').addEventListener('input', function(e) {
+            groupFilterQuery = e.target.value.trim();
+            renderCards();
+        });
+        document.getElementById('siteFilterInput').addEventListener('input', function(e) {
+            siteFilterQuery = e.target.value.trim();
+            renderCards();
+        });
+        document.getElementById('sortSelect').addEventListener('change', function(e) {
+            sortMode = e.target.value;
+            renderCards();
+        });
+
+        // 拖拽导入（文件 + 文件夹）
+        const dropzone = document.getElementById('dropzone');
+        ['dragenter', 'dragover'].forEach(type => {
+            dropzone.addEventListener(type, function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                dropzone.classList.add('dragover');
+            });
+        });
+        ['dragleave', 'drop'].forEach(type => {
+            dropzone.addEventListener(type, function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (type === 'dragleave' && dropzone.contains(e.relatedTarget)) return;
+                dropzone.classList.remove('dragover');
+            });
+        });
+        dropzone.addEventListener('drop', async function(e) {
+            const dt = e.dataTransfer;
+            if (!dt) return;
+            // 优先用 webkitGetAsEntry 支持文件夹递归
+            const entries = [];
+            if (dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
+                for (const item of dt.items) {
+                    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+                    if (entry) entries.push(entry);
+                }
+            }
+            if (entries.length) {
+                const files = [];
+                await Promise.all(entries.map(entry => collectEntryFiles(entry, files)));
+                ingestFiles(files);
+            } else if (dt.files && dt.files.length) {
+                ingestFiles(dt.files);
+            }
+        });
+
+        function collectEntryFiles(entry, out) {
+            return new Promise((resolve) => {
+                if (entry.isFile) {
+                    entry.file(file => { out.push(file); resolve(); }, () => resolve());
+                } else if (entry.isDirectory) {
+                    const reader = entry.createReader();
+                    const readBatch = () => {
+                        reader.readEntries(async (batch) => {
+                            if (!batch.length) { resolve(); return; }
+                            await Promise.all(batch.map(child => collectEntryFiles(child, out)));
+                            readBatch();
+                        }, () => resolve());
+                    };
+                    readBatch();
+                } else {
+                    resolve();
+                }
+            });
+        }
+
+        window.addEventListener('beforeunload', clearAll);
+    </script>
+</body>
+</html>
