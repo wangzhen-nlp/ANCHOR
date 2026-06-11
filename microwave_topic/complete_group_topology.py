@@ -421,8 +421,17 @@ def _closure_upstream_hops(site_id, site_chain_index):
     return hops
 
 
-def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, upstream_adjacency=None):
+def _build_site_completion(
+    alarm_sites,
+    site_chain_index,
+    restrict_relation,
+    upstream_adjacency=None,
+    excluded_ancestor_site_ids=None,
+):
     alarm_sites = sorted({_normalize_text(site) for site in alarm_sites if _normalize_text(site)})
+    excluded_ancestor_site_ids = {
+        _normalize_text(site) for site in (excluded_ancestor_site_ids or []) if _normalize_text(site)
+    }
     selected_sites = set(alarm_sites)
 
     # restrict-relation 把 upstream_site_hops 裁成了直接邻居，需要沿带权边累加还原完整上游链
@@ -443,7 +452,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
 
     common_candidates = None
     for site_id in alarm_sites:
-        candidates = set(reach_by_site[site_id])
+        candidates = set(reach_by_site[site_id]) - excluded_ancestor_site_ids
         common_candidates = candidates if common_candidates is None else common_candidates & candidates
     common_candidates = common_candidates or set()
 
@@ -482,7 +491,7 @@ def _build_site_completion(alarm_sites, site_chain_index, restrict_relation, ups
             hops = {
                 upstream_site: hop
                 for upstream_site, hop in reach_by_site[site_id].items()
-                if upstream_site != site_id
+                if upstream_site != site_id and upstream_site not in excluded_ancestor_site_ids
             }
             if not hops:
                 no_upstream_sites.append(site_id)
@@ -546,6 +555,23 @@ def _build_topology_highlight_sites(completion):
             "label": "无可用 upstream 站点",
         })
     return result
+
+
+def _filter_non_offline_alarm_site_highlight_sites(highlight_sites, non_offline_alarm_site_ids):
+    non_offline_alarm_site_ids = {
+        _normalize_text(site_id) for site_id in (non_offline_alarm_site_ids or []) if _normalize_text(site_id)
+    }
+    kept = []
+    removed_site_ids = []
+    for item in highlight_sites or []:
+        if not isinstance(item, dict):
+            continue
+        site_id = _normalize_text(item.get("site_id", ""))
+        if site_id and site_id in non_offline_alarm_site_ids:
+            removed_site_ids.append(site_id)
+            continue
+        kept.append(item)
+    return kept, sorted(set(removed_site_ids))
 
 
 def _filter_hub_highlight_sites(highlight_sites, site_graph_data):
@@ -867,11 +893,23 @@ def complete_group_topology(
         if _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
     })
     offline_alarm_sites = _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne)
+    non_offline_alarm_sites = sorted(set(alarm_sites) - set(offline_alarm_sites))
     completion = _build_site_completion(
-        offline_alarm_sites, site_chain_index, restrict_relation, upstream_adjacency
+        offline_alarm_sites,
+        site_chain_index,
+        restrict_relation,
+        upstream_adjacency,
+        excluded_ancestor_site_ids=non_offline_alarm_sites,
     )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
+    (
+        topology_highlight_sites,
+        non_offline_alarm_site_filtered_ancestor_site_ids,
+    ) = _filter_non_offline_alarm_site_highlight_sites(
+        topology_highlight_sites,
+        non_offline_alarm_sites,
+    )
     topology_highlight_sites, hub_filtered_ancestor_site_ids = _filter_hub_highlight_sites(
         topology_highlight_sites,
         site_graph_data,
@@ -989,7 +1027,7 @@ def complete_group_topology(
         "original_alarm_ne_ids": sorted(alarm_ne_ids),
         "original_alarm_site_ids": alarm_sites,
         "ancestor_source_site_ids": offline_alarm_sites,
-        "non_offline_alarm_site_ids": sorted(set(alarm_sites) - set(offline_alarm_sites)),
+        "non_offline_alarm_site_ids": non_offline_alarm_sites,
         "selected_site_ids": all_site_ids,
         "added_site_ids": context_sites,
         "added_ne_ids": sorted(ne_id for ne_id in included_ne_ids if ne_id not in set(alarm_ne_ids)),
@@ -999,6 +1037,7 @@ def complete_group_topology(
         "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
+        "non_offline_alarm_site_filtered_ancestor_site_ids": non_offline_alarm_site_filtered_ancestor_site_ids,
         "hub_filtered_ancestor_site_ids": hub_filtered_ancestor_site_ids,
         "ran_without_data_link_filtered_ancestor_site_ids": ran_without_data_link_filtered_ancestor_site_ids,
         "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
