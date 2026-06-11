@@ -15,6 +15,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from alarm_tools.alarm_types import OFFLINE_ALARMS
 from fault_grouping.site_topology import build_site_to_ne_ids, normalize_site_chain_hops
 from topology_resources import (
     NE_GRAPH_JSON,
@@ -25,6 +26,7 @@ from topology_resources import (
 
 
 BLOCKED_ANCESTOR_SITE_IDS = {"13PWK0024"}
+OFFLINE_ALARM_KEYS = {str(alarm or "").strip().upper() for alarm in OFFLINE_ALARMS} | {"OFFLINE"}
 
 
 def _normalize_text(value):
@@ -284,6 +286,68 @@ def _extract_alarm_ne_ids(group):
             if isinstance(alarms, list) and alarms and ne_id not in ne_ids:
                 ne_ids.append(ne_id)
     return ne_ids
+
+
+def _is_offline_alarm_type(value):
+    text = _normalize_text(value)
+    if not text:
+        return False
+    upper_text = text.upper()
+    return upper_text in OFFLINE_ALARM_KEYS or "OFFLINE" in upper_text or "断站" in text
+
+
+def _record_has_offline_alarm(record):
+    if not isinstance(record, dict):
+        return False
+    for field_name in ("告警标题", "告警标准名", "alarm", "alarm_type", "title"):
+        if _is_offline_alarm_type(record.get(field_name, "")):
+            return True
+    return False
+
+
+def _append_unique_site(site_ids, site_id):
+    site_id = _normalize_text(site_id)
+    if site_id and site_id not in site_ids:
+        site_ids.append(site_id)
+
+
+def _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne):
+    site_ids = []
+
+    for symptom in group.get("symptoms") or []:
+        if not isinstance(symptom, dict) or not _record_has_offline_alarm(symptom):
+            continue
+        site_id = _normalize_text(symptom.get("node") or symptom.get("site_id") or "")
+        ne_id = _normalize_text(symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "")
+        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+
+    match_info = group.get("match_info") if isinstance(group.get("match_info"), dict) else {}
+    for symptom in match_info.get("symptoms") or []:
+        if not isinstance(symptom, dict) or not _record_has_offline_alarm(symptom):
+            continue
+        site_id = _normalize_text(symptom.get("node") or symptom.get("site_id") or "")
+        ne_id = _normalize_text(symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "")
+        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+
+    for alarm in group.get("alarms") or []:
+        if not isinstance(alarm, dict) or not _record_has_offline_alarm(alarm):
+            continue
+        site_id = _normalize_text(alarm.get("站点ID") or alarm.get("site_id") or alarm.get("node") or "")
+        ne_id = _normalize_text(alarm.get("告警源") or alarm.get("alarm_source") or alarm.get("ne_id") or alarm.get("source") or "")
+        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+
+    ne_info = group.get("ne_info", {})
+    if isinstance(ne_info, dict):
+        for ne_id, info in ne_info.items():
+            if not isinstance(info, dict):
+                continue
+            for alarm in info.get("alarm") or []:
+                if not isinstance(alarm, dict) or not _record_has_offline_alarm(alarm):
+                    continue
+                site_id = _normalize_text(alarm.get("site_id") or alarm.get("node") or info.get("site_id") or "")
+                _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+
+    return sorted(site_ids)
 
 
 def _build_weighted_upstream_adjacency(site_chain_index):
@@ -802,8 +866,9 @@ def complete_group_topology(
         for ne_id in alarm_ne_ids
         if _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
     })
+    offline_alarm_sites = _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne)
     completion = _build_site_completion(
-        alarm_sites, site_chain_index, restrict_relation, upstream_adjacency
+        offline_alarm_sites, site_chain_index, restrict_relation, upstream_adjacency
     )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
@@ -923,6 +988,8 @@ def complete_group_topology(
         "restrict_relation": restrict_relation,
         "original_alarm_ne_ids": sorted(alarm_ne_ids),
         "original_alarm_site_ids": alarm_sites,
+        "ancestor_source_site_ids": offline_alarm_sites,
+        "non_offline_alarm_site_ids": sorted(set(alarm_sites) - set(offline_alarm_sites)),
         "selected_site_ids": all_site_ids,
         "added_site_ids": context_sites,
         "added_ne_ids": sorted(ne_id for ne_id in included_ne_ids if ne_id not in set(alarm_ne_ids)),
@@ -938,7 +1005,7 @@ def complete_group_topology(
         "shared_data_link_pruned_ancestor_site_ids": shared_data_link_pruned_ancestor_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
-        "site_level_connected": bool(completion["common_upstream_site"]) or len(alarm_sites) <= 1,
+        "site_level_connected": bool(completion["common_upstream_site"]) or len(offline_alarm_sites) <= 1,
     }
     return group
 
@@ -995,7 +1062,7 @@ def complete_groups(
                 completion = completed.get("topology_completion", {})
                 if completion.get("common_upstream_site"):
                     stats["common_upstream_group_count"] += 1
-                elif len(completion.get("original_alarm_site_ids") or []) > 1:
+                elif len(completion.get("ancestor_source_site_ids") or []) > 1:
                     stats["fallback_upstream_group_count"] += 1
                 ancestor_count = _ancestor_highlight_count(completion)
                 if ancestor_count == 1:
