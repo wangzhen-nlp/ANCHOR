@@ -470,6 +470,19 @@ def _data_to_ancestor_edge_score(data_site, ancestor_site, directed_edge_types):
     return (len(edge_types), ranked_types)
 
 
+def _shared_data_neighbor_winner(left_site, right_site, common_data_sites, directed_edge_types):
+    winners = set()
+    for data_site in common_data_sites:
+        left_score = _data_to_ancestor_edge_score(data_site, left_site, directed_edge_types)
+        right_score = _data_to_ancestor_edge_score(data_site, right_site, directed_edge_types)
+        if left_score == right_score:
+            continue
+        winners.add(left_site if left_score > right_score else right_site)
+    if len(winners) == 1:
+        return next(iter(winners))
+    return None
+
+
 def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site_links, directed_edge_types):
     if len(highlight_sites or []) <= 1:
         return list(highlight_sites or []), [], []
@@ -511,17 +524,15 @@ def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site
             )
             if not common_data_sites:
                 continue
-            left_score = max(
-                (_data_to_ancestor_edge_score(data_site, left_site, directed_edge_types) for data_site in common_data_sites),
-                default=(0, ()),
+            winner_site = _shared_data_neighbor_winner(
+                left_site,
+                right_site,
+                common_data_sites,
+                directed_edge_types,
             )
-            right_score = max(
-                (_data_to_ancestor_edge_score(data_site, right_site, directed_edge_types) for data_site in common_data_sites),
-                default=(0, ()),
-            )
-            if left_score == right_score:
+            if not winner_site:
                 continue
-            shared_data_removed_site_ids.add(right_site if left_score > right_score else left_site)
+            shared_data_removed_site_ids.add(right_site if winner_site == left_site else left_site)
             break
 
     all_removed_site_ids = removed_site_ids | shared_data_removed_site_ids

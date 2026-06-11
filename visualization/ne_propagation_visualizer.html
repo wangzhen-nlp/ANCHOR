@@ -6060,6 +6060,22 @@
         function rebuildSiteNeighborExpansion(preserveViewport) {
             if (!siteNeighborModeEnabled) return false;
             if (!neGraphData || typeof neGraphData !== 'object') {
+                // 离线导出快照：没有 ne_graph.json 无法重新计算邻居，
+                // 但导出时已保存扩展结果，可在 base / 已保存的扩展图之间切换
+                const offline = window.__offlineNeighborExpansion;
+                if (offline && offline.hasExpansion) {
+                    if (siteNeighborAnchorNodes.size === 0) {
+                        restoreBaseCurrentGraph();
+                    } else {
+                        currentNodes = offline.expandedNodes.map(function(n) { return Object.assign({}, n); });
+                        currentLinks = offline.expandedLinks.map(function(l) { return Object.assign({}, l); });
+                        filteredLinks = currentLinks.slice();
+                        document.getElementById('currentNodes').textContent = currentNodes.length;
+                        renderAlarmGroupPartitionSummary();
+                    }
+                    renderMap({ preserveViewport: preserveViewport !== false });
+                    return true;
+                }
                 showError('请先加载 ne_graph.json');
                 return false;
             }
@@ -6574,9 +6590,17 @@
                 '      if (neState && Array.isArray(neState.base_nodes) && neState.base_nodes.length) {',
                 '        baseCurrentNodes = neState.base_nodes.map(function(n){ return Object.assign({}, n, { domainStyle: getDomainStyle(n.domain || "") }); });',
                 '        baseCurrentLinks = (neState.base_links || []).map(function(l){ return Object.assign({}, l); });',
+                '        // 离线快照同时保存了扩展前(base)与扩展后(current)两份图，',
+                '        // 没有 ne_graph.json 时也能在两者之间来回切换',
+                '        window.__offlineNeighborExpansion = {',
+                '          hasExpansion: true,',
+                '          expandedNodes: currentNodes.map(function(n){ return Object.assign({}, n); }),',
+                '          expandedLinks: currentLinks.map(function(l){ return Object.assign({}, l); })',
+                '        };',
                 '      } else {',
                 '        baseCurrentNodes = currentNodes.map(function(n){ return Object.assign({}, n); });',
                 '        baseCurrentLinks = currentLinks.map(function(l){ return Object.assign({}, l); });',
+                '        window.__offlineNeighborExpansion = null;',
                 '      }',
                 '      if (neState) {',
                 '        siteNeighborHopCount = Math.max(1, Number(neState.hop_count) || 1);',
