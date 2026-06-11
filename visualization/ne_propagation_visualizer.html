@@ -6059,45 +6059,46 @@
 
         function rebuildSiteNeighborExpansion(preserveViewport) {
             if (!siteNeighborModeEnabled) return false;
-            if (!neGraphData || typeof neGraphData !== 'object') {
-                // 离线导出快照：没有 ne_graph.json 无法重新计算邻居，
-                // 但导出时已保存扩展结果，可在 base / 已保存的扩展图之间切换
-                const offline = window.__offlineNeighborExpansion;
-                if (offline && offline.hasExpansion) {
-                    if (siteNeighborAnchorNodes.size === 0) {
-                        restoreBaseCurrentGraph();
-                    } else if (offline.contributions && Object.keys(offline.contributions).length) {
-                        // 按当前选中的锚点动态求并集：base ∪ 各选中锚点带来的扩展 NE
-                        const activeIds = new Set(offline.baseNodeIds || []);
-                        siteNeighborAnchorNodes.forEach(function(anchorId) {
-                            activeIds.add(anchorId);
-                            const contrib = offline.contributions[anchorId];
-                            if (Array.isArray(contrib)) {
-                                contrib.forEach(function(neId) { activeIds.add(neId); });
-                            }
-                        });
-                        currentNodes = offline.expandedNodes
-                            .filter(function(n) { return activeIds.has(n.id); })
-                            .map(function(n) { return Object.assign({}, n); });
-                        currentLinks = offline.expandedLinks.filter(function(l) {
-                            const s = typeof l.source === 'object' ? l.source.id : l.source;
-                            const t = typeof l.target === 'object' ? l.target.id : l.target;
-                            return activeIds.has(s) && activeIds.has(t);
-                        }).map(function(l) { return Object.assign({}, l); });
-                        filteredLinks = currentLinks.slice();
-                        document.getElementById('currentNodes').textContent = currentNodes.length;
-                        renderAlarmGroupPartitionSummary();
-                    } else {
-                        // 旧快照没有按锚点拆分的数据，退回整体恢复
-                        currentNodes = offline.expandedNodes.map(function(n) { return Object.assign({}, n); });
-                        currentLinks = offline.expandedLinks.map(function(l) { return Object.assign({}, l); });
-                        filteredLinks = currentLinks.slice();
-                        document.getElementById('currentNodes').textContent = currentNodes.length;
-                        renderAlarmGroupPartitionSummary();
-                    }
-                    renderMap({ preserveViewport: preserveViewport !== false });
-                    return true;
+            // 若本页是由导出快照恢复的（带离线扩展数据），始终以快照为准做邻居增删，
+            // 不依赖能否再次加载 ne_graph.json —— 经总览页用 blob URL 打开时，
+            // 相对 fetch 在 http/file 环境下行为不同，曾导致“去掉邻居后加不回来”。
+            const offline = window.__offlineNeighborExpansion;
+            if (offline && offline.hasExpansion) {
+                if (siteNeighborAnchorNodes.size === 0) {
+                    restoreBaseCurrentGraph();
+                } else if (offline.contributions && Object.keys(offline.contributions).length) {
+                    // 按当前选中的锚点动态求并集：base ∪ 各选中锚点带来的扩展 NE
+                    const activeIds = new Set(offline.baseNodeIds || []);
+                    siteNeighborAnchorNodes.forEach(function(anchorId) {
+                        activeIds.add(anchorId);
+                        const contrib = offline.contributions[anchorId];
+                        if (Array.isArray(contrib)) {
+                            contrib.forEach(function(neId) { activeIds.add(neId); });
+                        }
+                    });
+                    currentNodes = offline.expandedNodes
+                        .filter(function(n) { return activeIds.has(n.id); })
+                        .map(function(n) { return Object.assign({}, n); });
+                    currentLinks = offline.expandedLinks.filter(function(l) {
+                        const s = typeof l.source === 'object' ? l.source.id : l.source;
+                        const t = typeof l.target === 'object' ? l.target.id : l.target;
+                        return activeIds.has(s) && activeIds.has(t);
+                    }).map(function(l) { return Object.assign({}, l); });
+                    filteredLinks = currentLinks.slice();
+                    document.getElementById('currentNodes').textContent = currentNodes.length;
+                    renderAlarmGroupPartitionSummary();
+                } else {
+                    // 旧快照没有按锚点拆分的数据，退回整体恢复
+                    currentNodes = offline.expandedNodes.map(function(n) { return Object.assign({}, n); });
+                    currentLinks = offline.expandedLinks.map(function(l) { return Object.assign({}, l); });
+                    filteredLinks = currentLinks.slice();
+                    document.getElementById('currentNodes').textContent = currentNodes.length;
+                    renderAlarmGroupPartitionSummary();
                 }
+                renderMap({ preserveViewport: preserveViewport !== false });
+                return true;
+            }
+            if (!neGraphData || typeof neGraphData !== 'object') {
                 showError('请先加载 ne_graph.json');
                 return false;
             }

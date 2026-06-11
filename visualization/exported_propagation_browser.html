@@ -463,7 +463,15 @@
             const item = items.find(it => it.id === id);
             if (!item) return;
             if (!item.blobUrl) {
-                item.blobUrl = URL.createObjectURL(new Blob([item.html], { type: 'text/html;charset=utf-8' }));
+                // 经 blob URL 打开导出页时，让它优先使用内嵌的离线扩展快照：
+                // 禁掉其自动加载 ne_graph.json —— 否则当本总览页经 http 服务打开时，
+                // 导出页的相对 fetch 会拉到全量拓扑、走在线重算路径，
+                // 导致“去掉邻居后加不回来”。ne_graph 只用于邻居扩展，禁用它对快照查看无影响。
+                const patched = item.html.replace(
+                    /\.\.\/topology_resources\/ne_graph\.json/g,
+                    '../topology_resources/__snapshot_offline_no_ne_graph__.json'
+                );
+                item.blobUrl = URL.createObjectURL(new Blob([patched], { type: 'text/html;charset=utf-8' }));
             }
             window.open(item.blobUrl, '_blank');
         }
