@@ -277,9 +277,10 @@ def main():
     parser.add_argument(
         "--feature-l2-normalize",
         action="store_true",
-        help="Scale the α ridge by the exposure mass ΣE so --feature-l2 is "
-             "data-size-independent and actually controls ρ (λ≈0.01-0.1 bites). "
-             "OFF by default = legacy raw ridge (λ negligible at large scale).",
+        help="Scale the α ridge by event/data mass N (not raw exposure ΣE) so "
+             "--feature-l2 is data-size-independent and actually controls ρ "
+             "(λ≈0.01-0.1 bites). OFF by default = legacy raw ridge "
+             "(λ negligible at large scale).",
     )
     parser.add_argument(
         "--feature-topo-max-hops",

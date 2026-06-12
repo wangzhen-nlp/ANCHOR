@@ -1606,26 +1606,23 @@ def fit_mhp_feature(
     converged = False
     prev_ll = -np.inf
 
-    # OPT-IN α-ridge normalization (l2_normalize). The α data term sums
-    # N_c·logα − E_c·α over millions of (candidate, combo) buckets, so its
-    # curvature scales with the exposure mass ΣE; an unscaled ridge λ·‖w‖² (a
-    # handful of weights) is negligible at any sane λ. Scaling by ΣE turns
-    # --feature-l2 into a data-size-independent shrinkage where λ≈0.01–0.1
-    # actually bites and controls ρ. OFF by default → unchanged behavior.
+    # OPT-IN α-ridge normalization (l2_normalize). An unscaled ridge λ·‖w‖² (a
+    # handful of weights) is negligible against the α data term, so λ never bites.
+    # The data term Σ_c [N_c·logα − E_c·α] has magnitude ≈ ΣN_c = Σ E_c·α_c ≈ N
+    # (the event count) at the optimum — NOT the exposure mass ΣE, which is huge
+    # because most of it sits on candidates whose α≈0. So we scale the ridge by N:
+    # --feature-l2 becomes a data-size-independent shrinkage (≈ a fraction of the
+    # data term) where λ≈0.01–0.1 actually bites and controls ρ. (Scaling by ΣE
+    # instead over-shrinks by ~ΣE/N, often 1e4–1e5×, collapsing every α below
+    # edge_threshold → empty active set → ρ reads 0.) OFF by default → unchanged.
     l2_alpha = float(l2)
     if l2_normalize:
-        if use_dynamic:
-            if use_target_dynamic:
-                _exp_mass = float(e_coo_real[2].sum()) if e_coo_real is not None else 0.0
-            else:
-                _exp_mass = float(exposure_2d.sum())
-        else:
-            _exp_mass = float(exposure.sum())
-        l2_alpha = float(l2) * max(_exp_mass, 1.0)
+        _data_mass = float(N)
+        l2_alpha = float(l2) * max(_data_mass, 1.0)
         if config.verbose:
             print(
-                f"[mhp-feat] l2_normalize=ON: α-ridge λ·ΣE={l2_alpha:.4g} "
-                f"(λ={l2:g}, ΣE={_exp_mass:.4g}); μ-ridge stays λ={l2:g}",
+                f"[mhp-feat] l2_normalize=ON: α-ridge λ·N={l2_alpha:.4g} "
+                f"(λ={l2:g}, N={_data_mass:.4g}); μ-ridge stays λ={l2:g}",
                 flush=True,
             )
 
@@ -1904,7 +1901,7 @@ def fit_mhp_feature(
             kernel_names = list(feature_names)
             if use_dynamic:
                 kernel_names = kernel_names + list(dynamic_feature_names or [])
-            checkpoint_kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2)
+            checkpoint_kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2_alpha)
             checkpoint_mu_kernel = (
                 FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
                 if use_mu_features and best_w_mu is not None
@@ -1979,7 +1976,7 @@ def fit_mhp_feature(
     kernel_names = list(feature_names)
     if use_dynamic:
         kernel_names = kernel_names + list(dynamic_feature_names or [])
-    kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2)
+    kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2_alpha)
     mu_kernel = (
         FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
         if use_mu_features and best_w_mu is not None

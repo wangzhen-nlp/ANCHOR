@@ -113,10 +113,10 @@ class AlarmMHPConfig:
     # (inductive — generalizes to unseen pairs). feature mode needs the NE graph.
     edge_mode: str = "device"
     feature_l2: float = 1e-3                  # ridge on feature weights
-    feature_l2_normalize: bool = False        # scale the α ridge by exposure mass
-                                              # ΣE so feature_l2 is data-size-
-                                              # independent and actually bites
-                                              # (controls ρ); OFF = legacy raw ridge
+    feature_l2_normalize: bool = False        # scale the α ridge by event/data mass
+                                              # N (not raw exposure ΣE) so feature_l2
+                                              # is data-size-independent and actually
+                                              # bites (controls ρ); OFF = legacy raw ridge
     feature_topo_max_hops: int = 2            # candidate topology reach (feature mode)
     feature_topo_min_score: float = 0.0       # candidate topology score floor
     # Topology PRIOR for feature mode (device-parity): pseudo-count prior that
