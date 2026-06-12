@@ -122,6 +122,7 @@ def _build_config(args):
         topology_prior_min_score=args.topology_prior_min_score,
         edge_mode=args.edge_mode,
         feature_l2=args.feature_l2,
+        feature_l2_normalize=args.feature_l2_normalize,
         feature_topo_max_hops=args.feature_topo_max_hops,
         feature_topo_min_score=args.feature_topo_min_score,
         feature_topo_prior_boost=args.feature_topo_prior_boost,
@@ -142,6 +143,7 @@ def _build_config(args):
         bucket_edges_sec=_parse_bucket_edges(args.bucket_edges_sec),
         val_split=args.val_split,
         early_stop_patience=args.early_stop_patience,
+        selection_metric=args.selection_metric,
         regions=parse_regions(args.regions),
         min_group_events=args.min_group_events,
         seed=args.seed,
@@ -273,6 +275,13 @@ def main():
         help="Ridge penalty on feature weights (feature mode). Default: 1e-3.",
     )
     parser.add_argument(
+        "--feature-l2-normalize",
+        action="store_true",
+        help="Scale the α ridge by the exposure mass ΣE so --feature-l2 is "
+             "data-size-independent and actually controls ρ (λ≈0.01-0.1 bites). "
+             "OFF by default = legacy raw ridge (λ negligible at large scale).",
+    )
+    parser.add_argument(
         "--feature-topo-max-hops",
         type=int,
         default=2,
@@ -402,7 +411,20 @@ def main():
         "--early-stop-patience",
         type=int,
         default=5,
-        help="Patience iterations of no val LL improvement before early stop.",
+        help="Patience iterations of no val LL improvement before early stop "
+             "(only used with --selection-metric val).",
+    )
+    parser.add_argument(
+        "--selection-metric",
+        choices=("train", "val"),
+        default="train",
+        help=(
+            "Metric driving model selection + early stop. 'train' (default, "
+            "legacy): keep the train-LL-best weights, no val early stop; val LL "
+            "is still printed each iter when --val-split>0 (informational only, "
+            "model is bit-for-bit identical to a no-val run). 'val': select the "
+            "val-LL peak snapshot and early-stop when val LL plateaus."
+        ),
     )
     parser.add_argument(
         "--regions",

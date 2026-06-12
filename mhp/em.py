@@ -1342,6 +1342,7 @@ def fit_mhp_feature(
     init_mu: Optional[np.ndarray] = None,
     w_prior_mean: Optional[np.ndarray] = None,
     l2: float = 1e-3,
+    l2_normalize: bool = False,
     mu_phi: Optional[np.ndarray] = None,
     mu_feature_names: Optional[list] = None,
     cand_topo_score: Optional[np.ndarray] = None,
@@ -1605,6 +1606,29 @@ def fit_mhp_feature(
     converged = False
     prev_ll = -np.inf
 
+    # OPT-IN α-ridge normalization (l2_normalize). The α data term sums
+    # N_c·logα − E_c·α over millions of (candidate, combo) buckets, so its
+    # curvature scales with the exposure mass ΣE; an unscaled ridge λ·‖w‖² (a
+    # handful of weights) is negligible at any sane λ. Scaling by ΣE turns
+    # --feature-l2 into a data-size-independent shrinkage where λ≈0.01–0.1
+    # actually bites and controls ρ. OFF by default → unchanged behavior.
+    l2_alpha = float(l2)
+    if l2_normalize:
+        if use_dynamic:
+            if use_target_dynamic:
+                _exp_mass = float(e_coo_real[2].sum()) if e_coo_real is not None else 0.0
+            else:
+                _exp_mass = float(exposure_2d.sum())
+        else:
+            _exp_mass = float(exposure.sum())
+        l2_alpha = float(l2) * max(_exp_mass, 1.0)
+        if config.verbose:
+            print(
+                f"[mhp-feat] l2_normalize=ON: α-ridge λ·ΣE={l2_alpha:.4g} "
+                f"(λ={l2:g}, ΣE={_exp_mass:.4g}); μ-ridge stays λ={l2:g}",
+                flush=True,
+            )
+
     for it in range(config.max_iters):
         t_iter = time.monotonic()
         if use_dynamic:
@@ -1836,13 +1860,13 @@ def fit_mhp_feature(
                 )
                 w_new = fit_dynamic_weights_mstep_coo(
                     cand_phi, dynamic_combo_bits, n_coo, e_coo_fixed, w,
-                    l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
+                    l2=l2_alpha, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
                     progress=_mstep_progress,
                 )
             else:
                 w_new = fit_dynamic_weights_mstep(
                     cand_phi, dynamic_combo_bits, n2d, exposure_2d, w,
-                    l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
+                    l2=l2_alpha, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
                     progress=_mstep_progress,
                     n0_extra=dynamic_n0_extra,
                     e0_extra=dynamic_e0_extra,
@@ -1854,7 +1878,7 @@ def fit_mhp_feature(
             # statistics (no-op when prior_num/prior_exp are all zero).
             w_new = fit_weights_mstep(
                 cand_phi, n_resp + prior_num, exposure + prior_exp, w,
-                l2=l2, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX
+                l2=l2_alpha, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX
             )
             alpha_new = softplus(cand_phi @ w_new)
         if use_mu_features:
@@ -1902,7 +1926,7 @@ def fit_mhp_feature(
                 max_active_sources_per_dim=config.max_active_sources_per_dim,
                 beta_shared=True,
             )
-            best_callback(
+            _stop_signal = best_callback(
                 MHPResult(
                     params=checkpoint_params,
                     log_likelihood=best_ll,
@@ -1915,6 +1939,16 @@ def fit_mhp_feature(
                 ),
                 entry,
             )
+            if _stop_signal:
+                # best_callback (held-out LL tracker) asked to stop: val LL has
+                # plateaued. The val-optimal snapshot is already captured caller-
+                # side, so break here rather than burn iters overfitting train.
+                if config.verbose:
+                    print(
+                        f"[mhp-feat] early stop at iter {it} (held-out LL plateaued)",
+                        flush=True,
+                    )
+                break
         if config.verbose and n_chunks > 1:
             _iters_msg = f" ({_ms_last[0] + 1} inner iters)" if use_dynamic else ""
             print(

@@ -113,6 +113,10 @@ class AlarmMHPConfig:
     # (inductive — generalizes to unseen pairs). feature mode needs the NE graph.
     edge_mode: str = "device"
     feature_l2: float = 1e-3                  # ridge on feature weights
+    feature_l2_normalize: bool = False        # scale the α ridge by exposure mass
+                                              # ΣE so feature_l2 is data-size-
+                                              # independent and actually bites
+                                              # (controls ρ); OFF = legacy raw ridge
     feature_topo_max_hops: int = 2            # candidate topology reach (feature mode)
     feature_topo_min_score: float = 0.0       # candidate topology score floor
     # Topology PRIOR for feature mode (device-parity): pseudo-count prior that
@@ -146,6 +150,12 @@ class AlarmMHPConfig:
     # stopping if val LL stops improving for `early_stop_patience` iters).
     val_split: float = 0.0                   # 0.0 disables hold-out
     early_stop_patience: int = 5             # iterations of no val LL improvement
+    # Which metric drives model SELECTION + early stop: "train" (legacy — pick
+    # the train-LL-best weights, no val early stop; val LL is still printed each
+    # iter when val_split>0, purely informational) or "val" (pick the val-LL
+    # peak snapshot + early-stop when val LL plateaus). Default "train" keeps
+    # existing runs bit-for-bit reproducible.
+    selection_metric: str = "train"
     regions: tuple = ()
     min_group_events: int = 1
     seed: int = 0
@@ -236,6 +246,8 @@ class AlarmMHPConfig:
             raise ValueError("val_split must be in [0, 1)")
         if self.early_stop_patience < 1:
             raise ValueError("early_stop_patience must be >= 1")
+        if self.selection_metric not in ("train", "val"):
+            raise ValueError("selection_metric must be 'train' or 'val'")
         if self.min_group_events < 1:
             raise ValueError("min_group_events must be >= 1")
         del sequence_config
@@ -961,30 +973,31 @@ def train_alarm_mhp(
     mhp_config = config.mhp_config()
     mhp_config.verbose = verbose
 
-    # Track val LL for early stopping
+    # Live held-out val LL → model selection + early stop. EM ascends train LL
+    # monotonically, so best_callback fires ~every iter; we eval val LL on each
+    # such snapshot (one forward LL pass over the val tail, no M-step) and keep
+    # the snapshot at the val-LL peak. This makes the saved model the
+    # generalizing one instead of the most train-overfit one. With val_split=0
+    # the tracking is inert and behavior is unchanged (every train-best written).
     val_ll_history: list[float] = []
-    best_val_ll = -np.inf
-    best_val_iter = -1
-    early_stop_state = {"patience_left": config.early_stop_patience}
-
     val_trace: list[dict] = []
+    val_state = {
+        "best_val_ll": -np.inf,
+        "best_val_iter": -1,
+        "best_snapshot": None,     # MHPResult captured at the val-LL peak
+        "patience_left": int(config.early_stop_patience),
+    }
 
     def iter_callback(trace_entry: dict):
-        if val_events is None or val_events.n == 0:
-            return
-        # Cheaply reuse the dense alpha/beta we built in EM by recomputing
-        # via log_likelihood(). For 50k val events this is ~1 sec.
-        from mhp.em import log_likelihood as mhp_ll
-        # Build a transient sparse params from current best snapshot:
-        # We can't easily access the live dense matrix here, so this is an
-        # approximation — see TODO below for a tighter hook.
-        # For now we approximate val LL using the iteration's reported
-        # `active_edges` proxy and skip the actual eval. Future work: add a
-        # sweep callback that exposes the dense (α, β, μ) to compute val LL.
+        # Per-iter diagnostics trace. The held-out val LL itself is evaluated in
+        # write_best_checkpoint (the best_callback), which receives the
+        # materialized (α, β, μ) snapshot; here we record the train-side
+        # trajectory + ρ so the artifact carries the full per-iter history.
         val_trace.append({
             "iter": trace_entry["iter"],
             "active_edges": trace_entry["active_edges"],
             "log_likelihood_train": trace_entry["log_likelihood"],
+            "spectral_radius": trace_entry.get("spectral_radius"),
         })
 
     # Topology prior (optional): sparse extra prior mass on topologically
@@ -1022,62 +1035,121 @@ def train_alarm_mhp(
     feat_at_vocab = None
     feat_mu_spec = None
 
-    def write_best_checkpoint(best_result: MHPResult, trace_entry: dict):
-        if not best_checkpoint_path:
-            return
-        metadata = {
-            "checkpoint": True,
-            "checkpoint_kind": "best_train_log_likelihood",
-            "checkpoint_iter": int(trace_entry.get("iter", best_result.iterations_run - 1)),
-            "checkpoint_metric": "train_log_likelihood",
-            "considered_event_count": considered_event_count,
-            "region_filter": region_filter_stats,
-            "sequence_stats": sequence_stats,
-            "modeled_event_count": train_events.n + (val_events.n if val_events else 0),
-            "train_event_count": train_events.n,
-            "val_event_count": (val_events.n if val_events else 0),
-            "type_count": M,
-            "active_edge_count": len(best_result.params.edge_alpha),
-            "spectral_radius": (
-                float(best_result.params.spectral_radius())
-                if len(best_result.params.edge_alpha) else None
-            ),
-            "stability_radius": float(config.stability_radius),
-            "run_args": dict(run_args) if run_args else None,
-            "best_log_likelihood": float(best_result.log_likelihood),
-            "best_val_log_likelihood": None,
-            "iterations_run": int(best_result.iterations_run),
-            "converged": False,
-            "type_labels": list(vocabs.type_vocab.labels),
-            "time_slack_sec": float(config.time_slack_sec),
-            "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
-            "feature_kernel": (
-                best_result.feature_kernel.to_dict()
-                if best_result.feature_kernel is not None else None
-            ),
-            "feature_runtime": (
-                _build_feature_runtime(best_result, vocabs, config, feat_at_vocab, feat_mu_spec)
-                if config.edge_mode == "feature"
-                else None
-            ),
-            "val_trace": list(val_trace),
-        }
-        artifact = AlarmMHPArtifact(
-            params=best_result.params,
-            vocabs=vocabs,
-            config=config,
-            training_metadata=metadata,
-            trace=best_result.trace,
-        )
-        tmp_path = f"{best_checkpoint_path}.tmp"
-        save_alarm_mhp_artifact(tmp_path, artifact)
-        os.replace(tmp_path, best_checkpoint_path)
-        if verbose:
+    def write_best_checkpoint(best_result: MHPResult, trace_entry: dict) -> bool:
+        # Called by EM whenever train LL hits a new best (≈ every iter, since EM
+        # ascends monotonically). Returns True to request early stop (val LL has
+        # plateaued); the feature-mode loop honors this signal.
+        use_val = val_events is not None and val_events.n > 0
+        # Whether the held-out metric drives selection/early-stop, vs. just being
+        # printed. "train" (default) → legacy: every train-best is the new best,
+        # no early stop; val LL is computed only for the log line.
+        select_on_val = use_val and config.selection_metric == "val"
+        val_ll = None
+        improved = True               # train metric → every train-best "improves"
+        if use_val:
+            from mhp.em import log_likelihood as mhp_ll
+            val_ll = float(mhp_ll(val_events, best_result.params, config=mhp_config))
+            val_ll_history.append(val_ll)
+        if select_on_val:
+            prev_best = val_state["best_val_ll"]
+            improved = val_ll > prev_best + 1e-6 * abs(prev_best)
+            if improved:
+                val_state["best_val_ll"] = val_ll
+                val_state["best_val_iter"] = int(trace_entry.get("iter", -1))
+                val_state["best_snapshot"] = best_result
+                val_state["patience_left"] = int(config.early_stop_patience)
+            else:
+                val_state["patience_left"] -= 1
+        if use_val and verbose:
+            _it = int(trace_entry.get("iter", -1))
+            _rho = trace_entry.get("spectral_radius")
+            _rho_s = f" ρ={_rho:.3f}" if _rho is not None else ""
+            if select_on_val:
+                _flag = ("↑best" if improved
+                         else f"no-improve (patience {max(val_state['patience_left'], 0)})")
+            else:
+                _flag = "(train-selected)"
             print(
-                f"[train] best checkpoint updated: {best_checkpoint_path} "
-                f"(iter={metadata['checkpoint_iter']}, ll={best_result.log_likelihood:.2f})",
+                f"[train]   iter={_it:3d} val_ll={val_ll:.2f}{_rho_s} "
+                f"(train_ll={best_result.log_likelihood:.2f}) {_flag}",
                 flush=True,
             )
+
+        # File checkpoint: when selecting on val, persist only the val-improving
+        # snapshot (don't overwrite a generalizing model with a later overfit
+        # one). Otherwise persist every train-best (legacy behavior).
+        if best_checkpoint_path and improved:
+            metadata = {
+                "checkpoint": True,
+                "checkpoint_kind": (
+                    "best_val_log_likelihood" if select_on_val else "best_train_log_likelihood"
+                ),
+                "checkpoint_iter": int(trace_entry.get("iter", best_result.iterations_run - 1)),
+                "checkpoint_metric": (
+                    "val_log_likelihood" if select_on_val else "train_log_likelihood"
+                ),
+                "considered_event_count": considered_event_count,
+                "region_filter": region_filter_stats,
+                "sequence_stats": sequence_stats,
+                "modeled_event_count": train_events.n + (val_events.n if val_events else 0),
+                "train_event_count": train_events.n,
+                "val_event_count": (val_events.n if val_events else 0),
+                "type_count": M,
+                "active_edge_count": len(best_result.params.edge_alpha),
+                "spectral_radius": (
+                    float(best_result.params.spectral_radius())
+                    if len(best_result.params.edge_alpha) else None
+                ),
+                "stability_radius": float(config.stability_radius),
+                "run_args": dict(run_args) if run_args else None,
+                "best_log_likelihood": float(best_result.log_likelihood),
+                "best_val_log_likelihood": val_ll,
+                "iterations_run": int(best_result.iterations_run),
+                "converged": False,
+                "type_labels": list(vocabs.type_vocab.labels),
+                "time_slack_sec": float(config.time_slack_sec),
+                "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
+                "feature_kernel": (
+                    best_result.feature_kernel.to_dict()
+                    if best_result.feature_kernel is not None else None
+                ),
+                "feature_runtime": (
+                    _build_feature_runtime(best_result, vocabs, config, feat_at_vocab, feat_mu_spec)
+                    if config.edge_mode == "feature"
+                    else None
+                ),
+                "val_trace": list(val_trace),
+            }
+            artifact = AlarmMHPArtifact(
+                params=best_result.params,
+                vocabs=vocabs,
+                config=config,
+                training_metadata=metadata,
+                trace=best_result.trace,
+            )
+            tmp_path = f"{best_checkpoint_path}.tmp"
+            save_alarm_mhp_artifact(tmp_path, artifact)
+            os.replace(tmp_path, best_checkpoint_path)
+            if verbose:
+                _vl = f", val_ll={val_ll:.2f}" if use_val else ""
+                print(
+                    f"[train] best checkpoint updated: {best_checkpoint_path} "
+                    f"(iter={metadata['checkpoint_iter']}, ll={best_result.log_likelihood:.2f}{_vl})",
+                    flush=True,
+                )
+
+        # Early stop: only when selecting on val and val LL has not improved for
+        # `early_stop_patience` snapshots. Train selection never early-stops.
+        if select_on_val and val_state["patience_left"] <= 0:
+            if verbose:
+                print(
+                    f"[train]   val LL plateaued → early stop "
+                    f"(best val_ll={val_state['best_val_ll']:.2f} "
+                    f"@ iter {val_state['best_val_iter']})",
+                    flush=True,
+                )
+            return True
+        return False
 
     if config.edge_mode == "feature":
         # Feature-weighted α = softplus(w·φ) over device-agnostic pair features.
@@ -1197,6 +1269,7 @@ def train_alarm_mhp(
             cand_phi=phi,
             feature_names=feat_names,
             l2=config.feature_l2,
+            l2_normalize=config.feature_l2_normalize,
             mu_phi=mu_phi,                       # inductive parameterized μ
             mu_feature_names=mu_spec.feature_names,
             cand_topo_score=cand_topo_score,     # topology pseudo-count prior
@@ -1262,8 +1335,31 @@ def train_alarm_mhp(
 
     final_val_ll: Optional[float] = None
     if val_events is not None and val_events.n > 0:
-        from mhp.em import log_likelihood as mhp_ll
-        final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
+        # Prefer the val-LL-optimal snapshot (captured live during EM) over the
+        # final train-LL-optimal weights — that is the whole point of holding out
+        # data. Keep the completed run's trace/iteration/converged fields for the
+        # report; swap in the generalizing params/kernels.
+        snap = val_state["best_snapshot"]
+        if snap is not None and snap is not result:
+            result = replace(
+                result,
+                params=snap.params,
+                log_likelihood=snap.log_likelihood,
+                p_self=snap.p_self,
+                feature_kernel=snap.feature_kernel,
+                mu_kernel=snap.mu_kernel,
+            )
+            final_val_ll = float(val_state["best_val_ll"])
+            if verbose:
+                print(
+                    f"[train] selected val-best snapshot from iter "
+                    f"{val_state['best_val_iter']}: val_ll={final_val_ll:.2f} "
+                    f"(train_ll={result.log_likelihood:.2f})",
+                    flush=True,
+                )
+        else:
+            from mhp.em import log_likelihood as mhp_ll
+            final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
         if verbose:
             print(
                 f"[train] held-out val LL on last {val_events.n} events: {final_val_ll:.2f} "
