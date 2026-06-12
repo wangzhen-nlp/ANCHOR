@@ -17,6 +17,7 @@ import io
 import zipfile
 import argparse
 from collections import defaultdict
+from datetime import datetime
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
@@ -36,37 +37,28 @@ from topology_resources import (
 PROGRESS_ROW_STEP = 5000
 
 
-def _merge_fields_preserve_first(existing: dict, incoming: dict, entity_label: str, entity_id: str, source_label: str) -> dict:
-    """按字段合并记录；冲突时优先保留字符更长的非空值。"""
-    merged = dict(existing)
-    for field, incoming_value in incoming.items():
-        if incoming_value in ("", None):
-            continue
-
-        existing_value = merged.get(field, "")
-        if existing_value in ("", None):
-            merged[field] = incoming_value
-            continue
-
-        if existing_value != incoming_value:
-            if len(str(incoming_value)) > len(str(existing_value)):
-                merged[field] = incoming_value
-    return merged
+LAST_MODIFIED_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
 
-def _merge_scalar_preserve_first(mapping: dict, key: str, value: str, entity_label: str, field_name: str, source_label: str) -> None:
-    """合并单字段映射；冲突时优先保留字符更长的非空值。"""
-    if not key or value in ("", None):
-        return
+def _require_last_modified(record: dict, row_number: int, source: str) -> datetime:
+    """校验并解析 last_Modified（形如 2025-09-19 12:33:33.325）；缺失或格式不符直接报错退出。"""
+    raw = (record.get('last_Modified') or '').strip()
+    if not raw:
+        raise SystemExit(f"{source} 第 {row_number} 行缺少 last_Modified 字段: {record}")
+    try:
+        return datetime.strptime(raw, LAST_MODIFIED_FORMAT)
+    except ValueError:
+        raise SystemExit(
+            f"{source} 第 {row_number} 行 last_Modified 格式错误: {raw!r}"
+            f"（要求形如 2025-09-19 12:33:33.325）"
+        )
 
-    existing_value = mapping.get(key, "")
-    if existing_value in ("", None):
-        mapping[key] = value
-        return
 
-    if existing_value != value:
-        if len(str(value)) > len(str(existing_value)):
-            mapping[key] = value
+def _keep_latest(records: dict, key: str, last_modified: datetime, payload) -> None:
+    """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。"""
+    existing = records.get(key)
+    if existing is None or last_modified > existing[0]:
+        records[key] = (last_modified, payload)
 
 
 def _parse_bool(value) -> bool:
@@ -76,12 +68,12 @@ def _parse_bool(value) -> bool:
 
 def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
     """
-    从SYS_NE_0306中加载nativeId -> ne_site_id的映射
+    从SYS_NE中加载nativeId -> ne_site_id的映射；同 nativeId 按 last_Modified 取最新记录
 
     Returns:
         {nativeId: ne_site_id}
     """
-    mapping = {}
+    records = {}
 
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
@@ -89,31 +81,28 @@ def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
+        last_modified = _require_last_modified(row, row_count, 'SYS_NE')
         nativeId = (row.get('nativeId') or '').strip().upper()
         ne_site_id = (row.get('ne_site_id') or '').strip().upper()
-        _merge_scalar_preserve_first(
-            mapping,
-            nativeId,
-            ne_site_id,
-            entity_label="NE",
-            field_name="ne_site_id",
-            source_label=data_dir,
-        )
+        if not (nativeId and ne_site_id):
+            continue
+        _keep_latest(records, nativeId, last_modified, ne_site_id)
     progress.set(row_count)
     progress.close()
 
-    print(f"  共 {len(mapping)} 条映射")
+    mapping = {key: payload for key, (_, payload) in records.items()}
+    print(f"  读取 {row_count} 行，去重后 {len(mapping)} 条映射")
     return mapping
 
 
 def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
     """
-    从SYS_SITE_0306中加载站点信息
+    从SYS_SITE中加载站点信息；同 site_id 按 last_Modified 取最新记录，不做字段合并
 
     Returns:
         {site_id: {longitude, latitude, site_type, region_id, is_hub}}
     """
-    site_info = {}
+    records = {}
 
     progress = ProgressBar(0, "  读取站点记录")
     row_count = 0
@@ -121,6 +110,7 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
+        last_modified = _require_last_modified(row, row_count, 'SYS_SITE')
         site_id = (row.get('site_id') or '').strip().upper()
         if not site_id:
             continue
@@ -132,17 +122,12 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
             'region_id': (row.get('region_id') or '').strip(),
             'is_hub': _parse_bool(row.get('is_hub', '')),
         }
-        site_info[site_id] = _merge_fields_preserve_first(
-            site_info.get(site_id, {}),
-            incoming,
-            entity_label="SITE",
-            entity_id=site_id,
-            source_label=data_dir,
-        )
+        _keep_latest(records, site_id, last_modified, incoming)
     progress.set(row_count)
     progress.close()
 
-    print(f"  共 {len(site_info)} 个站点")
+    site_info = {key: payload for key, (_, payload) in records.items()}
+    print(f"  读取 {row_count} 行，去重后 {len(site_info)} 个站点")
     return site_info
 
 
@@ -220,6 +205,42 @@ def iter_link_records(link_input: str, progress: ProgressBar = None):
         yield from _iter_link_file(link_input)
 
 
+# 链路记录的去重键字段，按优先级取第一个非空值
+LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
+
+
+def load_latest_link_records(link_input: str) -> list:
+    """读取链路记录并按 last_Modified 去重：同一链路 ID 只保留最新记录。
+
+    无法确定链路 ID 的记录不参与去重，原样保留。
+    """
+    records = {}
+    no_key_records = []
+
+    progress = ProgressBar(0, "  读取链路记录")
+    row_count = 0
+    for record in iter_link_records(link_input, progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        last_modified = _require_last_modified(record, row_count, '链路输入')
+        key = ''
+        for field in LINK_KEY_FIELDS:
+            key = (record.get(field) or '').strip()
+            if key:
+                break
+        if not key:
+            no_key_records.append(record)
+            continue
+        _keep_latest(records, key, last_modified, record)
+    progress.set(row_count)
+    progress.close()
+
+    latest_records = [payload for _, payload in records.values()] + no_key_records
+    print(f"  读取 {row_count} 行，去重后 {len(latest_records)} 条链路记录")
+    return latest_records
+
+
 def build_site_graph(link_input: str, ne_site_map: dict) -> dict:
     """
     根据链路信息生成站点邻接图
@@ -239,13 +260,8 @@ def build_site_graph(link_input: str, ne_site_map: dict) -> dict:
 
     link_count = 0
     mapped_count = 0
-    record_count = 0
 
-    progress = ProgressBar(0, "  读取链路记录")
-    for record in iter_link_records(link_input, progress):
-        record_count += 1
-        if record_count % PROGRESS_ROW_STEP == 0:
-            progress.set(record_count)
+    for record in load_latest_link_records(link_input):
         a_ne = (record.get('a_end_ne_nativeId') or '').strip().upper()
         z_ne = (record.get('z_end_ne_nativeId') or '').strip().upper()
         a_ne = a_ne or (record.get("a_end_ne_nativeId(')") or '').strip().upper()
@@ -274,8 +290,6 @@ def build_site_graph(link_input: str, ne_site_map: dict) -> dict:
                 site_links[z_site][a_site][link_type] = '<->'
         else:
             site_links[z_site][a_site][link_type] = '<-'
-    progress.set(record_count)
-    progress.close()
 
     print(f"  处理 {link_count} 条链路")
     print(f"  成功映射 {mapped_count} 条")

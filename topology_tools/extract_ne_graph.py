@@ -30,37 +30,21 @@ from topology_resources import (
 )
 from topology_tools.extract_site_graph import (
     PROGRESS_ROW_STEP,
+    _keep_latest,
+    _require_last_modified,
     iter_csv_dir_records,
-    iter_link_records,
+    load_latest_link_records,
 )
-
-
-def _merge_fields_preserve_first(existing: dict, incoming: dict, entity_label: str, entity_id: str, source_label: str) -> dict:
-    """按字段合并记录；冲突时优先保留字符更长的非空值。"""
-    merged = dict(existing)
-    for field, incoming_value in incoming.items():
-        if incoming_value in ("", None):
-            continue
-
-        existing_value = merged.get(field, "")
-        if existing_value in ("", None):
-            merged[field] = incoming_value
-            continue
-
-        if existing_value != incoming_value:
-            if len(str(incoming_value)) > len(str(existing_value)):
-                merged[field] = incoming_value
-    return merged
 
 
 def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
     """
-    从SYS_NE_0306加载NE信息
+    从SYS_NE加载NE信息；同 nativeId 按 last_Modified 取最新记录，不做字段合并
 
     Returns:
         {nativeId: {domain, name, manufacturer, region_id, site_id, ...}}
     """
-    ne_info = {}
+    records = {}
 
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
@@ -68,6 +52,7 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
+        last_modified = _require_last_modified(row, row_count, 'SYS_NE')
         nativeId = (row.get('nativeId') or '').strip().upper()
         if not nativeId:
             continue
@@ -81,16 +66,12 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
             'site_id': (row.get('ne_site_id') or '').strip().upper(),
             'running_status': (row.get('running_status') or '').strip()
         }
-        ne_info[nativeId] = _merge_fields_preserve_first(
-            ne_info.get(nativeId, {}),
-            incoming,
-            entity_label="NE",
-            entity_id=nativeId,
-            source_label=data_dir,
-        )
+        _keep_latest(records, nativeId, last_modified, incoming)
     progress.set(row_count)
     progress.close()
 
+    ne_info = {key: payload for key, (_, payload) in records.items()}
+    print(f"  读取 {row_count} 行，去重后 {len(ne_info)} 个NE")
     return ne_info
 
 
@@ -143,13 +124,8 @@ def build_ne_graph(link_input: str) -> dict:
 
     link_count = 0
     mapped_count = 0
-    record_count = 0
 
-    progress = ProgressBar(0, "  读取链路记录")
-    for record in iter_link_records(link_input, progress):
-        record_count += 1
-        if record_count % PROGRESS_ROW_STEP == 0:
-            progress.set(record_count)
+    for record in load_latest_link_records(link_input):
         a_ne = (record.get('a_end_ne_nativeId') or '').strip().upper()
         z_ne = (record.get('z_end_ne_nativeId') or '').strip().upper()
         a_ne = a_ne or (record.get("a_end_ne_nativeId(')") or '').strip().upper()
@@ -172,8 +148,6 @@ def build_ne_graph(link_input: str) -> dict:
                 ne_links[z_ne][a_ne][link_type] = '<->'
         else:
             ne_links[z_ne][a_ne][link_type] = '<-'
-    progress.set(record_count)
-    progress.close()
 
     print(f"  处理 {link_count} 条链路")
     print(f"  成功映射 {mapped_count} 条")
