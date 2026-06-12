@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from dataclasses import replace as _replace
+from datetime import datetime
 import json
 import os
 import sys
@@ -842,6 +843,282 @@ def _write_jsonl(path, records):
     return count
 
 
+def _default_visual_metrics_output(visual_output_path: str) -> str:
+    return f"{visual_output_path}.metrics.json"
+
+
+def _default_baseline_visual_output(visual_output_path: str) -> str:
+    if visual_output_path.endswith(".jsonl"):
+        return f"{visual_output_path[:-6]}.baseline.jsonl"
+    return f"{visual_output_path}.baseline.jsonl"
+
+
+def _is_disabled_path(path) -> bool:
+    return str(path or "").strip().lower() in {"", "0", "false", "none", "off"}
+
+
+def _compact_visual_metrics(metrics, metrics_output_path: str = ""):
+    if not metrics:
+        return None
+    compact = {
+        "metrics_output": metrics_output_path or "",
+        "health": metrics.get("health") or {},
+        "overall": metrics.get("overall") or {},
+        "topology": metrics.get("topology") or {},
+        "risk_flags": metrics.get("risk_flags") or {},
+    }
+    distributions = metrics.get("distributions") or {}
+    for key in ("duration_sec", "event_count", "real_event_count", "virtual_event_count"):
+        if key in distributions:
+            compact.setdefault("distributions", {})[key] = distributions[key]
+    return compact
+
+
+def _print_visual_health_summary(metrics, *, label: str = "visual"):
+    health = (metrics or {}).get("health") or {}
+    if not health:
+        return
+    components = health.get("components") or {}
+    print(
+        f"[stream] {label} health={float(health.get('grouping_health_score', 0.0)):.1f}/100 "
+        f"(topology={float(components.get('topology_explainability', 0.0)):.1f}, "
+        f"time={float(components.get('time_compactness', 0.0)):.1f}, "
+        f"size={float(components.get('size_reasonableness', 0.0)):.1f}, "
+        f"singleton={float(components.get('singleton_control', 0.0)):.1f}, "
+        f"virtual={float(components.get('virtual_reasonableness', 0.0)):.1f}, "
+        f"risk={float(components.get('risk_cleanliness', 0.0)):.1f})",
+        flush=True,
+    )
+
+
+def _compute_visual_metrics_if_available(args, *, visual_count: int, quiet: bool = False):
+    if not args.visual_output or visual_count <= 0:
+        return None, ""
+    if args.visual_metrics_output is not None and _is_disabled_path(args.visual_metrics_output):
+        return None, ""
+
+    metrics_output = (
+        _default_visual_metrics_output(args.visual_output)
+        if args.visual_metrics_output is None
+        else str(args.visual_metrics_output)
+    )
+
+    if not quiet:
+        print("[stream] computing visual grouping metrics ...", flush=True)
+    from fault_grouping.tools.analyze_visual_group_metrics import analyze
+
+    metrics = analyze(
+        args.visual_output,
+        ne_graph_path=args.ne_graph,
+        site_graph_path=args.site_graph,
+        topo_max_hops=args.visual_metrics_topo_max_hops,
+        max_pairwise_ne=args.visual_metrics_max_pairwise_ne,
+        risk_duration_sec=args.visual_metrics_risk_duration_sec,
+        risk_site_count=args.visual_metrics_risk_site_count,
+        risk_unknown_pair_ratio=args.visual_metrics_risk_unknown_pair_ratio,
+        health_target_duration_sec=args.health_target_duration_sec,
+        health_target_virtual_ratio=args.health_target_virtual_ratio,
+        health_target_size_p50=args.health_target_size_p50,
+        health_target_size_p90=args.health_target_size_p90,
+        health_target_size_p99=args.health_target_size_p99,
+        include_details=not args.visual_metrics_no_detail,
+    )
+    if metrics_output:
+        _write_json(metrics_output, metrics)
+    if not quiet:
+        _print_visual_health_summary(metrics)
+        if metrics_output:
+            print(f"visual metrics written to: {metrics_output}", flush=True)
+    return metrics, metrics_output
+
+
+def _first_text(mapping, keys):
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return text
+    return ""
+
+
+def _parse_alarm_time(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts if ts > 0 else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        ts = float(text)
+        return ts if ts > 0 else None
+    except ValueError:
+        pass
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(text[:26], fmt).timestamp()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _alarm_group_ids(alarm, group_field):
+    from ticket_recall.evaluation.recall_common import _parse_group_ids
+
+    return _parse_group_ids(alarm.get(group_field))
+
+
+def _alarm_to_baseline_symptom(alarm, group_field):
+    ts = (
+        _parse_alarm_time(alarm.get("ts"))
+        or _parse_alarm_time(alarm.get("timestamp"))
+        or _parse_alarm_time(alarm.get("告警首次发生时间"))
+        or _parse_alarm_time(alarm.get("alarm_time"))
+        or _parse_alarm_time(alarm.get("first_occurrence_time"))
+    )
+    return {
+        "node": _first_text(alarm, ("site_id", "node", "站点ID", "site", "site_id_raw")),
+        "site_id": _first_text(alarm, ("site_id", "node", "站点ID", "site", "site_id_raw")),
+        "alarm_source": _first_text(alarm, ("alarm_source", "告警源", "source_ne", "ne", "ne_id")),
+        "alarm": _first_text(alarm, ("alarm_title", "alarm", "告警标题", "title")),
+        "alarm_type": _first_text(alarm, ("alarm_type", "alarm_title", "告警标题", "alarm", "title")),
+        "ts": ts,
+        "eid": _first_text(alarm, ("eid", "event_id", "告警编码ID", "alarm_id")),
+        "matched_role": "baseline_alarm_group",
+        "matched_rule": "alarm_group_baseline",
+        "工单号": _first_text(alarm, ("工单号", "ticket_id")),
+        "故障组ID": _first_text(alarm, (group_field, "故障组ID")),
+        "告警清除时间": _first_text(alarm, ("告警清除时间", "clear_time")),
+        "virtual": False,
+    }
+
+
+def _build_baseline_visual_records(alarm_events, *, group_field: str, min_group_events: int = 1):
+    grouped = {}
+    for alarm in alarm_events:
+        for group_id in _alarm_group_ids(alarm, group_field):
+            grouped.setdefault(str(group_id), []).append(alarm)
+
+    records = []
+    min_group_events = max(1, int(min_group_events or 1))
+    for group_id, alarms in grouped.items():
+        if len(alarms) < min_group_events:
+            continue
+        symptoms = [_alarm_to_baseline_symptom(alarm, group_field) for alarm in alarms]
+        symptoms.sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
+        timestamps = [s.get("ts") for s in symptoms if s.get("ts") is not None]
+        group_uuid = f"alarm-baseline-{group_id}"
+        records.append(
+            {
+                "uuid": group_uuid,
+                "group_id": group_uuid,
+                "rule": "alarm_group_baseline",
+                "source_group_id": group_id,
+                "event_count": len(symptoms),
+                "start_ts": min(timestamps) if timestamps else None,
+                "end_ts": max(timestamps) if timestamps else None,
+                "duration_sec": (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0,
+                "site_list": sorted({s.get("site_id", "") for s in symptoms if s.get("site_id", "")}),
+                "alarm_source_list": sorted({s.get("alarm_source", "") for s in symptoms if s.get("alarm_source", "")}),
+                "alarm_type_counts": dict(Counter(s.get("alarm_type", "") for s in symptoms if s.get("alarm_type", ""))),
+                "symptoms": symptoms,
+                "match_info": {
+                    "uuid": group_uuid,
+                    "rule": "alarm_group_baseline",
+                    "source_group_id": group_id,
+                    "related_group_uuids": [],
+                },
+            }
+        )
+    records.sort(
+        key=lambda r: (
+            r.get("start_ts") is None,
+            r.get("start_ts") or float("inf"),
+            str(r.get("source_group_id", "")),
+        )
+    )
+    return records
+
+
+def _compute_baseline_metrics_if_requested(args, alarm_events, *, quiet: bool = False):
+    group_field = str(args.baseline_group_field or "").strip()
+    if not group_field:
+        return None, "", 0, ""
+
+    baseline_output = (
+        _default_baseline_visual_output(args.visual_output)
+        if args.baseline_output is None
+        else str(args.baseline_output)
+    )
+    if _is_disabled_path(baseline_output):
+        return None, "", 0, ""
+
+    records = _build_baseline_visual_records(
+        alarm_events,
+        group_field=group_field,
+        min_group_events=args.baseline_min_group_events,
+    )
+    if not records:
+        if not quiet:
+            print(
+                f"[stream] baseline: no alarm groups found with field '{group_field}'",
+                flush=True,
+            )
+        return None, "", 0, ""
+
+    count = _write_jsonl(baseline_output, records)
+    if not quiet:
+        print(
+            f"baseline visual groups written to: {baseline_output}; groups={count}",
+            flush=True,
+        )
+
+    metrics_output = (
+        f"{baseline_output}.metrics.json"
+        if args.baseline_metrics_output is None
+        else str(args.baseline_metrics_output)
+    )
+    if _is_disabled_path(metrics_output):
+        return None, "", count, baseline_output
+
+    from fault_grouping.tools.analyze_visual_group_metrics import analyze
+
+    if not quiet:
+        print("[stream] computing baseline alarm-group metrics ...", flush=True)
+    metrics = analyze(
+        baseline_output,
+        ne_graph_path=args.ne_graph,
+        site_graph_path=args.site_graph,
+        topo_max_hops=args.visual_metrics_topo_max_hops,
+        max_pairwise_ne=args.visual_metrics_max_pairwise_ne,
+        risk_duration_sec=args.visual_metrics_risk_duration_sec,
+        risk_site_count=args.visual_metrics_risk_site_count,
+        risk_unknown_pair_ratio=args.visual_metrics_risk_unknown_pair_ratio,
+        health_target_duration_sec=args.health_target_duration_sec,
+        health_target_virtual_ratio=args.health_target_virtual_ratio,
+        health_target_size_p50=args.health_target_size_p50,
+        health_target_size_p90=args.health_target_size_p90,
+        health_target_size_p99=args.health_target_size_p99,
+        include_details=not args.visual_metrics_no_detail,
+    )
+    _write_json(metrics_output, metrics)
+    if not quiet:
+        _print_visual_health_summary(metrics, label="baseline alarm-group")
+        print(f"baseline metrics written to: {metrics_output}", flush=True)
+    return metrics, metrics_output, count, baseline_output
+
+
 # --------------------------------------------------------------------------
 # Cascade size diagnostic (mirrors training output)
 # --------------------------------------------------------------------------
@@ -1161,6 +1438,114 @@ def main():
         ),
     )
     parser.add_argument(
+        "--visual-metrics-output",
+        default=None,
+        help=(
+            "JSON output for label-free visual grouping health metrics. Default: "
+            "<visual-output>.metrics.json. Use 'none' to disable visual metrics."
+        ),
+    )
+    parser.add_argument(
+        "--visual-metrics-topo-max-hops",
+        type=int,
+        default=3,
+        help="Max NE topology hops used by visual metrics. Default: 3.",
+    )
+    parser.add_argument(
+        "--visual-metrics-max-pairwise-ne",
+        type=int,
+        default=200,
+        help=(
+            "Skip all-pair topology cohesion for groups with more than this many "
+            "NEs. Default: 200."
+        ),
+    )
+    parser.add_argument(
+        "--visual-metrics-risk-duration-sec",
+        type=float,
+        default=2 * 3600.0,
+        help="Risk flag threshold for long-duration groups. Default: 7200.",
+    )
+    parser.add_argument(
+        "--visual-metrics-risk-site-count",
+        type=int,
+        default=10,
+        help="Risk flag threshold for groups spanning many sites. Default: 10.",
+    )
+    parser.add_argument(
+        "--visual-metrics-risk-unknown-pair-ratio",
+        type=float,
+        default=0.5,
+        help="Risk flag threshold for unknown topology pair ratio. Default: 0.5.",
+    )
+    parser.add_argument(
+        "--health-target-duration-sec",
+        type=float,
+        default=3600.0,
+        help="Healthy p90 group duration target for the visual health score. Default: 3600.",
+    )
+    parser.add_argument(
+        "--health-target-virtual-ratio",
+        type=float,
+        default=0.2,
+        help="Healthy virtual-event ratio target for the visual health score. Default: 0.2.",
+    )
+    parser.add_argument(
+        "--health-target-size-p50",
+        type=float,
+        default=2.0,
+        help="Healthy p50 real-event group size target. Default: 2.",
+    )
+    parser.add_argument(
+        "--health-target-size-p90",
+        type=float,
+        default=20.0,
+        help="Healthy p90 real-event group size target. Default: 20.",
+    )
+    parser.add_argument(
+        "--health-target-size-p99",
+        type=float,
+        default=100.0,
+        help="Healthy p99 real-event group size target. Default: 100.",
+    )
+    parser.add_argument(
+        "--visual-metrics-no-detail",
+        action="store_true",
+        help="Do not include per-group detail in the visual metrics JSON.",
+    )
+    parser.add_argument(
+        "--baseline-group-field",
+        default="",
+        help=(
+            "Evaluate a baseline formed by the alarms' own group id field, "
+            "for example '故障组ID'. Empty string disables this baseline."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-output",
+        default=None,
+        help=(
+            "Visual-like JSONL for the alarm-group baseline. Default when "
+            "--baseline-group-field is set: <visual-output>.baseline.jsonl. "
+            "Use 'none' to disable baseline output and metrics."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-metrics-output",
+        default=None,
+        help=(
+            "Metrics JSON for the alarm-group baseline. Default: "
+            "<baseline-output>.metrics.json. Use 'none' to only write the "
+            "baseline visual JSONL."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-min-group-events",
+        type=int,
+        default=1,
+        help="Drop baseline alarm groups smaller than this. Default: 1.",
+    )
+    parser.add_argument(
         "--topo",
         default=SITE_GRAPH_BY_NE_JSON,
         help=f"Site topology for raw alarm inputs. Default: {resource_display('site_graph_by_ne.json')}.",
@@ -1355,6 +1740,24 @@ def main():
         parser.error("--visual-snapshot-age-sec must be >= 0")
     if args.visual_snapshot_check_interval_sec is not None and args.visual_snapshot_check_interval_sec < 0:
         parser.error("--visual-snapshot-check-interval-sec must be >= 0")
+    if args.visual_metrics_topo_max_hops < 1:
+        parser.error("--visual-metrics-topo-max-hops must be >= 1")
+    if args.visual_metrics_max_pairwise_ne < 2:
+        parser.error("--visual-metrics-max-pairwise-ne must be >= 2")
+    if args.visual_metrics_risk_duration_sec < 0:
+        parser.error("--visual-metrics-risk-duration-sec must be >= 0")
+    if args.visual_metrics_risk_site_count < 0:
+        parser.error("--visual-metrics-risk-site-count must be >= 0")
+    if args.visual_metrics_risk_unknown_pair_ratio < 0:
+        parser.error("--visual-metrics-risk-unknown-pair-ratio must be >= 0")
+    if args.health_target_duration_sec <= 0:
+        parser.error("--health-target-duration-sec must be > 0")
+    if args.health_target_virtual_ratio <= 0:
+        parser.error("--health-target-virtual-ratio must be > 0")
+    if args.health_target_size_p50 <= 0 or args.health_target_size_p90 <= 0 or args.health_target_size_p99 <= 0:
+        parser.error("--health-target-size-p50/p90/p99 must be > 0")
+    if args.baseline_min_group_events < 1:
+        parser.error("--baseline-min-group-events must be >= 1")
     try:
         topology_relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
     except ValueError as exc:
@@ -1461,6 +1864,7 @@ def main():
             if visual_output is not None:
                 visual_output.close()
         elapsed = time.monotonic() - t_imp_start
+        visual_count = visual_output.emitted_count if visual_output is not None else 0
         if not args.quiet:
             print(
                 f"[stream] impute done: groups={len(groups)}, "
@@ -1468,6 +1872,21 @@ def main():
                 f"processed={impute_stats['processed']}, elapsed={elapsed:.1f}s",
                 flush=True,
             )
+        visual_metrics, visual_metrics_output = _compute_visual_metrics_if_available(
+            args,
+            visual_count=visual_count,
+            quiet=args.quiet,
+        )
+        (
+            baseline_metrics,
+            baseline_metrics_output,
+            baseline_visual_count,
+            baseline_visual_output,
+        ) = _compute_baseline_metrics_if_requested(
+            args,
+            alarm_events,
+            quiet=args.quiet,
+        )
         metadata = {
             "algorithm": "alarm_flow_mhp.stream+impute",
             "model": os.path.abspath(args.model),
@@ -1495,11 +1914,17 @@ def main():
                     float(args.visual_snapshot_age_sec or 0.0),
                     args.visual_snapshot_check_interval_sec,
                 ),
+                "baseline_group_field": str(args.baseline_group_field or ""),
+                "baseline_min_group_events": args.baseline_min_group_events,
             },
             "group_count": len(groups),
             "modeled_event_count": impute_stats["processed"],
             "imputed_missing_events": sum(g.get("virtual_event_count", 0) for g in groups),
-            "visual_group_count": visual_output.emitted_count if visual_output is not None else 0,
+            "visual_group_count": visual_count,
+            "visual_metrics": _compact_visual_metrics(visual_metrics, visual_metrics_output),
+            "baseline_visual_group_count": baseline_visual_count,
+            "baseline_visual_output": baseline_visual_output,
+            "baseline_metrics": _compact_visual_metrics(baseline_metrics, baseline_metrics_output),
             "births": impute_stats["births"],
             "deaths": impute_stats["deaths"],
             "drop_stats": impute_stats["dropped"],
@@ -1515,7 +1940,6 @@ def main():
             n = _write_jsonl(args.edges_output, edges)
             print(f"branching edges written to: {args.edges_output}; edges={n}")
         if args.visual_output:
-            visual_count = visual_output.emitted_count if visual_output is not None else 0
             print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
         return
     min_close = stream_config.history_window_sec + stream_config.time_slack_sec
@@ -1670,6 +2094,7 @@ def main():
         if visual_output is not None:
             visual_output.close()
     t_stream_end = time.monotonic()
+    visual_count = visual_output.emitted_count if visual_output is not None else 0
 
     stats = assigner.stats()
     groups = assigner.closed_groups
@@ -1683,6 +2108,21 @@ def main():
             f"unknown_type:{stats['dropped_unknown_type']}}}",
             flush=True,
         )
+    visual_metrics, visual_metrics_output = _compute_visual_metrics_if_available(
+        args,
+        visual_count=visual_count,
+        quiet=args.quiet,
+    )
+    (
+        baseline_metrics,
+        baseline_metrics_output,
+        baseline_visual_count,
+        baseline_visual_output,
+    ) = _compute_baseline_metrics_if_requested(
+        args,
+        alarm_events,
+        quiet=args.quiet,
+    )
 
     # Diagnostic distribution over ALL closed cascades (pre min_group_events
     # filter) — comparable to training. `groups` (emitted) is filtered.
@@ -1705,10 +2145,16 @@ def main():
             "topology_relation_prior": dict(stream_config.topology_relation_prior or {}),
             "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
             "visual_snapshot_check_interval_sec": visual_snapshot_check_interval_sec,
+            "baseline_group_field": str(args.baseline_group_field or ""),
+            "baseline_min_group_events": args.baseline_min_group_events,
         },
         "group_count": len(groups),
         "emitted_group_count": len(groups),
-        "visual_group_count": visual_output.emitted_count if visual_output is not None else 0,
+        "visual_group_count": visual_count,
+        "visual_metrics": _compact_visual_metrics(visual_metrics, visual_metrics_output),
+        "baseline_visual_group_count": baseline_visual_count,
+        "baseline_visual_output": baseline_visual_output,
+        "baseline_metrics": _compact_visual_metrics(baseline_metrics, baseline_metrics_output),
         "closed_cascade_count": stats["closed_cascade_count"],
         "modeled_event_count": stats["total_events_processed"],
         "immigrant_count": stats["total_immigrants"],
@@ -1736,7 +2182,6 @@ def main():
         print(f"branching edges written to: {args.edges_output}; edges={n}")
 
     if args.visual_output:
-        visual_count = visual_output.emitted_count if visual_output is not None else 0
         print(f"visual groups written to: {args.visual_output}; groups={visual_count}")
 
     if cascade_stats and not args.quiet:

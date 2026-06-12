@@ -609,6 +609,31 @@ def _filter_ran_without_data_link_highlight_sites(highlight_sites, site_has_data
     return kept, sorted(set(removed_site_ids))
 
 
+def _filter_to_single_data_ancestor_highlight_site(highlight_sites, site_has_data):
+    highlight_sites = list(highlight_sites or [])
+    site_has_data = set(site_has_data or ())
+    data_ancestor_site_ids = {
+        _normalize_text(item.get("site_id", ""))
+        for item in highlight_sites
+        if isinstance(item, dict) and _normalize_text(item.get("site_id", "")) in site_has_data
+    }
+    if len(data_ancestor_site_ids) != 1:
+        return highlight_sites, []
+
+    keep_site_id = next(iter(data_ancestor_site_ids))
+    removed_site_ids = []
+    kept = []
+    for item in highlight_sites:
+        if not isinstance(item, dict):
+            continue
+        site_id = _normalize_text(item.get("site_id", ""))
+        if site_id and site_id != keep_site_id:
+            removed_site_ids.append(site_id)
+            continue
+        kept.append(item)
+    return kept, sorted(set(removed_site_ids))
+
+
 def _edge_type_rank(edge_type):
     role_rank = {"Data": 3, "Microwave": 2, "Ran": 1, "Other": 0}
     return tuple(sorted((role_rank.get(role, 0) for role in edge_type)))
@@ -935,6 +960,13 @@ def complete_group_topology(
         site_links,
         directed_edge_types,
     )
+    (
+        topology_highlight_sites,
+        single_data_ancestor_pruned_site_ids,
+    ) = _filter_to_single_data_ancestor_highlight_site(
+        topology_highlight_sites,
+        site_has_data,
+    )
     topology_highlight_site_ids = sorted(
         item["site_id"]
         for item in topology_highlight_sites
@@ -944,6 +976,7 @@ def complete_group_topology(
     pruned_output_site_ids = (
         set(data_link_pruned_ancestor_site_ids)
         | set(shared_data_link_pruned_ancestor_site_ids)
+        | set(single_data_ancestor_pruned_site_ids)
     ) - set(alarm_sites)
     selected_sites = set(selected_sites) - pruned_output_site_ids
 
@@ -1042,6 +1075,7 @@ def complete_group_topology(
         "ran_without_data_link_filtered_ancestor_site_ids": ran_without_data_link_filtered_ancestor_site_ids,
         "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
         "shared_data_link_pruned_ancestor_site_ids": shared_data_link_pruned_ancestor_site_ids,
+        "single_data_ancestor_pruned_site_ids": single_data_ancestor_pruned_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(offline_alarm_sites) <= 1,
