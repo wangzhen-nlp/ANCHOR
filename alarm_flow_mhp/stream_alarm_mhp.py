@@ -935,7 +935,13 @@ def _compute_visual_metrics_if_available(args, *, visual_count: int, quiet: bool
     return metrics, metrics_output
 
 
-def _compute_baseline_metrics_if_requested(args, alarm_events, *, quiet: bool = False):
+def _compute_baseline_metrics_if_requested(
+    args,
+    alarm_events,
+    *,
+    min_group_events: int,
+    quiet: bool = False,
+):
     group_field = str(args.baseline_group_field or "").strip()
     if not group_field:
         return None, "", 0, ""
@@ -958,7 +964,7 @@ def _compute_baseline_metrics_if_requested(args, alarm_events, *, quiet: bool = 
         alarm_events,
         group_field=group_field,
         ne_graph_data=load_json_if_exists(args.ne_graph),
-        min_group_events=args.baseline_min_group_events,
+        min_group_events=min_group_events,
     )
     count = write_baseline_jsonl(baseline_output, records)
     if not quiet:
@@ -1425,8 +1431,11 @@ def main():
     parser.add_argument(
         "--baseline-min-group-events",
         type=int,
-        default=1,
-        help="Drop baseline alarm groups smaller than this. Default: 1.",
+        default=None,
+        help=(
+            "Drop baseline alarm groups smaller than this. Default: same as "
+            "the effective stream --min-group-events."
+        ),
     )
     parser.add_argument(
         "--topo",
@@ -1639,7 +1648,7 @@ def main():
         parser.error("--health-target-virtual-ratio must be > 0")
     if args.health_target_size_p50 <= 0 or args.health_target_size_p90 <= 0 or args.health_target_size_p99 <= 0:
         parser.error("--health-target-size-p50/p90/p99 must be > 0")
-    if args.baseline_min_group_events < 1:
+    if args.baseline_min_group_events is not None and args.baseline_min_group_events < 1:
         parser.error("--baseline-min-group-events must be >= 1")
     try:
         topology_relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
@@ -1700,6 +1709,11 @@ def main():
         topology_relation_prior=topology_relation_prior,
         time_slack_sec=args.time_slack_sec,
         late_penalty_half_life_sec=args.late_penalty_half_life_sec,
+    )
+    baseline_min_group_events = (
+        int(args.baseline_min_group_events)
+        if args.baseline_min_group_events is not None
+        else int(stream_config.min_group_events)
     )
     if not args.quiet:
         visual_snapshot_check_interval_sec = _resolve_visual_snapshot_check_interval(
@@ -1768,6 +1782,7 @@ def main():
         ) = _compute_baseline_metrics_if_requested(
             args,
             alarm_events,
+            min_group_events=baseline_min_group_events,
             quiet=args.quiet,
         )
         metadata = {
@@ -1798,7 +1813,7 @@ def main():
                     args.visual_snapshot_check_interval_sec,
                 ),
                 "baseline_group_field": str(args.baseline_group_field or ""),
-                "baseline_min_group_events": args.baseline_min_group_events,
+                "baseline_min_group_events": baseline_min_group_events,
             },
             "group_count": len(groups),
             "modeled_event_count": impute_stats["processed"],
@@ -2001,11 +2016,12 @@ def main():
         baseline_metrics_output,
         baseline_visual_count,
         baseline_visual_output,
-    ) = _compute_baseline_metrics_if_requested(
-        args,
-        alarm_events,
-        quiet=args.quiet,
-    )
+        ) = _compute_baseline_metrics_if_requested(
+            args,
+            alarm_events,
+            min_group_events=baseline_min_group_events,
+            quiet=args.quiet,
+        )
 
     # Diagnostic distribution over ALL closed cascades (pre min_group_events
     # filter) — comparable to training. `groups` (emitted) is filtered.
@@ -2029,7 +2045,7 @@ def main():
             "visual_snapshot_age_sec": args.visual_snapshot_age_sec,
             "visual_snapshot_check_interval_sec": visual_snapshot_check_interval_sec,
             "baseline_group_field": str(args.baseline_group_field or ""),
-            "baseline_min_group_events": args.baseline_min_group_events,
+            "baseline_min_group_events": baseline_min_group_events,
         },
         "group_count": len(groups),
         "emitted_group_count": len(groups),

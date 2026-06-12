@@ -68,7 +68,7 @@ def main():
         help="可选：保存构造出来的 baseline visual JSONL，便于后续复查",
     )
     parser.add_argument("--group-field", default="故障组ID", help="告警中的故障组字段名，默认: 故障组ID")
-    parser.add_argument("--min-group-events", type=int, default=1, help="丢弃小于该告警数的原始故障组，默认 1")
+    parser.add_argument("--min-group-events", type=int, default=2, help="丢弃小于该告警数的原始故障组，默认 2")
     parser.add_argument(
         "--regions",
         "--region",
