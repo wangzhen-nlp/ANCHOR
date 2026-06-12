@@ -11,7 +11,6 @@
 
 import json
 import os
-import csv
 import argparse
 
 from collections import defaultdict
@@ -21,12 +20,18 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
+from alarm_tools.progress_utils import ProgressBar
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_GRAPH_JSON,
     SYS_LINK_JSONL,
     SYS_NE_DIR,
     resource_display,
+)
+from topology_tools.extract_site_graph import (
+    PROGRESS_ROW_STEP,
+    iter_csv_dir_records,
+    iter_link_records,
 )
 
 
@@ -57,32 +62,34 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
     """
     ne_info = {}
 
-    csv_files = sorted(f for f in os.listdir(data_dir) if f.endswith('.csv') and 'SYS_NE' in f)
-    for csv_file in csv_files:
-        csv_path = os.path.join(data_dir, csv_file)
-        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                nativeId = row.get('nativeId', '').strip().upper()
-                if not nativeId:
-                    continue
-                incoming = {
-                    'domain': row.get('domain', '').strip(),
-                    'type': row.get('typeId', '').strip(),
-                    'network_type': row.get('network_type', '').strip(),
-                    'name': row.get('name', '').strip(),
-                    'manufacturer': row.get('manufacturer', '').strip(),
-                    'region_id': row.get('regionId1', '').strip(),
-                    'site_id': row.get('ne_site_id', '').strip().upper(),
-                    'running_status': row.get('running_status', '').strip()
-                }
-                ne_info[nativeId] = _merge_fields_preserve_first(
-                    ne_info.get(nativeId, {}),
-                    incoming,
-                    entity_label="NE",
-                    entity_id=nativeId,
-                    source_label=csv_file,
-                )
+    progress = ProgressBar(0, "  读取NE记录")
+    row_count = 0
+    for row in iter_csv_dir_records(data_dir, 'SYS_NE', progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        nativeId = (row.get('nativeId') or '').strip().upper()
+        if not nativeId:
+            continue
+        incoming = {
+            'domain': (row.get('domain') or '').strip(),
+            'type': (row.get('typeId') or '').strip(),
+            'network_type': (row.get('network_type') or '').strip(),
+            'name': (row.get('name') or '').strip(),
+            'manufacturer': (row.get('manufacturer') or '').strip(),
+            'region_id': (row.get('regionId1') or '').strip(),
+            'site_id': (row.get('ne_site_id') or '').strip().upper(),
+            'running_status': (row.get('running_status') or '').strip()
+        }
+        ne_info[nativeId] = _merge_fields_preserve_first(
+            ne_info.get(nativeId, {}),
+            incoming,
+            entity_label="NE",
+            entity_id=nativeId,
+            source_label=data_dir,
+        )
+    progress.set(row_count)
+    progress.close()
 
     return ne_info
 
@@ -115,16 +122,16 @@ def load_site_info(site_graph_file: str = SITE_GRAPH_JSON) -> dict:
     return site_info
 
 
-def build_ne_graph(jsonl_file: str) -> dict:
+def build_ne_graph(link_input: str) -> dict:
     """
-    根据链路信息生成站点邻接图
+    根据链路信息生成NE邻接图
 
     Returns:
         {
-            site_id: {
+            ne_id: {
                 link: {
-                    neighbor_site_id: {
-                        link_type: link_direction,
+                    neighbor_ne_id: {
+                        link_layer: link_direction,
                         ...
                     }
                 }
@@ -136,32 +143,37 @@ def build_ne_graph(jsonl_file: str) -> dict:
 
     link_count = 0
     mapped_count = 0
+    record_count = 0
 
-    with open(jsonl_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            record = json.loads(line)
-            a_ne = record.get('a_end_ne_nativeId', '').upper()
-            z_ne = record.get('z_end_ne_nativeId', '').upper()
-            a_ne = a_ne or record.get("a_end_ne_nativeId(')", "").upper()
-            z_ne = z_ne or record.get("z_end_ne_nativeId(')", "").upper()
-            link_type = record.get('link_type', '').upper()
+    progress = ProgressBar(0, "  读取链路记录")
+    for record in iter_link_records(link_input, progress):
+        record_count += 1
+        if record_count % PROGRESS_ROW_STEP == 0:
+            progress.set(record_count)
+        a_ne = (record.get('a_end_ne_nativeId') or '').strip().upper()
+        z_ne = (record.get('z_end_ne_nativeId') or '').strip().upper()
+        a_ne = a_ne or (record.get("a_end_ne_nativeId(')") or '').strip().upper()
+        z_ne = z_ne or (record.get("z_end_ne_nativeId(')") or '').strip().upper()
+        link_type = (record.get('link_layer') or '').strip().upper()
 
-            if not (a_ne and z_ne):
-                continue
+        if not (a_ne and z_ne):
+            continue
 
-            link_count += 1
+        link_count += 1
 
-            mapped_count += 1
-            if link_type in ne_links[a_ne][z_ne]:
-                if ne_links[a_ne][z_ne][link_type] == '<-':
-                    ne_links[a_ne][z_ne][link_type] = '<->'
-            else:
-                ne_links[a_ne][z_ne][link_type] = '->'
-            if link_type in ne_links[z_ne][a_ne]:
-                if ne_links[z_ne][a_ne][link_type] == '->':
-                    ne_links[z_ne][a_ne][link_type] = '<->'
-            else:
-                ne_links[z_ne][a_ne][link_type] = '<-'
+        mapped_count += 1
+        if link_type in ne_links[a_ne][z_ne]:
+            if ne_links[a_ne][z_ne][link_type] == '<-':
+                ne_links[a_ne][z_ne][link_type] = '<->'
+        else:
+            ne_links[a_ne][z_ne][link_type] = '->'
+        if link_type in ne_links[z_ne][a_ne]:
+            if ne_links[z_ne][a_ne][link_type] == '->':
+                ne_links[z_ne][a_ne][link_type] = '<->'
+        else:
+            ne_links[z_ne][a_ne][link_type] = '<-'
+    progress.set(record_count)
+    progress.close()
 
     print(f"  处理 {link_count} 条链路")
     print(f"  成功映射 {mapped_count} 条")
@@ -184,7 +196,10 @@ def main():
     parser.add_argument(
         "--link-input",
         default=SYS_LINK_JSONL,
-        help=f"链路 JSONL 输入，默认: {resource_display('sys_link_1231.jsonl')}",
+        help=(
+            "链路输入，支持 .jsonl/.csv/.zip(内含CSV) 文件或包含这些文件的目录，"
+            f"默认: {resource_display('sys_link_1231.jsonl')}"
+        ),
     )
     parser.add_argument(
         "-o",

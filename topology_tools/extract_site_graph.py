@@ -83,28 +83,22 @@ def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
     """
     mapping = {}
 
-    csv_files = sorted(f for f in os.listdir(data_dir) if f.endswith('.csv') and 'SYS_NE' in f)
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
-    for csv_file in csv_files:
-        csv_path = os.path.join(data_dir, csv_file)
-        progress.set_extra_text(csv_file, force=True)
-        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                row_count += 1
-                if row_count % PROGRESS_ROW_STEP == 0:
-                    progress.set(row_count)
-                nativeId = row.get('nativeId', '').strip().upper()
-                ne_site_id = row.get('ne_site_id', '').strip().upper()
-                _merge_scalar_preserve_first(
-                    mapping,
-                    nativeId,
-                    ne_site_id,
-                    entity_label="NE",
-                    field_name="ne_site_id",
-                    source_label=csv_file,
-                )
+    for row in iter_csv_dir_records(data_dir, 'SYS_NE', progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        nativeId = (row.get('nativeId') or '').strip().upper()
+        ne_site_id = (row.get('ne_site_id') or '').strip().upper()
+        _merge_scalar_preserve_first(
+            mapping,
+            nativeId,
+            ne_site_id,
+            entity_label="NE",
+            field_name="ne_site_id",
+            source_label=data_dir,
+        )
     progress.set(row_count)
     progress.close()
 
@@ -121,36 +115,30 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
     """
     site_info = {}
 
-    csv_files = sorted(f for f in os.listdir(data_dir) if f.endswith('.csv') and 'SYS_SITE' in f)
     progress = ProgressBar(0, "  读取站点记录")
     row_count = 0
-    for csv_file in csv_files:
-        csv_path = os.path.join(data_dir, csv_file)
-        progress.set_extra_text(csv_file, force=True)
-        with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                row_count += 1
-                if row_count % PROGRESS_ROW_STEP == 0:
-                    progress.set(row_count)
-                site_id = row.get('site_id', '').strip().upper()
-                if not site_id:
-                    continue
-                incoming = {
-                    'site_name': row.get('name', '').strip(),
-                    'site_type': row.get('site_type', '').strip(),
-                    'longitude': row.get('longitude', '').strip(),
-                    'latitude': row.get('latitude', '').strip(),
-                    'region_id': row.get('region_id', '').strip(),
-                    'is_hub': _parse_bool(row.get('is_hub', '')),
-                }
-                site_info[site_id] = _merge_fields_preserve_first(
-                    site_info.get(site_id, {}),
-                    incoming,
-                    entity_label="SITE",
-                    entity_id=site_id,
-                    source_label=csv_file,
-                )
+    for row in iter_csv_dir_records(data_dir, 'SYS_SITE', progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        site_id = (row.get('site_id') or '').strip().upper()
+        if not site_id:
+            continue
+        incoming = {
+            'site_name': (row.get('name') or '').strip(),
+            'site_type': (row.get('site_type') or '').strip(),
+            'longitude': (row.get('longitude') or '').strip(),
+            'latitude': (row.get('latitude') or '').strip(),
+            'region_id': (row.get('region_id') or '').strip(),
+            'is_hub': _parse_bool(row.get('is_hub', '')),
+        }
+        site_info[site_id] = _merge_fields_preserve_first(
+            site_info.get(site_id, {}),
+            incoming,
+            entity_label="SITE",
+            entity_id=site_id,
+            source_label=data_dir,
+        )
     progress.set(row_count)
     progress.close()
 
@@ -159,6 +147,20 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
 
 
 LINK_FILE_SUFFIXES = ('.jsonl', '.csv', '.zip')
+CSV_FILE_SUFFIXES = ('.csv', '.zip')
+
+
+def _iter_zip_csv(zip_path: str):
+    """迭代 zip 包内所有 CSV 的记录。"""
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in sorted(zf.namelist()):
+            if not name.lower().endswith('.csv'):
+                continue
+            with zf.open(name) as member:
+                text = io.TextIOWrapper(
+                    member, encoding='utf-8-sig', errors='replace', newline=''
+                )
+                yield from csv.DictReader(text)
 
 
 def _iter_link_file(file_path: str):
@@ -174,17 +176,29 @@ def _iter_link_file(file_path: str):
         with open(file_path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
             yield from csv.DictReader(f)
     elif lower.endswith('.zip'):
-        with zipfile.ZipFile(file_path) as zf:
-            for name in sorted(zf.namelist()):
-                if not name.lower().endswith('.csv'):
-                    continue
-                with zf.open(name) as member:
-                    text = io.TextIOWrapper(
-                        member, encoding='utf-8-sig', errors='replace', newline=''
-                    )
-                    yield from csv.DictReader(text)
+        yield from _iter_zip_csv(file_path)
     else:
         raise SystemExit(f"不支持的链路文件格式: {file_path}（支持 .jsonl/.csv/.zip）")
+
+
+def iter_csv_dir_records(data_dir: str, name_keyword: str, progress: ProgressBar = None):
+    """迭代目录中文件名含 name_keyword 的 .csv / .zip(内含CSV) 文件的记录。"""
+    file_names = sorted(
+        name for name in os.listdir(data_dir)
+        if name_keyword in name and name.lower().endswith(CSV_FILE_SUFFIXES)
+    )
+    if not file_names:
+        print(f"警告: 目录中未找到文件名含 {name_keyword} 的 .csv/.zip 文件: {data_dir}")
+        return
+    for name in file_names:
+        if progress is not None:
+            progress.set_extra_text(name, force=True)
+        path = os.path.join(data_dir, name)
+        if name.lower().endswith('.csv'):
+            with open(path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
+                yield from csv.DictReader(f)
+        else:
+            yield from _iter_zip_csv(path)
 
 
 def iter_link_records(link_input: str, progress: ProgressBar = None):
