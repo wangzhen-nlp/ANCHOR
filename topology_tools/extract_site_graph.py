@@ -17,7 +17,6 @@ import io
 import zipfile
 import argparse
 from collections import defaultdict
-from datetime import datetime
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
@@ -37,24 +36,23 @@ from topology_resources import (
 PROGRESS_ROW_STEP = 5000
 
 
-LAST_MODIFIED_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-
-
-def _require_last_modified(record: dict, row_number: int, source: str) -> datetime:
-    """校验并解析 last_Modified（形如 2025-09-19 12:33:33.325）；缺失或格式不符直接报错退出。"""
-    raw = (record.get('last_Modified') or '').strip()
-    if not raw:
+def _require_last_modified(record: dict, row_number: int, source: str) -> int:
+    """校验并解析 last_Modified（毫秒级 Unix 时间戳，形如 1758256413325）；缺失或格式不符直接报错退出。"""
+    raw = record.get('last_Modified')
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if raw in ("", None):
         raise SystemExit(f"{source} 第 {row_number} 行缺少 last_Modified 字段: {record}")
     try:
-        return datetime.strptime(raw, LAST_MODIFIED_FORMAT)
-    except ValueError:
+        return int(raw)
+    except (ValueError, TypeError):
         raise SystemExit(
             f"{source} 第 {row_number} 行 last_Modified 格式错误: {raw!r}"
-            f"（要求形如 2025-09-19 12:33:33.325）"
+            f"（要求为毫秒级 Unix 时间戳，形如 1758256413325）"
         )
 
 
-def _keep_latest(records: dict, key: str, last_modified: datetime, payload) -> None:
+def _keep_latest(records: dict, key: str, last_modified: int, payload) -> None:
     """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。"""
     existing = records.get(key)
     if existing is None or last_modified > existing[0]:
