@@ -23,7 +23,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from dataclasses import replace as _replace
-from datetime import datetime
 import json
 import os
 import sys
@@ -878,9 +877,13 @@ def _print_visual_health_summary(metrics, *, label: str = "visual"):
     health = (metrics or {}).get("health") or {}
     if not health:
         return
+    score = health.get("grouping_health_score")
+    if score is None:
+        print(f"[stream] {label} health=N/A (no groups)", flush=True)
+        return
     components = health.get("components") or {}
     print(
-        f"[stream] {label} health={float(health.get('grouping_health_score', 0.0)):.1f}/100 "
+        f"[stream] {label} health={float(score):.1f}/100 "
         f"(topology={float(components.get('topology_explainability', 0.0)):.1f}, "
         f"time={float(components.get('time_compactness', 0.0)):.1f}, "
         f"size={float(components.get('size_reasonableness', 0.0)):.1f}, "
@@ -932,125 +935,6 @@ def _compute_visual_metrics_if_available(args, *, visual_count: int, quiet: bool
     return metrics, metrics_output
 
 
-def _first_text(mapping, keys):
-    for key in keys:
-        value = mapping.get(key)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text and text.lower() not in {"nan", "none", "null"}:
-            return text
-    return ""
-
-
-def _parse_alarm_time(value):
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        ts = float(value)
-        return ts if ts > 0 else None
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        ts = float(text)
-        return ts if ts > 0 else None
-    except ValueError:
-        pass
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%f",
-    ):
-        try:
-            return datetime.strptime(text[:26], fmt).timestamp()
-        except ValueError:
-            pass
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
-
-def _alarm_group_ids(alarm, group_field):
-    from ticket_recall.evaluation.recall_common import _parse_group_ids
-
-    return _parse_group_ids(alarm.get(group_field))
-
-
-def _alarm_to_baseline_symptom(alarm, group_field):
-    ts = (
-        _parse_alarm_time(alarm.get("ts"))
-        or _parse_alarm_time(alarm.get("timestamp"))
-        or _parse_alarm_time(alarm.get("告警首次发生时间"))
-        or _parse_alarm_time(alarm.get("alarm_time"))
-        or _parse_alarm_time(alarm.get("first_occurrence_time"))
-    )
-    return {
-        "node": _first_text(alarm, ("site_id", "node", "站点ID", "site", "site_id_raw")),
-        "site_id": _first_text(alarm, ("site_id", "node", "站点ID", "site", "site_id_raw")),
-        "alarm_source": _first_text(alarm, ("alarm_source", "告警源", "source_ne", "ne", "ne_id")),
-        "alarm": _first_text(alarm, ("alarm_title", "alarm", "告警标题", "title")),
-        "alarm_type": _first_text(alarm, ("alarm_type", "alarm_title", "告警标题", "alarm", "title")),
-        "ts": ts,
-        "eid": _first_text(alarm, ("eid", "event_id", "告警编码ID", "alarm_id")),
-        "matched_role": "baseline_alarm_group",
-        "matched_rule": "alarm_group_baseline",
-        "工单号": _first_text(alarm, ("工单号", "ticket_id")),
-        "故障组ID": _first_text(alarm, (group_field, "故障组ID")),
-        "告警清除时间": _first_text(alarm, ("告警清除时间", "clear_time")),
-        "virtual": False,
-    }
-
-
-def _build_baseline_visual_records(alarm_events, *, group_field: str, min_group_events: int = 1):
-    grouped = {}
-    for alarm in alarm_events:
-        for group_id in _alarm_group_ids(alarm, group_field):
-            grouped.setdefault(str(group_id), []).append(alarm)
-
-    records = []
-    min_group_events = max(1, int(min_group_events or 1))
-    for group_id, alarms in grouped.items():
-        if len(alarms) < min_group_events:
-            continue
-        symptoms = [_alarm_to_baseline_symptom(alarm, group_field) for alarm in alarms]
-        symptoms.sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
-        timestamps = [s.get("ts") for s in symptoms if s.get("ts") is not None]
-        group_uuid = f"alarm-baseline-{group_id}"
-        records.append(
-            {
-                "uuid": group_uuid,
-                "group_id": group_uuid,
-                "rule": "alarm_group_baseline",
-                "source_group_id": group_id,
-                "event_count": len(symptoms),
-                "start_ts": min(timestamps) if timestamps else None,
-                "end_ts": max(timestamps) if timestamps else None,
-                "duration_sec": (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0,
-                "site_list": sorted({s.get("site_id", "") for s in symptoms if s.get("site_id", "")}),
-                "alarm_source_list": sorted({s.get("alarm_source", "") for s in symptoms if s.get("alarm_source", "")}),
-                "alarm_type_counts": dict(Counter(s.get("alarm_type", "") for s in symptoms if s.get("alarm_type", ""))),
-                "symptoms": symptoms,
-                "match_info": {
-                    "uuid": group_uuid,
-                    "rule": "alarm_group_baseline",
-                    "source_group_id": group_id,
-                    "related_group_uuids": [],
-                },
-            }
-        )
-    records.sort(
-        key=lambda r: (
-            r.get("start_ts") is None,
-            r.get("start_ts") or float("inf"),
-            str(r.get("source_group_id", "")),
-        )
-    )
-    return records
-
-
 def _compute_baseline_metrics_if_requested(args, alarm_events, *, quiet: bool = False):
     group_field = str(args.baseline_group_field or "").strip()
     if not group_field:
@@ -1064,20 +948,19 @@ def _compute_baseline_metrics_if_requested(args, alarm_events, *, quiet: bool = 
     if _is_disabled_path(baseline_output):
         return None, "", 0, ""
 
-    records = _build_baseline_visual_records(
+    from fault_grouping.tools.alarm_group_baseline import (
+        build_baseline_records,
+        load_json_if_exists,
+        write_jsonl as write_baseline_jsonl,
+    )
+
+    records = build_baseline_records(
         alarm_events,
         group_field=group_field,
+        ne_graph_data=load_json_if_exists(args.ne_graph),
         min_group_events=args.baseline_min_group_events,
     )
-    if not records:
-        if not quiet:
-            print(
-                f"[stream] baseline: no alarm groups found with field '{group_field}'",
-                flush=True,
-            )
-        return None, "", 0, ""
-
-    count = _write_jsonl(baseline_output, records)
+    count = write_baseline_jsonl(baseline_output, records)
     if not quiet:
         print(
             f"baseline visual groups written to: {baseline_output}; groups={count}",
@@ -1457,7 +1340,7 @@ def main():
         default=200,
         help=(
             "Skip all-pair topology cohesion for groups with more than this many "
-            "NEs. Default: 200."
+            "NEs. 0 disables all-pair topology cohesion. Default: 200."
         ),
     )
     parser.add_argument(
@@ -1742,8 +1625,8 @@ def main():
         parser.error("--visual-snapshot-check-interval-sec must be >= 0")
     if args.visual_metrics_topo_max_hops < 1:
         parser.error("--visual-metrics-topo-max-hops must be >= 1")
-    if args.visual_metrics_max_pairwise_ne < 2:
-        parser.error("--visual-metrics-max-pairwise-ne must be >= 2")
+    if args.visual_metrics_max_pairwise_ne < 0:
+        parser.error("--visual-metrics-max-pairwise-ne must be >= 0")
     if args.visual_metrics_risk_duration_sec < 0:
         parser.error("--visual-metrics-risk-duration-sec must be >= 0")
     if args.visual_metrics_risk_site_count < 0:

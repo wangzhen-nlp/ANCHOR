@@ -16,11 +16,12 @@ def load_ordered_alarm_events(
     end_time=None,
     clear_delay_sec=0.0,
     regions=None,
+    show_progress=True,
 ):
     """Load alarms with the same filtering and ordering rules as match_rules."""
     selected_regions = parse_regions(regions)
     if is_sorted_alarm_cache_file(alarm_input):
-        metadata, events = load_sorted_alarm_cache(alarm_input, show_progress=True)
+        metadata, events = load_sorted_alarm_cache(alarm_input, show_progress=show_progress)
         if selected_regions:
             ne_graph_data = load_ne_graph(ne_graph_path)
             events, region_filter_stats = filter_alarm_events_by_regions(
@@ -48,4 +49,5 @@ def load_ordered_alarm_events(
         end_time=end_time,
         clear_delay_sec=clear_delay_sec,
         regions=selected_regions,
+        show_progress=show_progress,
     )

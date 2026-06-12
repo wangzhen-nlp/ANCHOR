@@ -21,6 +21,7 @@ import json
 import math
 import statistics
 import sys
+import time
 from itertools import combinations
 from pathlib import Path
 
@@ -283,6 +284,20 @@ def _edge_relation(edge, topology_index, node_infos):
     return classify_topology_relation(source_ne, target_ne, topology_index, node_infos)
 
 
+def _cached_pair_relation(source_ne, target_ne, topology_index, node_infos, pair_relation_cache):
+    left = str(source_ne or "").strip()
+    right = str(target_ne or "").strip()
+    if left > right:
+        left, right = right, left
+    key = (left, right)
+    cached = pair_relation_cache.get(key)
+    if cached is not None:
+        return cached
+    relation = classify_topology_relation(left, right, topology_index, node_infos)
+    pair_relation_cache[key] = relation
+    return relation
+
+
 def _percentiles(values, percentiles=(50, 75, 90, 95, 99)):
     vals = sorted(v for v in values if v is not None)
     if not vals:
@@ -417,6 +432,21 @@ def build_health_score(
 ):
     """Build an interpretable 0-100 health score from aggregate diagnostics."""
     overall = result.get("overall", {})
+    if int(overall.get("group_count", 0) or 0) <= 0:
+        return {
+            "grouping_health_score": None,
+            "components": {},
+            "weights": dict(HEALTH_WEIGHTS),
+            "targets": {
+                "duration_p90_sec": float(target_duration_sec),
+                "virtual_event_ratio": float(target_virtual_ratio),
+                "real_event_count_p50": float(target_size_p50),
+                "real_event_count_p90": float(target_size_p90),
+                "real_event_count_p99": float(target_size_p99),
+            },
+            "not_applicable": True,
+            "interpretation": "Health is not defined because there are no groups to evaluate.",
+        }
     dist = result.get("distributions", {})
     topo = result.get("topology", {})
 
@@ -494,6 +524,7 @@ def analyze_record(
     topology_index,
     node_infos,
     ne_to_site,
+    pair_relation_cache,
     max_pairwise_ne,
     risk_duration_sec,
     risk_site_count,
@@ -521,9 +552,17 @@ def analyze_record(
 
     pair_relations = Counter()
     pair_count = 0
-    if len(nes) <= max_pairwise_ne:
+    if max_pairwise_ne > 0 and len(nes) <= max_pairwise_ne:
         for source_ne, target_ne in combinations(nes, 2):
-            pair_relations[classify_topology_relation(source_ne, target_ne, topology_index, node_infos)] += 1
+            pair_relations[
+                _cached_pair_relation(
+                    source_ne,
+                    target_ne,
+                    topology_index,
+                    node_infos,
+                    pair_relation_cache,
+                )
+            ] += 1
             pair_count += 1
 
     metrics = GroupMetrics(
@@ -592,11 +631,18 @@ def analyze(
     health_target_size_p90=20.0,
     health_target_size_p99=100.0,
     include_details=True,
+    progress_every=0,
+    verbose=False,
 ):
+    t0 = time.monotonic()
+    if verbose:
+        print(f"[metrics] loading NE graph: {ne_graph_path}", flush=True)
     ne_graph_data = _load_json(ne_graph_path)
     # Site graph is currently only recorded for reproducibility. Site ids used by
     # metrics come from symptoms/ne_graph, because visual output is NE-centric.
     site_graph_exists = Path(site_graph_path).exists()
+    if verbose:
+        print(f"[metrics] building graph context/index (max_hops={topo_max_hops}) ...", flush=True)
     graph_context = build_graph_context(ne_graph_data)
     topology_index = NETopologyIndex.from_graph(ne_graph_data, max_hops=topo_max_hops)
     node_infos = getattr(graph_context, "node_infos", {}) or {}
@@ -604,9 +650,17 @@ def analyze(
         ne_id: str(getattr(info, "site_id", "") or "")
         for ne_id, info in node_infos.items()
     }
+    if verbose:
+        print(
+            f"[metrics] graph ready: nodes={len(node_infos)}, "
+            f"elapsed={time.monotonic() - t0:.1f}s",
+            flush=True,
+        )
 
     groups = []
     skipped = 0
+    pair_relation_cache = {}
+    t_scan = time.monotonic()
     for line_num, record in _iter_jsonl(visual_jsonl):
         try:
             groups.append(
@@ -616,6 +670,7 @@ def analyze(
                     topology_index=topology_index,
                     node_infos=node_infos,
                     ne_to_site=ne_to_site,
+                    pair_relation_cache=pair_relation_cache,
                     max_pairwise_ne=max_pairwise_ne,
                     risk_duration_sec=risk_duration_sec,
                     risk_site_count=risk_site_count,
@@ -625,6 +680,15 @@ def analyze(
         except Exception as exc:
             skipped += 1
             print(f"跳过第 {line_num} 行指标计算失败: {exc}", file=sys.stderr)
+        if verbose and progress_every and line_num % progress_every == 0:
+            elapsed = time.monotonic() - t_scan
+            rate = line_num / max(elapsed, 1e-9)
+            print(
+                f"[metrics] processed {line_num} records "
+                f"({rate:.0f} rec/s, kept={len(groups)}, skipped={skipped}, "
+                f"pair_cache={len(pair_relation_cache)}, elapsed={elapsed:.1f}s)",
+                flush=True,
+            )
 
     total_groups = len(groups)
     total_events = sum(g.event_count for g in groups)
@@ -666,7 +730,7 @@ def analyze(
             "metric_notes": [
                 "No labels are used; metrics are diagnostics/proxies, not ground truth.",
                 "missing_edge_relation_distribution is based on visual missing_topology_edges.",
-                "pair_relation_distribution is based on all NE pairs inside each group when ne_count <= max_pairwise_ne.",
+                "pair_relation_distribution is based on all NE pairs inside each group when 0 < ne_count <= max_pairwise_ne.",
             ],
         },
         "overall": {
@@ -745,17 +809,22 @@ def print_summary(result):
     print("=" * 60)
     health = result.get("health") or {}
     if health:
-        print(f"健康度: {health.get('grouping_health_score', 0):.1f}/100")
+        score = health.get("grouping_health_score")
+        if score is None:
+            print("健康度: N/A (no groups)")
+        else:
+            print(f"健康度: {score:.1f}/100")
         comps = health.get("components") or {}
-        print(
-            "  components: "
-            f"topology={comps.get('topology_explainability', 0):.1f}, "
-            f"time={comps.get('time_compactness', 0):.1f}, "
-            f"size={comps.get('size_reasonableness', 0):.1f}, "
-            f"singleton={comps.get('singleton_control', 0):.1f}, "
-            f"virtual={comps.get('virtual_reasonableness', 0):.1f}, "
-            f"risk={comps.get('risk_cleanliness', 0):.1f}"
-        )
+        if comps:
+            print(
+                "  components: "
+                f"topology={comps.get('topology_explainability', 0):.1f}, "
+                f"time={comps.get('time_compactness', 0):.1f}, "
+                f"size={comps.get('size_reasonableness', 0):.1f}, "
+                f"singleton={comps.get('singleton_control', 0):.1f}, "
+                f"virtual={comps.get('virtual_reasonableness', 0):.1f}, "
+                f"risk={comps.get('risk_cleanliness', 0):.1f}"
+            )
     print(f"故障组数: {overall['group_count']}")
     print(
         f"告警数: total={overall['event_count']} real={overall['real_event_count']} "
@@ -808,7 +877,7 @@ def main():
     parser.add_argument("--ne-graph", default=NE_GRAPH_JSON, help=f"NE graph JSON，默认 {resource_display('ne_graph.json')}")
     parser.add_argument("--site-graph", default=SITE_GRAPH_JSON, help=f"Site graph JSON，默认 {resource_display('site_graph.json')}")
     parser.add_argument("--topo-max-hops", type=int, default=3, help="拓扑关系计算的最大 hop，默认 3")
-    parser.add_argument("--max-pairwise-ne", type=int, default=200, help="每组最多对多少个 NE 做全 pair 拓扑统计，默认 200")
+    parser.add_argument("--max-pairwise-ne", type=int, default=200, help="每组最多对多少个 NE 做全 pair 拓扑统计，默认 200；0 表示关闭")
     parser.add_argument("--risk-duration-sec", type=float, default=2 * 3600, help="long_duration 风险阈值，默认 7200")
     parser.add_argument("--risk-site-count", type=int, default=10, help="many_sites 风险阈值，默认 10")
     parser.add_argument("--risk-unknown-pair-ratio", type=float, default=0.5, help="high_unknown_pair_ratio 风险阈值，默认 0.5")
@@ -818,12 +887,16 @@ def main():
     parser.add_argument("--health-target-size-p90", type=float, default=20.0, help="健康度 size_reasonableness 的 p90 合理上限，默认 20")
     parser.add_argument("--health-target-size-p99", type=float, default=100.0, help="健康度 size_reasonableness 的 p99 合理上限，默认 100")
     parser.add_argument("--no-detail", action="store_true", help="输出 JSON 不包含逐组 detail，文件更小")
+    parser.add_argument("--progress-every", type=int, default=1000, help="每处理 N 行打印一次进度；0 表示关闭。默认 1000")
+    parser.add_argument("--quiet", action="store_true", help="不打印阶段和进度日志，只输出最终摘要")
     args = parser.parse_args()
 
     if args.topo_max_hops < 1:
         parser.error("--topo-max-hops must be >= 1")
-    if args.max_pairwise_ne < 2:
-        parser.error("--max-pairwise-ne must be >= 2")
+    if args.max_pairwise_ne < 0:
+        parser.error("--max-pairwise-ne must be >= 0")
+    if args.progress_every < 0:
+        parser.error("--progress-every must be >= 0")
 
     result = analyze(
         args.visual_jsonl,
@@ -840,6 +913,8 @@ def main():
         health_target_size_p90=args.health_target_size_p90,
         health_target_size_p99=args.health_target_size_p99,
         include_details=not args.no_detail,
+        progress_every=args.progress_every,
+        verbose=not args.quiet,
     )
     print_summary(result)
 

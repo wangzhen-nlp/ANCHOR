@@ -58,6 +58,7 @@ def build_sorted_alarms(
     end_time=None,
     clear_delay_sec=0.0,
     regions=None,
+    show_progress=True,
 ):
     start_ts = parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
     end_ts = parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
@@ -90,6 +91,7 @@ def build_sorted_alarms(
         clear_delay_sec=clear_delay_sec,
         allowed_alarm_sources=allowed_alarm_sources,
         region_filter_stats=region_filter_stats,
+        show_progress=show_progress,
     )
     region_filter_stats["pre_sort_event_count"] = len(valid_alarms)
     valid_alarms.sort(key=lambda item: item["ts"])

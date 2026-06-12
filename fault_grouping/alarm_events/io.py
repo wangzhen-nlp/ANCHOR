@@ -68,13 +68,14 @@ def load_valid_alarms(
     clear_delay_sec=0.0,
     allowed_alarm_sources=None,
     region_filter_stats=None,
+    show_progress=True,
 ):
     processed_count = 0
     valid_alarms = []
     normal_alarm_count = 0
     clear_alarm_count = 0
 
-    for alarm in stream_alarm_inputs(alarm_file_path, show_progress=True):
+    for alarm in stream_alarm_inputs(alarm_file_path, show_progress=show_progress):
         processed_count += 1
 
         alarm_title = alarm.get('告警标题', '')
