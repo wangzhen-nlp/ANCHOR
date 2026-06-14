@@ -4359,6 +4359,72 @@
                 '">' + svgHtml + renderMarkerAlarmGroupBadges(node) + renderMarkerVirtualBadge(node) + '</div>';
         }
 
+        // 构建设备标记气泡内容（每次打开都按当前根因标注重建，避免勾选痕迹丢失）
+        function buildNodeMarkerPopup(node, lat, lng) {
+            const style = getDomainStyle(node.domain || '');
+            const isHighlighted = highlightedNodes.has(node.id);
+            let popupContent = '<div class="popup-title">' + getRawNodeId(node) + '</div>' +
+                '<div class="popup-row">站点: ' + getNodeSiteTitle(node) + '</div>' +
+                '<div class="popup-row">名称: ' + (node.site_name || node.site_id || '-') + '</div>' +
+                '<div class="popup-row">Group: ' + (node.group || '-') + '</div>' +
+                '<div class="popup-row">类型: ' + (node.network_type || node.type || '-') + '</div>' +
+                '<div class="popup-row">Domain: <span style="color:' + style.color + '; font-weight:bold;">' + style.label + '</span></div>' +
+                '<div class="popup-row">厂商: ' + (node.manufacturer || '-') + '</div>';
+            if (lat !== undefined && lat !== null && lng !== undefined && lng !== null) {
+                popupContent += '<div class="popup-row">坐标: ' + Number(lat).toFixed(6) + ', ' + Number(lng).toFixed(6) + '</div>';
+            }
+
+            if (node.alarm && node.alarm.length > 0) {
+                const alarmGroups = getNodeAlarmGroupIds(node);
+                if (alarmGroups.length > 0) {
+                    popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">涉及故障组</div>' +
+                        '<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">' +
+                        alarmGroups.map(function(groupId) {
+                            return '<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 6px; border-radius:999px; background:#f6f8fa; border:1px solid #d0d7de; color:#24292f; font-size:10px; font-weight:700;">' +
+                                renderAlarmGroupMarker(groupId, { size: 18 }) + '<span>' + escapeHtml(groupId) + '</span>' +
+                            '</span>';
+                        }).join('') +
+                        '</div>';
+                }
+                const alarmRows = node.alarm.map(function(alarm, alarmIndex) {
+                    const alarmTime = getAlarmDisplayTime(alarm);
+                    const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
+                    const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
+                    const ticketId = alarm['工单号'] || '-';
+                    const faultGroup = getAlarmFaultGroupId(alarm);
+                    const faultGroupHtml = faultGroup
+                        ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
+                        : '<span>-</span>';
+                    const virtualBadge = renderVirtualAlarmBadge(alarm);
+                    return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
+                        '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
+                        '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+                            '<span>' + alarmTitle + '</span>' + virtualBadge +
+                        '</div>' +
+                        '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
+                        '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
+                        '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
+                        buildAlarmRootCauseLabel(node, alarm, alarmIndex) +
+                        '</div>';
+                }).join('');
+                popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">告警列表 (' + node.alarm.length + ' 个)</div>' + alarmRows;
+            } else {
+                popupContent += '<div class="popup-row">告警: 0 个</div>';
+            }
+
+            // 根因标注（设备级）
+            popupContent += buildDeviceRootCauseHtml(node);
+
+            if (isHighlighted) {
+                popupContent += '<div class="popup-row" style="color: #ffd700; font-weight: bold; font-size: 11px; margin-top: 4px;">⭐ 搜索匹配站点</div>';
+            }
+
+            popupContent += (multiSelectMode ? '<div class="popup-row" style="color: #cf222e; font-weight: bold; margin-top: 8px; border-top: 1px solid #d0d7de; padding-top: 8px;">' +
+                (multiSelectedNodes.has(node.id) ? '✓ 已选中 (点击取消)' : '点击标记以选择') + '</div>' : '');
+
+            return popupContent;
+        }
+
         // 当前组中该设备是否被标为根因（告警根因 或 设备根因）
         function isRootCauseNode(node) {
             if (!node) return false;
@@ -4780,78 +4846,15 @@
 
                 const marker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
 
-                // Popup 内容
-                let popupContent = '<div class="popup-title">' + getRawNodeId(node) + '</div>' +
-                    '<div class="popup-row">站点: ' + getNodeSiteTitle(node) + '</div>' +
-                    '<div class="popup-row">名称: ' + (node.site_name || node.site_id || '-') + '</div>' +
-                    '<div class="popup-row">Group: ' + (node.group || '-') + '</div>' +
-                    '<div class="popup-row">类型: ' + (node.network_type || node.type || '-') + '</div>' +
-                    '<div class="popup-row">Domain: <span style="color:' + style.color + '; font-weight:bold;">' + style.label + '</span></div>' +
-                    '<div class="popup-row">厂商: ' + (node.manufacturer || '-') + '</div>' +
-                    '<div class="popup-row">坐标: ' + lat.toFixed(6) + ', ' + lng.toFixed(6) + '</div>';
-
-                if (node.alarm && node.alarm.length > 0) {
-                    const alarmGroups = getNodeAlarmGroupIds(node);
-                    if (alarmGroups.length > 0) {
-                        popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">涉及故障组</div>' +
-                            '<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">' +
-                            alarmGroups.map(function(groupId) {
-                                return '<span style="display:inline-flex; align-items:center; gap:4px; padding:2px 6px; border-radius:999px; background:#f6f8fa; border:1px solid #d0d7de; color:#24292f; font-size:10px; font-weight:700;">' +
-                                    renderAlarmGroupMarker(groupId, { size: 18 }) + '<span>' + escapeHtml(groupId) + '</span>' +
-                                '</span>';
-                            }).join('') +
-                            '</div>';
-                    }
-                    const alarmRows = node.alarm.map(function(alarm, alarmIndex) {
-                        const alarmTime = getAlarmDisplayTime(alarm);
-                        const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
-                        const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
-                        const ticketId = alarm['工单号'] || '-';
-                        const faultGroup = getAlarmFaultGroupId(alarm);
-                        const faultGroupHtml = faultGroup
-                            ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
-                            : '<span>-</span>';
-                        const virtualBadge = renderVirtualAlarmBadge(alarm);
-                        return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
-                            '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
-                            '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
-                                '<span>' + alarmTitle + '</span>' + virtualBadge +
-                            '</div>' +
-                            '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
-                            '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
-                            '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
-                            buildAlarmRootCauseLabel(node, alarm, alarmIndex) +
-                            '</div>';
-                    }).join('');
-
-                    popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">告警列表 (' + node.alarm.length + ' 个)</div>' + alarmRows;
-                } else {
-                    popupContent += '<div class="popup-row">告警: 0 个</div>';
-                }
-
-                // 根因标注（设备级）
-                popupContent += buildDeviceRootCauseHtml(node);
-                
-                if (isHighlighted) {
-                    popupContent += '<div class="popup-row" style="color: #ffd700; font-weight: bold; font-size: 11px; margin-top: 4px;">⭐ 搜索匹配站点</div>';
-                }
-                
-                // 显示扰动提示
-                if (jitterResult.jitteredCount > 0) {
-                    const originalPos = [parseFloat(node.latitude), parseFloat(node.longitude)];
-                    const hasJittered = Math.abs(lat - originalPos[0]) > 0.000001 || Math.abs(lng - originalPos[1]) > 0.000001;
-                    if (hasJittered) {
-                        popupContent += '<div class="popup-row" style="color: #0969da; font-size: 11px; margin-top: 4px;">⚠️ 位置已自动错开（<50米）</div>';
-                    }
-                }
-                
-                popupContent += (multiSelectMode ? '<div class="popup-row" style="color: #cf222e; font-weight: bold; margin-top: 8px; border-top: 1px solid #d0d7de; padding-top: 8px;">' + 
-                    (multiSelectedNodes.has(node.id) ? '✓ 已选中 (点击取消)' : '点击标记以选择') + '</div>' : '');
-
-                marker.bindPopup(popupContent, {
+                // Popup 内容：绑定时生成一次，并在每次打开时按当前根因标注重建（避免勾选痕迹丢失）
+                marker.bindPopup(buildNodeMarkerPopup(node, lat, lng), {
                     autoClose: false,      // 点击其他 popup 时不自动关闭
                     closeOnClick: false,   // 点击地图空白处时不关闭 ← 关键
                     autoPan: false         // 悬浮打开 popup 时不自动平移地图
+                });
+                marker.on('popupopen', function() {
+                    const ll = this.getLatLng();
+                    this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
                 });
 
                 // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
