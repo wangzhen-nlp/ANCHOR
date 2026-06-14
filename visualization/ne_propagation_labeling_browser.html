@@ -226,6 +226,30 @@
             font-weight: 700;
             word-break: break-word;
         }
+        .label-badge {
+            display: inline-block;
+            margin-left: 8px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            vertical-align: middle;
+        }
+        .label-badge.labeled {
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #86efac;
+        }
+        .label-badge.unlabeled {
+            background: #f3f4f6;
+            color: #6b7280;
+            border: 1px solid #d1d5db;
+        }
+        .label-counts {
+            font-size: 12px;
+            color: #475467;
+            font-weight: 600;
+        }
         .time {
             color: #475467;
             font-size: 13px;
@@ -347,6 +371,15 @@
                 <div class="hint">每行一个故障组对象</div>
             </div>
             <div class="filter-row">
+                <span class="site-filter-label">标注状态</span>
+                <div class="filters" id="labelFilters" style="margin:0;">
+                    <button class="filter-chip active" data-label-filter="all">全部</button>
+                    <button class="filter-chip" data-label-filter="labeled">已标注</button>
+                    <button class="filter-chip" data-label-filter="unlabeled">未标注</button>
+                </div>
+                <span id="labelCounts" class="label-counts">已标注 0 ｜ 未标注 0</span>
+            </div>
+            <div class="filter-row">
                 <span class="site-filter-label">备注过滤</span>
                 <input id="noteFilterInput" class="site-filter-input" type="text" placeholder="输入备注关键词，支持包含匹配">
             </div>
@@ -366,6 +399,7 @@
         let siteFilterQuery = '';
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
+        let labelFilter = 'all';   // 标注状态过滤：all / labeled / unlabeled
         let detailBlobUrls = [];
         let currentFaultGroupFileHandle = null;
         let currentFaultGroupFileName = '';
@@ -1071,7 +1105,30 @@
                         return false;
                     }
                 }
+
+                // 标注状态过滤
+                if (labelFilter === 'labeled' && !isGroupLabeled(group)) {
+                    return false;
+                }
+                if (labelFilter === 'unlabeled' && isGroupLabeled(group)) {
+                    return false;
+                }
                 return true;
+            });
+        }
+
+        // 是否已标注根因（任一根因设备 或 任一根因告警）
+        function isGroupLabeled(group) {
+            const rc = group && group.root_cause_annotations;
+            if (!rc || typeof rc !== 'object') return false;
+            return Object.keys(rc).some(function(neId) {
+                const entry = rc[neId];
+                if (!entry) return false;
+                if (entry.device === true) return true;
+                if (entry.alarms && typeof entry.alarms === 'object') {
+                    return Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+                }
+                return false;
             });
         }
 
@@ -1093,6 +1150,10 @@
 
             if (filterSummary) filterSummary.textContent = `过滤后 ${visibleGroups.length} 条`;
 
+            const labeledTotal = faultGroups.filter(isGroupLabeled).length;
+            const labelCountsEl = document.getElementById('labelCounts');
+            if (labelCountsEl) labelCountsEl.textContent = `已标注 ${labeledTotal} ｜ 未标注 ${faultGroups.length - labeledTotal}`;
+
             if (visibleGroups.length === 0) {
                 list.innerHTML = '';
                 emptyState.textContent = faultGroups.length === 0 ? '请选择一个 `jsonl` 文件' : '当前筛选条件下没有故障组';
@@ -1103,11 +1164,15 @@
             emptyState.style.display = 'none';
             list.innerHTML = visibleGroups.map((group) => {
                 const index = faultGroups.indexOf(group);
+                const labeled = isGroupLabeled(group);
+                const badge = labeled
+                    ? '<span class="label-badge labeled">已标注根因</span>'
+                    : '<span class="label-badge unlabeled">未标注根因</span>';
                 return `
                 <div class="card">
                     <div class="card-head">
                         <div>
-                            <div class="title">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}</div>
+                            <div class="title">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}${badge}</div>
                             <div class="time">故障组时间范围：${escapeHtml(getGroupTimeRange(group))}</div>
                         </div>
                         <button class="open-btn" onclick="openGroupDetail(${index})">查看详情</button>
@@ -1212,6 +1277,29 @@
             noteFilterQuery = event.target.value.trim();
             renderGroups();
         });
+
+        document.getElementById('labelFilters').addEventListener('click', function(event) {
+            const btn = event.target.closest('.filter-chip');
+            if (!btn) return;
+            labelFilter = btn.dataset.labelFilter || 'all';
+            this.querySelectorAll('.filter-chip').forEach(function(chip) {
+                chip.classList.toggle('active', (chip.dataset.labelFilter || 'all') === labelFilter);
+            });
+            renderGroups();
+        });
+
+        // 由标注页通过 window.opener 调用：回写某故障组的根因标注，实时刷新状态/计数/筛选
+        window.applyFaultGroupRootCause = function(groupUuid, annotations, note) {
+            const normalizedUuid = String(groupUuid || '').trim();
+            if (!normalizedUuid) return;
+            const index = faultGroups.findIndex(group => (group.uuid || group.match_info?.uuid || '') === normalizedUuid);
+            if (index < 0) return;
+            faultGroups[index].root_cause_annotations = (annotations && typeof annotations === 'object') ? annotations : {};
+            if (note !== undefined) {
+                faultGroups[index].note = note || '';
+            }
+            renderGroups();
+        };
     </script>
 </body>
 </html>

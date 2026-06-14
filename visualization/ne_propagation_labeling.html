@@ -90,6 +90,55 @@
             font-weight: 600;
         }
 
+        .group-nav-jump {
+            margin-top: -2px;
+        }
+
+        .group-nav-jump button {
+            background: #6e7781;
+        }
+
+        .group-nav-jump button:hover:not(:disabled) {
+            background: #57606a;
+        }
+
+        .autosave-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+        }
+
+        .autosave-bar button {
+            flex: 0 0 auto;
+            padding: 5px 8px;
+            background: #2da44e;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .autosave-bar button:hover {
+            background: #2c974b;
+        }
+
+        .autosave-status {
+            font-size: 11px;
+            color: #57606a;
+            line-height: 1.3;
+            word-break: break-all;
+        }
+
+        .autosave-status.saved {
+            color: #1a7f37;
+        }
+
+        .autosave-status.error {
+            color: #cf222e;
+        }
+
         .file-section {
             background: #f6f8fa;
             padding: 12px;
@@ -2113,6 +2162,15 @@
                 <button id="prevGroupBtn" onclick="goToAdjacentGroup(-1)">← 上一组</button>
                 <span id="groupNavStatus">- / -</span>
                 <button id="nextGroupBtn" onclick="goToAdjacentGroup(1)">下一组 →</button>
+            </div>
+            <div class="group-nav group-nav-jump" id="groupNavJump" style="display:none;">
+                <button id="nextUnlabeledBtn" onclick="goToNextByLabel(false)">下一个未标注</button>
+                <button id="nextLabeledBtn" onclick="goToNextByLabel(true)">下一个已标注</button>
+            </div>
+
+            <div class="autosave-bar" id="autosaveBar">
+                <button id="chooseResultFileBtn" onclick="chooseResultFile()">📂 选择结果文件</button>
+                <span class="autosave-status" id="autoSaveStatus">未选择结果文件，不会自动保存</span>
             </div>
 
             <!-- “选择数据文件”区域已隐藏：默认文件加载逻辑保持不变，相关元素仅保留供脚本引用 -->
@@ -4481,13 +4539,9 @@
 
             renderSiteOverlays(geoNodes, jitteredCoords);
             
-            // 显示/隐藏扰动指示器，并显示错开的节点数量
+            // 扰动指示器不再显示（按需求隐藏“已自动错开 N 个相近节点”提示）
             const jitterIndicator = document.getElementById('jitterIndicator');
-            const jitterCount = document.getElementById('jitterCount');
-            if (jitterResult.jitteredCount > 0) {
-                jitterIndicator.classList.add('show');
-                jitterCount.textContent = jitterResult.jitteredCount;
-            } else {
+            if (jitterIndicator) {
                 jitterIndicator.classList.remove('show');
             }
 
@@ -5484,9 +5538,6 @@
             if (multiSelectMode) {
                 indicator.textContent = '🎯 多选模式 - 点击节点进行选择';
                 indicator.classList.add('show');
-            } else if (siteNeighborModeEnabled) {
-                indicator.textContent = '🧭 邻居扩展模式 - 可多选锚点并扩展 N 跳邻居';
-                indicator.classList.add('show');
             } else {
                 indicator.classList.remove('show');
             }
@@ -5707,34 +5758,57 @@
             loadNoteToPanel();
         }
 
+        // 判断某故障组是否已标注根因（任一根因设备 或 任一根因告警）
+        function isGroupLabeled(group) {
+            const rc = group && group.root_cause_annotations;
+            if (!rc || typeof rc !== 'object') return false;
+            return Object.keys(rc).some(function(neId) {
+                const entry = rc[neId];
+                if (!entry) return false;
+                if (entry.device === true) return true;
+                if (entry.alarms && typeof entry.alarms === 'object') {
+                    return Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+                }
+                return false;
+            });
+        }
+
         // 更新“上一组/下一组”导航条
         function updateGroupNavUI() {
             const nav = document.getElementById('groupNav');
-            if (!nav) return;
-            if (groupNavList.length > 1) {
-                nav.style.display = 'flex';
-                const statusEl = document.getElementById('groupNavStatus');
-                if (statusEl) statusEl.textContent = (groupNavIndex + 1) + ' / ' + groupNavList.length;
-                const prevBtn = document.getElementById('prevGroupBtn');
-                const nextBtn = document.getElementById('nextGroupBtn');
-                if (prevBtn) prevBtn.disabled = groupNavIndex <= 0;
-                if (nextBtn) nextBtn.disabled = groupNavIndex >= groupNavList.length - 1;
-            } else {
-                nav.style.display = 'none';
-            }
+            const jump = document.getElementById('groupNavJump');
+            const multi = groupNavList.length > 1;
+            if (nav) nav.style.display = multi ? 'flex' : 'none';
+            if (jump) jump.style.display = multi ? 'flex' : 'none';
+            if (!multi) return;
+            const labeledCount = groupNavList.filter(isGroupLabeled).length;
+            const statusEl = document.getElementById('groupNavStatus');
+            if (statusEl) statusEl.textContent = (groupNavIndex + 1) + ' / ' + groupNavList.length + '（已标 ' + labeledCount + '）';
+            const prevBtn = document.getElementById('prevGroupBtn');
+            const nextBtn = document.getElementById('nextGroupBtn');
+            if (prevBtn) prevBtn.disabled = groupNavIndex <= 0;
+            if (nextBtn) nextBtn.disabled = groupNavIndex >= groupNavList.length - 1;
         }
 
-        // 跳转到相邻故障组（delta = -1 上一组，1 下一组）
-        function goToAdjacentGroup(delta) {
-            if (!groupNavList.length) return;
-            const newIndex = groupNavIndex + delta;
-            if (newIndex < 0 || newIndex >= groupNavList.length) return;
-            groupNavIndex = newIndex;
+        // 切换离开当前组前：同步备注、把状态回写总览页、自动落盘
+        function commitCurrentGroup() {
+            if (!graphData) return;
+            const ta = document.getElementById('noteTextarea');
+            if (ta) {
+                graphData.note = ta.value.trim();
+                graphData.note_updated_at = new Date().toISOString();
+            }
+            pushStatusToOverview();
+            autoSaveResults();
+        }
+
+        function loadGroupAtIndex(idx) {
+            groupNavIndex = idx;
             showLoading(true);
             try {
-                renderSingleGroup(groupNavList[groupNavIndex]);
+                renderSingleGroup(groupNavList[idx]);
                 const fileStatus = document.getElementById('fileStatus');
-                if (fileStatus) fileStatus.textContent = '已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组';
+                if (fileStatus) fileStatus.textContent = '已加载第 ' + (idx + 1) + ' / ' + groupNavList.length + ' 组';
             } catch (error) {
                 showError('加载故障组失败: ' + error.message);
                 showLoading(false);
@@ -5742,6 +5816,90 @@
             }
             updateGroupNavUI();
         }
+
+        // 跳转到相邻故障组（delta = -1 上一组，1 下一组）
+        function goToAdjacentGroup(delta) {
+            if (!groupNavList.length) return;
+            const newIndex = groupNavIndex + delta;
+            if (newIndex < 0 || newIndex >= groupNavList.length) return;
+            commitCurrentGroup();
+            loadGroupAtIndex(newIndex);
+        }
+
+        // 向后跳到下一个 已标注(labeled=true) / 未标注(labeled=false) 的故障组
+        function goToNextByLabel(labeled) {
+            if (!groupNavList.length) return;
+            let target = -1;
+            for (let idx = groupNavIndex + 1; idx < groupNavList.length; idx++) {
+                if (isGroupLabeled(groupNavList[idx]) === labeled) { target = idx; break; }
+            }
+            if (target === -1) {
+                updateAutoSaveStatus(labeled ? '后面没有已标注的故障组了' : '后面没有未标注的故障组了');
+                return;
+            }
+            commitCurrentGroup();
+            loadGroupAtIndex(target);
+        }
+
+        // ==========================================
+        // 结果文件自动保存
+        // ==========================================
+        let resultFileHandle = null;
+
+        function updateAutoSaveStatus(message, isError) {
+            const el = document.getElementById('autoSaveStatus');
+            if (!el) return;
+            el.textContent = message || '';
+            el.className = 'autosave-status' + (isError ? ' error' : (resultFileHandle ? ' saved' : ''));
+        }
+
+        function pushStatusToOverview() {
+            try {
+                const bridge = getFaultGroupBrowserBridge();
+                if (bridge && typeof bridge.applyFaultGroupRootCause === 'function' && originalGroupUuid) {
+                    bridge.applyFaultGroupRootCause(originalGroupUuid, graphData.root_cause_annotations || {}, graphData.note || '');
+                }
+            } catch (e) { /* 总览页不可用时忽略 */ }
+        }
+
+        function buildResultContent() {
+            return groupNavList.map(function(g) { return JSON.stringify(g); }).join('\n') + '\n';
+        }
+
+        async function chooseResultFile() {
+            if (!window.showSaveFilePicker) {
+                updateAutoSaveStatus('当前浏览器不支持自动保存（请用 Chrome/Edge）', true);
+                return;
+            }
+            try {
+                resultFileHandle = await window.showSaveFilePicker({
+                    suggestedName: 'labeling_result.jsonl',
+                    types: [{ description: 'Labeling Result JSONL', accept: { 'application/jsonl': ['.jsonl'], 'text/plain': ['.txt', '.json'] } }]
+                });
+                await autoSaveResults();
+                updateAutoSaveStatus('已选择结果文件，切换故障组时自动保存');
+            } catch (e) {
+                if (e && e.name === 'AbortError') return;
+                updateAutoSaveStatus('选择结果文件失败: ' + (e.message || e), true);
+            }
+        }
+
+        async function autoSaveResults() {
+            if (!resultFileHandle) return;
+            try {
+                const writable = await resultFileHandle.createWritable();
+                await writable.write(buildResultContent());
+                await writable.close();
+                updateAutoSaveStatus('✓ 已自动保存 ' + new Date().toLocaleTimeString());
+            } catch (e) {
+                updateAutoSaveStatus('自动保存失败: ' + (e.message || e), true);
+            }
+        }
+
+        // 关闭/刷新页面时尽力保存当前组（异步写入不保证完成，主要依赖切换时的保存）
+        window.addEventListener('beforeunload', function() {
+            try { commitCurrentGroup(); } catch (e) { /* ignore */ }
+        });
 
         // 从会话/文件载荷中提取（可能的）故障组列表与当前组
         function extractGroupPayload(payload) {
