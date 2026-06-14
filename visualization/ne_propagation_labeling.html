@@ -1736,6 +1736,61 @@
             overflow-y: auto;
         }
 
+        /* 根因标注 */
+        .rc-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top: 1px dashed rgba(0,0,0,0.12);
+            font-size: 12px;
+            font-weight: 600;
+            color: #cf222e;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .rc-row input {
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .rc-device {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 14px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: #fff5f5;
+            border: 1px solid #ffd6d6;
+            font-size: 13px;
+            font-weight: 700;
+            color: #cf222e;
+        }
+
+        .rc-device.disabled {
+            background: #f6f8fa;
+            border-color: #d0d7de;
+            color: #57606a;
+            cursor: not-allowed;
+        }
+
+        .rc-device input {
+            margin: 0;
+        }
+
+        .rc-device input:disabled {
+            cursor: not-allowed;
+        }
+
+        .rc-device-hint {
+            font-size: 11px;
+            font-weight: 500;
+            color: #8c959f;
+        }
+
         .alarm-item {
             padding: 8px 12px;
             margin: 6px 0;
@@ -4762,10 +4817,108 @@
         function showNodeAlarms(nodeId) {
             const node = allNodes.find(function(n) { return n.id === nodeId; });
             if (!node) return;
+            // 不论是否有告警都展示设备详情弹窗（用于根因标注）
+            showAlarmPopup(node);
+        }
 
-            if (node.alarm && node.alarm.length > 0) {
-                showAlarmPopup(node);
+        // ==========================================
+        // 根因标注：状态读写
+        // ==========================================
+        function getRootCauseStore() {
+            if (!graphData) return null;
+            if (!graphData.root_cause_annotations || typeof graphData.root_cause_annotations !== 'object') {
+                graphData.root_cause_annotations = {};
             }
+            return graphData.root_cause_annotations;
+        }
+
+        function getNodeRootCauseEntry(neId, create) {
+            const store = getRootCauseStore();
+            if (!store) return null;
+            if (!store[neId]) {
+                if (!create) return null;
+                store[neId] = { device: false, alarms: {} };
+            }
+            if (!store[neId].alarms || typeof store[neId].alarms !== 'object') {
+                store[neId].alarms = {};
+            }
+            return store[neId];
+        }
+
+        // 每条告警在所属设备内的稳定标识
+        function getAlarmRootCauseKey(alarm, index) {
+            const id = alarm && (alarm.alarm_id || alarm.eid);
+            if (id) return 'id:' + String(id);
+            const type = (alarm && (alarm.alarm_type || alarm.title)) || '';
+            const ticket = (alarm && alarm['工单号']) || '';
+            const ts = (alarm && alarm.ts) || (alarm && alarm.alarm_time) || '';
+            return 'k:' + type + '|' + ticket + '|' + ts + '|#' + index;
+        }
+
+        function deviceHasAlarms(node) {
+            return !!(node && Array.isArray(node.alarm) && node.alarm.length > 0);
+        }
+
+        function isAlarmRootCause(neId, alarm, index) {
+            const entry = getNodeRootCauseEntry(neId, false);
+            if (!entry) return false;
+            return !!entry.alarms[getAlarmRootCauseKey(alarm, index)];
+        }
+
+        // 设备级根因：有告警时由告警派生（任一告警是根因则设备是根因）；无告警时取手动值
+        function computeDeviceRootCause(node) {
+            const entry = getNodeRootCauseEntry(node.id, false);
+            if (deviceHasAlarms(node)) {
+                if (!entry) return false;
+                return node.alarm.some(function(a, i) { return !!entry.alarms[getAlarmRootCauseKey(a, i)]; });
+            }
+            return !!(entry && entry.device);
+        }
+
+        function onAlarmRootCauseToggle(index, checked) {
+            if (!currentAlarmNodeId) return;
+            const node = allNodes.find(function(n) { return n.id === currentAlarmNodeId; });
+            if (!node || !Array.isArray(node.alarm) || !node.alarm[index]) return;
+            const entry = getNodeRootCauseEntry(node.id, true);
+            if (!entry) return;
+            const key = getAlarmRootCauseKey(node.alarm[index], index);
+            if (checked) { entry.alarms[key] = true; } else { delete entry.alarms[key]; }
+            // 设备级随之联动更新
+            const deviceCb = document.getElementById('deviceRootCauseCheckbox');
+            if (deviceCb) deviceCb.checked = computeDeviceRootCause(node);
+        }
+
+        function onDeviceRootCauseToggle(checked) {
+            if (!currentAlarmNodeId) return;
+            const node = allNodes.find(function(n) { return n.id === currentAlarmNodeId; });
+            if (!node) return;
+            // 有告警时设备级不可手动设置
+            if (deviceHasAlarms(node)) {
+                const deviceCb = document.getElementById('deviceRootCauseCheckbox');
+                if (deviceCb) deviceCb.checked = computeDeviceRootCause(node);
+                return;
+            }
+            const entry = getNodeRootCauseEntry(node.id, true);
+            if (entry) entry.device = !!checked;
+        }
+
+        function buildDeviceRootCauseHtml(node) {
+            const hasAlarms = deviceHasAlarms(node);
+            const checked = computeDeviceRootCause(node) ? ' checked' : '';
+            if (hasAlarms) {
+                return '<div class="rc-device disabled">' +
+                    '<input type="checkbox" id="deviceRootCauseCheckbox" disabled' + checked + '>' +
+                    '<span>整个设备是否是根因</span>' +
+                    '<span class="rc-device-hint">（由告警是否为根因自动决定）</span>' +
+                    '</div>';
+            }
+            return '<div class="rc-device">' +
+                '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">' +
+                    '<input type="checkbox" id="deviceRootCauseCheckbox"' + checked + ' onchange="onDeviceRootCauseToggle(this.checked)">' +
+                    '<span>整个设备是否是根因</span>' +
+                '</label>' +
+                '<span class="rc-device-hint">（该设备无告警，可手动标注）</span>' +
+                '</div>';
         }
 
         // 显示告警弹窗（非模态）
@@ -4801,9 +4954,16 @@
                     '</div>';
             }
 
+            const hasAlarms = deviceHasAlarms(node);
+
+            if (!hasAlarms) {
+                alarmHtml += '<div style="padding: 10px; color: #57606a; font-size: 12px; background: #f6f8fa; border-radius: 6px;">该设备无告警</div>';
+            }
+
+            if (hasAlarms) {
             alarmHtml += '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + node.alarm.length + ' 个):</div>' +
                 '<div class="alarm-list">';
-            
+
             node.alarm.forEach(function(alarm, index) {
                 const alarmType = alarm.alarm_type || '未知';
                 const severity = alarm.severity || alarm.alarm_level || 'warning';
@@ -4853,11 +5013,16 @@
                     '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                     virtualMeta +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
+                    '<label class="rc-row"><input type="checkbox"' + (isAlarmRootCause(node.id, alarm, index) ? ' checked' : '') + ' onchange="onAlarmRootCauseToggle(' + index + ', this.checked)"><span>是否是根因</span></label>' +
                     '</div>';
             });
-            
+
             alarmHtml += '</div>';
-            
+            }
+
+            // 设备级根因标注
+            alarmHtml += buildDeviceRootCauseHtml(node);
+
             popupBody.innerHTML = alarmHtml;
             popup.classList.add('show');
         }
@@ -6662,7 +6827,8 @@
                 if (browserBridge && originalGroupUuid) {
                     try {
                         if (typeof browserBridge.prepareFaultGroupNoteSave === 'function') {
-                            const prepared = browserBridge.prepareFaultGroupNoteSave(originalGroupUuid, dataWithNote.note || '');
+                            const extraFields = { root_cause_annotations: dataWithNote.root_cause_annotations || {} };
+                            const prepared = browserBridge.prepareFaultGroupNoteSave(originalGroupUuid, dataWithNote.note || '', extraFields);
                             let saveResult = null;
 
                             // 没有绑定原文件句柄时，直接在当前点击事件里弹保存窗口，
@@ -6678,7 +6844,7 @@
                             }
 
                             if (typeof browserBridge.applySavedFaultGroupNote === 'function') {
-                                browserBridge.applySavedFaultGroupNote(originalGroupUuid, prepared.note, prepared.noteUpdatedAt);
+                                browserBridge.applySavedFaultGroupNote(originalGroupUuid, prepared.note, prepared.noteUpdatedAt, prepared.extraFields);
                             }
                             currentNote = prepared.note || '';
                             if (saveResult && saveResult.mode === 'overwrite') {

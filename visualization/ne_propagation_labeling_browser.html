@@ -488,11 +488,12 @@
             throw new Error('当前浏览器未提供可写文件句柄，请重新通过“选择 JSONL 文件”加载，或使用支持 File System Access API 的环境');
         }
 
-        window.prepareFaultGroupNoteSave = function(groupUuid, noteText) {
+        window.prepareFaultGroupNoteSave = function(groupUuid, noteText, extraFields) {
             const normalizedUuid = String(groupUuid || '').trim();
             if (!normalizedUuid) {
                 throw new Error('缺少故障组 UUID，无法准备备注保存');
             }
+            const safeExtraFields = (extraFields && typeof extraFields === 'object' && !Array.isArray(extraFields)) ? extraFields : {};
             const noteUpdatedAt = new Date().toISOString();
             let found = false;
             const content = faultGroups.map(group => {
@@ -503,6 +504,7 @@
                 found = true;
                 const updatedGroup = {
                     ...group,
+                    ...safeExtraFields,
                     note: noteText || '',
                     note_updated_at: noteUpdatedAt,
                 };
@@ -517,12 +519,13 @@
                 content,
                 note: noteText || '',
                 noteUpdatedAt,
+                extraFields: safeExtraFields,
                 suggestedFileName: currentFaultGroupFileName || `${normalizedUuid}.jsonl`,
                 hasBoundWritableHandle: !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable),
             };
         };
 
-        window.applySavedFaultGroupNote = function(groupUuid, noteText, noteUpdatedAt) {
+        window.applySavedFaultGroupNote = function(groupUuid, noteText, noteUpdatedAt, extraFields) {
             const normalizedUuid = String(groupUuid || '').trim();
             if (!normalizedUuid) {
                 return;
@@ -534,6 +537,9 @@
             faultGroups[index].note = noteText || '';
             if (noteUpdatedAt) {
                 faultGroups[index].note_updated_at = noteUpdatedAt;
+            }
+            if (extraFields && typeof extraFields === 'object' && !Array.isArray(extraFields)) {
+                Object.assign(faultGroups[index], extraFields);
             }
             renderGroups();
         };
