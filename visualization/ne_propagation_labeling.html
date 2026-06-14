@@ -2266,8 +2266,8 @@
             </div>
 
             <div class="autosave-bar" id="autosaveBar">
-                <button id="chooseResultFileBtn" onclick="chooseResultFile()">📂 选择结果文件</button>
-                <span class="autosave-status" id="autoSaveStatus">未选择结果文件，不会自动保存</span>
+                <button id="exportResultBtn" onclick="exportResultFile()">⬇ 导出结果文件</button>
+                <span class="autosave-status" id="autoSaveStatus">标注会自动保存到浏览器本地</span>
             </div>
 
             <div class="rc-locate-panel" id="rcLocatePanel" style="display:none;">
@@ -5207,6 +5207,8 @@
             updateMapSelection();
             renderRootCausePanel();
             updateGroupNavUI();
+            autoSaveResults();   // 勾选即自动保存到本地
+            pushStatusToOverview();
         }
 
         // 单条告警的“是否是根因”勾选
@@ -5996,7 +5998,8 @@
         // 渲染单个故障组（格式识别 + 备注 + 启用备注面板）
         function renderSingleGroup(data) {
             graphData = data;
-            currentNote = data.note || '';
+            restoreRcFromLocalStore(graphData); // 从本地恢复已保存的根因标注/备注
+            currentNote = graphData.note || '';
             originalGroupUuid = data.uuid || data.match_info?.uuid || '';
 
             if (graphData.ne_info) {
@@ -6099,15 +6102,21 @@
         }
 
         // ==========================================
-        // 结果文件自动保存
+        // 结果自动保存：默认写入浏览器本地（localStorage），无需手动选择文件；
+        // 需要落到磁盘文件时点“导出结果文件”一键下载 JSONL。
         // ==========================================
-        let resultFileHandle = null;
+        const RC_LS_KEY = 'mw_rc_annotations';
 
         function updateAutoSaveStatus(message, isError) {
             const el = document.getElementById('autoSaveStatus');
             if (!el) return;
             el.textContent = message || '';
-            el.className = 'autosave-status' + (isError ? ' error' : (resultFileHandle ? ' saved' : ''));
+            el.className = 'autosave-status' + (isError ? ' error' : ' saved');
+        }
+
+        function loadRcLocalStore() {
+            try { return JSON.parse(localStorage.getItem(RC_LS_KEY) || '{}') || {}; }
+            catch (e) { return {}; }
         }
 
         function pushStatusToOverview() {
@@ -6119,41 +6128,69 @@
             } catch (e) { /* 总览页不可用时忽略 */ }
         }
 
-        function buildResultContent() {
-            return groupNavList.map(function(g) { return JSON.stringify(g); }).join('\n') + '\n';
-        }
-
-        async function chooseResultFile() {
-            if (!window.showSaveFilePicker) {
-                updateAutoSaveStatus('当前浏览器不支持自动保存（请用 Chrome/Edge）', true);
-                return;
-            }
+        // 把当前故障组的根因标注 + 备注自动写入 localStorage（按 uuid 存）
+        function autoSaveResults() {
+            if (!graphData || !originalGroupUuid) return;
             try {
-                resultFileHandle = await window.showSaveFilePicker({
-                    suggestedName: 'labeling_result.jsonl',
-                    types: [{ description: 'Labeling Result JSONL', accept: { 'application/jsonl': ['.jsonl'], 'text/plain': ['.txt', '.json'] } }]
-                });
-                await autoSaveResults();
-                updateAutoSaveStatus('已选择结果文件，切换故障组时自动保存');
-            } catch (e) {
-                if (e && e.name === 'AbortError') return;
-                updateAutoSaveStatus('选择结果文件失败: ' + (e.message || e), true);
-            }
-        }
-
-        async function autoSaveResults() {
-            if (!resultFileHandle) return;
-            try {
-                const writable = await resultFileHandle.createWritable();
-                await writable.write(buildResultContent());
-                await writable.close();
-                updateAutoSaveStatus('✓ 已自动保存 ' + new Date().toLocaleTimeString());
+                const store = loadRcLocalStore();
+                store[originalGroupUuid] = {
+                    root_cause_annotations: graphData.root_cause_annotations || {},
+                    note: graphData.note || '',
+                    updated_at: new Date().toISOString()
+                };
+                localStorage.setItem(RC_LS_KEY, JSON.stringify(store));
+                updateAutoSaveStatus('✓ 已自动保存到本地 ' + new Date().toLocaleTimeString());
             } catch (e) {
                 updateAutoSaveStatus('自动保存失败: ' + (e.message || e), true);
             }
         }
 
-        // 关闭/刷新页面时尽力保存当前组（异步写入不保证完成，主要依赖切换时的保存）
+        // 加载某组时，从 localStorage 恢复其根因标注/备注（本地工作副本优先）
+        function restoreRcFromLocalStore(group) {
+            if (!group) return;
+            const uuid = group.uuid || (group.match_info && group.match_info.uuid) || '';
+            if (!uuid) return;
+            const entry = loadRcLocalStore()[uuid];
+            if (!entry) return;
+            if (entry.root_cause_annotations && typeof entry.root_cause_annotations === 'object') {
+                group.root_cause_annotations = entry.root_cause_annotations;
+            }
+            if (entry.note !== undefined && entry.note !== null) {
+                group.note = entry.note;
+            }
+        }
+
+        // 一键导出结果 JSONL（合并 localStorage 中所有已标注，确保未访问的组也带上）
+        function exportResultFile() {
+            const store = loadRcLocalStore();
+            const groups = groupNavList.length ? groupNavList : (graphData ? [graphData] : []);
+            if (!groups.length) {
+                updateAutoSaveStatus('没有可导出的故障组', true);
+                return;
+            }
+            const content = groups.map(function(g) {
+                const uuid = g.uuid || (g.match_info && g.match_info.uuid) || '';
+                const entry = store[uuid];
+                const merged = Object.assign({}, g);
+                if (entry) {
+                    merged.root_cause_annotations = entry.root_cause_annotations || g.root_cause_annotations || {};
+                    if (entry.note !== undefined) merged.note = entry.note;
+                }
+                return JSON.stringify(merged);
+            }).join('\n') + '\n';
+            const blob = new Blob([content], { type: 'application/jsonl' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'labeling_result.jsonl';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            updateAutoSaveStatus('已导出 labeling_result.jsonl（' + groups.length + ' 组）');
+        }
+
+        // 关闭/刷新页面时保存当前组（localStorage 写入是同步的，可靠）
         window.addEventListener('beforeunload', function() {
             try { commitCurrentGroup(); } catch (e) { /* ignore */ }
         });

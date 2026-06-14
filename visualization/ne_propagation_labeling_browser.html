@@ -1117,9 +1117,25 @@
             });
         }
 
+        // 读取标注页写入浏览器本地的根因标注（同源共享 localStorage）
+        function getLocalRootCauseStore() {
+            try { return JSON.parse(localStorage.getItem('mw_rc_annotations') || '{}') || {}; }
+            catch (e) { return {}; }
+        }
+
+        // 取某组的有效根因标注：本地保存优先，其次组对象自身
+        function getEffectiveRootCause(group) {
+            const uuid = group && (group.uuid || (group.match_info && group.match_info.uuid)) || '';
+            if (uuid) {
+                const entry = getLocalRootCauseStore()[uuid];
+                if (entry && entry.root_cause_annotations) return entry.root_cause_annotations;
+            }
+            return group && group.root_cause_annotations;
+        }
+
         // 是否已标注根因（任一根因设备 或 任一根因告警）
         function isGroupLabeled(group) {
-            const rc = group && group.root_cause_annotations;
+            const rc = getEffectiveRootCause(group);
             if (!rc || typeof rc !== 'object') return false;
             return Object.keys(rc).some(function(neId) {
                 const entry = rc[neId];
