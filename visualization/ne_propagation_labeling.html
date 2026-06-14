@@ -6029,13 +6029,16 @@
             });
         }
 
+        // 是否显示“上一组/下一组 未标注/已标注”跳转按钮（暂时隐藏，逻辑保留，置 true 即可恢复）
+        const SHOW_LABEL_JUMP_NAV = false;
+
         // 更新“上一组/下一组”导航条
         function updateGroupNavUI() {
             const nav = document.getElementById('groupNav');
             const multi = groupNavList.length > 1;
             if (nav) nav.style.display = multi ? 'flex' : 'none';
             document.querySelectorAll('.group-nav-jump').forEach(function(row) {
-                row.style.display = multi ? 'flex' : 'none';
+                row.style.display = (multi && SHOW_LABEL_JUMP_NAV) ? 'flex' : 'none';
             });
             if (!multi) return;
             const labeledCount = groupNavList.filter(isGroupLabeled).length;
