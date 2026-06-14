@@ -3340,6 +3340,7 @@
                     !e.target.closest('.node-item')) {
                     closeAlarmPopup();
                 }
+                hideDetailPanelOnOutsideClick(e);
             });
 
             document.addEventListener('keydown', function(e) {
@@ -5013,6 +5014,30 @@
             clearNodeSelection();
             clearEdgeSelection();
             closeAlarmPopup();
+        }
+
+        function hideDetailPanelOnOutsideClick(event) {
+            const detailPanel = document.getElementById('detailPanel');
+            if (!detailPanel || !detailPanel.classList.contains('show')) return;
+
+            const target = event.target;
+            if (detailPanel.contains(target)) return;
+
+            if (target.closest('.alarm-popup') ||
+                target.closest('.leaflet-popup-content') ||
+                target.closest('.custom-marker') ||
+                target.closest('.leaflet-marker-icon') ||
+                target.closest('.node-item')) {
+                return;
+            }
+
+            if (selectedNode) {
+                clearNodeSelection();
+            }
+            if (selectedEdge) {
+                clearEdgeSelection();
+            }
+            detailPanel.classList.remove('show');
         }
 
         // ==========================================
