@@ -3340,18 +3340,6 @@
                     !e.target.closest('.node-item')) {
                     closeAlarmPopup();
                 }
-                // 点击“设备页签/标记/侧栏”以外的区域（如地图空白处）时，关闭设备页签并取消选中
-                if (!e.target.closest('.leaflet-popup') &&
-                    !e.target.closest('.custom-marker') &&
-                    !e.target.closest('.leaflet-marker-icon') &&
-                    !e.target.closest('.alarm-popup') &&
-                    !e.target.closest('.sidebar')) {
-                    if (selectedNode) {
-                        clearNodeSelection();
-                    } else if (map) {
-                        map.closePopup();
-                    }
-                }
                 hideDetailPanelOnOutsideClick(e);
             });
 
@@ -4017,6 +4005,17 @@
             map.createPane('siteLabelPane');
             map.getPane('siteLabelPane').style.zIndex = 330;
             map.getPane('siteLabelPane').style.pointerEvents = 'none';
+
+            // 点击地图空白处关闭设备页签（标记默认 bubblingMouseEvents:false，
+            // 所以点设备标记不会触发 map 'click'，页签照常打开、不会被误关）
+            map.on('click', function() {
+                closeAlarmPopup();
+                if (selectedNode) {
+                    clearNodeSelection();
+                } else {
+                    map.closePopup();
+                }
+            });
         }
 
         function hasValidCoords(node) {
