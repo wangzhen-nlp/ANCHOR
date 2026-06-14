@@ -343,46 +343,8 @@
             <div class="sub">加载 `jsonl` 文件后，页面会展示所有故障组摘要；点击任意故障组可打开「微波群障根因标注」页进行标注。</div>
             <div class="toolbar">
                 <input id="fileInput" type="file" accept=".jsonl,.txt,.json">
-                <input id="referenceFileInput" type="file" accept=".json">
                 <button class="btn" onclick="openFaultGroupFile()">选择 JSONL 文件</button>
-                <button class="btn" onclick="document.getElementById('referenceFileInput').click()">选择关联明细 JSON</button>
                 <div class="hint">每行一个故障组对象</div>
-            </div>
-            <div class="reference-status" id="referenceStatus">关联明细 JSON：未加载</div>
-            <div class="filters" id="filters">
-                <button class="filter-chip active" data-filter="all">全部</button>
-                <button class="filter-chip" data-filter="with-related">有关联故障组</button>
-                <button class="filter-chip" data-filter="without-related">无关联故障组</button>
-                <button class="filter-chip" data-filter="ultimate">终极故障组</button>
-                <button class="filter-chip" data-filter="multi-site">站点数大于 1</button>
-            </div>
-            <div class="filter-row">
-                <span class="site-filter-label">规则过滤</span>
-                <div class="rule-filter-group">
-                    <input id="ruleFilterInput" class="site-filter-input" type="text" placeholder="输入规则名，回车/逗号添加多个">
-                    <button id="addRuleFilterBtn" class="filter-add-btn" type="button">添加</button>
-                    <button id="clearRuleFilterBtn" class="filter-add-btn" type="button">清空规则</button>
-                </div>
-                <div id="ruleFilterTokens" class="rule-filter-list"></div>
-            </div>
-            <div class="filter-row">
-                <span class="site-filter-label">站点过滤</span>
-                <input id="siteFilterInput" class="site-filter-input" type="text" placeholder="输入站点ID，支持包含匹配">
-            </div>
-            <div class="filter-row">
-                <span class="site-filter-label">工单号过滤</span>
-                <input id="ticketFilterInput" class="site-filter-input" type="text" placeholder="输入工单号，支持包含匹配">
-            </div>
-            <div class="filter-row">
-                <span class="site-filter-label">时间范围大于</span>
-                <div class="duration-filter-group">
-                    <input id="durationHoursInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="时">
-                    <span class="duration-filter-text">时</span>
-                    <input id="durationMinutesInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="分">
-                    <span class="duration-filter-text">分</span>
-                    <input id="durationSecondsInput" class="duration-filter-input" type="number" min="0" step="1" placeholder="秒">
-                    <span class="duration-filter-text">秒</span>
-                </div>
             </div>
             <div class="filter-row">
                 <span class="site-filter-label">备注过滤</span>
@@ -1120,7 +1082,7 @@
             const filterSummary = document.getElementById('filterSummary');
             const visibleGroups = filterGroups(faultGroups);
 
-            filterSummary.textContent = `过滤后 ${visibleGroups.length} 条`;
+            if (filterSummary) filterSummary.textContent = `过滤后 ${visibleGroups.length} 条`;
 
             if (visibleGroups.length === 0) {
                 list.innerHTML = '';
@@ -1215,6 +1177,7 @@
 
         function renderRuleFilterTokens() {
             const tokenList = document.getElementById('ruleFilterTokens');
+            if (!tokenList) return;
             if (ruleFilterQueries.length === 0) {
                 tokenList.innerHTML = '<span class="hint">未限制规则</span>';
                 return;
@@ -1252,94 +1215,10 @@
             reader.readAsText(file, 'utf-8');
         });
 
-        document.getElementById('referenceFileInput').addEventListener('change', function(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                try {
-                    referenceData = JSON.parse(e.target.result);
-                    rebuildReferenceIndex();
-                    document.getElementById('referenceStatus').textContent = `关联明细 JSON：已加载 ${file.name}`;
-                    renderGroups();
-                } catch (error) {
-                    referenceData = null;
-                    resetReferenceIndex();
-                    document.getElementById('referenceStatus').textContent = `关联明细 JSON：加载失败 - ${error.message}`;
-                    renderGroups();
-                }
-            };
-            reader.readAsText(file, 'utf-8');
-        });
-
-        document.getElementById('filters').addEventListener('click', function(event) {
-            const btn = event.target.closest('.filter-chip');
-            if (!btn) return;
-
-            const filter = btn.dataset.filter || 'all';
-            if (filter === 'all') {
-                activeFilters = new Set(['all']);
-            } else {
-                activeFilters.delete('all');
-                if (activeFilters.has(filter)) {
-                    activeFilters.delete(filter);
-                } else {
-                    activeFilters.add(filter);
-                }
-                if (activeFilters.size === 0) {
-                    activeFilters.add('all');
-                }
-            }
-
-            document.querySelectorAll('.filter-chip').forEach(chip => {
-                const chipFilter = chip.dataset.filter || 'all';
-                chip.classList.toggle('active', activeFilters.has(chipFilter));
-            });
-            renderGroups();
-        });
-
-        document.getElementById('addRuleFilterBtn').addEventListener('click', addRuleFiltersFromInput);
-        document.getElementById('clearRuleFilterBtn').addEventListener('click', clearRuleFilters);
-        document.getElementById('ruleFilterInput').addEventListener('keydown', function(event) {
-            if (event.key === 'Enter' || event.key === ',') {
-                event.preventDefault();
-                addRuleFiltersFromInput();
-            }
-        });
-        document.getElementById('ruleFilterInput').addEventListener('input', function(event) {
-            if (event.target.value.includes(',') || event.target.value.includes('，') || event.target.value.includes('\n')) {
-                addRuleFiltersFromInput();
-            }
-        });
-
-        document.getElementById('siteFilterInput').addEventListener('input', function(event) {
-            siteFilterQuery = event.target.value.trim();
-            renderGroups();
-        });
-
-        document.getElementById('ticketFilterInput').addEventListener('input', function(event) {
-            ticketFilterQuery = event.target.value.trim();
-            renderGroups();
-        });
-
         document.getElementById('noteFilterInput').addEventListener('input', function(event) {
             noteFilterQuery = event.target.value.trim();
             renderGroups();
         });
-
-        function updateDurationFilter() {
-            const hours = parseInt(document.getElementById('durationHoursInput').value || '0', 10) || 0;
-            const minutes = parseInt(document.getElementById('durationMinutesInput').value || '0', 10) || 0;
-            const seconds = parseInt(document.getElementById('durationSecondsInput').value || '0', 10) || 0;
-            durationFilterSeconds = hours * 3600 + minutes * 60 + seconds;
-            renderGroups();
-        }
-
-        document.getElementById('durationHoursInput').addEventListener('input', updateDurationFilter);
-        document.getElementById('durationMinutesInput').addEventListener('input', updateDurationFilter);
-        document.getElementById('durationSecondsInput').addEventListener('input', updateDurationFilter);
-        renderRuleFilterTokens();
     </script>
 </body>
 </html>
