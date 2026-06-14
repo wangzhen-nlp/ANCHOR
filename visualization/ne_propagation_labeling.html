@@ -4889,7 +4889,6 @@
                         closeAlarmPopup();
                         selectNodeWithoutMapRefresh(node.id);
                         if (!siteNeighborModeEnabled && selectedNode === node.id) {
-                            this.openPopup();   // 点击即在设备处弹出页签
                             showNodeAlarms(node.id);
                         }
                     }
@@ -5114,9 +5113,15 @@
             showDetailPanel(nodeId);
 
             // 邻居扩展模式下不弹 popup，尽量减少视觉打断。
-            const marker = mapMarkers[nodeId];
-            if (marker && !siteNeighborModeEnabled) {
-                marker.openPopup();
+            // 延迟到下一帧再开 popup：updateMapSelection() 刚用 setIcon 重建了标记 DOM，
+            // 同步立即 openPopup 在真实 Leaflet 中常常打不开，必须等图标 DOM 落定。
+            if (!siteNeighborModeEnabled) {
+                setTimeout(function() {
+                    const m = mapMarkers[nodeId];
+                    if (m && selectedNode === nodeId) {
+                        m.openPopup();
+                    }
+                }, 0);
             }
         }
 
