@@ -139,6 +139,90 @@
             color: #cf222e;
         }
 
+        .rc-locate-panel {
+            background: #fff5f5;
+            border: 1px solid #ffd6d6;
+            border-radius: 8px;
+            padding: 10px;
+        }
+
+        .rc-locate-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .rc-locate-header h4 {
+            font-size: 12px;
+            font-weight: 700;
+            color: #cf222e;
+        }
+
+        .rc-locate-header button {
+            flex: 0 0 auto;
+            padding: 4px 8px;
+            background: #cf222e;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        .rc-locate-header button:hover {
+            background: #a40e26;
+        }
+
+        .rc-locate-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            border: 1px solid #f3d0d0;
+            background: #ffffff;
+            font-size: 12px;
+            cursor: pointer;
+            margin-bottom: 4px;
+        }
+
+        .rc-locate-item:hover {
+            background: #fff0f0;
+            border-color: #cf222e;
+        }
+
+        .rc-locate-item .rc-loc-id {
+            font-weight: 600;
+            color: #24292f;
+            word-break: break-all;
+        }
+
+        .rc-locate-item .rc-loc-site {
+            color: #57606a;
+            font-size: 11px;
+        }
+
+        .rc-loc-tag {
+            flex: 0 0 auto;
+            margin-left: auto;
+            padding: 1px 6px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        .rc-loc-tag.alarm {
+            background: #fde2e2;
+            color: #cf222e;
+        }
+
+        .rc-loc-tag.device {
+            background: #e0e7ff;
+            color: #3538cd;
+        }
+
         .file-section {
             background: #f6f8fa;
             padding: 12px;
@@ -1186,6 +1270,17 @@
             filter: drop-shadow(0 0 8px #ffd700);
         }
 
+        /* 根因设备标记：醒目红色光环 */
+        .marker-pin.rc-root {
+            border-radius: 50%;
+            box-shadow: 0 0 0 3px #cf222e, 0 0 10px 2px rgba(207, 34, 46, 0.6);
+            z-index: 1500 !important;
+        }
+
+        .marker-pin.rc-root svg {
+            filter: drop-shadow(0 0 4px rgba(207, 34, 46, 0.9));
+        }
+
         .marker-alarm-groups {
             position: absolute;
             left: 22px;
@@ -2171,6 +2266,14 @@
             <div class="autosave-bar" id="autosaveBar">
                 <button id="chooseResultFileBtn" onclick="chooseResultFile()">📂 选择结果文件</button>
                 <span class="autosave-status" id="autoSaveStatus">未选择结果文件，不会自动保存</span>
+            </div>
+
+            <div class="rc-locate-panel" id="rcLocatePanel" style="display:none;">
+                <div class="rc-locate-header">
+                    <h4>根因设备 (<span id="rcLocateCount">0</span>)</h4>
+                    <button id="rcLocateAllBtn" onclick="locateAllRootCauseDevices()">定位根因</button>
+                </div>
+                <div class="rc-locate-list" id="rcLocateList"></div>
             </div>
 
             <!-- “选择数据文件”区域已隐藏：默认文件加载逻辑保持不变，相关元素仅保留供脚本引用 -->
@@ -4250,9 +4353,105 @@
         function buildMarkerHtml(node, svgHtml, isSelected, isHighlighted) {
             return '<div class="marker-pin ' +
                 (node.isNeighborExpanded ? 'neighbor-expanded ' : '') +
+                (isRootCauseNode(node) ? 'rc-root ' : '') +
                 (isSelected ? 'selected ' : '') +
                 (isHighlighted ? 'highlighted' : '') +
                 '">' + svgHtml + renderMarkerAlarmGroupBadges(node) + renderMarkerVirtualBadge(node) + '</div>';
+        }
+
+        // 当前组中该设备是否被标为根因（告警根因 或 设备根因）
+        function isRootCauseNode(node) {
+            if (!node) return false;
+            const entry = getNodeRootCauseEntry(node.id, false);
+            if (!entry) return false;
+            if (entry.device === true) return true;
+            if (entry.alarms && typeof entry.alarms === 'object') {
+                return Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+            }
+            return false;
+        }
+
+        // 返回当前组的根因设备列表：{ id, type:'alarm'|'device' }
+        function getRootCauseDeviceList() {
+            const store = (graphData && graphData.root_cause_annotations) || {};
+            const list = [];
+            Object.keys(store).forEach(function(neId) {
+                const entry = store[neId];
+                if (!entry) return;
+                const hasAlarmRc = entry.alarms && typeof entry.alarms === 'object' &&
+                    Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+                if (hasAlarmRc) {
+                    list.push({ id: neId, type: 'alarm' });
+                } else if (entry.device === true) {
+                    list.push({ id: neId, type: 'device' });
+                }
+            });
+            return list;
+        }
+
+        // 渲染侧栏“根因设备”可点击列表
+        function renderRootCausePanel() {
+            const panel = document.getElementById('rcLocatePanel');
+            if (!panel) return;
+            const list = getRootCauseDeviceList();
+            const listEl = document.getElementById('rcLocateList');
+            const countEl = document.getElementById('rcLocateCount');
+            if (countEl) countEl.textContent = String(list.length);
+            if (list.length === 0) {
+                panel.style.display = 'none';
+                if (listEl) listEl.innerHTML = '';
+                return;
+            }
+            panel.style.display = 'block';
+            if (!listEl) return;
+            listEl.innerHTML = list.map(function(item) {
+                const node = allNodes.find(function(n) { return n.id === item.id; });
+                const site = (node && (node.site_id || node.site_name)) || '-';
+                const tag = item.type === 'alarm'
+                    ? '<span class="rc-loc-tag alarm">告警根因</span>'
+                    : '<span class="rc-loc-tag device">设备根因</span>';
+                return '<div class="rc-locate-item" onclick="locateRootCauseDevice(' + rcJsLiteral(item.id) + ')">' +
+                    '<span class="rc-loc-id">' + escapeHtml(String(item.id)) + '</span>' +
+                    '<span class="rc-loc-site">' + escapeHtml(String(site)) + '</span>' +
+                    tag +
+                    '</div>';
+            }).join('');
+        }
+
+        // 定位到单个根因设备：平移/缩放并弹出详情
+        function locateRootCauseDevice(neId) {
+            if (!map) return;
+            const marker = mapMarkers[neId];
+            if (!marker) {
+                updateAutoSaveStatus('该根因设备当前未在地图显示（可能被设备类型筛选隐藏）', true);
+                return;
+            }
+            const latlng = marker.getLatLng();
+            map.setView(latlng, Math.max(map.getZoom(), 14), { animate: true });
+            closeAlarmPopup();
+            selectNodeWithoutMapRefresh(neId);
+            if (selectedNode === neId) {
+                showNodeAlarms(neId);
+            }
+        }
+
+        // 定位到所有根因设备：自动框选视野
+        function locateAllRootCauseDevices() {
+            if (!map) return;
+            const latlngs = [];
+            getRootCauseDeviceList().forEach(function(item) {
+                const m = mapMarkers[item.id];
+                if (m) latlngs.push(m.getLatLng());
+            });
+            if (!latlngs.length) {
+                updateAutoSaveStatus('没有可定位的根因设备', true);
+                return;
+            }
+            if (latlngs.length === 1) {
+                map.setView(latlngs[0], Math.max(map.getZoom(), 14), { animate: true });
+            } else {
+                map.fitBounds(L.latLngBounds(latlngs).pad(0.3));
+            }
         }
 
         function getSymptomAlarmSource(symptom) {
@@ -4942,6 +5141,7 @@
             if (checked) { entry.alarms[key] = true; } else { delete entry.alarms[key]; }
             // 设备级随之联动更新
             refreshDeviceRootCauseCheckboxes(node);
+            onRootCauseChanged();
         }
 
         function onDeviceRootCauseToggle(neId, checked) {
@@ -4954,6 +5154,14 @@
             }
             const entry = getNodeRootCauseEntry(node.id, true);
             if (entry) entry.device = !!checked;
+            onRootCauseChanged();
+        }
+
+        // 根因标注变化后：刷新地图标记的根因高亮 + 侧栏根因设备列表
+        function onRootCauseChanged() {
+            updateMapSelection();
+            renderRootCausePanel();
+            updateGroupNavUI();
         }
 
         // 单条告警的“是否是根因”勾选
@@ -5756,6 +5964,7 @@
 
             enableNotePanel();
             loadNoteToPanel();
+            renderRootCausePanel();
         }
 
         // 判断某故障组是否已标注根因（任一根因设备 或 任一根因告警）
