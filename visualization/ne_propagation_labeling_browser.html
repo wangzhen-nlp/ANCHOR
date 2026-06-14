@@ -1165,14 +1165,19 @@
             return group && group.root_cause_annotations;
         }
 
-        // 导出全部故障组的标注结果 JSONL（合并浏览器本地保存的根因标注/备注）
+        // 仅导出“已标注根因”的故障组（合并浏览器本地保存的根因标注/备注）
         function exportLabelingResult() {
             if (!faultGroups.length) {
                 document.getElementById('status').textContent = '请先加载 JSONL 文件再导出';
                 return;
             }
             const store = getLocalRootCauseStore();
-            const content = faultGroups.map(function(g) {
+            const labeledGroups = faultGroups.filter(isGroupLabeled);
+            if (!labeledGroups.length) {
+                document.getElementById('status').textContent = '当前没有已标注的故障组，无需导出';
+                return;
+            }
+            const content = labeledGroups.map(function(g) {
                 const uuid = g.uuid || (g.match_info && g.match_info.uuid) || '';
                 const entry = store[uuid];
                 const merged = Object.assign({}, g);
@@ -1191,8 +1196,7 @@
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            const labeled = faultGroups.filter(isGroupLabeled).length;
-            document.getElementById('status').textContent = '已导出 labeling_result.jsonl（共 ' + faultGroups.length + ' 组，已标注 ' + labeled + '）';
+            document.getElementById('status').textContent = '已导出 labeling_result.jsonl（已标注 ' + labeledGroups.length + ' 组）';
         }
 
         // 是否已标注根因（任一根因设备 或 任一根因告警）
