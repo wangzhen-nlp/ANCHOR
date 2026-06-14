@@ -4564,7 +4564,7 @@
                             }).join('') +
                             '</div>';
                     }
-                    const alarmRows = node.alarm.map(function(alarm) {
+                    const alarmRows = node.alarm.map(function(alarm, alarmIndex) {
                         const alarmTime = getAlarmDisplayTime(alarm);
                         const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
@@ -4582,6 +4582,7 @@
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                             '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
+                            buildAlarmRootCauseLabel(node, alarm, alarmIndex) +
                             '</div>';
                     }).join('');
 
@@ -4589,6 +4590,9 @@
                 } else {
                     popupContent += '<div class="popup-row">告警: 0 个</div>';
                 }
+
+                // 根因标注（设备级）
+                popupContent += buildDeviceRootCauseHtml(node);
                 
                 if (isHighlighted) {
                     popupContent += '<div class="popup-row" style="color: #ffd700; font-weight: bold; font-size: 11px; margin-top: 4px;">⭐ 搜索匹配站点</div>';
@@ -4875,46 +4879,65 @@
             return !!(entry && entry.device);
         }
 
-        function onAlarmRootCauseToggle(index, checked) {
-            if (!currentAlarmNodeId) return;
-            const node = allNodes.find(function(n) { return n.id === currentAlarmNodeId; });
+        // 在 JS 内联事件中安全嵌入字符串字面量
+        function rcJsLiteral(value) {
+            return "'" + String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
+        }
+
+        // 联动刷新所有已打开弹窗里该设备的设备级根因勾选框
+        function refreshDeviceRootCauseCheckboxes(node) {
+            const value = computeDeviceRootCause(node);
+            document.querySelectorAll('.rc-device-checkbox').forEach(function(cb) {
+                if (cb.getAttribute('data-ne') === node.id) {
+                    cb.checked = value;
+                }
+            });
+        }
+
+        function onAlarmRootCauseToggle(neId, index, checked) {
+            const node = allNodes.find(function(n) { return n.id === neId; });
             if (!node || !Array.isArray(node.alarm) || !node.alarm[index]) return;
             const entry = getNodeRootCauseEntry(node.id, true);
             if (!entry) return;
             const key = getAlarmRootCauseKey(node.alarm[index], index);
             if (checked) { entry.alarms[key] = true; } else { delete entry.alarms[key]; }
             // 设备级随之联动更新
-            const deviceCb = document.getElementById('deviceRootCauseCheckbox');
-            if (deviceCb) deviceCb.checked = computeDeviceRootCause(node);
+            refreshDeviceRootCauseCheckboxes(node);
         }
 
-        function onDeviceRootCauseToggle(checked) {
-            if (!currentAlarmNodeId) return;
-            const node = allNodes.find(function(n) { return n.id === currentAlarmNodeId; });
+        function onDeviceRootCauseToggle(neId, checked) {
+            const node = allNodes.find(function(n) { return n.id === neId; });
             if (!node) return;
             // 有告警时设备级不可手动设置
             if (deviceHasAlarms(node)) {
-                const deviceCb = document.getElementById('deviceRootCauseCheckbox');
-                if (deviceCb) deviceCb.checked = computeDeviceRootCause(node);
+                refreshDeviceRootCauseCheckboxes(node);
                 return;
             }
             const entry = getNodeRootCauseEntry(node.id, true);
             if (entry) entry.device = !!checked;
         }
 
+        // 单条告警的“是否是根因”勾选
+        function buildAlarmRootCauseLabel(node, alarm, index) {
+            const checked = isAlarmRootCause(node.id, alarm, index) ? ' checked' : '';
+            return '<label class="rc-row"><input type="checkbox" class="rc-alarm-checkbox"' + checked +
+                ' onchange="onAlarmRootCauseToggle(' + rcJsLiteral(node.id) + ', ' + index + ', this.checked)"><span>是否是根因</span></label>';
+        }
+
         function buildDeviceRootCauseHtml(node) {
             const hasAlarms = deviceHasAlarms(node);
             const checked = computeDeviceRootCause(node) ? ' checked' : '';
+            const dataAttr = ' data-ne="' + escapeHtml(node.id) + '"';
             if (hasAlarms) {
                 return '<div class="rc-device disabled">' +
-                    '<input type="checkbox" id="deviceRootCauseCheckbox" disabled' + checked + '>' +
+                    '<input type="checkbox" class="rc-device-checkbox" disabled' + checked + dataAttr + '>' +
                     '<span>整个设备是否是根因</span>' +
                     '<span class="rc-device-hint">（由告警是否为根因自动决定）</span>' +
                     '</div>';
             }
             return '<div class="rc-device">' +
                 '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">' +
-                    '<input type="checkbox" id="deviceRootCauseCheckbox"' + checked + ' onchange="onDeviceRootCauseToggle(this.checked)">' +
+                    '<input type="checkbox" class="rc-device-checkbox"' + checked + dataAttr + ' onchange="onDeviceRootCauseToggle(' + rcJsLiteral(node.id) + ', this.checked)">' +
                     '<span>整个设备是否是根因</span>' +
                 '</label>' +
                 '<span class="rc-device-hint">（该设备无告警，可手动标注）</span>' +
@@ -5013,7 +5036,7 @@
                     '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                     virtualMeta +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
-                    '<label class="rc-row"><input type="checkbox"' + (isAlarmRootCause(node.id, alarm, index) ? ' checked' : '') + ' onchange="onAlarmRootCauseToggle(' + index + ', this.checked)"><span>是否是根因</span></label>' +
+                    buildAlarmRootCauseLabel(node, alarm, index) +
                     '</div>';
             });
 
