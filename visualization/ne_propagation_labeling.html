@@ -4921,7 +4921,7 @@
         function buildAlarmRootCauseLabel(node, alarm, index) {
             const checked = isAlarmRootCause(node.id, alarm, index) ? ' checked' : '';
             return '<label class="rc-row"><input type="checkbox" class="rc-alarm-checkbox"' + checked +
-                ' onchange="onAlarmRootCauseToggle(' + rcJsLiteral(node.id) + ', ' + index + ', this.checked)"><span>是否是根因</span></label>';
+                ' onchange="onAlarmRootCauseToggle(' + rcJsLiteral(node.id) + ', ' + index + ', this.checked)"><span>是根因</span></label>';
         }
 
         function buildDeviceRootCauseHtml(node) {
@@ -4931,14 +4931,14 @@
             if (hasAlarms) {
                 return '<div class="rc-device disabled">' +
                     '<input type="checkbox" class="rc-device-checkbox" disabled' + checked + dataAttr + '>' +
-                    '<span>整个设备是否是根因</span>' +
+                    '<span>设备是根因</span>' +
                     '<span class="rc-device-hint">（由告警是否为根因自动决定）</span>' +
                     '</div>';
             }
             return '<div class="rc-device">' +
                 '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">' +
                     '<input type="checkbox" class="rc-device-checkbox"' + checked + dataAttr + ' onchange="onDeviceRootCauseToggle(' + rcJsLiteral(node.id) + ', this.checked)">' +
-                    '<span>整个设备是否是根因</span>' +
+                    '<span>设备是根因</span>' +
                 '</label>' +
                 '<span class="rc-device-hint">（该设备无告警，可手动标注）</span>' +
                 '</div>';
