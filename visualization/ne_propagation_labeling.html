@@ -4870,26 +4870,7 @@
                     this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
                 });
 
-                // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
-                marker.on('mouseover', function() {
-                    if (siteNeighborModeEnabled) {
-                        return;
-                    }
-                    // 修改：如果有选中的节点且不是当前这个，不要打开 popup（避免关闭选中的）
-                    if (selectedNode && selectedNode !== node.id) {
-                        return; // 不响应其他节点的悬浮
-                    }
-                    this.openPopup();
-                });
-                marker.on('mouseout', function() {
-                    if (siteNeighborModeEnabled) {
-                        return;
-                    }
-                    // 修改：只有未选中的节点，鼠标移出才关闭popup；选中的节点保持显示
-                    if (selectedNode !== node.id) {
-                        this.closePopup();
-                    }
-                });
+                // 仅在点击时弹出设备页签（不再使用悬停打开/关闭）
 
                 // ==========================================
                 // 修改地图标记点击事件中的多选处理逻辑
@@ -4898,7 +4879,7 @@
                 marker.on('click', function(e) {
                     suppressMapBlankClickOnce();
                     L.DomEvent.stopPropagation(e);
-                    
+
                     if (multiSelectMode) {
                         // 多选模式下使用无感刷新（不重新渲染地图）
                         toggleNodeSelection(node.id, true);
@@ -4908,6 +4889,7 @@
                         closeAlarmPopup();
                         selectNodeWithoutMapRefresh(node.id);
                         if (!siteNeighborModeEnabled && selectedNode === node.id) {
+                            this.openPopup();   // 点击即在设备处弹出页签
                             showNodeAlarms(node.id);
                         }
                     }
