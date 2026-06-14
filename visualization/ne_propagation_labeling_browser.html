@@ -368,6 +368,7 @@
             <div class="toolbar">
                 <input id="fileInput" type="file" accept=".jsonl,.txt,.json">
                 <button class="btn" onclick="openFaultGroupFile()">选择 JSONL 文件</button>
+                <button class="btn" onclick="exportLabelingResult()">⬇ 导出结果文件</button>
                 <div class="hint">每行一个故障组对象</div>
             </div>
             <div class="filter-row">
@@ -1131,6 +1132,36 @@
                 if (entry && entry.root_cause_annotations) return entry.root_cause_annotations;
             }
             return group && group.root_cause_annotations;
+        }
+
+        // 导出全部故障组的标注结果 JSONL（合并浏览器本地保存的根因标注/备注）
+        function exportLabelingResult() {
+            if (!faultGroups.length) {
+                document.getElementById('status').textContent = '请先加载 JSONL 文件再导出';
+                return;
+            }
+            const store = getLocalRootCauseStore();
+            const content = faultGroups.map(function(g) {
+                const uuid = g.uuid || (g.match_info && g.match_info.uuid) || '';
+                const entry = store[uuid];
+                const merged = Object.assign({}, g);
+                if (entry) {
+                    merged.root_cause_annotations = entry.root_cause_annotations || g.root_cause_annotations || {};
+                    if (entry.note !== undefined) merged.note = entry.note;
+                }
+                return JSON.stringify(merged);
+            }).join('\n') + '\n';
+            const blob = new Blob([content], { type: 'application/jsonl' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'labeling_result.jsonl';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            const labeled = faultGroups.filter(isGroupLabeled).length;
+            document.getElementById('status').textContent = '已导出 labeling_result.jsonl（共 ' + faultGroups.length + ' 组，已标注 ' + labeled + '）';
         }
 
         // 是否已标注根因（任一根因设备 或 任一根因告警）

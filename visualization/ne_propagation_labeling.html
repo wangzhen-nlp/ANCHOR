@@ -2266,8 +2266,7 @@
             </div>
 
             <div class="autosave-bar" id="autosaveBar">
-                <button id="exportResultBtn" onclick="exportResultFile()">⬇ 导出结果文件</button>
-                <span class="autosave-status" id="autoSaveStatus">标注会自动保存到浏览器本地</span>
+                <span class="autosave-status" id="autoSaveStatus">标注会自动保存到浏览器本地（在总览页可导出结果文件）</span>
             </div>
 
             <div class="rc-locate-panel" id="rcLocatePanel" style="display:none;">
@@ -6160,35 +6159,7 @@
             }
         }
 
-        // 一键导出结果 JSONL（合并 localStorage 中所有已标注，确保未访问的组也带上）
-        function exportResultFile() {
-            const store = loadRcLocalStore();
-            const groups = groupNavList.length ? groupNavList : (graphData ? [graphData] : []);
-            if (!groups.length) {
-                updateAutoSaveStatus('没有可导出的故障组', true);
-                return;
-            }
-            const content = groups.map(function(g) {
-                const uuid = g.uuid || (g.match_info && g.match_info.uuid) || '';
-                const entry = store[uuid];
-                const merged = Object.assign({}, g);
-                if (entry) {
-                    merged.root_cause_annotations = entry.root_cause_annotations || g.root_cause_annotations || {};
-                    if (entry.note !== undefined) merged.note = entry.note;
-                }
-                return JSON.stringify(merged);
-            }).join('\n') + '\n';
-            const blob = new Blob([content], { type: 'application/jsonl' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'labeling_result.jsonl';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            updateAutoSaveStatus('已导出 labeling_result.jsonl（' + groups.length + ' 组）');
-        }
+        // 导出结果文件改到总览页进行（那里有全部故障组）
 
         // 关闭/刷新页面时保存当前组（localStorage 写入是同步的，可靠）
         window.addEventListener('beforeunload', function() {
