@@ -2377,6 +2377,7 @@
                 
                 <div class="map-toolbar">
                     <button onclick="fitMapBounds()" title="适应所有节点">⊡ 适应视图</button>
+                    <button onclick="restoreNodePositions()" title="恢复被拖动的站点位置">↺ 位置恢复</button>
                     <button onclick="toggleMapConnections()" id="toggleConnectionsBtn" class="active">📡 显示连接</button>
                     <button onclick="clearMapSelection()" id="clearMapSelBtn">✕ 清除选择</button>
                     <button onclick="toggleSiteNeighborMode()" id="mapSiteNeighborBtn" class="warning">🧭 邻居扩展</button>
@@ -3052,6 +3053,8 @@
 
         let map = null;
         let mapMarkers = {};
+        let siteDragOffsets = {}; // { siteKey: [dLat, dLng] } 站点整体拖动偏移
+        let _dragSiteKey = null, _dragStartLatLng = null, _dragSiblings = []; // 拖动临时状态
         let mapPolylines = []; // 存储边引用，用于点击事件
         let showMapConnections = true;
         let mapDistanceLines = [];
@@ -4819,6 +4822,14 @@
             const jitterResult = getJitteredCoords(geoNodes);
             const jitteredCoords = jitterResult.coords;
 
+            // 应用站点拖动偏移（同站点设备整体平移；用于人工调整位置）
+            geoNodes.forEach(function(node) {
+                const off = siteDragOffsets[getNodeSiteKey(node)];
+                if (off && jitteredCoords[node.id]) {
+                    jitteredCoords[node.id] = [jitteredCoords[node.id][0] + off[0], jitteredCoords[node.id][1] + off[1]];
+                }
+            });
+
             renderSiteOverlays(geoNodes, jitteredCoords);
             
             // 扰动指示器不再显示（按需求隐藏“已自动错开 N 个相近节点”提示）
@@ -4861,7 +4872,43 @@
                     popupAnchor: [0, -svgSize/2]
                 });
 
-                const marker = L.marker([lat, lng], { icon: customIcon }).addTo(map);
+                const marker = L.marker([lat, lng], { icon: customIcon, draggable: true, autoPan: false }).addTo(map);
+
+                // 拖动：按住站点内任一设备拖动 → 该站点所有设备整体平移
+                marker.on('dragstart', function() {
+                    _dragSiteKey = getNodeSiteKey(node);
+                    const s = this.getLatLng();
+                    _dragStartLatLng = [s.lat, s.lng];
+                    _dragSiblings = [];
+                    currentNodes.forEach(function(n) {
+                        if (n.id !== node.id && getNodeSiteKey(n) === _dragSiteKey && mapMarkers[n.id]) {
+                            const ll = mapMarkers[n.id].getLatLng();
+                            _dragSiblings.push({ marker: mapMarkers[n.id], start: [ll.lat, ll.lng] });
+                        }
+                    });
+                    this.closePopup();
+                });
+                marker.on('drag', function() {
+                    if (!_dragStartLatLng) return;
+                    const cur = this.getLatLng();
+                    const dLat = cur.lat - _dragStartLatLng[0];
+                    const dLng = cur.lng - _dragStartLatLng[1];
+                    _dragSiblings.forEach(function(s) {
+                        s.marker.setLatLng([s.start[0] + dLat, s.start[1] + dLng]);
+                    });
+                    scheduleDragRedraw(); // 连接线/站点圈跟随平移
+                });
+                marker.on('dragend', function() {
+                    if (!_dragStartLatLng) return;
+                    const cur = this.getLatLng();
+                    const dLat = cur.lat - _dragStartLatLng[0];
+                    const dLng = cur.lng - _dragStartLatLng[1];
+                    const key = _dragSiteKey;
+                    const prev = siteDragOffsets[key] || [0, 0];
+                    siteDragOffsets[key] = [prev[0] + dLat, prev[1] + dLng];
+                    _dragSiteKey = null; _dragStartLatLng = null; _dragSiblings = [];
+                    renderMap({ preserveViewport: true });
+                });
 
                 // Popup 内容：绑定时生成一次，并在每次打开时按当前根因标注重建（避免勾选痕迹丢失）
                 marker.bindPopup(buildNodeMarkerPopup(node, lat, lng), {
@@ -5768,6 +5815,42 @@
             }
         }
 
+        // 位置恢复：清除所有站点拖动偏移，恢复到默认布局
+        function restoreNodePositions() {
+            if (Object.keys(siteDragOffsets).length === 0) return;
+            siteDragOffsets = {};
+            renderMap({ preserveViewport: true });
+        }
+
+        // 拖动过程中按当前标记位置实时重绘连接线与站点圈（每帧最多一次）
+        let _dragRedrawPending = false;
+        function scheduleDragRedraw() {
+            if (_dragRedrawPending) return;
+            _dragRedrawPending = true;
+            const raf = window.requestAnimationFrame || function(fn) { return setTimeout(fn, 16); };
+            raf(function() {
+                _dragRedrawPending = false;
+                redrawLinksAndOverlaysForDrag();
+            });
+        }
+
+        function redrawLinksAndOverlaysForDrag() {
+            if (!map) return;
+            const liveCoords = {};
+            currentNodes.forEach(function(n) {
+                const m = mapMarkers[n.id];
+                if (m) { const ll = m.getLatLng(); liveCoords[n.id] = [ll.lat, ll.lng]; }
+            });
+            // 重绘连接线
+            mapPolylines.forEach(function(line) { map.removeLayer(line); });
+            mapPolylines = [];
+            if (showMapConnections && currentLinks.length > 0) {
+                drawMapConnections(liveCoords);
+            }
+            // 重绘站点圈/标签
+            renderSiteOverlays(getMapRenderableNodes(), liveCoords);
+        }
+
         function toggleMapConnections() {
             showMapConnections = !showMapConnections;
             document.getElementById('toggleConnectionsBtn').classList.toggle('active', showMapConnections);
@@ -5997,6 +6080,7 @@
         // 渲染单个故障组（格式识别 + 备注 + 启用备注面板）
         function renderSingleGroup(data) {
             graphData = data;
+            siteDragOffsets = {}; // 切换故障组时清除上一组的拖动偏移
             restoreRcFromLocalStore(graphData); // 从本地恢复已保存的根因标注/备注
             currentNote = graphData.note || '';
             originalGroupUuid = data.uuid || data.match_info?.uuid || '';
