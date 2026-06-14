@@ -1114,24 +1114,8 @@
                     </div>
                     <div class="meta">
                         <div class="meta-item">
-                            <div class="meta-label">关联规则</div>
-                            <div class="meta-value">${escapeHtml(getGroupRuleText(group))}</div>
-                        </div>
-                        <div class="meta-item">
-                            <div class="meta-label">关联故障组</div>
-                            <div class="meta-value">${renderRelatedGroupLinks(group)}</div>
-                        </div>
-                        <div class="meta-item">
                             <div class="meta-label">站点数 / 设备数 / 告警数</div>
                             <div class="meta-value">${getSiteCount(group)} / ${getNodeCount(group)} / ${getSymptomCount(group)}</div>
-                        </div>
-                        <div class="meta-item meta-item--wide">
-                            <div class="meta-label">相关工单号</div>
-                            <div class="meta-value">${renderStackedFieldValues(group, ['工单号'], 'ticket')}</div>
-                        </div>
-                        <div class="meta-item meta-item--wide">
-                            <div class="meta-label">告警故障组ID</div>
-                            <div class="meta-value">${renderStackedFieldValues(group, ['故障组ID'], 'alarm-group')}</div>
                         </div>
                         ${(group.note || (group.match_info && group.match_info.note)) ? `
                         <div class="meta-item meta-item--wide" style="background: #fffbeb; border: 1px solid #fcd34d;">

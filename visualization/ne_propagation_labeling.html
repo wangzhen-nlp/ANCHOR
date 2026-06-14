@@ -28,25 +28,25 @@
         }
 
         .sidebar {
-            width: 380px;
+            width: 280px;
             background: #ffffff;
             border-right: 1px solid #d0d7de;
             display: flex;
             flex-direction: column;
-            gap: 10px;
-            padding: 15px;
+            gap: 6px;
+            padding: 10px;
             overflow-y: auto;
             z-index: 1000;
             box-shadow: 2px 0 8px rgba(0,0,0,0.05);
         }
 
         .sidebar h1 {
-            font-size: 18px;
+            font-size: 15px;
             color: #0969da;
             display: flex;
             align-items: center;
-            gap: 8px;
-            margin-bottom: 5px;
+            gap: 6px;
+            margin-bottom: 2px;
         }
 
         .sidebar h1::before {
@@ -56,18 +56,18 @@
         .group-nav {
             display: flex;
             align-items: center;
-            gap: 8px;
-            margin-bottom: 12px;
+            gap: 6px;
+            margin-bottom: 4px;
         }
 
         .group-nav button {
             flex: 1;
-            padding: 8px;
+            padding: 6px;
             background: #0969da;
             color: #fff;
             border: none;
             border-radius: 6px;
-            font-size: 13px;
+            font-size: 12px;
             cursor: pointer;
             transition: background 0.2s;
         }
@@ -459,35 +459,35 @@
 
         .stats-panel {
             background: #f6f8fa;
-            padding: 12px;
+            padding: 10px;
             border-radius: 8px;
             border: 1px solid #d0d7de;
         }
 
         .stats-panel h3 {
-            font-size: 13px;
+            font-size: 12px;
             color: #57606a;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
             border-bottom: 1px solid #d0d7de;
-            padding-bottom: 6px;
+            padding-bottom: 4px;
         }
 
         .stat-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 8px;
+            gap: 6px;
         }
 
         .stat-item {
             background: #ffffff;
-            padding: 10px;
+            padding: 6px;
             border-radius: 6px;
             text-align: center;
             border: 1px solid #d0d7de;
         }
 
         .stat-item .value {
-            font-size: 20px;
+            font-size: 17px;
             font-weight: bold;
             color: #0969da;
         }
@@ -2005,16 +2005,16 @@
         /* 备注编辑区域样式 */
         .note-panel {
             background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-            padding: 12px;
+            padding: 10px;
             border-radius: 8px;
             border: 1px solid #f59e0b;
-            margin-top: 10px;
+            margin-top: 4px;
         }
 
         .note-panel h3 {
-            font-size: 13px;
+            font-size: 12px;
             color: #b45309;
-            margin-bottom: 10px;
+            margin-bottom: 6px;
             display: flex;
             align-items: center;
             gap: 6px;
@@ -2026,8 +2026,8 @@
 
         .note-textarea {
             width: 100%;
-            min-height: 80px;
-            padding: 10px;
+            min-height: 56px;
+            padding: 8px;
             border: 1px solid #fcd34d;
             border-radius: 6px;
             background: #ffffff;
@@ -2122,20 +2122,12 @@
                 <button id="nextGroupBtn" onclick="goToAdjacentGroup(1)">下一组 →</button>
             </div>
 
-            <div class="file-section">
-                <h3>选择数据文件</h3>
-                <div class="file-select">
-                    <input type="file" id="fileInput" accept=".json" style="display: none;">
-                    <input type="file" id="neGraphFileInput" accept=".json" style="display: none;">
-                    <button onclick="document.getElementById('fileInput').click()" id="fileSelectBtn">
-                        📁 选择 JSON 文件
-                    </button>
-                    <button onclick="document.getElementById('neGraphFileInput').click()" id="neGraphSelectBtn" style="margin-top: 8px; background: #0969da;">
-                        🗺️ 选择 ne_graph.json
-                    </button>
-                    <p id="fileStatus">请选择 JSON 文件</p>
-                    <p id="neGraphStatus" style="font-size: 11px; color: #57606a; margin-top: 6px; word-break: break-all;">ne_graph：未加载</p>
-                </div>
+            <!-- “选择数据文件”区域已隐藏：默认文件加载逻辑保持不变，相关元素仅保留供脚本引用 -->
+            <div class="file-section" style="display: none;">
+                <input type="file" id="fileInput" accept=".json">
+                <input type="file" id="neGraphFileInput" accept=".json">
+                <p id="fileStatus">请选择 JSON 文件</p>
+                <p id="neGraphStatus">ne_graph：未加载</p>
             </div>
 
             <!-- 备注编辑区域 -->
@@ -4921,7 +4913,7 @@
         function buildAlarmRootCauseLabel(node, alarm, index) {
             const checked = isAlarmRootCause(node.id, alarm, index) ? ' checked' : '';
             return '<label class="rc-row"><input type="checkbox" class="rc-alarm-checkbox"' + checked +
-                ' onchange="onAlarmRootCauseToggle(' + rcJsLiteral(node.id) + ', ' + index + ', this.checked)"><span>是根因</span></label>';
+                ' onchange="onAlarmRootCauseToggle(' + rcJsLiteral(node.id) + ', ' + index + ', this.checked)"><span>根因告警</span></label>';
         }
 
         function buildDeviceRootCauseHtml(node) {
@@ -4931,16 +4923,14 @@
             if (hasAlarms) {
                 return '<div class="rc-device disabled">' +
                     '<input type="checkbox" class="rc-device-checkbox" disabled' + checked + dataAttr + '>' +
-                    '<span>设备是根因</span>' +
-                    '<span class="rc-device-hint">（由告警是否为根因自动决定）</span>' +
+                    '<span>根因设备</span>' +
                     '</div>';
             }
             return '<div class="rc-device">' +
                 '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin:0;">' +
                     '<input type="checkbox" class="rc-device-checkbox"' + checked + dataAttr + ' onchange="onDeviceRootCauseToggle(' + rcJsLiteral(node.id) + ', this.checked)">' +
-                    '<span>设备是根因</span>' +
+                    '<span>根因设备</span>' +
                 '</label>' +
-                '<span class="rc-device-hint">（该设备无告警，可手动标注）</span>' +
                 '</div>';
         }
 
