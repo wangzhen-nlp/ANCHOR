@@ -3098,8 +3098,10 @@
                 if (e.key === 'Escape') {
                     if (multiSelectMode) exitMultiSelect();
                     closeAlarmPopup();
-                    document.getElementById('groupSuggestions').classList.remove('show');
-                    document.getElementById('searchSuggestions').classList.remove('show');
+                    const gs = document.getElementById('groupSuggestions');
+                    if (gs) gs.classList.remove('show');
+                    const ss = document.getElementById('searchSuggestions');
+                    if (ss) ss.classList.remove('show');
                 }
                 if (e.key === 'm' || e.key === 'M') {
                     if (e.ctrlKey || e.metaKey) {
@@ -3111,10 +3113,12 @@
 
             document.addEventListener('click', function(e) {
                 if (!e.target.closest('.group-input-row')) {
-                    document.getElementById('groupSuggestions').classList.remove('show');
+                    const gs = document.getElementById('groupSuggestions');
+                    if (gs) gs.classList.remove('show');
                 }
                 if (!e.target.closest('.search-input-row')) {
-                    document.getElementById('searchSuggestions').classList.remove('show');
+                    const ss = document.getElementById('searchSuggestions');
+                    if (ss) ss.classList.remove('show');
                 }
             });
 
@@ -3164,7 +3168,8 @@
         // 设置 Group 输入框事件
         function setupGroupInput() {
             const input = document.getElementById('groupInput');
-            
+            if (!input) return;
+
             input.addEventListener('input', showGroupSuggestions);
             input.addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
@@ -3180,7 +3185,8 @@
         // 设置搜索输入框事件
         function setupSearchInput() {
             const input = document.getElementById('searchInput');
-            
+            if (!input) return;
+
             input.addEventListener('input', showSearchSuggestions);
             input.addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
@@ -3323,9 +3329,11 @@
             const container = document.getElementById('groupTags');
             const countSpan = document.getElementById('activeGroupCount');
             const statsCount = document.getElementById('activeGroupsCount');
-            
-            countSpan.textContent = activeGroups.size;
-            statsCount.textContent = activeGroups.size;
+
+            if (countSpan) countSpan.textContent = activeGroups.size;
+            if (statsCount) statsCount.textContent = activeGroups.size;
+
+            if (!container) return;
 
             if (activeGroups.size === 0) {
                 container.innerHTML = '<span class="group-tag empty">暂无 Group，请先添加</span>';
@@ -3616,8 +3624,9 @@
         // 显示搜索反馈
         function showSearchFeedback(message, type) {
             const btn = document.getElementById('searchAddBtn');
+            if (!btn) return;
             const originalText = btn.textContent;
-            
+
             btn.textContent = message;
             if (type === 'success') {
                 btn.style.background = '#2da44e';
@@ -3704,8 +3713,9 @@
         // 显示添加反馈
         function showAddFeedback(message, type) {
             const btn = document.getElementById('addGroupBtn');
+            if (!btn) return;
             const originalText = btn.textContent;
-            
+
             btn.textContent = message;
             if (type === 'success') {
                 btn.style.background = '#2da44e';
@@ -5272,10 +5282,11 @@
         // 可选：进入多选模式时清除其他选择状态（避免视觉混乱）
         // ==========================================
         function toggleMultiSelect() {
-            multiSelectMode = !multiSelectMode;
             const mapBtn = document.getElementById('mapMultiSelectBtn');
             const panel = document.getElementById('multiSelectPanel');
-            
+            if (!mapBtn || !panel) return;
+            multiSelectMode = !multiSelectMode;
+
             if (multiSelectMode) {
                 if (siteNeighborModeEnabled) {
                     handleSiteNeighborModeToggle(false);
@@ -5347,8 +5358,9 @@
         }
 
         function updateMultiSelectUI() {
-            document.getElementById('selectedNodesCount').textContent = multiSelectedNodes.size;
-            
+            const countEl = document.getElementById('selectedNodesCount');
+            if (countEl) countEl.textContent = multiSelectedNodes.size;
+
             document.querySelectorAll('.node-item').forEach(function(item) {
                 const nodeId = item.querySelector('.ne-id')?.textContent;
                 if (nodeId && multiSelectedNodes.has(nodeId)) {
@@ -5678,13 +5690,8 @@
             window.edgeDetails = edgeDetails;
             graphData.group_info = buildDisplayGroupInfo(data.group_info || {}, hiddenNeIds, hiddenSiteIds);
 
-            // 启用输入
-            document.getElementById('groupInput').disabled = false;
-            document.getElementById('addGroupBtn').disabled = false;
-            document.getElementById('searchInput').disabled = false;
-            document.getElementById('searchAddBtn').disabled = false;
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info).length + ' 个 Group, ' + allNodes.length + ' 个节点';
-            
+
             renderAlarmMetaSummary();
             updateStats();
             if (graphData.group_info && Object.keys(graphData.group_info).length > 0) {
@@ -5708,11 +5715,6 @@
                 window.edgeDetails = data.edge_details;
             }
             
-            // 启用输入
-            document.getElementById('groupInput').disabled = false;
-            document.getElementById('addGroupBtn').disabled = false;
-            document.getElementById('searchInput').disabled = false;
-            document.getElementById('searchAddBtn').disabled = false;
             document.getElementById('fileStatus').textContent = '已加载: ' + Object.keys(graphData.group_info || {}).length + ' 个 Group, ' + allNodes.length + ' 个节点';
             
             renderAlarmMetaSummary();
@@ -6028,6 +6030,7 @@
         // 节点列表（支持高亮显示）
         function renderNodeList(highlightId) {
             const container = document.getElementById('nodeListContent');
+            if (!container) return;
             if (currentNodes.length === 0) {
                 container.innerHTML = '<div style="text-align: center; color: #8c959f; padding: 20px;">暂无节点，请添加 Group</div>';
                 return;
