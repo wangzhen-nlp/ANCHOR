@@ -203,16 +203,48 @@
             padding: 0 2px;
         }
         .list {
-            margin-top: 22px;
+            margin-top: 16px;
             display: grid;
-            gap: 14px;
+            gap: 8px;
         }
         .card {
             background: #fff;
             border: 1px solid #e4e7ec;
-            border-radius: 16px;
-            padding: 18px;
-            box-shadow: 0 10px 22px rgba(15, 23, 42, 0.04);
+            border-radius: 10px;
+            padding: 10px 14px;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.04);
+        }
+        .card-row {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .group-id-link {
+            font-size: 15px;
+            font-weight: 700;
+            color: #0969da;
+            cursor: pointer;
+            word-break: break-all;
+        }
+        .group-id-link:hover {
+            text-decoration: underline;
+        }
+        .card-stats {
+            margin-left: auto;
+            font-size: 12px;
+            color: #475467;
+            white-space: nowrap;
+        }
+        .card-note {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #92400e;
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-style: italic;
         }
         .card-head {
             display: flex;
@@ -228,10 +260,9 @@
         }
         .label-badge {
             display: inline-block;
-            margin-left: 8px;
-            padding: 2px 8px;
+            padding: 1px 8px;
             border-radius: 999px;
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 700;
             vertical-align: middle;
         }
@@ -252,8 +283,8 @@
         }
         .time {
             color: #475467;
-            font-size: 13px;
-            margin-top: 6px;
+            font-size: 12px;
+            margin-top: 4px;
         }
         .open-btn {
             flex-shrink: 0;
@@ -1215,27 +1246,16 @@
                 const badge = labeled
                     ? '<span class="label-badge labeled">已标注根因</span>'
                     : '<span class="label-badge unlabeled">未标注根因</span>';
+                const note = group.note || (group.match_info && group.match_info.note) || '';
                 return `
                 <div class="card">
-                    <div class="card-head">
-                        <div>
-                            <div class="title">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}${badge}</div>
-                            <div class="time">故障组时间范围：${escapeHtml(getGroupTimeRange(group))}</div>
-                        </div>
-                        <button class="open-btn" onclick="openGroupDetail(${index})">查看详情</button>
+                    <div class="card-row">
+                        <span class="group-id-link" onclick="openGroupDetail(${index})" title="点击查看详情">${escapeHtml(group.uuid || group.match_info?.uuid || `故障组 ${index + 1}`)}</span>
+                        ${badge}
+                        <span class="card-stats">站点 ${getSiteCount(group)} · 设备 ${getNodeCount(group)} · 告警 ${getSymptomCount(group)}</span>
                     </div>
-                    <div class="meta">
-                        <div class="meta-item">
-                            <div class="meta-label">站点数 / 设备数 / 告警数</div>
-                            <div class="meta-value">${getSiteCount(group)} / ${getNodeCount(group)} / ${getSymptomCount(group)}</div>
-                        </div>
-                        ${(group.note || (group.match_info && group.match_info.note)) ? `
-                        <div class="meta-item meta-item--wide" style="background: #fffbeb; border: 1px solid #fcd34d;">
-                            <div class="meta-label" style="color: #b45309;">📝 备注</div>
-                            <div class="meta-value" style="color: #92400e; font-style: italic;">${escapeHtml(group.note || (group.match_info && group.match_info.note) || '')}</div>
-                        </div>
-                        ` : ''}
-                    </div>
+                    <div class="time">时间范围：${escapeHtml(getGroupTimeRange(group))}</div>
+                    ${note ? `<div class="card-note">📝 ${escapeHtml(note)}</div>` : ''}
                 </div>
             `;
             }).join('');
