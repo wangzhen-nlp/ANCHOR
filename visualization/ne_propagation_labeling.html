@@ -3043,7 +3043,6 @@
         let baseCurrentLinks = [];
         let selectedNode = null;
         let selectedEdge = null; // 当前选中的边
-        let suppressNextMapBlankClick = false;
 
         let multiSelectMode = false;
         let multiSelectedNodes = new Set();
@@ -3335,11 +3334,23 @@
             document.addEventListener('click', function(e) {
                 // 如果点击的不是告警弹窗内部，则关闭弹窗
                 if (!e.target.closest('.alarm-popup') &&
-                    !e.target.closest('.leaflet-popup') &&
+                    !e.target.closest('.leaflet-popup-content') &&
                     !e.target.closest('.custom-marker') &&
                     !e.target.closest('.leaflet-marker-icon') &&
                     !e.target.closest('.node-item')) {
                     closeAlarmPopup();
+                }
+                // 点击“设备页签/标记/侧栏”以外的区域（如地图空白处）时，关闭设备页签并取消选中
+                if (!e.target.closest('.leaflet-popup') &&
+                    !e.target.closest('.custom-marker') &&
+                    !e.target.closest('.leaflet-marker-icon') &&
+                    !e.target.closest('.alarm-popup') &&
+                    !e.target.closest('.sidebar')) {
+                    if (selectedNode) {
+                        clearNodeSelection();
+                    } else if (map) {
+                        map.closePopup();
+                    }
                 }
                 hideDetailPanelOnOutsideClick(e);
             });
@@ -4006,17 +4017,6 @@
             map.createPane('siteLabelPane');
             map.getPane('siteLabelPane').style.zIndex = 330;
             map.getPane('siteLabelPane').style.pointerEvents = 'none';
-
-            map.on('click', function(e) {
-                const target = e && e.originalEvent ? e.originalEvent.target : null;
-                if (suppressNextMapBlankClick) {
-                    suppressNextMapBlankClick = false;
-                    return;
-                }
-                if (!target || isInteractiveMapTarget(target)) return;
-
-                closeFloatingSelection();
-            });
         }
 
         function hasValidCoords(node) {
@@ -4870,16 +4870,34 @@
                     this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
                 });
 
-                // 仅在点击时弹出设备页签（不再使用悬停打开/关闭）
+                // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
+                marker.on('mouseover', function() {
+                    if (siteNeighborModeEnabled) {
+                        return;
+                    }
+                    // 修改：如果有选中的节点且不是当前这个，不要打开 popup（避免关闭选中的）
+                    if (selectedNode && selectedNode !== node.id) {
+                        return; // 不响应其他节点的悬浮
+                    }
+                    this.openPopup();
+                });
+                marker.on('mouseout', function() {
+                    if (siteNeighborModeEnabled) {
+                        return;
+                    }
+                    // 修改：只有未选中的节点，鼠标移出才关闭popup；选中的节点保持显示
+                    if (selectedNode !== node.id) {
+                        this.closePopup();
+                    }
+                });
 
                 // ==========================================
                 // 修改地图标记点击事件中的多选处理逻辑
                 // ==========================================
 
                 marker.on('click', function(e) {
-                    suppressMapBlankClickOnce();
                     L.DomEvent.stopPropagation(e);
-
+                    
                     if (multiSelectMode) {
                         // 多选模式下使用无感刷新（不重新渲染地图）
                         toggleNodeSelection(node.id, true);
@@ -5007,73 +5025,31 @@
         function clearAllSelection() {
             clearNodeSelection();
             clearEdgeSelection();
-            closeMapPopups();
             closeAlarmPopup();
-        }
-
-        function hasOpenMapPopup() {
-            return !!document.querySelector('.leaflet-popup');
-        }
-
-        function closeMapPopups() {
-            if (map) {
-                map.closePopup();
-            }
-            Object.values(mapMarkers || {}).forEach(function(marker) {
-                if (marker && typeof marker.closePopup === 'function') {
-                    marker.closePopup();
-                }
-            });
-        }
-
-        function isInteractiveMapTarget(target) {
-            return !!(target && target.closest && (
-                target.closest('.custom-marker') ||
-                target.closest('.leaflet-marker-icon') ||
-                target.closest('.leaflet-popup') ||
-                target.closest('.leaflet-interactive')
-            ));
-        }
-
-        function suppressMapBlankClickOnce() {
-            suppressNextMapBlankClick = true;
-            setTimeout(function() {
-                suppressNextMapBlankClick = false;
-            }, 0);
         }
 
         function hideDetailPanelOnOutsideClick(event) {
             const detailPanel = document.getElementById('detailPanel');
-            const detailPanelShown = !!(detailPanel && detailPanel.classList.contains('show'));
-            if (!detailPanelShown && !hasOpenMapPopup() && !selectedNode && !selectedEdge) return;
+            if (!detailPanel || !detailPanel.classList.contains('show')) return;
 
             const target = event.target;
-            if (detailPanel && detailPanel.contains(target)) return;
+            if (detailPanel.contains(target)) return;
 
             if (target.closest('.alarm-popup') ||
-                target.closest('.leaflet-popup') ||
+                target.closest('.leaflet-popup-content') ||
                 target.closest('.custom-marker') ||
                 target.closest('.leaflet-marker-icon') ||
                 target.closest('.node-item')) {
                 return;
             }
 
-            closeFloatingSelection();
-        }
-
-        function closeFloatingSelection() {
-            const detailPanel = document.getElementById('detailPanel');
             if (selectedNode) {
                 clearNodeSelection();
             }
             if (selectedEdge) {
                 clearEdgeSelection();
             }
-            closeMapPopups();
-            closeAlarmPopup();
-            if (detailPanel) {
-                detailPanel.classList.remove('show');
-            }
+            detailPanel.classList.remove('show');
         }
 
         // ==========================================
@@ -5113,15 +5089,9 @@
             showDetailPanel(nodeId);
 
             // 邻居扩展模式下不弹 popup，尽量减少视觉打断。
-            // 延迟到下一帧再开 popup：updateMapSelection() 刚用 setIcon 重建了标记 DOM，
-            // 同步立即 openPopup 在真实 Leaflet 中常常打不开，必须等图标 DOM 落定。
-            if (!siteNeighborModeEnabled) {
-                setTimeout(function() {
-                    const m = mapMarkers[nodeId];
-                    if (m && selectedNode === nodeId) {
-                        m.openPopup();
-                    }
-                }, 0);
+            const marker = mapMarkers[nodeId];
+            if (marker && !siteNeighborModeEnabled) {
+                marker.openPopup();
             }
         }
 
@@ -5533,7 +5503,6 @@
                             direction: 'center'
                         });
                         segmentPolyline.on('click', function(e) {
-                            suppressMapBlankClickOnce();
                             L.DomEvent.stopPropagation(e);
                             selectEdge(this.linkData, this.sourceId, this.targetId);
                         });
@@ -5586,7 +5555,6 @@
 
                 // 新增：边点击事件（需求3）
                 polyline.on('click', function(e) {
-                    suppressMapBlankClickOnce();
                     L.DomEvent.stopPropagation(e);
                     selectEdge(this.linkData, this.sourceId, this.targetId);
                 });
