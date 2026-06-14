@@ -1270,15 +1270,13 @@
             filter: drop-shadow(0 0 8px #ffd700);
         }
 
-        /* 根因设备标记：醒目红色光环 */
+        /* 根因设备标记：用设备自身的红色边框表示（不再用外圈红圆），仅保留贴合形状的轻微红色高光 */
         .marker-pin.rc-root {
-            border-radius: 50%;
-            box-shadow: 0 0 0 3px #cf222e, 0 0 10px 2px rgba(207, 34, 46, 0.6);
             z-index: 1500 !important;
         }
 
         .marker-pin.rc-root svg {
-            filter: drop-shadow(0 0 4px rgba(207, 34, 46, 0.9));
+            filter: drop-shadow(0 0 3px rgba(207, 34, 46, 0.85));
         }
 
         .marker-alarm-groups {
@@ -4676,6 +4674,10 @@
         }
 
         function getNodeStrokeStyle(node, isSelected, isHighlighted) {
+            // 根因设备：直接用设备自身的红色粗边框表示（不再用外圈红圆）
+            if (isRootCauseNode(node)) {
+                return { strokeWidth: 5, strokeColor: '#cf222e' };
+            }
             if (isHighlighted) {
                 return { strokeWidth: 5, strokeColor: '#ffd700' };
             }
