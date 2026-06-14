@@ -53,6 +53,43 @@
             content: '📡';
         }
 
+        .group-nav {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        .group-nav button {
+            flex: 1;
+            padding: 8px;
+            background: #0969da;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .group-nav button:hover:not(:disabled) {
+            background: #0860c4;
+        }
+
+        .group-nav button:disabled {
+            background: #c6cdd5;
+            cursor: not-allowed;
+        }
+
+        .group-nav #groupNavStatus {
+            flex: 0 0 auto;
+            min-width: 56px;
+            text-align: center;
+            font-size: 12px;
+            color: #57606a;
+            font-weight: 600;
+        }
+
         .file-section {
             background: #f6f8fa;
             padding: 12px;
@@ -2024,6 +2061,12 @@
         <div class="sidebar">
             <h1>微波群障根因标注</h1>
 
+            <div class="group-nav" id="groupNav" style="display:none;">
+                <button id="prevGroupBtn" onclick="goToAdjacentGroup(-1)">← 上一组</button>
+                <span id="groupNavStatus">- / -</span>
+                <button id="nextGroupBtn" onclick="goToAdjacentGroup(1)">下一组 →</button>
+            </div>
+
             <div class="file-section">
                 <h3>选择数据文件</h3>
                 <div class="file-select">
@@ -2811,6 +2854,10 @@
         let showMapConnections = true;
         let mapDistanceLines = [];
         let mapSiteOverlays = [];
+
+        // 故障组导航（上一组/下一组）
+        let groupNavList = [];
+        let groupNavIndex = -1;
 
         // Group 管理变量
         let activeGroups = new Set();
@@ -5471,6 +5518,76 @@
         }
 
         // 数据加载
+        // 渲染单个故障组（格式识别 + 备注 + 启用备注面板）
+        function renderSingleGroup(data) {
+            graphData = data;
+            currentNote = data.note || '';
+            originalGroupUuid = data.uuid || data.match_info?.uuid || '';
+
+            if (graphData.ne_info) {
+                loadOriginalFormat(graphData);
+            } else if (graphData.nodes) {
+                loadVizFormat(graphData);
+            } else {
+                throw new Error('未知数据格式');
+            }
+
+            enableNotePanel();
+            loadNoteToPanel();
+        }
+
+        // 更新“上一组/下一组”导航条
+        function updateGroupNavUI() {
+            const nav = document.getElementById('groupNav');
+            if (!nav) return;
+            if (groupNavList.length > 1) {
+                nav.style.display = 'flex';
+                const statusEl = document.getElementById('groupNavStatus');
+                if (statusEl) statusEl.textContent = (groupNavIndex + 1) + ' / ' + groupNavList.length;
+                const prevBtn = document.getElementById('prevGroupBtn');
+                const nextBtn = document.getElementById('nextGroupBtn');
+                if (prevBtn) prevBtn.disabled = groupNavIndex <= 0;
+                if (nextBtn) nextBtn.disabled = groupNavIndex >= groupNavList.length - 1;
+            } else {
+                nav.style.display = 'none';
+            }
+        }
+
+        // 跳转到相邻故障组（delta = -1 上一组，1 下一组）
+        function goToAdjacentGroup(delta) {
+            if (!groupNavList.length) return;
+            const newIndex = groupNavIndex + delta;
+            if (newIndex < 0 || newIndex >= groupNavList.length) return;
+            groupNavIndex = newIndex;
+            showLoading(true);
+            try {
+                renderSingleGroup(groupNavList[groupNavIndex]);
+                const fileStatus = document.getElementById('fileStatus');
+                if (fileStatus) fileStatus.textContent = '已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组';
+            } catch (error) {
+                showError('加载故障组失败: ' + error.message);
+                showLoading(false);
+                disableNotePanel();
+            }
+            updateGroupNavUI();
+        }
+
+        // 从会话/文件载荷中提取（可能的）故障组列表与当前组
+        function extractGroupPayload(payload) {
+            if (payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.groups)) {
+                const groups = payload.groups;
+                let index = (typeof payload.index === 'number') ? payload.index : 0;
+                if (index < 0 || index >= groups.length) index = 0;
+                return { groups: groups, index: index, current: groups[index] };
+            }
+            if (Array.isArray(payload)) {
+                return { groups: payload, index: 0, current: payload[0] };
+            }
+            const current = (payload && typeof payload === 'object' && !Array.isArray(payload) && payload.group)
+                ? payload.group : payload;
+            return { groups: [], index: -1, current: current };
+        }
+
         function loadData() {
             const urlParams = new URLSearchParams(window.location.search);
             const dataFile = urlParams.get('file');
@@ -5484,32 +5601,17 @@
                     if (!rawData) {
                         throw new Error('未找到对应的故障组数据');
                     }
-                    const sessionPayload = JSON.parse(rawData);
-                    const data = (
-                        sessionPayload &&
-                        typeof sessionPayload === 'object' &&
-                        !Array.isArray(sessionPayload) &&
-                        sessionPayload.group
-                    ) ? sessionPayload.group : sessionPayload;
-                    graphData = data;
-                    // 提取已有备注
-                    currentNote = data.note || '';
-                    originalGroupUuid = data.uuid || data.match_info?.uuid || '';
-                    
-                    if (graphData.ne_info) {
-                        loadOriginalFormat(graphData);
-                    } else if (graphData.nodes) {
-                        loadVizFormat(graphData);
-                    } else {
-                        throw new Error('未知数据格式');
-                    }
-                    
-                    // 启用备注面板并加载备注
-                    enableNotePanel();
-                    loadNoteToPanel();
-                    
+                    const payload = extractGroupPayload(JSON.parse(rawData));
+                    groupNavList = payload.groups;
+                    groupNavIndex = payload.index;
+
+                    renderSingleGroup(payload.current);
+
                     localStorage.removeItem(sessionKey);
-                    fileStatus.textContent = '已加载单个故障组详情';
+                    fileStatus.textContent = groupNavList.length > 1
+                        ? ('已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组')
+                        : '已加载单个故障组详情';
+                    updateGroupNavUI();
                 } catch (error) {
                     showError('加载故障组详情失败: ' + error.message);
                     showLoading(false);
@@ -5523,20 +5625,14 @@
                 fetch(dataFile)
                     .then(function(response) { return response.json(); })
                     .then(function(data) {
-                        graphData = data;
-                        // 提取已有备注
-                        currentNote = data.note || '';
-                        originalGroupUuid = data.uuid || data.match_info?.uuid || '';
-                        
-                        if (graphData.ne_info) {
-                            loadOriginalFormat(graphData);
-                        } else if (graphData.nodes) {
-                            loadVizFormat(graphData);
+                        const payload = extractGroupPayload(data);
+                        groupNavList = payload.groups;
+                        groupNavIndex = payload.index;
+                        renderSingleGroup(payload.current);
+                        if (groupNavList.length > 1) {
+                            fileStatus.textContent = '已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组';
                         }
-                        
-                        // 启用备注面板并加载备注
-                        enableNotePanel();
-                        loadNoteToPanel();
+                        updateGroupNavUI();
                     })
                     .catch(function(error) {
                         showError('加载数据失败: ' + error.message);
@@ -6664,22 +6760,11 @@
             const reader = new FileReader();
             reader.onload = function(e) {
                 try {
-                    const data = JSON.parse(e.target.result);
-                    // 提取已有备注
-                    currentNote = data.note || '';
-                    originalGroupUuid = data.uuid || data.match_info?.uuid || '';
-                    
-                    if (data.ne_info) {
-                        loadOriginalFormat(data);
-                    } else if (data.nodes) {
-                        loadVizFormat(data);
-                    } else {
-                        throw new Error('未知数据格式');
-                    }
-                    
-                    // 启用备注面板并加载备注
-                    enableNotePanel();
-                    loadNoteToPanel();
+                    const payload = extractGroupPayload(JSON.parse(e.target.result));
+                    groupNavList = payload.groups;
+                    groupNavIndex = payload.index;
+                    renderSingleGroup(payload.current);
+                    updateGroupNavUI();
                 } catch (error) {
                     showError('解析文件失败: ' + error.message);
                     showLoading(false);

@@ -955,15 +955,18 @@
 
         function openGroupDetail(index) {
             const group = faultGroups[index];
+            // 以当前可见（过滤后）的顺序作为上一组/下一组的导航列表
+            const visibleGroups = filterGroups(faultGroups);
+            let navIndex = visibleGroups.indexOf(group);
+            if (navIndex < 0) navIndex = 0;
+            const payload = { group, groups: visibleGroups, index: navIndex };
             const sessionKey = `fault-group-${Date.now()}-${index}`;
             try {
-                localStorage.setItem(sessionKey, JSON.stringify({
-                    group
-                }));
+                localStorage.setItem(sessionKey, JSON.stringify(payload));
                 window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
             } catch (error) {
                 console.warn('localStorage 写入故障组详情失败，改用 Blob URL 打开:', error);
-                const blob = new Blob([JSON.stringify(group)], { type: 'application/json' });
+                const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
                 const blobUrl = URL.createObjectURL(blob);
                 detailBlobUrls.push(blobUrl);
                 window.open(`ne_propagation_labeling.html?file=${encodeURIComponent(blobUrl)}`, '_blank');
