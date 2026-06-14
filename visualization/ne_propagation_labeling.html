@@ -2258,9 +2258,13 @@
                 <span id="groupNavStatus">- / -</span>
                 <button id="nextGroupBtn" onclick="goToAdjacentGroup(1)">下一组 →</button>
             </div>
-            <div class="group-nav group-nav-jump" id="groupNavJump" style="display:none;">
-                <button id="nextUnlabeledBtn" onclick="goToNextByLabel(false)">下一个未标注</button>
-                <button id="nextLabeledBtn" onclick="goToNextByLabel(true)">下一个已标注</button>
+            <div class="group-nav group-nav-jump" style="display:none;">
+                <button onclick="goToByLabel(false, -1)">← 上一组未标注</button>
+                <button onclick="goToByLabel(false, 1)">下一组未标注 →</button>
+            </div>
+            <div class="group-nav group-nav-jump" style="display:none;">
+                <button onclick="goToByLabel(true, -1)">← 上一组已标注</button>
+                <button onclick="goToByLabel(true, 1)">下一组已标注 →</button>
             </div>
 
             <div class="autosave-bar" id="autosaveBar">
@@ -6024,10 +6028,11 @@
         // 更新“上一组/下一组”导航条
         function updateGroupNavUI() {
             const nav = document.getElementById('groupNav');
-            const jump = document.getElementById('groupNavJump');
             const multi = groupNavList.length > 1;
             if (nav) nav.style.display = multi ? 'flex' : 'none';
-            if (jump) jump.style.display = multi ? 'flex' : 'none';
+            document.querySelectorAll('.group-nav-jump').forEach(function(row) {
+                row.style.display = multi ? 'flex' : 'none';
+            });
             if (!multi) return;
             const labeledCount = groupNavList.filter(isGroupLabeled).length;
             const statusEl = document.getElementById('groupNavStatus');
@@ -6075,14 +6080,16 @@
         }
 
         // 向后跳到下一个 已标注(labeled=true) / 未标注(labeled=false) 的故障组
-        function goToNextByLabel(labeled) {
+        // 按标注状态向前/后跳转：labeled=true 已标注 / false 未标注；direction=1 下一组 / -1 上一组
+        function goToByLabel(labeled, direction) {
             if (!groupNavList.length) return;
             let target = -1;
-            for (let idx = groupNavIndex + 1; idx < groupNavList.length; idx++) {
+            for (let idx = groupNavIndex + direction; idx >= 0 && idx < groupNavList.length; idx += direction) {
                 if (isGroupLabeled(groupNavList[idx]) === labeled) { target = idx; break; }
             }
             if (target === -1) {
-                updateAutoSaveStatus(labeled ? '后面没有已标注的故障组了' : '后面没有未标注的故障组了');
+                const dirText = direction > 0 ? '后面' : '前面';
+                updateAutoSaveStatus(dirText + '没有' + (labeled ? '已标注' : '未标注') + '的故障组了');
                 return;
             }
             commitCurrentGroup();
