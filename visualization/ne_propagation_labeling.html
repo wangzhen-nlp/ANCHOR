@@ -547,22 +547,15 @@
         }
 
         .device-filter-panel {
-            position: absolute;
-            left: 12px;
-            top: 58px;
-            z-index: 500;
-            background: rgba(255, 255, 255, 0.96);
+            background: #f6f8fa;
             border: 1px solid #d0d7de;
             border-radius: 8px;
-            padding: 10px 12px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.12);
-            backdrop-filter: blur(4px);
-            min-width: 210px;
+            padding: 10px;
         }
 
         .device-filter-panel h4 {
             font-size: 12px;
-            color: #0969da;
+            color: #57606a;
             margin-bottom: 8px;
             font-weight: 700;
         }
@@ -2130,6 +2123,33 @@
                 <p id="neGraphStatus">ne_graph：未加载</p>
             </div>
 
+            <div class="device-filter-panel" id="deviceTypeFilterPanel">
+                <h4>设备类型筛选</h4>
+                <div class="device-filter-grid">
+                    <label class="device-filter-item">
+                        <input type="checkbox" data-device-filter="DATA" checked onchange="updateDeviceTypeFilter(this)">
+                        <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><rect x="1.5" y="1.5" width="10" height="10" fill="#00BFFF" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
+                        <span>Data</span>
+                    </label>
+                    <label class="device-filter-item">
+                        <input type="checkbox" data-device-filter="TRANSMISSION" checked onchange="updateDeviceTypeFilter(this)">
+                        <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><circle cx="6.5" cy="6.5" r="5" fill="#FF8C00" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
+                        <span>Transmission</span>
+                    </label>
+                    <label class="device-filter-item">
+                        <input type="checkbox" data-device-filter="RAN" checked onchange="updateDeviceTypeFilter(this)">
+                        <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><polygon points="6.5,1.5 11.5,11.5 1.5,11.5" fill="#32CD32" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
+                        <span>Ran</span>
+                    </label>
+                    <label class="device-filter-item">
+                        <input type="checkbox" data-device-filter="OTHER" checked onchange="updateDeviceTypeFilter(this)">
+                        <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><polygon points="6.5,1.5 11.5,6.5 6.5,11.5 1.5,6.5" fill="#808080" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
+                        <span>Other</span>
+                    </label>
+                </div>
+                <div class="device-filter-status" id="deviceTypeFilterStatus">显示全部设备</div>
+            </div>
+
             <!-- 备注编辑区域 -->
             <div class="note-panel" id="notePanel">
                 <h3>故障组备注</h3>
@@ -2198,33 +2218,6 @@
                     <button onclick="toggleMapConnections()" id="toggleConnectionsBtn" class="active">📡 显示连接</button>
                     <button onclick="clearMapSelection()" id="clearMapSelBtn">✕ 清除选择</button>
                     <button onclick="toggleSiteNeighborMode()" id="mapSiteNeighborBtn" class="warning">🧭 邻居扩展</button>
-                </div>
-
-                <div class="device-filter-panel" id="deviceTypeFilterPanel">
-                    <h4>设备类型筛选</h4>
-                    <div class="device-filter-grid">
-                        <label class="device-filter-item">
-                            <input type="checkbox" data-device-filter="DATA" checked onchange="updateDeviceTypeFilter(this)">
-                            <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><rect x="1.5" y="1.5" width="10" height="10" fill="#00BFFF" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
-                            <span>Data</span>
-                        </label>
-                        <label class="device-filter-item">
-                            <input type="checkbox" data-device-filter="TRANSMISSION" checked onchange="updateDeviceTypeFilter(this)">
-                            <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><circle cx="6.5" cy="6.5" r="5" fill="#FF8C00" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
-                            <span>Transmission</span>
-                        </label>
-                        <label class="device-filter-item">
-                            <input type="checkbox" data-device-filter="RAN" checked onchange="updateDeviceTypeFilter(this)">
-                            <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><polygon points="6.5,1.5 11.5,11.5 1.5,11.5" fill="#32CD32" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
-                            <span>Ran</span>
-                        </label>
-                        <label class="device-filter-item">
-                            <input type="checkbox" data-device-filter="OTHER" checked onchange="updateDeviceTypeFilter(this)">
-                            <span class="device-filter-shape"><svg width="13" height="13" viewBox="0 0 13 13"><polygon points="6.5,1.5 11.5,6.5 6.5,11.5 1.5,6.5" fill="#808080" stroke="rgba(0,0,0,0.2)" stroke-width="1"/></svg></span>
-                            <span>Other</span>
-                        </label>
-                    </div>
-                    <div class="device-filter-status" id="deviceTypeFilterStatus">显示全部设备</div>
                 </div>
 
                 <div class="distance-stats" id="distanceStats">
