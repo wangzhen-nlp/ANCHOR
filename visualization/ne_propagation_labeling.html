@@ -2079,27 +2079,6 @@
                 </div>
             </div>
 
-            <div class="neighbor-mode-panel">
-                <h3>站点邻居扩展</h3>
-                <div class="neighbor-mode-row">
-                    <label>
-                        <input type="checkbox" id="siteNeighborModeCheckbox">
-                        点击设备时扩展站点 N 跳邻居
-                    </label>
-                    <input type="number" id="siteNeighborHopInput" class="neighbor-hop-input" min="1" step="1" value="1">
-                </div>
-                <div class="neighbor-mode-row" style="margin-top: 10px;">
-                    <span style="font-size: 12px; color: #57606a;">已选锚点</span>
-                    <span class="selected-nodes-count" id="siteNeighborSelectedCount">0</span>
-                    <button onclick="clearSiteNeighborSelection()" style="flex: 0.6;">清空</button>
-                    <button onclick="handleSiteNeighborModeToggle(false)" style="flex: 0.6;">退出</button>
-                </div>
-                <div class="neighbor-mode-hint">
-                    开启后，可连续点击多个设备；每个设备所在站点都会作为锚点，按站点连接关系把这些锚点站点的 N 跳邻居站点及其设备并集补到当前视图中。
-                    当前仅在已加载 JSON 所包含的节点和连边范围内生效。
-                </div>
-            </div>
-
             <!-- 详情面板（节点/边共用） -->
             <div class="detail-panel" id="detailPanel">
                 <h3 id="detailPanelTitle">节点详情</h3>
