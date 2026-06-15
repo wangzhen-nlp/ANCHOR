@@ -392,13 +392,191 @@
             border-radius: 18px;
         }
         input[type="file"] { display: none; }
+        body.labeling-mode {
+            overflow: hidden;
+        }
+        .labeling-shell {
+            position: fixed;
+            inset: 0;
+            display: none;
+            background: #f8fafc;
+            z-index: 1000;
+        }
+        .labeling-shell.is-open {
+            display: grid;
+            grid-template-rows: 52px 1fr;
+        }
+        .labeling-topbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 12px;
+            background: #fff;
+            border-bottom: 1px solid #d0d5dd;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+            min-width: 0;
+            z-index: 3;
+        }
+        .shell-btn {
+            border: 1px solid #d0d5dd;
+            border-radius: 8px;
+            padding: 8px 12px;
+            background: #fff;
+            color: #344054;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .shell-btn:hover {
+            background: #f8fafc;
+            border-color: #98a2b3;
+        }
+        .shell-btn.primary {
+            background: #111827;
+            border-color: #111827;
+            color: #fff;
+        }
+        .shell-btn.primary:hover {
+            background: #0b1220;
+        }
+        .shell-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+        .labeling-shell-title {
+            min-width: 0;
+            flex: 1;
+            color: #344054;
+            font-size: 13px;
+            font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .labeling-frame {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            background: #fff;
+        }
+        .drawer-scrim {
+            position: fixed;
+            inset: 52px 0 0 0;
+            display: none;
+            background: rgba(15, 23, 42, 0.25);
+            z-index: 4;
+        }
+        .labeling-drawer {
+            position: fixed;
+            left: 0;
+            top: 52px;
+            bottom: 0;
+            width: min(380px, 88vw);
+            display: flex;
+            flex-direction: column;
+            background: #fff;
+            border-right: 1px solid #d0d5dd;
+            box-shadow: 10px 0 28px rgba(15, 23, 42, 0.18);
+            transform: translateX(-105%);
+            transition: none;
+            z-index: 5;
+        }
+        .labeling-shell.drawer-open .drawer-scrim {
+            display: block;
+        }
+        .labeling-shell.drawer-open .labeling-drawer {
+            transform: translateX(0);
+        }
+        .drawer-scrim.is-open {
+            display: block;
+        }
+        .labeling-drawer.is-open {
+            transform: translateX(0);
+        }
+        .drawer-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            padding: 12px;
+            border-bottom: 1px solid #eaecf0;
+        }
+        .drawer-title {
+            color: #111827;
+            font-size: 14px;
+            font-weight: 800;
+        }
+        .drawer-list {
+            overflow: auto;
+            padding: 10px;
+            display: grid;
+            gap: 8px;
+        }
+        .drawer-group-btn {
+            width: 100%;
+            text-align: left;
+            border: 1px solid #e4e7ec;
+            border-radius: 8px;
+            padding: 10px;
+            background: #fff;
+            color: #1f2937;
+            cursor: pointer;
+        }
+        .drawer-group-btn:hover {
+            background: #f8fafc;
+            border-color: #98a2b3;
+        }
+        .drawer-group-btn.active {
+            border-color: #0969da;
+            box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.12);
+        }
+        .drawer-group-title {
+            display: block;
+            font-size: 13px;
+            font-weight: 800;
+            color: #0969da;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .drawer-group-meta {
+            display: block;
+            margin-top: 5px;
+            color: #667085;
+            font-size: 12px;
+        }
+        .drawer-empty {
+            padding: 20px;
+            color: #667085;
+            text-align: center;
+            font-size: 13px;
+        }
+        @media (max-width: 720px) {
+            .labeling-shell.is-open {
+                grid-template-rows: auto 1fr;
+            }
+            .labeling-topbar {
+                flex-wrap: wrap;
+            }
+            .labeling-shell-title {
+                flex-basis: 100%;
+                order: 3;
+            }
+            .drawer-scrim {
+                top: 90px;
+            }
+            .labeling-drawer {
+                top: 90px;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="page">
         <div class="hero">
             <h1>微波群障根因标注总览</h1>
-            <div class="sub">页面自动加载 data/ 目录下的故障组；点击任意故障组可打开「微波群障根因标注」页进行标注，标注会实时回写到对应文件。</div>
+            <div class="sub">页面自动加载 data/ 目录下的故障组；点击任意故障组可进入标注模式，标注会实时回写到对应文件。</div>
             <div style="margin-top:10px;">
                 <button class="btn" onclick="clearLabelingCache()" title="清空浏览器本地保存的全部根因标注/备注工作副本">🗑 清空标注缓存</button>
             </div>
@@ -424,6 +602,25 @@
         <div class="empty" id="emptyState">正在从 data/ 加载故障组…</div>
     </div>
 
+    <div class="labeling-shell" id="labelingShell" aria-hidden="true">
+        <div class="labeling-topbar">
+            <button class="shell-btn primary" onclick="returnToOverview()">返回总览</button>
+            <button class="shell-btn" onclick="toggleLabelingDrawer()">故障组列表</button>
+            <button class="shell-btn" id="shellPrevBtn" onclick="openAdjacentLabelingGroup(-1)">上一组</button>
+            <button class="shell-btn" id="shellNextBtn" onclick="openAdjacentLabelingGroup(1)">下一组</button>
+            <div class="labeling-shell-title" id="labelingShellTitle">未选择故障组</div>
+        </div>
+        <iframe id="labelingFrame" class="labeling-frame" name="ne_labeling_detail" title="微波群障根因标注"></iframe>
+        <div class="drawer-scrim" onclick="closeLabelingDrawer()"></div>
+        <aside class="labeling-drawer" aria-label="故障组列表">
+            <div class="drawer-head">
+                <div class="drawer-title">故障组列表</div>
+                <button class="shell-btn" onclick="closeLabelingDrawer()">关闭</button>
+            </div>
+            <div class="drawer-list" id="labelingDrawerList"></div>
+        </aside>
+    </div>
+
     <script>
         let faultGroups = [];
         let groupSourceFiles = {};   // uuid -> data/ 下源文件名（服务模式：传给标注页用于实时回写）
@@ -437,6 +634,7 @@
         let currentFaultGroupFileHandle = null;
         let currentFaultGroupFileName = '';
         let durationFilterSeconds = 0;
+        let activeLabelingUuid = '';
 
         window.getLoadedFaultGroupFileContext = function() {
             return {
@@ -501,33 +699,196 @@
 
         const LABELING_DETAIL_WINDOW_NAME = 'ne_labeling_detail';
 
-        function openLabelingDetailUrl(url) {
-            const detailWindow = window.open(url, LABELING_DETAIL_WINDOW_NAME);
-            if (!detailWindow) {
-                window.alert('浏览器阻止了弹窗，请允许此页面打开标注窗口后重试。');
-                return false;
+        function getLabelingFrame() {
+            return document.getElementById('labelingFrame');
+        }
+
+        function setLabelingMode(open) {
+            const shell = document.getElementById('labelingShell');
+            if (!shell) return;
+            shell.classList.toggle('is-open', !!open);
+            shell.setAttribute('aria-hidden', open ? 'false' : 'true');
+            document.body.classList.toggle('labeling-mode', !!open);
+        }
+
+        async function commitLabelingFrameIfNeeded(useBeacon) {
+            const frame = getLabelingFrame();
+            if (!frame || !frame.contentWindow) return;
+            try {
+                if (typeof frame.contentWindow.commitCurrentGroup === 'function') {
+                    await Promise.resolve(frame.contentWindow.commitCurrentGroup(!!useBeacon));
+                }
+            } catch (error) {
+                console.warn('同步当前标注失败:', error);
             }
-            try { detailWindow.focus(); } catch (error) { /* ignore */ }
+        }
+
+        async function openLabelingDetailUrl(url, group) {
+            const frame = getLabelingFrame();
+            if (!frame) return false;
+            await commitLabelingFrameIfNeeded(false);
+            activeLabelingUuid = groupUuidOf(group) || activeLabelingUuid;
+            frame.name = LABELING_DETAIL_WINDOW_NAME;
+            frame.src = url;
+            setLabelingMode(true);
+            closeLabelingDrawer();
+            refreshLabelingShellState();
             return true;
         }
 
-        function openGroupDetailWithWindowPayload(payload) {
-            const detailWindow = window.open('about:blank', LABELING_DETAIL_WINDOW_NAME);
-            if (!detailWindow) {
-                window.alert('浏览器阻止了弹窗，请允许此页面打开新窗口后重试。');
-                return false;
-            }
+        async function openGroupDetailWithWindowPayload(payload) {
+            const frame = getLabelingFrame();
+            if (!frame) return false;
             try {
-                detailWindow.name = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
-                detailWindow.location.href = 'ne_propagation_labeling.html?window_payload=1';
-                detailWindow.focus();
+                await commitLabelingFrameIfNeeded(false);
+                const payloadInfo = extractPayloadCurrentGroup(payload);
+                activeLabelingUuid = groupUuidOf(payloadInfo.current) || activeLabelingUuid;
+                const encodedPayload = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
+                frame.name = encodedPayload;
+                try { frame.contentWindow.name = encodedPayload; } catch (nameError) { /* ignore */ }
+                frame.src = 'ne_propagation_labeling.html?window_payload=1';
+                setLabelingMode(true);
+                closeLabelingDrawer();
+                refreshLabelingShellState();
                 return true;
             } catch (error) {
-                try { detailWindow.close(); } catch (closeError) { /* ignore */ }
-                console.warn('window.name 写入故障组详情失败:', error);
+                console.warn('iframe window.name 写入故障组详情失败:', error);
                 return false;
             }
         }
+
+        function extractPayloadCurrentGroup(payload) {
+            if (payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.groups)) {
+                let index = (typeof payload.index === 'number') ? payload.index : 0;
+                if (index < 0 || index >= payload.groups.length) index = 0;
+                return { current: normalizeFaultGroupRecord(payload.groups[index]), index };
+            }
+            const current = (payload && typeof payload === 'object' && !Array.isArray(payload) && payload.group)
+                ? payload.group : payload;
+            return { current: normalizeFaultGroupRecord(current), index: -1 };
+        }
+
+        async function returnToOverview() {
+            const frame = getLabelingFrame();
+            await commitLabelingFrameIfNeeded(false);
+            closeLabelingDrawer();
+            setLabelingMode(false);
+            activeLabelingUuid = '';
+            if (frame) {
+                frame.removeAttribute('src');
+                frame.name = LABELING_DETAIL_WINDOW_NAME;
+            }
+            renderGroups();
+        }
+
+        function toggleLabelingDrawer() {
+            const shell = document.getElementById('labelingShell');
+            if (!shell) return;
+            const nextOpen = !shell.classList.contains('drawer-open');
+            shell.classList.toggle('drawer-open', nextOpen);
+            const scrim = document.querySelector('.drawer-scrim');
+            const drawer = document.querySelector('.labeling-drawer');
+            if (scrim) {
+                scrim.classList.toggle('is-open', nextOpen);
+                scrim.style.display = nextOpen ? 'block' : '';
+            }
+            if (drawer) {
+                drawer.classList.toggle('is-open', nextOpen);
+                drawer.style.transform = nextOpen ? 'translateX(0)' : 'translateX(-105%)';
+            }
+            renderLabelingDrawerList();
+        }
+
+        function closeLabelingDrawer() {
+            const shell = document.getElementById('labelingShell');
+            if (shell) shell.classList.remove('drawer-open');
+            const scrim = document.querySelector('.drawer-scrim');
+            const drawer = document.querySelector('.labeling-drawer');
+            if (scrim) {
+                scrim.classList.remove('is-open');
+                scrim.style.display = '';
+            }
+            if (drawer) {
+                drawer.classList.remove('is-open');
+                drawer.style.transform = 'translateX(-105%)';
+            }
+        }
+
+        function getVisibleGroups() {
+            return filterGroups(faultGroups);
+        }
+
+        function getVisibleGroupIndexByUuid(uuid) {
+            const normalizedUuid = String(uuid || '').trim();
+            if (!normalizedUuid) return -1;
+            return getVisibleGroups().findIndex(group => groupUuidOf(group) === normalizedUuid);
+        }
+
+        function updateLabelingShellChrome() {
+            const shellTitle = document.getElementById('labelingShellTitle');
+            const prevBtn = document.getElementById('shellPrevBtn');
+            const nextBtn = document.getElementById('shellNextBtn');
+            const visibleGroups = getVisibleGroups();
+            const visibleIndex = getVisibleGroupIndexByUuid(activeLabelingUuid);
+            if (shellTitle) {
+                if (!activeLabelingUuid) {
+                    shellTitle.textContent = '未选择故障组';
+                } else if (visibleIndex >= 0) {
+                    shellTitle.textContent = '故障组 ' + (visibleIndex + 1) + ' / ' + visibleGroups.length + '：' + activeLabelingUuid;
+                } else {
+                    shellTitle.textContent = '当前故障组：' + activeLabelingUuid + '（不在当前筛选结果中）';
+                }
+            }
+            if (prevBtn) prevBtn.disabled = visibleIndex <= 0;
+            if (nextBtn) nextBtn.disabled = visibleIndex < 0 || visibleIndex >= visibleGroups.length - 1;
+        }
+
+        function renderLabelingDrawerList() {
+            const list = document.getElementById('labelingDrawerList');
+            if (!list) return;
+            const visibleGroups = getVisibleGroups();
+            if (visibleGroups.length === 0) {
+                list.innerHTML = '<div class="drawer-empty">当前筛选条件下没有故障组</div>';
+                return;
+            }
+            list.innerHTML = visibleGroups.map(function(group) {
+                const index = faultGroups.indexOf(group);
+                const uuid = groupUuidOf(group) || ('故障组 ' + (index + 1));
+                const active = uuid === activeLabelingUuid;
+                const labeled = isGroupLabeled(group);
+                const note = getEffectiveNote(group);
+                return '<button class="drawer-group-btn' + (active ? ' active' : '') + '" onclick="openGroupDetail(' + index + ')">' +
+                    '<span class="drawer-group-title">' + escapeHtml(uuid) + '</span>' +
+                    '<span class="drawer-group-meta">' + (labeled ? '已标注' : '未标注') +
+                    ' · 站点 ' + getSiteCount(group) +
+                    ' · 设备 ' + getNodeCount(group) +
+                    (note ? ' · 有备注' : '') +
+                    '</span>' +
+                '</button>';
+            }).join('');
+        }
+
+        function refreshLabelingShellState() {
+            const shell = document.getElementById('labelingShell');
+            if (!shell || !shell.classList.contains('is-open')) return;
+            updateLabelingShellChrome();
+            renderLabelingDrawerList();
+        }
+
+        function openAdjacentLabelingGroup(delta) {
+            const visibleGroups = getVisibleGroups();
+            const visibleIndex = getVisibleGroupIndexByUuid(activeLabelingUuid);
+            const nextIndex = visibleIndex + delta;
+            if (nextIndex < 0 || nextIndex >= visibleGroups.length) return;
+            const group = visibleGroups[nextIndex];
+            const index = faultGroups.indexOf(group);
+            if (index >= 0) openGroupDetail(index);
+        }
+
+        window.updateActiveLabelingGroup = function(groupUuid) {
+            activeLabelingUuid = String(groupUuid || '').trim();
+            refreshLabelingShellState();
+        };
 
         function updateFaultGroupFileStatus(inputPath, writableMode) {
             const pathText = inputPath || currentFaultGroupFileName || '-';
@@ -863,7 +1224,7 @@
             return alarmGroups.length > 0 ? alarmGroups.join('，') : '无';
         }
 
-        function openGroupDetail(index) {
+        async function openGroupDetail(index) {
             const group = normalizeFaultGroupRecord(faultGroups[index]);
             // 以当前可见（过滤后）的顺序作为上一组/下一组的导航列表
             const visibleGroups = normalizeFaultGroupList(filterGroups(faultGroups));
@@ -873,20 +1234,20 @@
             const sessionKey = `fault-group-${Date.now()}-${index}`;
             try {
                 localStorage.setItem(sessionKey, JSON.stringify(payload));
-                openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`);
+                await openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, group);
             } catch (error) {
                 console.warn('localStorage 写入完整故障组导航失败，改用 window.name 保留上一组/下一组:', error);
-                if (openGroupDetailWithWindowPayload(payload)) {
+                if (await openGroupDetailWithWindowPayload(payload)) {
                     return;
                 }
 
                 const singlePayload = { group };
                 try {
                     localStorage.setItem(sessionKey, JSON.stringify(singlePayload));
-                    openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`);
+                    await openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, group);
                 } catch (singleError) {
                     console.warn('localStorage 写入当前故障组失败，改用 window.name 打开:', singleError);
-                    openGroupDetailWithWindowPayload(singlePayload);
+                    await openGroupDetailWithWindowPayload(singlePayload);
                 }
             }
         }
@@ -1075,6 +1436,7 @@
                 list.innerHTML = '';
                 emptyState.textContent = faultGroups.length === 0 ? '暂无故障组（请确认 data/ 目录下有 jsonl，并已通过 start_labeling 启动）' : '当前筛选条件下没有故障组';
                 emptyState.style.display = 'block';
+                refreshLabelingShellState();
                 return;
             }
 
@@ -1098,6 +1460,7 @@
                 </div>
             `;
             }).join('');
+            refreshLabelingShellState();
         }
 
         function parseRuleFilterInput(value) {
@@ -1190,7 +1553,7 @@
             }
         });
 
-        // 由标注页通过 window.opener 调用：回写某故障组的根因标注，实时刷新状态/计数/筛选
+        // 由标注页通过 parent/opener 调用：回写某故障组的根因标注，实时刷新状态/计数/筛选
         window.applyFaultGroupRootCause = function(groupUuid, annotations, note) {
             const normalizedUuid = String(groupUuid || '').trim();
             if (!normalizedUuid) return;

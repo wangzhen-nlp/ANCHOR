@@ -3193,6 +3193,12 @@
 
         function getFaultGroupBrowserBridge() {
             const candidates = [];
+            if (window.parent && window.parent !== window) {
+                candidates.push(window.parent);
+            }
+            if (window.top && window.top !== window && window.top !== window.parent) {
+                candidates.push(window.top);
+            }
             if (window.opener && !window.opener.closed) {
                 candidates.push(window.opener);
             }
@@ -3207,7 +3213,8 @@
                     if (candidate && (
                         typeof candidate.applyFaultGroupRootCause === 'function' ||
                         typeof candidate.saveFaultGroupNoteToSource === 'function' ||
-                        typeof candidate.prepareFaultGroupNoteSave === 'function'
+                        typeof candidate.prepareFaultGroupNoteSave === 'function' ||
+                        typeof candidate.updateActiveLabelingGroup === 'function'
                     )) {
                         return candidate;
                     }
@@ -3217,6 +3224,7 @@
             }
             return null;
         }
+        window.getFaultGroupBrowserBridge = getFaultGroupBrowserBridge;
 
         function escapeHtml(value) {
             return String(value ?? '')
@@ -6222,6 +6230,7 @@
             enableNotePanel();
             loadNoteToPanel();
             renderRootCausePanel();
+            notifyActiveGroupToOverview();
         }
 
         // 判断某故障组是否已标注根因（任一根因设备 或 任一根因告警）
@@ -6261,7 +6270,7 @@
         }
 
         // 切换离开当前组前：同步备注、把状态回写总览页、自动落盘
-        function commitCurrentGroup() {
+        function commitCurrentGroup(useBeacon) {
             if (!graphData) return;
             const ta = document.getElementById('noteTextarea');
             if (ta) {
@@ -6270,7 +6279,9 @@
             }
             pushStatusToOverview();
             autoSaveResults();
+            flushServerWriteBack(!!useBeacon);
         }
+        window.commitCurrentGroup = commitCurrentGroup;
 
         function loadGroupAtIndex(idx) {
             groupNavIndex = idx;
@@ -6373,6 +6384,15 @@
             } catch (e) { /* 总览页不可用时忽略 */ }
         }
 
+        function notifyActiveGroupToOverview() {
+            try {
+                const bridge = getFaultGroupBrowserBridge();
+                if (bridge && typeof bridge.updateActiveLabelingGroup === 'function' && originalGroupUuid) {
+                    bridge.updateActiveLabelingGroup(originalGroupUuid);
+                }
+            } catch (e) { /* 总览页不可用时忽略 */ }
+        }
+
         // 把当前故障组的根因标注 + 备注自动写入 localStorage（每组一个独立 key）。
         // 只写当前组那一小份，保存成本与“历史已标注组数”无关。
         function autoSaveResults() {
@@ -6409,28 +6429,61 @@
             _writeBackTimer = setTimeout(doServerWriteBack, 400);
         }
 
-        function doServerWriteBack() {
-            _writeBackTimer = null;
+        function buildServerWriteBackPayload() {
             const file = rcSourceFiles[originalGroupUuid];
-            if (!file || !rcOriginalGroup) return;
+            if (!file || !rcOriginalGroup) return null;
             const out = Object.assign({}, rcOriginalGroup, {
                 root_cause_annotations: (graphData && graphData.root_cause_annotations) || {},
                 note: (graphData && graphData.note) || '',
                 note_updated_at: (graphData && graphData.note_updated_at) || new Date().toISOString()
             });
-            fetch('/save?file=' + encodeURIComponent(file), {
+            return { file, body: JSON.stringify(out) };
+        }
+
+        function doServerWriteBack() {
+            _writeBackTimer = null;
+            const payload = buildServerWriteBackPayload();
+            if (!payload) return Promise.resolve();
+            return fetch('/save?file=' + encodeURIComponent(payload.file), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(out)
+                body: payload.body
             }).then(function(r) {
                 if (r.ok) {
-                    updateAutoSaveStatus('✓ 已实时回写 ' + file + ' ' + new Date().toLocaleTimeString());
+                    updateAutoSaveStatus('✓ 已实时回写 ' + payload.file + ' ' + new Date().toLocaleTimeString());
                 } else {
                     updateAutoSaveStatus('实时回写失败 HTTP ' + r.status + '（已存本地缓存）', true);
                 }
             }).catch(function(e) {
                 updateAutoSaveStatus('实时回写失败：' + (e.message || e) + '（已存本地缓存）', true);
             });
+        }
+
+        function flushServerWriteBack(useBeacon) {
+            if (_writeBackTimer) {
+                clearTimeout(_writeBackTimer);
+                _writeBackTimer = null;
+            }
+            const payload = buildServerWriteBackPayload();
+            if (!payload) return Promise.resolve();
+            const url = '/save?file=' + encodeURIComponent(payload.file);
+            if (useBeacon && navigator.sendBeacon) {
+                const ok = navigator.sendBeacon(url, new Blob([payload.body], { type: 'application/json' }));
+                if (ok) return Promise.resolve();
+            }
+            try {
+                return fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: payload.body,
+                    keepalive: !!useBeacon
+                }).catch(function(e) {
+                    updateAutoSaveStatus('实时回写失败：' + (e.message || e) + '（已存本地缓存）', true);
+                });
+            } catch (e) {
+                updateAutoSaveStatus('实时回写失败：' + (e.message || e) + '（已存本地缓存）', true);
+                return Promise.resolve();
+            }
         }
 
         // 加载某组时，从 localStorage 恢复其根因标注/备注（本地工作副本优先）
@@ -6452,7 +6505,9 @@
 
         // 关闭/刷新页面时保存当前组（localStorage 写入是同步的，可靠）
         window.addEventListener('beforeunload', function() {
-            try { commitCurrentGroup(); } catch (e) { /* ignore */ }
+            try {
+                commitCurrentGroup(true);
+            } catch (e) { /* ignore */ }
         });
 
         // 从会话/文件载荷中提取（可能的）故障组列表与当前组
