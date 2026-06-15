@@ -435,7 +435,7 @@
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
         let labelFilter = 'all';   // 标注状态过滤：all / labeled / unlabeled
-        let detailBlobUrls = [];
+        const FAULT_GROUP_WINDOW_PAYLOAD_PREFIX = 'FAULT_GROUP_WINDOW_PAYLOAD:';
         let currentFaultGroupFileHandle = null;
         let currentFaultGroupFileName = '';
         let durationFilterSeconds = 0;
@@ -493,6 +493,33 @@
             return groups.map(group => JSON.stringify(group)).join('\n') + '\n';
         }
 
+        function normalizeFaultGroupRecord(record) {
+            if (!record || typeof record !== 'object' || Array.isArray(record)) {
+                return record;
+            }
+            if (record.ne_info || record.nodes) {
+                return record;
+            }
+            if (record.group && typeof record.group === 'object' && !Array.isArray(record.group)) {
+                return record.group;
+            }
+            return record;
+        }
+
+        function normalizeFaultGroupList(records) {
+            return (records || []).map(normalizeFaultGroupRecord);
+        }
+
+        function openGroupDetailWithWindowPayload(payload) {
+            const detailWindow = window.open('about:blank', '_blank');
+            if (!detailWindow) {
+                window.alert('浏览器阻止了弹窗，请允许此页面打开新窗口后重试。');
+                return;
+            }
+            detailWindow.name = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
+            detailWindow.location.href = 'ne_propagation_labeling.html?window_payload=1';
+        }
+
         function updateFaultGroupFileStatus(inputPath, writableMode) {
             const pathText = inputPath || currentFaultGroupFileName || '-';
             const writableText = writableMode ? '已绑定原文件，可尝试回写备注' : '未获得原文件写入权限';
@@ -501,7 +528,7 @@
 
         function loadFaultGroupText(content, inputPath, fileHandle) {
             try {
-                faultGroups = parseJsonl(content);
+                faultGroups = normalizeFaultGroupList(parseJsonl(content));
                 currentFaultGroupFileHandle = fileHandle || null;
                 currentFaultGroupFileName = inputPath || currentFaultGroupFileName || '';
                 document.getElementById('status').textContent = `已加载 ${faultGroups.length} 个故障组`;
@@ -1029,9 +1056,9 @@
         }
 
         function openGroupDetail(index) {
-            const group = faultGroups[index];
+            const group = normalizeFaultGroupRecord(faultGroups[index]);
             // 以当前可见（过滤后）的顺序作为上一组/下一组的导航列表
-            const visibleGroups = filterGroups(faultGroups);
+            const visibleGroups = normalizeFaultGroupList(filterGroups(faultGroups));
             let navIndex = visibleGroups.indexOf(group);
             if (navIndex < 0) navIndex = 0;
             const payload = { group, groups: visibleGroups, index: navIndex };
@@ -1040,15 +1067,15 @@
                 localStorage.setItem(sessionKey, JSON.stringify(payload));
                 window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
             } catch (error) {
-                console.warn('localStorage 写入故障组详情失败，改用 Blob URL 打开:', error);
-                const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-                const blobUrl = URL.createObjectURL(blob);
-                detailBlobUrls.push(blobUrl);
-                window.open(`ne_propagation_labeling.html?file=${encodeURIComponent(blobUrl)}`, '_blank');
-                setTimeout(() => {
-                    URL.revokeObjectURL(blobUrl);
-                    detailBlobUrls = detailBlobUrls.filter(url => url !== blobUrl);
-                }, 10 * 60 * 1000);
+                console.warn('localStorage 写入完整故障组导航失败，退化为仅打开当前故障组:', error);
+                const singlePayload = { group };
+                try {
+                    localStorage.setItem(sessionKey, JSON.stringify(singlePayload));
+                    window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+                } catch (singleError) {
+                    console.warn('localStorage 写入当前故障组失败，改用 window.name 打开:', singleError);
+                    openGroupDetailWithWindowPayload(singlePayload);
+                }
             }
         }
 
@@ -1407,7 +1434,7 @@
         (function autoLoadDefaultData() {
             const data = window.FAULT_GROUPS_DATA;
             if (!Array.isArray(data) || data.length === 0) return;
-            faultGroups = data;
+            faultGroups = normalizeFaultGroupList(data);
             currentFaultGroupFileName = 'data/';
             document.getElementById('status').textContent = '已自动加载 ' + faultGroups.length + ' 个故障组（来自 data/）';
             updateFaultGroupFileStatus('data/', false);

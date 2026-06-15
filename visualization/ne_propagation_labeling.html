@@ -6324,26 +6324,78 @@
         });
 
         // 从会话/文件载荷中提取（可能的）故障组列表与当前组
+        function normalizeFaultGroupRecord(record) {
+            if (!record || typeof record !== 'object' || Array.isArray(record)) {
+                return record;
+            }
+            if (record.ne_info || record.nodes) {
+                return record;
+            }
+            if (record.group && typeof record.group === 'object' && !Array.isArray(record.group)) {
+                return record.group;
+            }
+            return record;
+        }
+
+        function normalizeFaultGroupList(records) {
+            return (records || []).map(normalizeFaultGroupRecord);
+        }
+
+        const FAULT_GROUP_WINDOW_PAYLOAD_PREFIX = 'FAULT_GROUP_WINDOW_PAYLOAD:';
+
         function extractGroupPayload(payload) {
             if (payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.groups)) {
-                const groups = payload.groups;
+                const groups = normalizeFaultGroupList(payload.groups);
                 let index = (typeof payload.index === 'number') ? payload.index : 0;
                 if (index < 0 || index >= groups.length) index = 0;
                 return { groups: groups, index: index, current: groups[index] };
             }
             if (Array.isArray(payload)) {
-                return { groups: payload, index: 0, current: payload[0] };
+                const groups = normalizeFaultGroupList(payload);
+                return { groups: groups, index: 0, current: groups[0] };
             }
             const current = (payload && typeof payload === 'object' && !Array.isArray(payload) && payload.group)
                 ? payload.group : payload;
-            return { groups: [], index: -1, current: current };
+            return { groups: [], index: -1, current: normalizeFaultGroupRecord(current) };
+        }
+
+        function renderExtractedGroupPayload(payload, fileStatus, sourceLabel) {
+            groupNavList = payload.groups;
+            groupNavIndex = payload.index;
+            renderSingleGroup(payload.current);
+            if (fileStatus) {
+                fileStatus.textContent = groupNavList.length > 1
+                    ? ('已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组')
+                    : (sourceLabel || '已加载单个故障组详情');
+            }
+            updateGroupNavUI();
         }
 
         function loadData() {
             const urlParams = new URLSearchParams(window.location.search);
             const dataFile = urlParams.get('file');
             const sessionKey = urlParams.get('session_key');
+            const windowPayload = urlParams.get('window_payload');
             const fileStatus = document.getElementById('fileStatus');
+
+            if (windowPayload) {
+                showLoading(true);
+                try {
+                    const rawName = window.name || '';
+                    if (rawName.indexOf(FAULT_GROUP_WINDOW_PAYLOAD_PREFIX) !== 0) {
+                        throw new Error('未找到窗口传递的故障组数据');
+                    }
+                    const encodedPayload = rawName.slice(FAULT_GROUP_WINDOW_PAYLOAD_PREFIX.length);
+                    window.name = '';
+                    const payload = extractGroupPayload(JSON.parse(decodeURIComponent(encodedPayload)));
+                    renderExtractedGroupPayload(payload, fileStatus, '已加载单个故障组详情');
+                } catch (error) {
+                    showError('加载故障组详情失败: ' + error.message);
+                    showLoading(false);
+                    disableNotePanel();
+                }
+                return;
+            }
 
             if (sessionKey) {
                 showLoading(true);
@@ -6353,16 +6405,9 @@
                         throw new Error('未找到对应的故障组数据');
                     }
                     const payload = extractGroupPayload(JSON.parse(rawData));
-                    groupNavList = payload.groups;
-                    groupNavIndex = payload.index;
-
-                    renderSingleGroup(payload.current);
+                    renderExtractedGroupPayload(payload, fileStatus, '已加载单个故障组详情');
 
                     localStorage.removeItem(sessionKey);
-                    fileStatus.textContent = groupNavList.length > 1
-                        ? ('已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组')
-                        : '已加载单个故障组详情';
-                    updateGroupNavUI();
                 } catch (error) {
                     showError('加载故障组详情失败: ' + error.message);
                     showLoading(false);
@@ -6377,13 +6422,7 @@
                     .then(function(response) { return response.json(); })
                     .then(function(data) {
                         const payload = extractGroupPayload(data);
-                        groupNavList = payload.groups;
-                        groupNavIndex = payload.index;
-                        renderSingleGroup(payload.current);
-                        if (groupNavList.length > 1) {
-                            fileStatus.textContent = '已加载第 ' + (groupNavIndex + 1) + ' / ' + groupNavList.length + ' 组';
-                        }
-                        updateGroupNavUI();
+                        renderExtractedGroupPayload(payload, fileStatus);
                     })
                     .catch(function(error) {
                         showError('加载数据失败: ' + error.message);
