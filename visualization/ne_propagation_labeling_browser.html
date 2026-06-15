@@ -1427,6 +1427,13 @@
             renderGroups();
         });
 
+        window.addEventListener('storage', function(event) {
+            if (!event.key) return;
+            if (event.key === 'mw_rc_annotations' || event.key.indexOf('mw_rc_annotations:') === 0) {
+                renderGroups();
+            }
+        });
+
         // 由标注页通过 window.opener 调用：回写某故障组的根因标注，实时刷新状态/计数/筛选
         window.applyFaultGroupRootCause = function(groupUuid, annotations, note) {
             const normalizedUuid = String(groupUuid || '').trim();

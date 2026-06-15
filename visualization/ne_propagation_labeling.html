@@ -3215,7 +3215,11 @@
             }
             for (const candidate of candidates) {
                 try {
-                    if (candidate && typeof candidate.saveFaultGroupNoteToSource === 'function') {
+                    if (candidate && (
+                        typeof candidate.applyFaultGroupRootCause === 'function' ||
+                        typeof candidate.saveFaultGroupNoteToSource === 'function' ||
+                        typeof candidate.prepareFaultGroupNoteSave === 'function'
+                    )) {
                         return candidate;
                     }
                 } catch (error) {
@@ -7523,7 +7527,11 @@
 
         // 监听备注输入变化
         document.getElementById('noteTextarea').addEventListener('input', function(e) {
-            // 可以在这里添加自动保存逻辑
+            if (!graphData) return;
+            graphData.note = e.target.value.trim();
+            graphData.note_updated_at = new Date().toISOString();
+            autoSaveResults();
+            pushStatusToOverview();
         });
 
         // 文件处理
