@@ -1449,6 +1449,12 @@
             font-size: 13px;
         }
 
+        .edge-detail-popup .leaflet-popup-content {
+            width: 360px;
+            max-height: 420px;
+            overflow-y: auto;
+        }
+
         .popup-title {
             font-weight: bold;
             color: #0969da;
@@ -5114,7 +5120,7 @@
             layer.on('click', function(e) {
                 L.DomEvent.stopPropagation(e);
                 if (e && e.originalEvent) L.DomEvent.stopPropagation(e.originalEvent);
-                selectEdge(this.linkData, this.sourceId, this.targetId);
+                selectEdge(this.linkData, this.sourceId, this.targetId, e && e.latlng);
             });
         }
 
@@ -5723,7 +5729,7 @@
         // 修改后的边选择函数（支持再次点击取消选中，自动清除节点选择）
         // ==========================================
 
-        function selectEdge(link, sourceId, targetId) {
+        function selectEdge(link, sourceId, targetId, clickLatLng) {
             // 检查是否点击同一条边（取消选中）
             const isSameEdge = selectedEdge && 
                 ((selectedEdge.source === sourceId && selectedEdge.target === targetId) ||
@@ -5731,6 +5737,7 @@
             
             if (isSameEdge) {
                 clearEdgeSelection();
+                if (map) map.closePopup();
                 document.getElementById('detailPanel').classList.remove('show');
                 return;
             }
@@ -5768,17 +5775,23 @@
                 }
             });
             
-            showEdgeDetailPanel(link, sourceId, targetId);
+            showEdgeDetailPanel(link, sourceId, targetId, clickLatLng);
         }
 
-        // 新增：显示边详情面板（需求3）
-        function showEdgeDetailPanel(link, sourceId, targetId) {
-            const panel = document.getElementById('detailPanel');
-            const title = document.getElementById('detailPanelTitle');
-            const content = document.getElementById('detailContent');
-            
-            title.textContent = '边详情';
-            
+        function getEdgePopupLatLng(sourceId, targetId, clickLatLng) {
+            if (clickLatLng) return clickLatLng;
+            const sourceMarker = mapMarkers[sourceId];
+            const targetMarker = mapMarkers[targetId];
+            if (sourceMarker && targetMarker) {
+                const a = sourceMarker.getLatLng();
+                const b = targetMarker.getLatLng();
+                return L.latLng((a.lat + b.lat) / 2, (a.lng + b.lng) / 2);
+            }
+            return map ? map.getCenter() : L.latLng(0, 0);
+        }
+
+        // 边详情改为地图 popup，与设备详情保持同一种交互形态
+        function showEdgeDetailPanel(link, sourceId, targetId, clickLatLng) {
             const sourceNode = allNodes.find(function(n) { return n.id === sourceId; });
             const targetNode = allNodes.find(function(n) { return n.id === targetId; });
             
@@ -5795,6 +5808,7 @@
             const rightAlarm = link.right_alarm || null;
             
             let html = '<div class="edge-detail-panel">';
+            html += '<div class="popup-title">边详情</div>';
             
             // 边类型标识
             html += '<div style="margin-bottom: 10px;">';
@@ -5884,9 +5898,22 @@
             html += '</div>';
             
             html += '</div>'; // edge-detail-panel
-            
-            content.innerHTML = html;
-            revealSidebarDetailPanel(panel);
+
+            const panel = document.getElementById('detailPanel');
+            if (panel) panel.classList.remove('show');
+            if (map) {
+                map.closePopup();
+                L.popup({
+                    className: 'edge-detail-popup',
+                    autoClose: false,
+                    closeOnClick: false,
+                    autoPan: true,
+                    maxWidth: 420
+                })
+                    .setLatLng(getEdgePopupLatLng(sourceId, targetId, clickLatLng))
+                    .setContent(html)
+                    .openOn(map);
+            }
         }
 
         function fitMapBounds() {
