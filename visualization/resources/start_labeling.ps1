@@ -122,8 +122,9 @@ $idleTimeoutSec = 15
 
 try {
     while ($true) {
-        if (-not $listener.Pending()) {
-            Start-Sleep -Milliseconds 200
+        # Poll 在有连接到达时立即返回（零延迟），否则最多等 0.5s 再查空闲——
+        # 不能用固定 Start-Sleep，否则每个请求都被拖延，逐个加载 data 文件时会很慢。
+        if (-not $listener.Server.Poll(500000, [System.Net.Sockets.SelectMode]::SelectRead)) {
             if (((Get-Date) - $lastSeen).TotalSeconds -gt $idleTimeoutSec) {
                 Write-Host "所有标注页已关闭，本地服务自动退出。"
                 break
@@ -131,7 +132,8 @@ try {
             continue
         }
         $client = $listener.AcceptTcpClient()
-        $lastSeen = Get-Date   # 任意请求（含 /ping 心跳）都刷新存活时间
+        $client.ReceiveTimeout = 5000   # 防止空连接(预连接)在读请求时永久阻塞单线程服务
+        $lastSeen = Get-Date            # 任意请求（含 /ping 心跳）都刷新存活时间
         $stream = $client.GetStream()
         try {
             $req = Read-Request $stream
