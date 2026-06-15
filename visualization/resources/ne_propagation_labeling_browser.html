@@ -399,6 +399,9 @@
         <div class="hero">
             <h1>微波群障根因标注总览</h1>
             <div class="sub">页面自动加载 data/ 目录下的故障组；点击任意故障组可打开「微波群障根因标注」页进行标注，标注会实时回写到对应文件。</div>
+            <div style="margin-top:10px;">
+                <button class="btn" onclick="clearLabelingCache()" title="清空浏览器本地保存的全部根因标注/备注工作副本">🗑 清空标注缓存</button>
+            </div>
             <div class="filter-row">
                 <span class="site-filter-label">标注状态</span>
                 <div class="filters" id="labelFilters" style="margin:0;">
@@ -1192,6 +1195,29 @@
         //   · file:// 模式：用 data.js 注入的 window.FAULT_GROUPS_DATA（无回写，靠 localStorage + 手动导出）。
         // 两种都失败/缺省时，手动选择文件的入口仍可用。
         function groupUuidOf(g) { return (g && (g.uuid || (g.match_info && g.match_info.uuid))) || ''; }
+
+        // 清空标注相关的浏览器本地缓存：根因标注/备注工作副本(mw_rc_annotations*) + 打开故障组的临时数据(fault-group-*)
+        function clearLabelingCache() {
+            const ok = confirm(
+                '确定清空所有标注缓存吗？\n\n' +
+                '将删除浏览器本地(localStorage)保存的全部根因标注/备注工作副本，以及打开故障组的临时数据。\n\n' +
+                '· 服务模式：data/ 文件里的标注是真源，不受影响；\n' +
+                '· file:// 模式：localStorage 是唯一副本，未导出的标注将永久丢失。'
+            );
+            if (!ok) return;
+            const toRemove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (!key) continue;
+                if (key === 'mw_rc_annotations' || key.indexOf('mw_rc_annotations:') === 0 || key.indexOf('fault-group-') === 0) {
+                    toRemove.push(key);
+                }
+            }
+            toRemove.forEach(function(k) { localStorage.removeItem(k); });
+            const statusEl = document.getElementById('status');
+            if (statusEl) statusEl.textContent = '已清空标注缓存（删除 ' + toRemove.length + ' 项）';
+            renderGroups();
+        }
 
         (async function autoLoadDefaultData() {
             const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
