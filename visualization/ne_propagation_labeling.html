@@ -2378,6 +2378,7 @@
                 <div class="map-toolbar">
                     <button onclick="fitMapBounds()" title="适应所有节点">⊡ 适应视图</button>
                     <button onclick="restoreNodePositions()" title="恢复被拖动的站点位置">↺ 位置恢复</button>
+                    <button onclick="cycleJitterLevel()" id="jitterLevelBtn" title="同站点设备的错开间距（小/中/大）">↔ 间距:中</button>
                     <button onclick="toggleMapConnections()" id="toggleConnectionsBtn" class="active">📡 显示连接</button>
                     <button onclick="clearMapSelection()" id="clearMapSelBtn">✕ 清除选择</button>
                     <button onclick="toggleSiteNeighborMode()" id="mapSiteNeighborBtn" class="warning">🧭 邻居扩展</button>
@@ -2880,8 +2881,9 @@
 
         // 应用坐标扰动，让距离很近的节点错开
         // thresholdMeters: 距离阈值（米），小于此距离的节点会被错开
-        function applyCoordinateJitter(coordsDict, domainDict, thresholdMeters) {
+        function applyCoordinateJitter(coordsDict, domainDict, thresholdMeters, jitterScale) {
             thresholdMeters = thresholdMeters || 50; // 默认50米
+            jitterScale = jitterScale || 1; // 同站点设备错开半径的倍数（间距档位）
             
             const nodeIds = Object.keys(coordsDict);
             const jitteredCoords = {};
@@ -2928,7 +2930,7 @@
                     const count = nearbyNodes.length;
                     // 根据节点数量动态调整半径，确保不会重叠
                     const baseRadius = Math.max(thresholdMeters * 0.6, 30); // 至少30米
-                    const radius = baseRadius + (count * 5); // 节点越多，半径越大
+                    const radius = (baseRadius + (count * 5)) * jitterScale; // 节点越多，半径越大；再乘以间距档位
                     
                     // 将半径转换为经纬度偏移（约111km/度）
                     const latOffset = radius / 111000;
@@ -3017,6 +3019,11 @@
             });
         }
 
+        // 同站点设备错开间距档位（小/中/大），可在地图工具栏切换
+        const JITTER_SCALES = { small: 1, medium: 2, large: 3.5 };
+        const JITTER_LABELS = { small: '小', medium: '中', large: '大' };
+        let jitterLevel = 'medium'; // 默认比原来更大
+
         // 为当前节点应用坐标扰动
         function getJitteredCoords(nodes) {
             const rawCoords = {};
@@ -3030,8 +3037,8 @@
                 }
             });
             
-            // 使用50米作为距离阈值，距离小于50米的节点会被错开
-            return applyCoordinateJitter(rawCoords, domainDict, 50);
+            // 使用50米作为距离阈值，距离小于50米的节点会被错开；按档位放大错开半径
+            return applyCoordinateJitter(rawCoords, domainDict, 50, JITTER_SCALES[jitterLevel] || 1);
         }
 
         // 全局变量
@@ -5819,6 +5826,15 @@
         function restoreNodePositions() {
             if (Object.keys(siteDragOffsets).length === 0) return;
             siteDragOffsets = {};
+            renderMap({ preserveViewport: true });
+        }
+
+        // 切换同站点设备错开间距档位（小 → 中 → 大 → 小）
+        function cycleJitterLevel() {
+            const order = ['small', 'medium', 'large'];
+            jitterLevel = order[(order.indexOf(jitterLevel) + 1) % order.length];
+            const btn = document.getElementById('jitterLevelBtn');
+            if (btn) btn.textContent = '↔ 间距:' + (JITTER_LABELS[jitterLevel] || '中');
             renderMap({ preserveViewport: true });
         }
 
