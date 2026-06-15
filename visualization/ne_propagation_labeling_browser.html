@@ -514,10 +514,17 @@
             const detailWindow = window.open('about:blank', '_blank');
             if (!detailWindow) {
                 window.alert('浏览器阻止了弹窗，请允许此页面打开新窗口后重试。');
-                return;
+                return false;
             }
-            detailWindow.name = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
-            detailWindow.location.href = 'ne_propagation_labeling.html?window_payload=1';
+            try {
+                detailWindow.name = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
+                detailWindow.location.href = 'ne_propagation_labeling.html?window_payload=1';
+                return true;
+            } catch (error) {
+                try { detailWindow.close(); } catch (closeError) { /* ignore */ }
+                console.warn('window.name 写入故障组详情失败:', error);
+                return false;
+            }
         }
 
         function updateFaultGroupFileStatus(inputPath, writableMode) {
@@ -1067,7 +1074,11 @@
                 localStorage.setItem(sessionKey, JSON.stringify(payload));
                 window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
             } catch (error) {
-                console.warn('localStorage 写入完整故障组导航失败，退化为仅打开当前故障组:', error);
+                console.warn('localStorage 写入完整故障组导航失败，改用 window.name 保留上一组/下一组:', error);
+                if (openGroupDetailWithWindowPayload(payload)) {
+                    return;
+                }
+
                 const singlePayload = { group };
                 try {
                     localStorage.setItem(sessionKey, JSON.stringify(singlePayload));
