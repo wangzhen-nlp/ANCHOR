@@ -1083,6 +1083,24 @@ def complete_group_topology(
     return group
 
 
+def _group_uuid(group):
+    return (
+        _normalize_text(group.get("uuid"))
+        or _normalize_text((group.get("match_info") or {}).get("uuid"))
+        or _normalize_text(group.get("故障组ID"))
+    )
+
+
+def _safe_filename(name, fallback):
+    """把故障组ID转成文件系统安全的文件名（标注工具按文件名实时回写，需稳定且合法）。"""
+    text = _normalize_text(name) or fallback
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
+    text = text.strip().strip(".").strip()  # Windows 不允许以空格或点结尾
+    if not text:
+        text = fallback
+    return text[:120]
+
+
 def complete_groups(
     input_path,
     output_path,
@@ -1091,6 +1109,7 @@ def complete_groups(
     site_chains_path,
     show_progress=True,
     ancestor_output="all",
+    per_file=False,
 ):
     ne_graph_data = _load_json_object(ne_graph_path, "ne_graph", warn_if_missing=True)
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
@@ -1115,7 +1134,18 @@ def complete_groups(
         "added_ne_count": 0,
     }
     progress = _build_group_progress(input_path, show_progress)
-    with open(output_path, "w", encoding="utf-8") as fw:
+    # per_file=True：每个故障组写一个单行 jsonl 文件到 output_path 目录（标注工具 data/ 所需格式，
+    # 支持按文件实时回写）；否则保持原行为：所有组流式写入单个多行 jsonl 文件。
+    out_dir = None
+    out_fh = None
+    per_file_used = {}
+    per_file_count = 0
+    if per_file:
+        out_dir = Path(output_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_fh = open(output_path, "w", encoding="utf-8")
+    try:
         try:
             for group in _iter_jsonl(input_path):
                 stats["input_group_count"] += 1
@@ -1152,15 +1182,35 @@ def complete_groups(
                     continue
                 stats["added_site_count"] += len(completion.get("added_site_ids", []))
                 stats["added_ne_count"] += len(completion.get("added_ne_ids", []))
-                fw.write(json.dumps(completed, ensure_ascii=False, separators=(",", ":")))
-                fw.write("\n")
+                line = json.dumps(completed, ensure_ascii=False, separators=(",", ":"))
+                if per_file:
+                    base = _safe_filename(_group_uuid(completed), f"group_{per_file_count}")
+                    if base in per_file_used:
+                        per_file_used[base] += 1
+                        name = f"{base}_{per_file_used[base]}"
+                    else:
+                        per_file_used[base] = 0
+                        name = base
+                    (out_dir / f"{name}.jsonl").write_text(line + "\n", encoding="utf-8")
+                    per_file_count += 1
+                else:
+                    out_fh.write(line)
+                    out_fh.write("\n")
                 stats["output_group_count"] += 1
                 progress.update(stats)
         finally:
             progress.close()
+    finally:
+        if out_fh is not None:
+            out_fh.close()
 
     stats["input"] = input_path
-    stats["output"] = output_path
+    if per_file:
+        stats["output_dir"] = output_path
+        stats["output_file_count"] = per_file_count
+    else:
+        stats["output"] = output_path
+    stats["per_file"] = per_file
     stats["ne_graph"] = ne_graph_path
     stats["site_graph"] = site_graph_path
     stats["site_chains"] = site_chains_path
@@ -1174,7 +1224,15 @@ def build_arg_parser():
         description="按站点 upstream_site_hops 信息为故障组补齐站点级拓扑"
     )
     parser.add_argument("input", help="输入故障组 JSONL")
-    parser.add_argument("output", help="输出补齐拓扑后的故障组 JSONL")
+    parser.add_argument(
+        "output",
+        help="输出位置：默认为单个多行 JSONL 文件；加 --per-file 时为输出目录（每组一个单行 jsonl）",
+    )
+    parser.add_argument(
+        "--per-file",
+        action="store_true",
+        help="每个故障组输出为单独的单行 jsonl 文件到 output 目录（标注工具 data/ 所需格式，支持按文件实时回写）",
+    )
     parser.add_argument(
         "--ne-graph",
         default=NE_GRAPH_JSON,
@@ -1215,6 +1273,7 @@ def main():
         args.site_chains,
         show_progress=not args.no_progress,
         ancestor_output=args.ancestor_output,
+        per_file=args.per_file,
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
