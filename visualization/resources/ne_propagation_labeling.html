@@ -4011,10 +4011,10 @@
             map.getPane('siteLabelPane').style.zIndex = 330;
             map.getPane('siteLabelPane').style.pointerEvents = 'none';
 
-            // 边的透明点击层放在 markerPane(600) 之上，保证点在连线上时优先命中边、
-            // 而不是被底下的节点标记抢走（邻居扩展模式节点密集时尤为关键）。
+            // 边的透明点击层放在 markerPane(600) 之下，避免节点附近的粗 hitbox 抢走节点点击。
+            // 点连线中段仍可选边；点节点图标时优先选节点。
             map.createPane('edgeHitboxPane');
-            map.getPane('edgeHitboxPane').style.zIndex = 650;
+            map.getPane('edgeHitboxPane').style.zIndex = 390;
 
             // 点击地图空白处关闭设备页签（标记默认 bubblingMouseEvents:false，
             // 所以点设备标记不会触发 map 'click'，页签照常打开、不会被误关）
@@ -5131,7 +5131,7 @@
                 ];
             }
             const hitbox = L.polyline(hbLatlngs, {
-                pane: 'edgeHitboxPane',   // 置于 markerPane 之上，点连线中段时优先命中边而非底下节点
+                pane: 'edgeHitboxPane',
                 color: '#000000',
                 weight: 14,
                 opacity: 0.001,
