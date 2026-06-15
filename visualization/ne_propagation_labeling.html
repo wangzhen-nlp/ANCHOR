@@ -7,6 +7,9 @@
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <!-- 同目录 ne_graph.js（由 ne_graph.json 转换而来）会注入 window.NE_GRAPH_DATA，
+         以便 file:// 下双击打开也能自动加载拓扑；文件不存在时此行无害地 404，自动退回手动选择。 -->
+    <script src="ne_graph.js"></script>
     <style>
         * {
             margin: 0;
@@ -3320,6 +3323,7 @@
         // 初始化
         document.addEventListener('DOMContentLoaded', function() {
             pristineDocumentHtml = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+            migrateRcStoreIfNeeded();   // 旧版单一 blob → 按组独立 key（一次性）
             initMap();
             setupGroupInput();
             setupSearchInput();
@@ -3397,12 +3401,20 @@
         }
 
         async function tryLoadDefaultNeGraph() {
-            const defaultPath = '../topology_resources/ne_graph.json';
             const statusEl = document.getElementById('neGraphStatus');
             if (!statusEl) return;
 
+            // 1) 优先用同目录 ne_graph.js 注入的全局 —— file:// 下双击打开也能自动加载（无需服务器）
+            const injected = window.NE_GRAPH_DATA;
+            if (injected && typeof injected === 'object' && !Array.isArray(injected)) {
+                neGraphData = injected;
+                statusEl.textContent = 'ne_graph：已自动加载 ne_graph.js，NE 数 ' + Object.keys(neGraphData).length;
+                return;
+            }
+
+            // 2) 退回 fetch ne_graph.json —— 仅当通过 http(s) 服务器打开时有效；file:// 下会失败属预期
             try {
-                const response = await fetch(defaultPath);
+                const response = await fetch('ne_graph.json');
                 if (!response.ok) {
                     throw new Error('HTTP ' + response.status);
                 }
@@ -3411,11 +3423,10 @@
                     throw new Error('ne_graph.json 顶层必须是对象');
                 }
                 neGraphData = data;
-                statusEl.textContent = 'ne_graph：已自动加载 ../topology_resources/ne_graph.json，NE 数 ' + Object.keys(neGraphData).length;
+                statusEl.textContent = 'ne_graph：已自动加载 ne_graph.json，NE 数 ' + Object.keys(neGraphData).length;
             } catch (error) {
                 neGraphData = null;
-                statusEl.textContent = 'ne_graph：默认加载失败，请手动选择文件';
-                console.warn('默认加载 ne_graph.json 失败:', error);
+                statusEl.textContent = 'ne_graph：未自动加载，请手动选择文件（或在同目录放 ne_graph.js）';
             }
         }
 
@@ -6208,7 +6219,32 @@
         // 结果自动保存：默认写入浏览器本地（localStorage），无需手动选择文件；
         // 需要落到磁盘文件时点“导出结果文件”一键下载 JSONL。
         // ==========================================
-        const RC_LS_KEY = 'mw_rc_annotations';
+        const RC_LS_KEY = 'mw_rc_annotations';        // 旧版：单一大 blob（仅用于一次性迁移 + 兜底读取）
+        const RC_LS_PREFIX = 'mw_rc_annotations:';    // 新版：每个故障组一个独立 key
+        function rcEntryKey(uuid) { return RC_LS_PREFIX + uuid; }
+
+        // QuotaExceededError 跨浏览器判定（Chrome/Firefox 名称与错误码不同）
+        function isQuotaExceededError(e) {
+            return !!e && (e.name === 'QuotaExceededError' || e.name === 'NS_ERROR_DOM_QUOTA_REACHED'
+                || e.code === 22 || e.code === 1014);
+        }
+
+        // 一次性迁移：把旧的单一 blob 拆成按 uuid 的独立 key，避免每次保存重写整个大字符串。
+        // 迁移后删除旧 blob；已存在独立 key 的不覆盖（独立 key 是更新的工作副本）。
+        function migrateRcStoreIfNeeded() {
+            let legacy;
+            try { legacy = localStorage.getItem(RC_LS_KEY); } catch (e) { return; }
+            if (!legacy) return;
+            try {
+                const store = JSON.parse(legacy) || {};
+                Object.keys(store).forEach(function(uuid) {
+                    if (localStorage.getItem(rcEntryKey(uuid)) === null) {
+                        localStorage.setItem(rcEntryKey(uuid), JSON.stringify(store[uuid]));
+                    }
+                });
+                localStorage.removeItem(RC_LS_KEY);
+            } catch (e) { /* 迁移失败保留旧 blob，loadRcEntry 仍会兜底读取 */ }
+        }
 
         function updateAutoSaveStatus(message, isError) {
             const el = document.getElementById('autoSaveStatus');
@@ -6217,9 +6253,17 @@
             el.className = 'autosave-status' + (isError ? ' error' : ' saved');
         }
 
-        function loadRcLocalStore() {
-            try { return JSON.parse(localStorage.getItem(RC_LS_KEY) || '{}') || {}; }
-            catch (e) { return {}; }
+        // 读取单个故障组的标注（优先独立 key，迁移未执行/失败时兜底读旧 blob）
+        function loadRcEntry(uuid) {
+            if (!uuid) return null;
+            try {
+                const raw = localStorage.getItem(rcEntryKey(uuid));
+                if (raw !== null) return JSON.parse(raw);
+            } catch (e) { /* 落到兜底 */ }
+            try {
+                const legacy = JSON.parse(localStorage.getItem(RC_LS_KEY) || '{}') || {};
+                return legacy[uuid] || null;
+            } catch (e) { return null; }
         }
 
         function pushStatusToOverview() {
@@ -6231,20 +6275,29 @@
             } catch (e) { /* 总览页不可用时忽略 */ }
         }
 
-        // 把当前故障组的根因标注 + 备注自动写入 localStorage（按 uuid 存）
+        // 把当前故障组的根因标注 + 备注自动写入 localStorage（每组一个独立 key）。
+        // 只写当前组那一小份，保存成本与“历史已标注组数”无关。
         function autoSaveResults() {
             if (!graphData || !originalGroupUuid) return;
+            const entry = {
+                root_cause_annotations: graphData.root_cause_annotations || {},
+                note: graphData.note || '',
+                updated_at: new Date().toISOString()
+            };
             try {
-                const store = loadRcLocalStore();
-                store[originalGroupUuid] = {
-                    root_cause_annotations: graphData.root_cause_annotations || {},
-                    note: graphData.note || '',
-                    updated_at: new Date().toISOString()
-                };
-                localStorage.setItem(RC_LS_KEY, JSON.stringify(store));
+                localStorage.setItem(rcEntryKey(originalGroupUuid), JSON.stringify(entry));
                 updateAutoSaveStatus('✓ 已自动保存到本地 ' + new Date().toLocaleTimeString());
             } catch (e) {
-                updateAutoSaveStatus('自动保存失败: ' + (e.message || e), true);
+                if (isQuotaExceededError(e)) {
+                    const msg = '⚠ 本地存储已满，标注未能保存！请立即点击「导出结果文件」落盘，否则新标注会丢失。';
+                    updateAutoSaveStatus(msg, true);
+                    if (!autoSaveResults._quotaAlerted) {
+                        autoSaveResults._quotaAlerted = true;   // 同一会话只弹一次，避免每次勾选都打断
+                        try { alert(msg); } catch (_) { /* ignore */ }
+                    }
+                } else {
+                    updateAutoSaveStatus('自动保存失败: ' + (e.message || e), true);
+                }
             }
         }
 
@@ -6253,7 +6306,7 @@
             if (!group) return;
             const uuid = group.uuid || (group.match_info && group.match_info.uuid) || '';
             if (!uuid) return;
-            const entry = loadRcLocalStore()[uuid];
+            const entry = loadRcEntry(uuid);
             if (!entry) return;
             if (entry.root_cause_annotations && typeof entry.root_cause_annotations === 'object') {
                 group.root_cause_annotations = entry.root_cause_annotations;

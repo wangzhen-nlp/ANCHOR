@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>微波群障根因标注总览</title>
+    <!-- 同目录 data.js（由 data/ 下的 jsonl 转换而来）会注入 window.FAULT_GROUPS_DATA，
+         以便 file:// 下双击打开即自动加载，省去手动选 jsonl；文件不存在时此行无害地 404。 -->
+    <script src="data.js"></script>
     <style>
         * { box-sizing: border-box; }
         body {
@@ -1129,9 +1132,9 @@
                     return false;
                 }
 
-                // 备注过滤（支持 group.note 和 group.match_info.note）
+                // 备注过滤（本地保存优先，与卡片显示一致）
                 if (noteFilterQuery) {
-                    const note = group.note || (group.match_info && group.match_info.note) || '';
+                    const note = getEffectiveNote(group);
                     const query = noteFilterQuery.toLowerCase();
                     if (!note.toLowerCase().includes(query)) {
                         return false;
@@ -1149,10 +1152,26 @@
             });
         }
 
-        // 读取标注页写入浏览器本地的根因标注（同源共享 localStorage）
+        // 读取标注页写入浏览器本地的根因标注（同源共享 localStorage）。
+        // 标注页已改为“每个故障组一个独立 key”(mw_rc_annotations:<uuid>)，
+        // 这里合并旧版单一 blob(mw_rc_annotations) 与新版独立 key，统一成 { uuid: entry }。
         function getLocalRootCauseStore() {
-            try { return JSON.parse(localStorage.getItem('mw_rc_annotations') || '{}') || {}; }
-            catch (e) { return {}; }
+            const store = {};
+            try {
+                const legacy = JSON.parse(localStorage.getItem('mw_rc_annotations') || '{}') || {};
+                Object.keys(legacy).forEach(function(uuid) { store[uuid] = legacy[uuid]; });
+            } catch (e) { /* ignore */ }
+            const prefix = 'mw_rc_annotations:';
+            try {
+                for (let i = 0; i < localStorage.length; i++) {
+                    const key = localStorage.key(i);
+                    if (key && key.indexOf(prefix) === 0) {
+                        try { store[key.slice(prefix.length)] = JSON.parse(localStorage.getItem(key)); }
+                        catch (e) { /* 跳过损坏条目 */ }
+                    }
+                }
+            } catch (e) { /* ignore */ }
+            return store;
         }
 
         // 取某组的有效根因标注：本地保存优先，其次组对象自身
@@ -1163,6 +1182,17 @@
                 if (entry && entry.root_cause_annotations) return entry.root_cause_annotations;
             }
             return group && group.root_cause_annotations;
+        }
+
+        // 取某组的有效备注：本地保存优先，其次组对象自身（与 getEffectiveRootCause 一致）。
+        // 这样重新选择 JSONL 文件后，标注页里写入本地但尚未导出回文件的备注仍能显示。
+        function getEffectiveNote(group) {
+            const uuid = group && (group.uuid || (group.match_info && group.match_info.uuid)) || '';
+            if (uuid) {
+                const entry = getLocalRootCauseStore()[uuid];
+                if (entry && entry.note !== undefined && entry.note !== null) return entry.note;
+            }
+            return (group && group.note) || (group && group.match_info && group.match_info.note) || '';
         }
 
         // 仅导出“已标注根因”的故障组（合并浏览器本地保存的根因标注/备注）
@@ -1250,7 +1280,7 @@
                 const badge = labeled
                     ? '<span class="label-badge labeled">已标注根因</span>'
                     : '<span class="label-badge unlabeled">未标注根因</span>';
-                const note = group.note || (group.match_info && group.match_info.note) || '';
+                const note = getEffectiveNote(group);
                 return `
                 <div class="card">
                     <div class="card-row">
@@ -1371,6 +1401,18 @@
             }
             renderGroups();
         };
+
+        // 默认数据：若同目录 data.js 注入了 window.FAULT_GROUPS_DATA 则自动加载，省去手动选 jsonl。
+        // 没有 data.js（未运行转换工具）时跳过，手动选择文件的入口仍可用。
+        (function autoLoadDefaultData() {
+            const data = window.FAULT_GROUPS_DATA;
+            if (!Array.isArray(data) || data.length === 0) return;
+            faultGroups = data;
+            currentFaultGroupFileName = 'data/';
+            document.getElementById('status').textContent = '已自动加载 ' + faultGroups.length + ' 个故障组（来自 data/）';
+            updateFaultGroupFileStatus('data/', false);
+            renderGroups();
+        })();
     </script>
 </body>
 </html>
