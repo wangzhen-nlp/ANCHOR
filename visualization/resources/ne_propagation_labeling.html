@@ -2129,9 +2129,10 @@
 
         .edge-nodes-display {
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
-            gap: 10px;
+            gap: 8px;
             margin: 10px 0;
             padding: 10px;
             background: #ffffff;
@@ -2145,6 +2146,7 @@
             background: #f6f8fa;
             border-radius: 6px;
             font-size: 11px;
+            width: 100%;
         }
 
         .edge-node-box .node-id {
@@ -2161,6 +2163,7 @@
         .edge-arrow {
             font-size: 16px;
             color: #0969da;
+            line-height: 1;
         }
 
         /* 备注编辑区域样式 */
@@ -5794,6 +5797,26 @@
             return map ? map.getCenter() : L.latLng(0, 0);
         }
 
+        function getEdgeTopologyArrow(link, topology) {
+            const text = [
+                topology,
+                link && link.predicted_relation,
+                link && link.relation,
+                link && link.direction
+            ].map(function(value) {
+                return String(value || '').trim();
+            }).filter(Boolean).join(' ').toLowerCase();
+
+            const isBidirectional = /<\s*-\s*>|↔|↕|双向|bidirectional|both/.test(text);
+            const hasLeft = /<\s*-|←|target[\s_-]*to[\s_-]*source|reverse/.test(text);
+            const hasRight = /-\s*>|→|source[\s_-]*to[\s_-]*target|forward|downstream/.test(text);
+
+            if (isBidirectional || (hasLeft && hasRight)) return '↕';
+            if (hasLeft) return '↑';
+            if (hasRight) return '↓';
+            return '↓';
+        }
+
         // 边详情改为地图 popup，与设备详情保持同一种交互形态
         function showEdgeDetailPanel(link, sourceId, targetId, clickLatLng) {
             const sourceNode = allNodes.find(function(n) { return n.id === sourceId; });
@@ -5805,12 +5828,7 @@
             const connectionType = link.connection_type || '未知';
             const distance = link.distance || 0;
             const topology = link.topology || '-';
-            const timeWindow = link.time_window || '-';
-            
-            // 获取告警信息
-            const leftAlarm = link.left_alarm || null;
-            const rightAlarm = link.right_alarm || null;
-            
+            const topologyArrow = getEdgeTopologyArrow(link, topology);
             let html = '<div class="edge-detail-panel">';
             html += '<div class="popup-title">边详情</div>';
             
@@ -5856,8 +5874,6 @@
             if (distance > 0) {
                 html += '<div class="link-row"><span class="link-label">距离:</span><span class="link-value">' + distance + ' km</span></div>';
             }
-            html += '<div class="link-row"><span class="link-label">拓扑:</span><span class="link-value">' + topology + '</span></div>';
-            html += '<div class="link-row"><span class="link-label">时间窗口:</span><span class="link-value">' + timeWindow + '</span></div>';
             html += '</div>';
             
             // 节点信息
@@ -5866,41 +5882,13 @@
             html += '<div class="node-id">' + sourceId + '</div>';
             html += '<div class="node-site">' + (sourceNode ? (sourceNode.site_id || '-') : '-') + '</div>';
             html += '</div>';
-            html += '<div class="edge-arrow">→</div>';
+            html += '<div class="edge-arrow">' + topologyArrow + '</div>';
             html += '<div class="edge-node-box">';
             html += '<div class="node-id">' + targetId + '</div>';
             html += '<div class="node-site">' + (targetNode ? (targetNode.site_id || '-') : '-') + '</div>';
             html += '</div>';
             html += '</div>';
-            
-            // 左侧告警
-            html += '<div class="alarm-section left">';
-            html += '<h4>🔴 源节点告警 (Left)</h4>';
-            if (leftAlarm) {
-                html += '<div class="edge-alarm-item">';
-                html += '<div style="font-weight: bold; color: #cf222e;">' + (leftAlarm.alarm_type || '未知告警') + '</div>';
-                html += '<div class="alarm-time">' + getAlarmDisplayTime(leftAlarm) + '</div>';
-                html += '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">NE: ' + (leftAlarm.ne_id || sourceId) + '</div>';
-                html += '</div>';
-            } else {
-                html += '<div class="no-alarm">✓ 无告警</div>';
-            }
-            html += '</div>';
-            
-            // 右侧告警
-            html += '<div class="alarm-section right">';
-            html += '<h4>🟠 目标节点告警 (Right)</h4>';
-            if (rightAlarm) {
-                html += '<div class="edge-alarm-item">';
-                html += '<div style="font-weight: bold; color: #cf222e;">' + (rightAlarm.alarm_type || '未知告警') + '</div>';
-                html += '<div class="alarm-time">' + getAlarmDisplayTime(rightAlarm) + '</div>';
-                html += '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">NE: ' + (rightAlarm.ne_id || targetId) + '</div>';
-                html += '</div>';
-            } else {
-                html += '<div class="no-alarm">✓ 无告警</div>';
-            }
-            html += '</div>';
-            
+
             html += '</div>'; // edge-detail-panel
 
             const panel = document.getElementById('detailPanel');
