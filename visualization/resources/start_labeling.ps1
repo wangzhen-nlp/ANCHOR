@@ -102,6 +102,15 @@ function Get-SafeName {
     return $decoded
 }
 
+function Get-QueryParam {
+    param([string]$Query, [string]$Name)
+    foreach ($kv in ($Query -split '&')) {
+        $pair = $kv -split '=', 2
+        if ($pair.Length -eq 2 -and $pair[0] -eq $Name) { return $pair[1] }
+    }
+    return $null
+}
+
 $port = Get-FreePort
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
 $listener.Start()
@@ -116,16 +125,32 @@ Write-Host "  关闭：关掉所有标注页后服务会自动退出；也可在
 Write-Host ("=" * 56)
 Start-Process $entryUrl
 
-# 心跳联动：页面每隔几秒请求 /ping；所有标注页关闭后心跳停止，空闲超过阈值即自动退出。
-$lastSeen = Get-Date
-$idleTimeoutSec = 15
+# 心跳联动：每个页面带 pageId 请求 /ping；关闭时尽量 /leave；失联页面由超时清理兜底。
+# everConnected 门闩：首个请求到达前不计空闲超时，避免冷启动浏览器较慢时服务被提前关掉。
+$pageTtlSec = 90
+$shutdownGraceSec = 10
+$activePages = @{}
+$noActiveSince = $null
+$everConnected = $false
 
 try {
     while ($true) {
+        $now = Get-Date
+        foreach ($pageId in @($activePages.Keys)) {
+            if (($now - $activePages[$pageId]).TotalSeconds -gt $pageTtlSec) {
+                $activePages.Remove($pageId) | Out-Null
+            }
+        }
+        if ($activePages.Count -gt 0) {
+            $noActiveSince = $null
+        } elseif ($everConnected -and $null -eq $noActiveSince) {
+            $noActiveSince = $now
+        }
+
         # Poll 在有连接到达时立即返回（零延迟），否则最多等 0.5s 再查空闲——
         # 不能用固定 Start-Sleep，否则每个请求都被拖延，逐个加载 data 文件时会很慢。
         if (-not $listener.Server.Poll(500000, [System.Net.Sockets.SelectMode]::SelectRead)) {
-            if (((Get-Date) - $lastSeen).TotalSeconds -gt $idleTimeoutSec) {
+            if ($everConnected -and $activePages.Count -eq 0 -and $null -ne $noActiveSince -and (($now - $noActiveSince).TotalSeconds -gt $shutdownGraceSec)) {
                 Write-Host "所有标注页已关闭，本地服务自动退出。"
                 break
             }
@@ -133,7 +158,7 @@ try {
         }
         $client = $listener.AcceptTcpClient()
         $client.ReceiveTimeout = 5000   # 防止空连接(预连接)在读请求时永久阻塞单线程服务
-        $lastSeen = Get-Date            # 任意请求（含 /ping 心跳）都刷新存活时间
+        $everConnected = $true
         $stream = $client.GetStream()
         try {
             $req = Read-Request $stream
@@ -141,8 +166,22 @@ try {
             $query = if ($req.Target.Contains('?')) { ($req.Target -split '\?', 2)[1] } else { '' }
 
             if ($req.Method -eq 'GET' -and $path -eq '/ping') {
-                # 心跳：仅用于保活（$lastSeen 已在上面刷新），返回个 200 即可
-                Send-Response $stream 200 'OK' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) 'application/json; charset=utf-8'
+                $pageId = Get-QueryParam $query 'pageId'
+                if (-not [string]::IsNullOrWhiteSpace($pageId)) {
+                    $activePages[$pageId] = Get-Date
+                    $noActiveSince = $null
+                }
+                $json = '{"ok":true,"activePages":' + $activePages.Count + '}'
+                Send-Response $stream 200 'OK' ([System.Text.Encoding]::UTF8.GetBytes($json)) 'application/json; charset=utf-8'
+            }
+            elseif (($req.Method -eq 'GET' -or $req.Method -eq 'POST') -and $path -eq '/leave') {
+                $pageId = Get-QueryParam $query 'pageId'
+                if (-not [string]::IsNullOrWhiteSpace($pageId)) {
+                    $activePages.Remove($pageId) | Out-Null
+                }
+                if ($activePages.Count -eq 0) { $noActiveSince = Get-Date }
+                $json = '{"ok":true,"activePages":' + $activePages.Count + '}'
+                Send-Response $stream 200 'OK' ([System.Text.Encoding]::UTF8.GetBytes($json)) 'application/json; charset=utf-8'
             }
             elseif ($req.Method -eq 'GET' -and $path -eq '/list') {
                 $names = @()
@@ -155,11 +194,7 @@ try {
                 Send-Response $stream 200 'OK' ([System.Text.Encoding]::UTF8.GetBytes($json)) 'application/json; charset=utf-8'
             }
             elseif ($req.Method -eq 'POST' -and $path -eq '/save') {
-                $fileParam = $null
-                foreach ($kv in ($query -split '&')) {
-                    $pair = $kv -split '=', 2
-                    if ($pair.Length -eq 2 -and $pair[0] -eq 'file') { $fileParam = $pair[1] }
-                }
+                $fileParam = Get-QueryParam $query 'file'
                 $name = Get-SafeName $fileParam
                 if (-not $name) {
                     Send-Response $stream 400 'Bad Request' ([System.Text.Encoding]::UTF8.GetBytes('invalid file name'))

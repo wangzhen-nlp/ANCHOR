@@ -6474,6 +6474,7 @@
         }
 
         const FAULT_GROUP_WINDOW_PAYLOAD_PREFIX = 'FAULT_GROUP_WINDOW_PAYLOAD:';
+        const LABELING_DETAIL_WINDOW_NAME = 'ne_labeling_detail';
 
         function extractGroupPayload(payload) {
             if (payload && typeof payload === 'object' && !Array.isArray(payload) && Array.isArray(payload.groups)) {
@@ -6518,7 +6519,7 @@
                         throw new Error('未找到窗口传递的故障组数据');
                     }
                     const encodedPayload = rawName.slice(FAULT_GROUP_WINDOW_PAYLOAD_PREFIX.length);
-                    window.name = '';
+                    window.name = LABELING_DETAIL_WINDOW_NAME;
                     const parsedWin = JSON.parse(decodeURIComponent(encodedPayload));
                     rcSourceFiles = (parsedWin && parsedWin.sourceFiles) || {};
                     const payload = extractGroupPayload(parsedWin);
@@ -7820,11 +7821,24 @@
             }
         });
 
-        // 心跳：服务模式下定期 ping，让本地服务知道页面还开着；所有标注页关闭后服务会自动退出。
+        // 心跳：服务模式下用 pageId 注册页面存活；关闭时尽量通知服务端，失败则由服务端超时兜底。
         if (location.protocol === 'http:' || location.protocol === 'https:') {
-            const _heartbeat = function() { fetch('/ping').catch(function() {}); };
+            const _pageId = 'page-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+            const _heartbeatUrl = '/ping?pageId=' + encodeURIComponent(_pageId);
+            const _leaveUrl = '/leave?pageId=' + encodeURIComponent(_pageId);
+            const _heartbeat = function() {
+                fetch(_heartbeatUrl, { cache: 'no-store' }).catch(function() {});
+            };
+            const _leave = function() {
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(_leaveUrl);
+                    return;
+                }
+                fetch(_leaveUrl, { method: 'POST', keepalive: true }).catch(function() {});
+            };
             _heartbeat();
-            setInterval(_heartbeat, 4000);
+            setInterval(_heartbeat, 10000);
+            window.addEventListener('pagehide', _leave);
         }
     </script>
 </body>

@@ -499,8 +499,20 @@
             return (records || []).map(normalizeFaultGroupRecord);
         }
 
+        const LABELING_DETAIL_WINDOW_NAME = 'ne_labeling_detail';
+
+        function openLabelingDetailUrl(url) {
+            const detailWindow = window.open(url, LABELING_DETAIL_WINDOW_NAME);
+            if (!detailWindow) {
+                window.alert('浏览器阻止了弹窗，请允许此页面打开标注窗口后重试。');
+                return false;
+            }
+            try { detailWindow.focus(); } catch (error) { /* ignore */ }
+            return true;
+        }
+
         function openGroupDetailWithWindowPayload(payload) {
-            const detailWindow = window.open('about:blank', '_blank');
+            const detailWindow = window.open('about:blank', LABELING_DETAIL_WINDOW_NAME);
             if (!detailWindow) {
                 window.alert('浏览器阻止了弹窗，请允许此页面打开新窗口后重试。');
                 return false;
@@ -508,6 +520,7 @@
             try {
                 detailWindow.name = FAULT_GROUP_WINDOW_PAYLOAD_PREFIX + encodeURIComponent(JSON.stringify(payload));
                 detailWindow.location.href = 'ne_propagation_labeling.html?window_payload=1';
+                detailWindow.focus();
                 return true;
             } catch (error) {
                 try { detailWindow.close(); } catch (closeError) { /* ignore */ }
@@ -860,7 +873,7 @@
             const sessionKey = `fault-group-${Date.now()}-${index}`;
             try {
                 localStorage.setItem(sessionKey, JSON.stringify(payload));
-                window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+                openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`);
             } catch (error) {
                 console.warn('localStorage 写入完整故障组导航失败，改用 window.name 保留上一组/下一组:', error);
                 if (openGroupDetailWithWindowPayload(payload)) {
@@ -870,7 +883,7 @@
                 const singlePayload = { group };
                 try {
                     localStorage.setItem(sessionKey, JSON.stringify(singlePayload));
-                    window.open(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+                    openLabelingDetailUrl(`ne_propagation_labeling.html?session_key=${encodeURIComponent(sessionKey)}`);
                 } catch (singleError) {
                     console.warn('localStorage 写入当前故障组失败，改用 window.name 打开:', singleError);
                     openGroupDetailWithWindowPayload(singlePayload);
@@ -1260,11 +1273,24 @@
             renderGroups();
         })();
 
-        // 心跳：服务模式下定期 ping，让本地服务知道页面还开着；所有标注页关闭后服务会自动退出。
+        // 心跳：服务模式下用 pageId 注册页面存活；关闭时尽量通知服务端，失败则由服务端超时兜底。
         if (location.protocol === 'http:' || location.protocol === 'https:') {
-            const _heartbeat = function() { fetch('/ping').catch(function() {}); };
+            const _pageId = 'page-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+            const _heartbeatUrl = '/ping?pageId=' + encodeURIComponent(_pageId);
+            const _leaveUrl = '/leave?pageId=' + encodeURIComponent(_pageId);
+            const _heartbeat = function() {
+                fetch(_heartbeatUrl, { cache: 'no-store' }).catch(function() {});
+            };
+            const _leave = function() {
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(_leaveUrl);
+                    return;
+                }
+                fetch(_leaveUrl, { method: 'POST', keepalive: true }).catch(function() {});
+            };
             _heartbeat();
-            setInterval(_heartbeat, 4000);
+            setInterval(_heartbeat, 10000);
+            window.addEventListener('pagehide', _leave);
         }
     </script>
 </body>
