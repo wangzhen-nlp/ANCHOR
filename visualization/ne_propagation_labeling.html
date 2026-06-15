@@ -2186,51 +2186,6 @@
             cursor: not-allowed;
         }
 
-        .note-actions {
-            display: flex;
-            gap: 8px;
-            margin-top: 10px;
-        }
-
-        .note-actions button {
-            flex: 1;
-            padding: 8px 12px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 12px;
-            font-weight: 600;
-            transition: all 0.2s;
-        }
-
-        .btn-save-note {
-            background: #f59e0b;
-            color: #fff;
-        }
-
-        .btn-save-note:hover:not(:disabled) {
-            background: #d97706;
-        }
-
-        .btn-save-note:disabled {
-            background: #fcd34d;
-            cursor: not-allowed;
-        }
-
-        .btn-download-note {
-            background: #10b981;
-            color: #fff;
-        }
-
-        .btn-download-note:hover:not(:disabled) {
-            background: #059669;
-        }
-
-        .btn-download-note:disabled {
-            background: #6ee7b7;
-            cursor: not-allowed;
-        }
-
         .note-status {
             font-size: 11px;
             color: #92400e;
@@ -2324,11 +2279,6 @@
                     placeholder="在此输入备注信息..."
                     disabled
                 ></textarea>
-                <div class="note-actions">
-                    <button class="btn-save-note" id="saveNoteBtn" onclick="saveNoteToFile()" disabled>
-                        💾 保存到文件
-                    </button>
-                </div>
                 <div class="note-status" id="noteStatus"></div>
             </div>
 
@@ -3084,6 +3034,9 @@
         let currentFileHandle = null; // File System Access API 文件句柄
         let currentNote = ''; // 当前备注内容
         let originalGroupUuid = ''; // 当前故障组UUID
+        let rcSourceFiles = {};     // uuid -> data/ 下源文件名（服务模式实时回写用）
+        let rcOriginalGroup = null; // 当前组从文件载入时的原始对象（回写时只改标注/备注，保留其余字段）
+        let _writeBackTimer = null; // 实时回写防抖计时器
         let neGraphData = null;
         let roleSiteSets = {
             associated_site: new Set(),
@@ -6112,6 +6065,9 @@
         // 渲染单个故障组（格式识别 + 备注 + 启用备注面板）
         function renderSingleGroup(data) {
             graphData = data;
+            // 记录从文件载入时的原始对象（在 loadOriginalFormat 改写 group_info 之前），
+            // 实时回写时以它为基底，仅替换 root_cause_annotations / note，保留其余字段不变。
+            try { rcOriginalGroup = JSON.parse(JSON.stringify(data)); } catch (e) { rcOriginalGroup = null; }
             siteDragOffsets = {}; // 切换故障组时清除上一组的拖动偏移
             restoreRcFromLocalStore(graphData); // 从本地恢复已保存的根因标注/备注
             currentNote = graphData.note || '';
@@ -6303,6 +6259,40 @@
                     updateAutoSaveStatus('自动保存失败: ' + (e.message || e), true);
                 }
             }
+            scheduleServerWriteBack();   // 服务模式下额外实时回写到 data/ 对应文件
+        }
+
+        // 服务模式（http://localhost）实时回写：把当前组以「原始对象 + 最新标注/备注」写回其源文件。
+        // 防抖 400ms，避免每次勾选都打一次请求；localStorage 仍是即时兜底。
+        function scheduleServerWriteBack() {
+            if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+            if (!rcSourceFiles[originalGroupUuid] || !rcOriginalGroup) return;
+            if (_writeBackTimer) clearTimeout(_writeBackTimer);
+            _writeBackTimer = setTimeout(doServerWriteBack, 400);
+        }
+
+        function doServerWriteBack() {
+            _writeBackTimer = null;
+            const file = rcSourceFiles[originalGroupUuid];
+            if (!file || !rcOriginalGroup) return;
+            const out = Object.assign({}, rcOriginalGroup, {
+                root_cause_annotations: (graphData && graphData.root_cause_annotations) || {},
+                note: (graphData && graphData.note) || '',
+                note_updated_at: (graphData && graphData.note_updated_at) || new Date().toISOString()
+            });
+            fetch('save?file=' + encodeURIComponent(file), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(out)
+            }).then(function(r) {
+                if (r.ok) {
+                    updateAutoSaveStatus('✓ 已实时回写 ' + file + ' ' + new Date().toLocaleTimeString());
+                } else {
+                    updateAutoSaveStatus('实时回写失败 HTTP ' + r.status + '（已存本地缓存）', true);
+                }
+            }).catch(function(e) {
+                updateAutoSaveStatus('实时回写失败：' + (e.message || e) + '（已存本地缓存）', true);
+            });
         }
 
         // 加载某组时，从 localStorage 恢复其根因标注/备注（本地工作副本优先）
@@ -6391,7 +6381,9 @@
                     }
                     const encodedPayload = rawName.slice(FAULT_GROUP_WINDOW_PAYLOAD_PREFIX.length);
                     window.name = '';
-                    const payload = extractGroupPayload(JSON.parse(decodeURIComponent(encodedPayload)));
+                    const parsedWin = JSON.parse(decodeURIComponent(encodedPayload));
+                    rcSourceFiles = (parsedWin && parsedWin.sourceFiles) || {};
+                    const payload = extractGroupPayload(parsedWin);
                     renderExtractedGroupPayload(payload, fileStatus, '已加载单个故障组详情');
                 } catch (error) {
                     showError('加载故障组详情失败: ' + error.message);
@@ -6408,7 +6400,9 @@
                     if (!rawData) {
                         throw new Error('未找到对应的故障组数据');
                     }
-                    const payload = extractGroupPayload(JSON.parse(rawData));
+                    const parsedSession = JSON.parse(rawData);
+                    rcSourceFiles = (parsedSession && parsedSession.sourceFiles) || {};
+                    const payload = extractGroupPayload(parsedSession);
                     renderExtractedGroupPayload(payload, fileStatus, '已加载单个故障组详情');
 
                     localStorage.removeItem(sessionKey);
@@ -7365,14 +7359,12 @@
         // 启用备注面板
         function enableNotePanel() {
             document.getElementById('noteTextarea').disabled = false;
-            document.getElementById('saveNoteBtn').disabled = false;
         }
 
         // 禁用备注面板
         function disableNotePanel() {
             const noteTextarea = document.getElementById('noteTextarea');
             noteTextarea.disabled = true;
-            document.getElementById('saveNoteBtn').disabled = true;
             noteTextarea.value = '';
             currentNote = '';
         }

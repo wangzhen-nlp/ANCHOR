@@ -23,9 +23,11 @@ if [ -d data ]; then
         } > data.js
         echo "已从 ${#files[@]} 个 jsonl 生成 data.js"
     else
+        rm -f data.js   # 清掉旧的，避免自动加载过期数据
         echo "提示：data/ 下没有 .jsonl，将不自动加载故障组（可在页面手动选择）。"
     fi
 else
+    rm -f data.js       # 清掉旧的，避免自动加载过期数据
     echo "提示：未发现 data/ 目录，将不自动加载故障组（可在页面手动选择）。"
 fi
 
@@ -33,6 +35,9 @@ fi
 if [ -f ne_graph.json ]; then
     { printf 'window.NE_GRAPH_DATA='; cat ne_graph.json; printf ';'; } > ne_graph.js
     echo "已从 ne_graph.json 生成 ne_graph.js"
+elif [ -f ne_graph.js ]; then
+    rm -f ne_graph.js   # 源文件已删，移除旧的生成物
+    echo "提示：未发现 ne_graph.json，已移除旧的 ne_graph.js。"
 fi
 
 # ③ 打开总览页

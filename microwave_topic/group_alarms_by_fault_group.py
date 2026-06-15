@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import re
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -533,12 +534,62 @@ def write_jsonl(groups, output_path):
             fw.write("\n")
 
 
+def _group_uuid(group):
+    return (
+        _normalize_text(group.get("uuid"))
+        or _normalize_text((group.get("match_info") or {}).get("uuid"))
+        or _normalize_text(group.get("故障组ID"))
+    )
+
+
+def _safe_filename(name, fallback):
+    """把故障组ID转成文件系统安全的文件名（标注工具按文件名实时回写，需稳定且合法）。"""
+    text = _normalize_text(name) or fallback
+    # 替换 Windows/Unix 非法字符与控制字符
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
+    # Windows 不允许文件名以空格或点结尾
+    text = text.strip().strip(".").strip()
+    if not text:
+        text = fallback
+    return text[:120]
+
+
+def write_per_file(groups, output_dir):
+    """每个故障组写为一个单行 jsonl 文件到 output_dir（标注工具 data/ 所需格式）。返回写出的文件名列表。"""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    used = {}
+    written = []
+    for index, group in enumerate(groups):
+        base = _safe_filename(_group_uuid(group), f"group_{index}")
+        if base in used:
+            used[base] += 1
+            name = f"{base}_{used[base]}"
+        else:
+            used[base] = 0
+            name = base
+        path = out / f"{name}.jsonl"
+        with open(path, "w", encoding="utf-8") as fw:
+            fw.write(json.dumps(group, ensure_ascii=False, separators=(",", ":")))
+            fw.write("\n")
+        written.append(path.name)
+    return written
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="按告警流中的非空故障组ID聚合告警，输出每行一个故障组的 JSONL"
     )
     parser.add_argument("alarms", help="告警流输入，支持 jsonl/csv/zip/目录，与 fault_grouping/match_rules.py 一致")
-    parser.add_argument("output", help="输出 JSONL 文件")
+    parser.add_argument(
+        "output",
+        help="输出位置：默认为单个多行 JSONL 文件；加 --per-file 时为输出目录（每组一个单行 jsonl）",
+    )
+    parser.add_argument(
+        "--per-file",
+        action="store_true",
+        help="每个故障组输出为单独的单行 jsonl 文件到 output 目录（标注工具 data/ 所需格式，支持按文件实时回写）",
+    )
     parser.add_argument(
         "--group-field",
         default=DEFAULT_GROUP_FIELD,
@@ -642,9 +693,14 @@ def main():
         visual_output=not args.no_visual_output,
         show_progress=not args.no_progress,
     )
-    write_jsonl(groups, args.output)
-
-    stats["output"] = args.output
+    if args.per_file:
+        written = write_per_file(groups, args.output)
+        stats["output_dir"] = args.output
+        stats["output_file_count"] = len(written)
+    else:
+        write_jsonl(groups, args.output)
+        stats["output"] = args.output
+    stats["per_file"] = args.per_file
     stats["group_field"] = args.group_field
     stats["ne_graph"] = args.ne_graph
     stats["site_graph"] = args.site_graph

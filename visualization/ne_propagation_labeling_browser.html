@@ -429,6 +429,7 @@
 
     <script>
         let faultGroups = [];
+        let groupSourceFiles = {};   // uuid -> data/ 下源文件名（服务模式：传给标注页用于实时回写）
         let activeFilters = new Set(['all']);
         let ruleFilterQueries = [];
         let siteFilterQuery = '';
@@ -1068,7 +1069,7 @@
             const visibleGroups = normalizeFaultGroupList(filterGroups(faultGroups));
             let navIndex = visibleGroups.indexOf(group);
             if (navIndex < 0) navIndex = 0;
-            const payload = { group, groups: visibleGroups, index: navIndex };
+            const payload = { group, groups: visibleGroups, index: navIndex, sourceFiles: groupSourceFiles };
             const sessionKey = `fault-group-${Date.now()}-${index}`;
             try {
                 localStorage.setItem(sessionKey, JSON.stringify(payload));
@@ -1447,9 +1448,44 @@
             renderGroups();
         };
 
-        // 默认数据：若同目录 data.js 注入了 window.FAULT_GROUPS_DATA 则自动加载，省去手动选 jsonl。
-        // 没有 data.js（未运行转换工具）时跳过，手动选择文件的入口仍可用。
-        (function autoLoadDefaultData() {
+        // 默认数据自动加载，两种模式：
+        //   · 服务模式(http://localhost)：从 /list + data/<file> 实时拉取，并记录每组来源文件，标注可实时回写；
+        //   · file:// 模式：用 data.js 注入的 window.FAULT_GROUPS_DATA（无回写，靠 localStorage + 手动导出）。
+        // 两种都失败/缺省时，手动选择文件的入口仍可用。
+        function groupUuidOf(g) { return (g && (g.uuid || (g.match_info && g.match_info.uuid))) || ''; }
+
+        (async function autoLoadDefaultData() {
+            const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
+            if (isHttp) {
+                try {
+                    const listResp = await fetch('list');
+                    if (!listResp.ok) throw new Error('HTTP ' + listResp.status);
+                    const files = await listResp.json();
+                    const groups = [];
+                    groupSourceFiles = {};
+                    for (const name of files) {
+                        try {
+                            const r = await fetch('data/' + encodeURIComponent(name));
+                            if (!r.ok) continue;
+                            const text = await r.text();
+                            normalizeFaultGroupList(parseJsonl(text)).forEach(function(g) {
+                                groups.push(g);
+                                const uuid = groupUuidOf(g);
+                                if (uuid) groupSourceFiles[uuid] = name;   // 单组单文件：uuid -> 文件名
+                            });
+                        } catch (e) { /* 跳过坏文件 */ }
+                    }
+                    faultGroups = groups;
+                    currentFaultGroupFileName = 'data/';
+                    document.getElementById('status').textContent = '已自动加载 ' + faultGroups.length + ' 个故障组（来自 data/，实时回写已启用）';
+                    updateFaultGroupFileStatus('data/', false);
+                    renderGroups();
+                } catch (e) {
+                    document.getElementById('status').textContent = '自动加载失败（可手动选择 jsonl）：' + (e.message || e);
+                }
+                return;
+            }
+            // file:// 模式：用 data.js 注入的全局
             const data = window.FAULT_GROUPS_DATA;
             if (!Array.isArray(data) || data.length === 0) return;
             faultGroups = normalizeFaultGroupList(data);
