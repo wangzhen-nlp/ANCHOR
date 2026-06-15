@@ -2241,7 +2241,13 @@
             </div>
 
             <div class="autosave-bar" id="autosaveBar">
-                <span class="autosave-status" id="autoSaveStatus">标注会自动保存到浏览器本地（在总览页可导出结果文件）</span>
+                <span class="autosave-status" id="autoSaveStatus">标注会自动保存到浏览器本地</span>
+            </div>
+
+            <!-- 详情面板（节点/边共用）：放在侧栏顶部，点击节点/边即可立即在左侧看到详情 -->
+            <div class="detail-panel" id="detailPanel">
+                <h3 id="detailPanelTitle">节点详情</h3>
+                <div id="detailContent"></div>
             </div>
 
             <div class="rc-locate-panel" id="rcLocatePanel" style="display:none;">
@@ -2324,11 +2330,6 @@
                 </div>
             </div>
 
-            <!-- 详情面板（节点/边共用） -->
-            <div class="detail-panel" id="detailPanel">
-                <h3 id="detailPanelTitle">节点详情</h3>
-                <div id="detailContent"></div>
-            </div>
         </div>
 
         <div class="main-content">
@@ -5816,6 +5817,8 @@
             
             content.innerHTML = html;
             panel.classList.add('show');
+            // 滚动到详情面板，确保点击边后能立刻在左侧栏看到（侧栏可滚动时尤为重要）
+            try { panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) { panel.scrollIntoView(); }
         }
 
         function fitMapBounds() {
