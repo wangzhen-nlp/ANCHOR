@@ -4011,6 +4011,11 @@
             map.getPane('siteLabelPane').style.zIndex = 330;
             map.getPane('siteLabelPane').style.pointerEvents = 'none';
 
+            // 边的透明点击层放在 markerPane(600) 之上，保证点在连线上时优先命中边、
+            // 而不是被底下的节点标记抢走（邻居扩展模式节点密集时尤为关键）。
+            map.createPane('edgeHitboxPane');
+            map.getPane('edgeHitboxPane').style.zIndex = 650;
+
             // 点击地图空白处关闭设备页签（标记默认 bubblingMouseEvents:false，
             // 所以点设备标记不会触发 map 'click'，页签照常打开、不会被误关）
             map.on('click', function() {
@@ -5113,7 +5118,19 @@
         }
 
         function createEdgeHitbox(latlngs, link, sourceId, targetId, tooltipHtml) {
-            const hitbox = L.polyline(latlngs, {
+            // 把点击层两端各收进一段，空出端点处的节点标记区域，
+            // 这样“点连线中段=选边”、“点节点图标=展开/拖动”互不抢夺。
+            let hbLatlngs = latlngs;
+            if (Array.isArray(latlngs) && latlngs.length === 2) {
+                const a = latlngs[0], b = latlngs[1];
+                const t = 0.18;
+                hbLatlngs = [
+                    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+                    [a[0] + (b[0] - a[0]) * (1 - t), a[1] + (b[1] - a[1]) * (1 - t)]
+                ];
+            }
+            const hitbox = L.polyline(hbLatlngs, {
+                pane: 'edgeHitboxPane',   // 置于 markerPane 之上，点连线中段时优先命中边而非底下节点
                 color: '#000000',
                 weight: 14,
                 opacity: 0.001,
