@@ -112,20 +112,37 @@ Write-Host "  微波群障根因标注 · 本地服务已启动"
 Write-Host "  地址：$entryUrl"
 Write-Host "  目录：$root"
 Write-Host "  实时回写：标注一变即写回 data\ 对应的 jsonl"
-Write-Host "  关闭：在本窗口按 Ctrl-C，或直接关掉窗口"
+Write-Host "  关闭：关掉所有标注页后服务会自动退出；也可在本窗口按 Ctrl-C 或直接关窗口"
 Write-Host ("=" * 56)
 Start-Process $entryUrl
 
+# 心跳联动：页面每隔几秒请求 /ping；所有标注页关闭后心跳停止，空闲超过阈值即自动退出。
+$lastSeen = Get-Date
+$idleTimeoutSec = 15
+
 try {
     while ($true) {
+        if (-not $listener.Pending()) {
+            Start-Sleep -Milliseconds 200
+            if (((Get-Date) - $lastSeen).TotalSeconds -gt $idleTimeoutSec) {
+                Write-Host "所有标注页已关闭，本地服务自动退出。"
+                break
+            }
+            continue
+        }
         $client = $listener.AcceptTcpClient()
+        $lastSeen = Get-Date   # 任意请求（含 /ping 心跳）都刷新存活时间
         $stream = $client.GetStream()
         try {
             $req = Read-Request $stream
             $path = ($req.Target -split '\?')[0]
             $query = if ($req.Target.Contains('?')) { ($req.Target -split '\?', 2)[1] } else { '' }
 
-            if ($req.Method -eq 'GET' -and $path -eq '/list') {
+            if ($req.Method -eq 'GET' -and $path -eq '/ping') {
+                # 心跳：仅用于保活（$lastSeen 已在上面刷新），返回个 200 即可
+                Send-Response $stream 200 'OK' ([System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')) 'application/json; charset=utf-8'
+            }
+            elseif ($req.Method -eq 'GET' -and $path -eq '/list') {
                 $names = @()
                 if (Test-Path -LiteralPath $dataDir) {
                     $names = @(Get-ChildItem -LiteralPath $dataDir -Filter '*.jsonl' -File | ForEach-Object { $_.Name })

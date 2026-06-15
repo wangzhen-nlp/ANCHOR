@@ -1259,6 +1259,13 @@
             updateFaultGroupFileStatus('data/', false);
             renderGroups();
         })();
+
+        // 心跳：服务模式下定期 ping，让本地服务知道页面还开着；所有标注页关闭后服务会自动退出。
+        if (location.protocol === 'http:' || location.protocol === 'https:') {
+            const _heartbeat = function() { fetch('/ping').catch(function() {}); };
+            _heartbeat();
+            setInterval(_heartbeat, 4000);
+        }
     </script>
 </body>
 </html>
