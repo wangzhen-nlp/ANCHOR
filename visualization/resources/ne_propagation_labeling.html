@@ -5734,10 +5734,12 @@
             }
             
             // 先清除之前选中的节点和高亮（新增 clearHighlight）
-            if (selectedNode) {
+            // 邻居模式下 selectedNode 是锚点，clearNodeSelection 会塌缩整个扩展并重绘（连带删掉刚点的边），
+            // 所以邻居模式点边时不清节点选择，保留锚点与已扩展邻居，只选边看详情。
+            if (selectedNode && !siteNeighborModeEnabled) {
                 clearNodeSelection();
             }
-            clearHighlight(); // ← 新增：点击边时清除高亮
+            clearHighlight(); // ← 点击边时清除搜索高亮（不影响邻居扩展）
             
             // 设置新的边选择...
             selectedEdge = { source: sourceId, target: targetId, data: link };
