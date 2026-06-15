@@ -3036,6 +3036,7 @@
         let baseCurrentLinks = [];
         let selectedNode = null;
         let selectedEdge = null; // 当前选中的边
+        let currentEdgePopup = null; // 当前边详情 popup，用于关闭时恢复边样式
 
         let multiSelectMode = false;
         let multiSelectedNodes = new Set();
@@ -4026,6 +4027,9 @@
             // 所以点设备标记不会触发 map 'click'，页签照常打开、不会被误关）
             map.on('click', function() {
                 closeAlarmPopup();
+                if (selectedEdge) {
+                    clearEdgeSelection();
+                }
                 // 邻居模式下 selectedNode 是锚点；点空白不应塌缩扩展，仅关弹窗。
                 if (selectedNode && !siteNeighborModeEnabled) {
                     clearNodeSelection();
@@ -5902,14 +5906,23 @@
             const panel = document.getElementById('detailPanel');
             if (panel) panel.classList.remove('show');
             if (map) {
+                currentEdgePopup = null;
                 map.closePopup();
-                L.popup({
+                const edgePopup = L.popup({
                     className: 'edge-detail-popup',
                     autoClose: false,
                     closeOnClick: false,
                     autoPan: true,
                     maxWidth: 420
-                })
+                });
+                edgePopup.on('remove', function() {
+                    if (currentEdgePopup === edgePopup) {
+                        currentEdgePopup = null;
+                        if (selectedEdge) clearEdgeSelection();
+                    }
+                });
+                currentEdgePopup = edgePopup;
+                edgePopup
                     .setLatLng(getEdgePopupLatLng(sourceId, targetId, clickLatLng))
                     .setContent(html)
                     .openOn(map);
