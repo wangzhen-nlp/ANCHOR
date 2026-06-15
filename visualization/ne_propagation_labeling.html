@@ -178,6 +178,23 @@
             background: #a40e26;
         }
 
+        .rc-locate-actions {
+            flex: 0 0 auto;
+            display: flex;
+            gap: 6px;
+        }
+
+        /* 清除根因：用描边样式与红色实心的“定位根因”区分（破坏性操作，弱化） */
+        #rcClearAllBtn {
+            background: #fff;
+            color: #cf222e;
+            border: 1px solid #cf222e;
+        }
+
+        #rcClearAllBtn:hover {
+            background: #ffeef0;
+        }
+
         .rc-locate-item {
             display: flex;
             align-items: center;
@@ -2230,7 +2247,10 @@
             <div class="rc-locate-panel" id="rcLocatePanel" style="display:none;">
                 <div class="rc-locate-header">
                     <h4>根因设备 (<span id="rcLocateCount">0</span>)</h4>
-                    <button id="rcLocateAllBtn" onclick="locateAllRootCauseDevices()">定位根因</button>
+                    <div class="rc-locate-actions">
+                        <button id="rcClearAllBtn" onclick="clearAllRootCause()">清除根因</button>
+                        <button id="rcLocateAllBtn" onclick="locateAllRootCauseDevices()">定位根因</button>
+                    </div>
                 </div>
                 <div class="rc-locate-list" id="rcLocateList"></div>
             </div>
@@ -4509,6 +4529,23 @@
             } else {
                 map.fitBounds(L.latLngBounds(latlngs).pad(0.3));
             }
+        }
+
+        // 清除当前故障组的全部根因标注（设备根因 + 告警根因），并同步刷新/落盘/回写
+        function clearAllRootCause() {
+            if (!graphData) return;
+            const count = getRootCauseDeviceList().length;
+            if (count === 0) {
+                updateAutoSaveStatus('当前没有根因标注');
+                return;
+            }
+            if (!confirm('确定清除当前故障组的全部根因标注（共 ' + count + ' 项）吗？')) return;
+            graphData.root_cause_annotations = {};
+            // 关闭可能打开的弹窗，避免里面残留已勾选的根因复选框
+            if (map) map.closePopup();
+            closeAlarmPopup();
+            onRootCauseChanged();   // 刷新地图高亮 + 侧栏列表（清空后面板会自动隐藏）+ 自动保存 + 回写
+            updateAutoSaveStatus('已清除当前故障组的全部根因标注');
         }
 
         function getSymptomAlarmSource(symptom) {

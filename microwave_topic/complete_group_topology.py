@@ -288,6 +288,97 @@ def _extract_alarm_ne_ids(group):
     return ne_ids
 
 
+def _record_alarm_source(record):
+    if not isinstance(record, dict):
+        return ""
+    return _normalize_text(
+        record.get("告警源")
+        or record.get("alarm_source")
+        or record.get("ne_id")
+        or record.get("source")
+        or ""
+    )
+
+
+def _iter_group_alarm_records(group):
+    records = [alarm for alarm in group.get("alarms") or [] if isinstance(alarm, dict)]
+    if records:
+        yield from records
+        return
+
+    records = [symptom for symptom in group.get("symptoms") or [] if isinstance(symptom, dict)]
+    if records:
+        yield from records
+        return
+
+    ne_info = group.get("ne_info", {})
+    if not isinstance(ne_info, dict):
+        return
+    for ne_id, info in ne_info.items():
+        if not isinstance(info, dict):
+            continue
+        for alarm in info.get("alarm") or []:
+            if isinstance(alarm, dict):
+                alarm = copy.deepcopy(alarm)
+                alarm.setdefault("alarm_source", ne_id)
+                yield alarm
+
+
+def _append_unique(values, value):
+    if value and value not in values:
+        values.append(value)
+
+
+def _check_group_alarm_topology(group, ne_graph_data, site_graph_data):
+    result = {
+        "checked_alarm_count": 0,
+        "missing_alarm_source_count": 0,
+        "missing_ne_ids": [],
+        "missing_site_ne_ids": [],
+        "missing_site_graph_ids": [],
+    }
+
+    alarm_records = list(_iter_group_alarm_records(group))
+    if not alarm_records:
+        alarm_records = [{"alarm_source": ne_id} for ne_id in _extract_alarm_ne_ids(group)]
+
+    for record in alarm_records:
+        result["checked_alarm_count"] += 1
+        ne_id = _record_alarm_source(record)
+        if not ne_id:
+            result["missing_alarm_source_count"] += 1
+            continue
+
+        if not isinstance(ne_graph_data, dict) or ne_id not in ne_graph_data:
+            _append_unique(result["missing_ne_ids"], ne_id)
+            continue
+        ne_info = ne_graph_data.get(ne_id, {})
+        if not isinstance(ne_info, dict):
+            _append_unique(result["missing_ne_ids"], ne_id)
+            continue
+
+        site_id = _normalize_text(ne_info.get("site_id", ""))
+        if not site_id:
+            _append_unique(result["missing_site_ne_ids"], ne_id)
+            continue
+
+        if not isinstance(site_graph_data, dict) or site_id not in site_graph_data:
+            _append_unique(result["missing_site_graph_ids"], site_id)
+            continue
+        site_info = site_graph_data.get(site_id, {})
+        if not isinstance(site_info, dict):
+            _append_unique(result["missing_site_graph_ids"], site_id)
+
+    result["ok"] = (
+        result["checked_alarm_count"] > 0
+        and result["missing_alarm_source_count"] == 0
+        and not result["missing_ne_ids"]
+        and not result["missing_site_ne_ids"]
+        and not result["missing_site_graph_ids"]
+    )
+    return result
+
+
 def _is_offline_alarm_type(value):
     text = _normalize_text(value)
     if not text:
@@ -421,17 +512,66 @@ def _closure_upstream_hops(site_id, site_chain_index):
     return hops
 
 
+def _reachable_hops_from_site(site_id, site_chain_index, restrict_relation, upstream_adjacency):
+    if restrict_relation:
+        hops, _parents = _reachable_upstream_sites(site_id, upstream_adjacency or {})
+        return hops
+    return _closure_upstream_hops(site_id, site_chain_index)
+
+
+def _promote_to_data_ancestor(
+    ancestor_site,
+    allowed_ancestor_sites,
+    data_site_ids,
+    site_chain_index,
+    restrict_relation,
+    upstream_adjacency,
+):
+    ancestor_site = _normalize_text(ancestor_site)
+    data_site_ids = {_normalize_text(site_id) for site_id in (data_site_ids or ()) if _normalize_text(site_id)}
+    if not ancestor_site or not data_site_ids:
+        return ancestor_site, None
+    if ancestor_site in data_site_ids:
+        return ancestor_site, None
+
+    allowed_ancestor_sites = {
+        _normalize_text(site_id) for site_id in (allowed_ancestor_sites or ()) if _normalize_text(site_id)
+    }
+    upstream_hops = _reachable_hops_from_site(
+        ancestor_site,
+        site_chain_index,
+        restrict_relation,
+        upstream_adjacency,
+    )
+    candidates = sorted(
+        site_id
+        for site_id in (set(upstream_hops) & allowed_ancestor_sites & data_site_ids)
+        if site_id != ancestor_site
+    )
+    if not candidates:
+        return ancestor_site, None
+
+    promoted_site = min(candidates, key=lambda site_id: (upstream_hops[site_id], site_id))
+    return promoted_site, {
+        "from_site_id": ancestor_site,
+        "to_site_id": promoted_site,
+        "upstream_hop": upstream_hops[promoted_site],
+    }
+
+
 def _build_site_completion(
     alarm_sites,
     site_chain_index,
     restrict_relation,
     upstream_adjacency=None,
     excluded_ancestor_site_ids=None,
+    data_site_ids=None,
 ):
     alarm_sites = sorted({_normalize_text(site) for site in alarm_sites if _normalize_text(site)})
     excluded_ancestor_site_ids = {
         _normalize_text(site) for site in (excluded_ancestor_site_ids or []) if _normalize_text(site)
     }
+    data_site_ids = {_normalize_text(site) for site in (data_site_ids or ()) if _normalize_text(site)}
     selected_sites = set(alarm_sites)
 
     # restrict-relation 把 upstream_site_hops 裁成了直接邻居，需要沿带权边累加还原完整上游链
@@ -457,35 +597,74 @@ def _build_site_completion(
     common_candidates = common_candidates or set()
 
     common_upstream_site = None
+    common_upstream_sites = []
     common_upstream_hops = {}
+    common_upstream_hops_by_site = {}
     farthest_upstream_sites = {}
     no_upstream_sites = []
     intermediate_site_chains = {}
+    intermediate_site_chains_by_target = {}
+    data_ancestor_promotions = []
+    data_ancestor_missing_site_ids = []
+
+    def _remember_data_ancestor(site_id):
+        site_id = _normalize_text(site_id)
+        if site_id and site_id not in data_site_ids:
+            _append_unique(data_ancestor_missing_site_ids, site_id)
+
+    def _promote_selected_ancestor(ancestor_site, allowed_ancestor_sites):
+        promoted_site, promotion = _promote_to_data_ancestor(
+            ancestor_site,
+            allowed_ancestor_sites,
+            data_site_ids,
+            site_chain_index,
+            restrict_relation,
+            upstream_adjacency,
+        )
+        if promotion:
+            _append_unique(data_ancestor_promotions, promotion)
+        _remember_data_ancestor(promoted_site)
+        return promoted_site
 
     def _select_path(site_id, target_site):
         # restrict 模式沿直接边补全中间站点；非 restrict 模式维持原行为，只纳入目标祖先站点。
         if restrict_relation:
             chain = _chain_sites(site_id, target_site, parents_by_site[site_id])
-            intermediate_site_chains[site_id] = chain
+            intermediate_site_chains.setdefault(site_id, chain)
+            intermediate_site_chains_by_target.setdefault(target_site, {})[site_id] = chain
             selected_sites.update(chain)
         else:
             selected_sites.add(target_site)
 
     if common_candidates:
-        common_upstream_site = min(
-            common_candidates,
-            key=lambda candidate: (
+        def _common_rank(candidate):
+            return (
                 sum(reach_by_site[site_id][candidate] for site_id in alarm_sites),
                 max(reach_by_site[site_id][candidate] for site_id in alarm_sites),
-                candidate,
-            ),
+            )
+
+        best_common_rank = min(_common_rank(candidate) for candidate in common_candidates)
+        lowest_common_sites = sorted(
+            candidate for candidate in common_candidates if _common_rank(candidate) == best_common_rank
         )
-        common_upstream_hops = {
-            site_id: reach_by_site[site_id][common_upstream_site]
-            for site_id in alarm_sites
-        }
-        for site_id in alarm_sites:
-            _select_path(site_id, common_upstream_site)
+        for lowest_common_site in lowest_common_sites:
+            if lowest_common_site not in common_upstream_sites:
+                common_upstream_sites.append(lowest_common_site)
+                common_upstream_hops_by_site[lowest_common_site] = {
+                    site_id: reach_by_site[site_id][lowest_common_site]
+                    for site_id in alarm_sites
+                }
+            router_site = _promote_selected_ancestor(lowest_common_site, common_candidates)
+            for site_id in alarm_sites:
+                _select_path(site_id, lowest_common_site)
+                if router_site != lowest_common_site and router_site in reach_by_site[site_id]:
+                    _select_path(site_id, router_site)
+        common_upstream_site = common_upstream_sites[0] if common_upstream_sites else None
+        common_upstream_hops = (
+            common_upstream_hops_by_site.get(common_upstream_site, {})
+            if common_upstream_site
+            else {}
+        )
     else:
         for site_id in alarm_sites:
             hops = {
@@ -498,30 +677,78 @@ def _build_site_completion(
                 continue
             max_hop = max(hops.values())
             farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
-            farthest_upstream_sites[site_id] = {"site_id": farthest_site, "hop": max_hop}
+            farthest_upstream_sites[site_id] = {
+                "site_id": farthest_site,
+                "hop": max_hop,
+            }
+            router_site = _promote_selected_ancestor(farthest_site, set(hops))
+            if router_site != farthest_site:
+                farthest_upstream_sites[site_id]["router_ancestor_site_id"] = router_site
+                farthest_upstream_sites[site_id]["router_ancestor_hop"] = reach_by_site[site_id].get(
+                    router_site,
+                    max_hop,
+                )
+                farthest_upstream_sites[site_id]["router_promoted"] = True
             _select_path(site_id, farthest_site)
+            if router_site != farthest_site and router_site in reach_by_site[site_id]:
+                _select_path(site_id, router_site)
 
     return {
         "selected_sites": selected_sites,
         "common_upstream_site": common_upstream_site,
+        "common_upstream_sites": common_upstream_sites,
         "common_upstream_hops": common_upstream_hops,
+        "common_upstream_hops_by_site": common_upstream_hops_by_site,
         "farthest_upstream_sites": farthest_upstream_sites,
         "no_upstream_sites": sorted(no_upstream_sites),
         "upstream_site_hops": reach_by_site,
         "intermediate_site_chains": intermediate_site_chains,
+        "intermediate_site_chains_by_target": intermediate_site_chains_by_target,
+        "data_ancestor_promotions": data_ancestor_promotions,
+        "data_ancestor_missing_site_ids": sorted(data_ancestor_missing_site_ids),
         "restrict_relation": restrict_relation,
     }
 
 
 def _build_topology_highlight_sites(completion):
+    common_upstream_sites = list(completion.get("common_upstream_sites") or [])
     common_upstream_site = completion.get("common_upstream_site")
-    if common_upstream_site:
-        return [{
-            "site_id": common_upstream_site,
-            "role": "common_upstream_site",
-            "label": "最低公共祖先站点",
-            "hops_by_source_site": completion.get("common_upstream_hops", {}),
-        }]
+    if common_upstream_site and common_upstream_site not in common_upstream_sites:
+        common_upstream_sites.insert(0, common_upstream_site)
+    if common_upstream_sites:
+        promotions_by_source = defaultdict(list)
+        for promotion in completion.get("data_ancestor_promotions") or []:
+            if isinstance(promotion, dict) and promotion.get("from_site_id"):
+                promotions_by_source[promotion.get("from_site_id")].append(promotion)
+        hops_by_target = completion.get("common_upstream_hops_by_site") or {}
+        missing_data_ancestor_site_ids = set(completion.get("data_ancestor_missing_site_ids") or [])
+        result = []
+        for site_id in common_upstream_sites:
+            item = {
+                "site_id": site_id,
+                "role": "common_upstream_site",
+                "label": (
+                    "最低公共祖先站点（未找到上游路由站点）"
+                    if site_id in missing_data_ancestor_site_ids
+                    else "最低公共祖先站点"
+                ),
+                "hops_by_source_site": hops_by_target.get(site_id, completion.get("common_upstream_hops", {})),
+            }
+            promotions = promotions_by_source.get(site_id, [])
+            if promotions:
+                item["router_ancestor_site_ids"] = sorted({
+                    _normalize_text(promotion.get("to_site_id", ""))
+                    for promotion in promotions
+                    if _normalize_text(promotion.get("to_site_id", ""))
+                })
+                item["router_promoted"] = True
+                item["router_promotion_hop"] = min(
+                    promotion.get("upstream_hop")
+                    for promotion in promotions
+                    if promotion.get("upstream_hop") is not None
+                )
+            result.append(item)
+        return result
 
     farthest_by_target = {}
     for source_site, selected in (completion.get("farthest_upstream_sites") or {}).items():
@@ -539,11 +766,19 @@ def _build_topology_highlight_sites(completion):
         })
         item["source_sites"].append(source_site)
         item["hops_by_source_site"][source_site] = selected.get("hop")
+        if selected.get("router_promoted"):
+            item["router_promoted"] = True
+            item.setdefault("router_ancestor_site_ids", [])
+            item["router_ancestor_site_ids"].append(_normalize_text(selected.get("router_ancestor_site_id", "")))
 
     result = []
     for site_id in sorted(farthest_by_target):
         item = farthest_by_target[site_id]
         item["source_sites"] = sorted(set(item["source_sites"]))
+        if item.get("router_ancestor_site_ids"):
+            item["router_ancestor_site_ids"] = sorted({
+                site_id for site_id in item["router_ancestor_site_ids"] if site_id
+            })
         result.append(item)
     for site_id in completion.get("no_upstream_sites") or []:
         site_id = _normalize_text(site_id)
@@ -919,12 +1154,15 @@ def complete_group_topology(
     })
     offline_alarm_sites = _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne)
     non_offline_alarm_sites = sorted(set(alarm_sites) - set(offline_alarm_sites))
+    if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
+        site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
     completion = _build_site_completion(
         offline_alarm_sites,
         site_chain_index,
         restrict_relation,
         upstream_adjacency,
         excluded_ancestor_site_ids=non_offline_alarm_sites,
+        data_site_ids=site_has_data,
     )
     selected_sites = completion["selected_sites"]
     topology_highlight_sites = _build_topology_highlight_sites(completion)
@@ -939,8 +1177,6 @@ def complete_group_topology(
         topology_highlight_sites,
         site_graph_data,
     )
-    if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
-        site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
     (
         topology_highlight_sites,
         ran_without_data_link_filtered_ancestor_site_ids,
@@ -1065,11 +1301,16 @@ def complete_group_topology(
         "added_site_ids": context_sites,
         "added_ne_ids": sorted(ne_id for ne_id in included_ne_ids if ne_id not in set(alarm_ne_ids)),
         "common_upstream_site": completion["common_upstream_site"],
+        "common_upstream_sites": completion["common_upstream_sites"],
         "common_upstream_hops": completion["common_upstream_hops"],
+        "common_upstream_hops_by_site": completion["common_upstream_hops_by_site"],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
         "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
+        "intermediate_site_chains_by_target": completion["intermediate_site_chains_by_target"],
+        "data_ancestor_promotions": completion["data_ancestor_promotions"],
+        "data_ancestor_missing_site_ids": completion["data_ancestor_missing_site_ids"],
         "non_offline_alarm_site_filtered_ancestor_site_ids": non_offline_alarm_site_filtered_ancestor_site_ids,
         "hub_filtered_ancestor_site_ids": hub_filtered_ancestor_site_ids,
         "ran_without_data_link_filtered_ancestor_site_ids": ran_without_data_link_filtered_ancestor_site_ids,
@@ -1130,6 +1371,11 @@ def complete_groups(
         "multiple_ancestor_group_count": 0,
         "skipped_by_ancestor_output_group_count": 0,
         "skipped_by_blocked_ancestor_site_group_count": 0,
+        "skipped_by_missing_alarm_topology_group_count": 0,
+        "missing_alarm_source_group_count": 0,
+        "missing_ne_graph_group_count": 0,
+        "missing_ne_site_group_count": 0,
+        "missing_site_graph_group_count": 0,
         "added_site_count": 0,
         "added_ne_count": 0,
     }
@@ -1178,6 +1424,23 @@ def complete_groups(
                     continue
                 if _blocked_ancestor_site_ids(completion):
                     stats["skipped_by_blocked_ancestor_site_group_count"] += 1
+                    progress.update(stats)
+                    continue
+                alarm_topology_check = _check_group_alarm_topology(
+                    completed,
+                    ne_graph_data,
+                    site_graph_data,
+                )
+                if not alarm_topology_check["ok"]:
+                    stats["skipped_by_missing_alarm_topology_group_count"] += 1
+                    if alarm_topology_check["missing_alarm_source_count"]:
+                        stats["missing_alarm_source_group_count"] += 1
+                    if alarm_topology_check["missing_ne_ids"]:
+                        stats["missing_ne_graph_group_count"] += 1
+                    if alarm_topology_check["missing_site_ne_ids"]:
+                        stats["missing_ne_site_group_count"] += 1
+                    if alarm_topology_check["missing_site_graph_ids"]:
+                        stats["missing_site_graph_group_count"] += 1
                     progress.update(stats)
                     continue
                 stats["added_site_count"] += len(completion.get("added_site_ids", []))

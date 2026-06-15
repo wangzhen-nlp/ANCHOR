@@ -398,13 +398,7 @@
     <div class="page">
         <div class="hero">
             <h1>微波群障根因标注总览</h1>
-            <div class="sub">加载 `jsonl` 文件后，页面会展示所有故障组摘要；点击任意故障组可打开「微波群障根因标注」页进行标注。</div>
-            <div class="toolbar">
-                <input id="fileInput" type="file" accept=".jsonl,.txt,.json">
-                <button class="btn" onclick="openFaultGroupFile()">选择 JSONL 文件</button>
-                <button class="btn" onclick="exportLabelingResult()">⬇ 导出结果文件</button>
-                <div class="hint">每行一个故障组对象</div>
-            </div>
+            <div class="sub">页面自动加载 data/ 目录下的故障组；点击任意故障组可打开「微波群障根因标注」页进行标注，标注会实时回写到对应文件。</div>
             <div class="filter-row">
                 <span class="site-filter-label">标注状态</span>
                 <div class="filters" id="labelFilters" style="margin:0;">
@@ -424,7 +418,7 @@
         </div>
 
         <div class="list" id="groupList"></div>
-        <div class="empty" id="emptyState">请选择一个 `jsonl` 文件</div>
+        <div class="empty" id="emptyState">正在从 data/ 加载故障组…</div>
     </div>
 
     <script>
@@ -550,10 +544,6 @@
                 updateFaultGroupFileStatus(inputPath, !!(currentFaultGroupFileHandle && currentFaultGroupFileHandle.createWritable));
                 renderGroups();
             }
-        }
-
-        function openFaultGroupFile() {
-            document.getElementById('fileInput').click();
         }
 
         async function writeUpdatedFaultGroups(groups, suggestedFileName) {
@@ -1234,40 +1224,6 @@
             return (group && group.note) || (group && group.match_info && group.match_info.note) || '';
         }
 
-        // 仅导出“已标注根因”的故障组（合并浏览器本地保存的根因标注/备注）
-        function exportLabelingResult() {
-            if (!faultGroups.length) {
-                document.getElementById('status').textContent = '请先加载 JSONL 文件再导出';
-                return;
-            }
-            const store = getLocalRootCauseStore();
-            const labeledGroups = faultGroups.filter(isGroupLabeled);
-            if (!labeledGroups.length) {
-                document.getElementById('status').textContent = '当前没有已标注的故障组，无需导出';
-                return;
-            }
-            const content = labeledGroups.map(function(g) {
-                const uuid = g.uuid || (g.match_info && g.match_info.uuid) || '';
-                const entry = store[uuid];
-                const merged = Object.assign({}, g);
-                if (entry) {
-                    merged.root_cause_annotations = entry.root_cause_annotations || g.root_cause_annotations || {};
-                    if (entry.note !== undefined) merged.note = entry.note;
-                }
-                return JSON.stringify(merged);
-            }).join('\n') + '\n';
-            const blob = new Blob([content], { type: 'application/jsonl' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'labeling_result.jsonl';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            document.getElementById('status').textContent = '已导出 labeling_result.jsonl（已标注 ' + labeledGroups.length + ' 组）';
-        }
-
         // 是否已标注根因（任一根因设备 或 任一根因告警）
         function isGroupLabeled(group) {
             const rc = getEffectiveRootCause(group);
@@ -1307,7 +1263,7 @@
 
             if (visibleGroups.length === 0) {
                 list.innerHTML = '';
-                emptyState.textContent = faultGroups.length === 0 ? '请选择一个 `jsonl` 文件' : '当前筛选条件下没有故障组';
+                emptyState.textContent = faultGroups.length === 0 ? '暂无故障组（请确认 data/ 目录下有 jsonl，并已通过 start_labeling 启动）' : '当前筛选条件下没有故障组';
                 emptyState.style.display = 'block';
                 return;
             }
@@ -1401,17 +1357,6 @@
                     }
                 });
         }
-
-        document.getElementById('fileInput').addEventListener('change', function(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            const inputPath = event.target.value || file.webkitRelativePath || file.name || '-';
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                loadFaultGroupText(e.target.result, inputPath, null);
-            };
-            reader.readAsText(file, 'utf-8');
-        });
 
         document.getElementById('noteFilterInput').addEventListener('input', function(event) {
             noteFilterQuery = event.target.value.trim();
