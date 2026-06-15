@@ -5,12 +5,15 @@
 #   其它 GET                -> 当前目录静态文件（html / jsonl / json 等，UTF-8 文本）
 # 启动后自动用默认浏览器打开总览页。关闭：在本窗口按 Ctrl-C 或直接关窗口。
 $ErrorActionPreference = 'Stop'
-$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$dataDir = Join-Path $dir 'data'
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path   # 本脚本所在目录（resources/）
+$root = Split-Path -Parent $scriptDir                          # 顶层目录（start_labeling.bat 所在）
+$resName = Split-Path -Leaf $scriptDir                         # 资源子目录名（默认 resources）
+$dataDir = Join-Path $root 'data'                              # 故障组数据在顶层 data/
+# 服务根设为顶层 $root，这样既能服务 resources\ 下的页面，也能服务 data\ 下的 jsonl。
 
-# 旧的 file:// 注入文件若残留会干扰服务模式（页面会优先用它们），删掉以走实时文件
+# 旧的 file:// 注入文件若残留会干扰服务模式（页面会优先用它们），删掉以走实时文件（它们和页面同在 resources\）
 foreach ($leftover in @('data.js', 'ne_graph.js')) {
-    $p = Join-Path $dir $leftover
+    $p = Join-Path $scriptDir $leftover
     if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
 }
 
@@ -103,11 +106,11 @@ $port = Get-FreePort
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
 $listener.Start()
 
-$entryUrl = "http://127.0.0.1:$port/ne_propagation_labeling_browser.html"
+$entryUrl = "http://127.0.0.1:$port/$resName/ne_propagation_labeling_browser.html"
 Write-Host ("=" * 56)
 Write-Host "  微波群障根因标注 · 本地服务已启动"
 Write-Host "  地址：$entryUrl"
-Write-Host "  目录：$dir"
+Write-Host "  目录：$root"
 Write-Host "  实时回写：标注一变即写回 data\ 对应的 jsonl"
 Write-Host "  关闭：在本窗口按 Ctrl-C，或直接关掉窗口"
 Write-Host ("=" * 56)
@@ -153,11 +156,11 @@ try {
             }
             elseif ($req.Method -eq 'GET') {
                 $rel = [System.Uri]::UnescapeDataString($path.TrimStart('/'))
-                if ([string]::IsNullOrWhiteSpace($rel)) { $rel = 'ne_propagation_labeling_browser.html' }
-                $full = Join-Path $dir $rel
-                # 限定在服务目录内，挡住穿越
+                if ([string]::IsNullOrWhiteSpace($rel)) { $rel = "$resName/ne_propagation_labeling_browser.html" }
+                $full = Join-Path $root $rel
+                # 限定在服务根目录内，挡住穿越
                 $fullResolved = [System.IO.Path]::GetFullPath($full)
-                if (-not $fullResolved.StartsWith([System.IO.Path]::GetFullPath($dir))) {
+                if (-not $fullResolved.StartsWith([System.IO.Path]::GetFullPath($root))) {
                     Send-Response $stream 403 'Forbidden' ([System.Text.Encoding]::UTF8.GetBytes('forbidden'))
                 }
                 elseif (Test-Path -LiteralPath $fullResolved -PathType Leaf) {

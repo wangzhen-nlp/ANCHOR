@@ -1403,14 +1403,14 @@
             const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
             if (isHttp) {
                 try {
-                    const listResp = await fetch('list');
+                    const listResp = await fetch('/list');
                     if (!listResp.ok) throw new Error('HTTP ' + listResp.status);
                     const files = await listResp.json();
                     const groups = [];
                     groupSourceFiles = {};
                     for (const name of files) {
                         try {
-                            const r = await fetch('data/' + encodeURIComponent(name));
+                            const r = await fetch('/data/' + encodeURIComponent(name));
                             if (!r.ok) continue;
                             const text = await r.text();
                             normalizeFaultGroupList(parseJsonl(text)).forEach(function(g) {

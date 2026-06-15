@@ -2518,6 +2518,10 @@
                 const visible = showMapConnections && isLinkVisibleByDeviceFilter(polyline.linkData || {});
                 setLeafletLayerVisible(polyline, visible);
             });
+            mapEdgeHitboxes.forEach(function(hitbox) {
+                const visible = showMapConnections && isLinkVisibleByDeviceFilter(hitbox.linkData || {});
+                setLeafletLayerVisible(hitbox, visible);
+            });
 
             mapDistanceLines.forEach(function(layer) {
                 const sourceNode = getCurrentNodeById(layer.sourceId);
@@ -3037,6 +3041,7 @@
         let siteDragOffsets = {}; // { siteKey: [dLat, dLng] } 站点整体拖动偏移
         let _dragSiteKey = null, _dragStartLatLng = null, _dragSiblings = []; // 拖动临时状态
         let mapPolylines = []; // 存储边引用，用于点击事件
+        let mapEdgeHitboxes = []; // 透明粗点击层，让细边更容易点中
         let showMapConnections = true;
         let mapDistanceLines = [];
         let mapSiteOverlays = [];
@@ -4819,6 +4824,8 @@
             mapMarkers = {};
             mapPolylines.forEach(function(line) { map.removeLayer(line); });
             mapPolylines = [];
+            mapEdgeHitboxes.forEach(function(line) { map.removeLayer(line); });
+            mapEdgeHitboxes = [];
             mapDistanceLines.forEach(function(line) { map.removeLayer(line); });
             mapDistanceLines = [];
             mapSiteOverlays.forEach(function(layer) { map.removeLayer(layer); });
@@ -5086,6 +5093,49 @@
             });
         }
 
+        function revealSidebarDetailPanel(panel) {
+            if (!panel) return;
+            panel.classList.add('show');
+            const sidebar = panel.closest('.sidebar');
+            if (sidebar) {
+                sidebar.scrollTop = 0;
+                return;
+            }
+            try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) { panel.scrollIntoView(); }
+        }
+
+        function attachEdgeClickHandler(layer) {
+            layer.on('click', function(e) {
+                L.DomEvent.stopPropagation(e);
+                if (e && e.originalEvent) L.DomEvent.stopPropagation(e.originalEvent);
+                selectEdge(this.linkData, this.sourceId, this.targetId);
+            });
+        }
+
+        function createEdgeHitbox(latlngs, link, sourceId, targetId, tooltipHtml) {
+            const hitbox = L.polyline(latlngs, {
+                color: '#000000',
+                weight: 14,
+                opacity: 0.001,
+                interactive: true,
+                bubblingMouseEvents: false,
+                dashArray: null,
+                className: 'map-edge-hitbox'
+            }).addTo(map);
+            hitbox.linkData = link;
+            hitbox.sourceId = sourceId;
+            hitbox.targetId = targetId;
+            if (tooltipHtml) {
+                hitbox.bindTooltip(tooltipHtml, {
+                    permanent: false,
+                    direction: 'center'
+                });
+            }
+            attachEdgeClickHandler(hitbox);
+            mapEdgeHitboxes.push(hitbox);
+            return hitbox;
+        }
+
         // 清除所有选择（节点和边）
         function clearAllSelection() {
             clearNodeSelection();
@@ -5102,6 +5152,7 @@
 
             if (target.closest('.alarm-popup') ||
                 target.closest('.leaflet-popup-content') ||
+                target.closest('.leaflet-interactive') ||
                 target.closest('.custom-marker') ||
                 target.closest('.leaflet-marker-icon') ||
                 target.closest('.node-item')) {
@@ -5554,7 +5605,8 @@
                             color: segmentColor,
                             weight: 3,
                             opacity: getMapLinkOpacity(link, false),
-                            dashArray: null
+                            dashArray: null,
+                            bubblingMouseEvents: false
                         }).addTo(map);
 
                         segmentPolyline.linkData = link;
@@ -5569,10 +5621,8 @@
                             permanent: false,
                             direction: 'center'
                         });
-                        segmentPolyline.on('click', function(e) {
-                            L.DomEvent.stopPropagation(e);
-                            selectEdge(this.linkData, this.sourceId, this.targetId);
-                        });
+                        attachEdgeClickHandler(segmentPolyline);
+                        createEdgeHitbox([segmentStart, segmentEnd], link, sourceId, targetId, tooltipHtml);
                         segmentPolyline.on('mouseover', function(e) {
                             this.setStyle({
                                 weight: 5,
@@ -5601,7 +5651,8 @@
                     color: edgeColor,
                     weight: 2.5,
                     opacity: getMapLinkOpacity(link, false),
-                    dashArray: getMapLinkDashArray(link)
+                    dashArray: getMapLinkDashArray(link),
+                    bubblingMouseEvents: false
                 }).addTo(map);
 
                 // 存储边数据到polyline以便点击时使用
@@ -5621,10 +5672,8 @@
                 });
 
                 // 新增：边点击事件（需求3）
-                polyline.on('click', function(e) {
-                    L.DomEvent.stopPropagation(e);
-                    selectEdge(this.linkData, this.sourceId, this.targetId);
-                });
+                attachEdgeClickHandler(polyline);
+                createEdgeHitbox(latlngs, link, sourceId, targetId, tooltipHtml);
 
                 // 鼠标悬停效果
                 polyline.on('mouseover', function(e) {
@@ -5816,9 +5865,7 @@
             html += '</div>'; // edge-detail-panel
             
             content.innerHTML = html;
-            panel.classList.add('show');
-            // 滚动到详情面板，确保点击边后能立刻在左侧栏看到（侧栏可滚动时尤为重要）
-            try { panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch (e) { panel.scrollIntoView(); }
+            revealSidebarDetailPanel(panel);
         }
 
         function fitMapBounds() {
@@ -5869,6 +5916,8 @@
             // 重绘连接线
             mapPolylines.forEach(function(line) { map.removeLayer(line); });
             mapPolylines = [];
+            mapEdgeHitboxes.forEach(function(line) { map.removeLayer(line); });
+            mapEdgeHitboxes = [];
             if (showMapConnections && currentLinks.length > 0) {
                 drawMapConnections(liveCoords);
             }
@@ -6320,7 +6369,7 @@
                 note: (graphData && graphData.note) || '',
                 note_updated_at: (graphData && graphData.note_updated_at) || new Date().toISOString()
             });
-            fetch('save?file=' + encodeURIComponent(file), {
+            fetch('/save?file=' + encodeURIComponent(file), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(out)
