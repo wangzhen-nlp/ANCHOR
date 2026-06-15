@@ -4020,7 +4020,8 @@
             // 所以点设备标记不会触发 map 'click'，页签照常打开、不会被误关）
             map.on('click', function() {
                 closeAlarmPopup();
-                if (selectedNode) {
+                // 邻居模式下 selectedNode 是锚点；点空白不应塌缩扩展，仅关弹窗。
+                if (selectedNode && !siteNeighborModeEnabled) {
                     clearNodeSelection();
                 } else {
                     map.closePopup();
@@ -5176,7 +5177,8 @@
                 return;
             }
 
-            if (selectedNode) {
+            // 邻居模式下不清节点选择（那会塌缩扩展）；仅取消边选择并隐藏详情面板。
+            if (selectedNode && !siteNeighborModeEnabled) {
                 clearNodeSelection();
             }
             if (selectedEdge) {
@@ -6591,6 +6593,89 @@
             return displayGroupInfo;
         }
 
+        function firstNonEmptyValue() {
+            for (let i = 0; i < arguments.length; i++) {
+                const value = arguments[i];
+                if (value !== undefined && value !== null && String(value).trim() !== '') {
+                    return String(value).trim();
+                }
+            }
+            return '';
+        }
+
+        function normalizeLinkDirectionValue(value) {
+            if (value && typeof value === 'object' && !Array.isArray(value)) {
+                return firstNonEmptyValue(value.topology, value.direction, value.relation, value.value);
+            }
+            return firstNonEmptyValue(value);
+        }
+
+        function normalizeTopologyLinkInfo(linkInfo) {
+            const empty = {
+                connection_type: '',
+                topology: '',
+                time_window: '',
+                distance: 0,
+                left_alarm: null,
+                right_alarm: null,
+                supplemental_fault_pattern_context: false
+            };
+
+            if (linkInfo === undefined || linkInfo === null || linkInfo === '') {
+                return empty;
+            }
+
+            if (typeof linkInfo !== 'object' || Array.isArray(linkInfo)) {
+                return Object.assign({}, empty, {
+                    connection_type: Array.isArray(linkInfo) ? linkInfo.map(String).join('/') : String(linkInfo)
+                });
+            }
+
+            const typeMap = (linkInfo.link_type && typeof linkInfo.link_type === 'object' && !Array.isArray(linkInfo.link_type))
+                ? linkInfo.link_type
+                : ((linkInfo.linkType && typeof linkInfo.linkType === 'object' && !Array.isArray(linkInfo.linkType)) ? linkInfo.linkType : null);
+            const reservedKeys = new Set([
+                'connection_type', 'connectionType', 'type', 'link_type', 'linkType', 'topology',
+                'direction', 'relation', 'time_window', 'timeWindow', 'distance', 'left_alarm',
+                'leftAlarm', 'right_alarm', 'rightAlarm', 'supplemental_fault_pattern_context'
+            ]);
+            const layerEntries = typeMap
+                ? Object.entries(typeMap)
+                : Object.entries(linkInfo).filter(function(entry) {
+                    const value = entry[1];
+                    return !reservedKeys.has(entry[0]) &&
+                        value !== undefined &&
+                        value !== null &&
+                        (typeof value !== 'object' || Array.isArray(value) || normalizeLinkDirectionValue(value));
+                });
+            const layerNames = layerEntries.map(function(entry) { return String(entry[0]).trim(); }).filter(Boolean);
+            const directionValues = Array.from(new Set(layerEntries.map(function(entry) {
+                return normalizeLinkDirectionValue(entry[1]);
+            }).filter(Boolean)));
+
+            return Object.assign({}, empty, {
+                connection_type: firstNonEmptyValue(
+                    linkInfo.connection_type,
+                    linkInfo.connectionType,
+                    typeof linkInfo.link_type === 'string' ? linkInfo.link_type : '',
+                    typeof linkInfo.linkType === 'string' ? linkInfo.linkType : '',
+                    linkInfo.type,
+                    layerNames.join('/')
+                ),
+                topology: firstNonEmptyValue(
+                    linkInfo.topology,
+                    linkInfo.direction,
+                    linkInfo.relation,
+                    directionValues.join(',')
+                ),
+                time_window: firstNonEmptyValue(linkInfo.time_window, linkInfo.timeWindow),
+                distance: linkInfo.distance || 0,
+                left_alarm: linkInfo.left_alarm || linkInfo.leftAlarm || null,
+                right_alarm: linkInfo.right_alarm || linkInfo.rightAlarm || null,
+                supplemental_fault_pattern_context: !!linkInfo.supplemental_fault_pattern_context
+            });
+        }
+
         function loadOriginalFormat(data) {
             graphData = data;
             updateRoleSiteSets(data);
@@ -6650,17 +6735,10 @@
                             if (!linkSet.has(key)) {
                                 linkSet.add(key);
                                 const linkInfo = neInfo.link[target];
-                                allLinks.push({ 
-                                    source: neId, 
-                                    target: target,
-                                    connection_type: linkInfo.connection_type || '',
-                                    topology: linkInfo.topology || '',
-                                    time_window: linkInfo.time_window || '',
-                                    distance: linkInfo.distance || 0,
-                                    left_alarm: linkInfo.left_alarm || null,
-                                    right_alarm: linkInfo.right_alarm || null,
-                                    supplemental_fault_pattern_context: !!linkInfo.supplemental_fault_pattern_context
-                                });
+                                allLinks.push(Object.assign({
+                                    source: neId,
+                                    target: target
+                                }, normalizeTopologyLinkInfo(linkInfo)));
                                 edgeDetails[key] = linkInfo;
                             }
                         }
@@ -6944,17 +7022,11 @@
                     const key = [sourceId, targetId].sort().join('|');
                     if (linkSet.has(key) || baseLinkKeySet.has(key)) return;
                     linkSet.add(key);
-                    mergedLinks.push({
+                    mergedLinks.push(Object.assign({
                         source: sourceId,
                         target: targetId,
-                        connection_type: linkInfo.connection_type || '',
-                        topology: linkInfo.topology || '',
-                        time_window: linkInfo.time_window || '',
-                        distance: linkInfo.distance || 0,
-                        left_alarm: linkInfo.left_alarm || null,
-                        right_alarm: linkInfo.right_alarm || null,
                         isNeighborExpanded: true
-                    });
+                    }, normalizeTopologyLinkInfo(linkInfo)));
                 });
             });
 
