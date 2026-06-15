@@ -4917,8 +4917,9 @@
                     renderMap({ preserveViewport: true });
                 });
 
-                // Popup 内容：绑定时生成一次，并在每次打开时按当前根因标注重建（避免勾选痕迹丢失）
-                marker.bindPopup(buildNodeMarkerPopup(node, lat, lng), {
+                // Popup 内容：绑定时仅放轻量占位（节点标题），完整内容在 popupopen 时懒构建。
+                // 避免为当前组每个 marker 预先生成整张告警表 HTML 并常驻内存（该内容打开时会被重建）。
+                marker.bindPopup('<div class="popup-title">' + getRawNodeId(node) + '</div>', {
                     autoClose: false,      // 点击其他 popup 时不自动关闭
                     closeOnClick: false,   // 点击地图空白处时不关闭 ← 关键
                     autoPan: false         // 悬浮打开 popup 时不自动平移地图

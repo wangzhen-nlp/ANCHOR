@@ -1052,7 +1052,14 @@ def train_alarm_mhp(
             val_ll_history.append(val_ll)
         if select_on_val:
             prev_best = val_state["best_val_ll"]
-            improved = val_ll > prev_best + 1e-6 * abs(prev_best)
+            if np.isfinite(prev_best):
+                # Relative tolerance so tiny numerical wiggles don't count as
+                # improvement. (abs(prev_best) is finite here, so no NaN.)
+                improved = val_ll > prev_best + 1e-6 * abs(prev_best)
+            else:
+                # First evaluation: prev_best is -inf, and -inf + 1e-6*inf = NaN
+                # would make every comparison False. Any finite val LL improves.
+                improved = bool(np.isfinite(val_ll))
             if improved:
                 val_state["best_val_ll"] = val_ll
                 val_state["best_val_iter"] = int(trace_entry.get("iter", -1))
