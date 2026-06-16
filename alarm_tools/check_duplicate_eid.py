@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""检查告警里是否存在相同 eid 的情况，支持 jsonl / csv / zip / 目录，可选时间段过滤。"""
+"""检查告警里是否存在相同 eid 的情况，支持 jsonl / csv / zip / 目录，可选时间段过滤。
+
+对于 eid 相同的告警：
+- 如果它们的所有字段完全相同，则视为同一条告警的重复记录，不算作重复；
+- 如果存在字段取了多个不同的值，则算作重复，并打印出这些有差异的字段及其取值。
+"""
 
 import argparse
 import json
@@ -18,6 +23,7 @@ from alarm_tools.alarm_inputs import stream_alarm_inputs
 DEFAULT_EID_FIELDS = ["告警编码ID", "alarm_id", "event_id", "id"]
 DEFAULT_TIME_FIELD = "告警首次发生时间"
 SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v1"
+MISSING = "<缺失>"
 
 _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d")
 
@@ -44,6 +50,19 @@ def _format_dt(dt_obj):
     return "-" if dt_obj is None else dt_obj.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _passes_time_filter(alarm, time_field, start, end):
+    if start is None and end is None:
+        return True
+    dt_obj = _parse_time(alarm.get(time_field))
+    if dt_obj is None:
+        return False
+    if start is not None and dt_obj < start:
+        return False
+    if end is not None and dt_obj > end:
+        return False
+    return True
+
+
 def _extract_eid(alarm, eid_fields):
     """提取告警的 eid，兼容嵌套在 alarm 字段下的情况。"""
     nested = alarm.get("alarm") if isinstance(alarm.get("alarm"), dict) else {}
@@ -55,13 +74,24 @@ def _extract_eid(alarm, eid_fields):
     return ""
 
 
+def _value_repr(value):
+    """把字段值规整成可比较 / 可展示的字符串。"""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def _record_fingerprint(alarm):
+    """整条记录的规范化指纹，用于判断两条记录是否完全相同。"""
+    return json.dumps(alarm, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_FIELD,
                         start=None, end=None, show_progress=True):
     eid_fields = eid_fields or DEFAULT_EID_FIELDS
 
-    # eid -> 命中告警数
+    # ---- Pass 1：流式统计每个 eid 的命中数（内存只保存按 eid 聚合的轻量信息）----
     eid_counts = {}
-    # eid -> 首条命中告警的时间（字符串，用于展示）
     eid_first_time = {}
 
     processed_count = 0
@@ -76,18 +106,9 @@ def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_F
             continue
         processed_count += 1
 
-        # 时间段过滤（仅在指定了 start/end 时生效）
-        if start is not None or end is not None:
-            dt_obj = _parse_time(alarm.get(time_field))
-            if dt_obj is None:
-                out_of_range_count += 1
-                continue
-            if start is not None and dt_obj < start:
-                out_of_range_count += 1
-                continue
-            if end is not None and dt_obj > end:
-                out_of_range_count += 1
-                continue
+        if not _passes_time_filter(alarm, time_field, start, end):
+            out_of_range_count += 1
+            continue
 
         eid = _extract_eid(alarm, eid_fields)
         if not eid:
@@ -99,11 +120,58 @@ def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_F
         if eid not in eid_first_time:
             eid_first_time[eid] = str(alarm.get(time_field) or "").strip()
 
-    duplicates = [
-        {"eid": eid, "count": count, "first_time": eid_first_time.get(eid, "")}
-        for eid, count in eid_counts.items()
-        if count > 1
-    ]
+    candidate_eids = {eid for eid, count in eid_counts.items() if count > 1}
+
+    # ---- Pass 2：仅对重复出现的 eid 收集字段级明细（内存仅与重复 eid 数相关）----
+    details = {
+        eid: {"count": 0, "fingerprints": set(), "fields": {}}
+        for eid in candidate_eids
+    }
+    if candidate_eids:
+        for alarm in stream_alarm_inputs(alarms_input, show_progress=show_progress):
+            if _is_sorted_alarm_cache_header(alarm):
+                continue
+            if not _passes_time_filter(alarm, time_field, start, end):
+                continue
+            eid = _extract_eid(alarm, eid_fields)
+            entry = details.get(eid)
+            if entry is None:
+                continue
+            entry["count"] += 1
+            entry["fingerprints"].add(_record_fingerprint(alarm))
+            for key, value in alarm.items():
+                field_entry = entry["fields"].setdefault(key, {"values": set(), "present": 0})
+                field_entry["values"].add(_value_repr(value))
+                field_entry["present"] += 1
+
+    # ---- 分类：完全相同 vs 字段有差异 ----
+    duplicates = []
+    identical_eid_count = 0
+    identical_alarm_count = 0
+
+    for eid, entry in details.items():
+        count = entry["count"]
+        # 所有记录指纹一致 => 完全相同，不算重复
+        if len(entry["fingerprints"]) <= 1:
+            identical_eid_count += 1
+            identical_alarm_count += count
+            continue
+
+        varying_fields = {}
+        for field, field_entry in entry["fields"].items():
+            values = set(field_entry["values"])
+            if field_entry["present"] < count:
+                values.add(MISSING)  # 部分记录缺失该字段，也算一种差异
+            if len(values) > 1:
+                varying_fields[field] = sorted(values)
+
+        duplicates.append({
+            "eid": eid,
+            "count": count,
+            "first_time": eid_first_time.get(eid, ""),
+            "varying_fields": varying_fields,
+        })
+
     duplicates.sort(key=lambda item: (-item["count"], item["eid"]))
     duplicate_alarm_count = sum(item["count"] for item in duplicates)
 
@@ -118,6 +186,8 @@ def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_F
         "unique_eid_count": len(eid_counts),
         "duplicate_eid_count": len(duplicates),
         "duplicate_alarm_count": duplicate_alarm_count,
+        "identical_eid_count": identical_eid_count,
+        "identical_alarm_count": identical_alarm_count,
         "no_eid_count": no_eid_count,
         "out_of_range_count": out_of_range_count,
         "cache_header_count": cache_header_count,
@@ -132,6 +202,14 @@ def _parse_time_arg(parser, value, name):
     if dt_obj is None:
         parser.error(f"{name} 时间格式无法解析: {value!r}（支持 'YYYY-MM-DD HH:MM:SS' 等）")
     return dt_obj
+
+
+def _format_values(values, max_show):
+    shown = values[:max_show]
+    text = " | ".join(shown)
+    if len(values) > max_show:
+        text += f" ...(共 {len(values)} 种)"
+    return text
 
 
 def main():
@@ -151,6 +229,7 @@ def main():
         help="eid 候选字段（按顺序取第一个非空），默认: " + " ".join(DEFAULT_EID_FIELDS),
     )
     parser.add_argument("--top", type=int, default=20, help="文本输出时展示的重复 eid 数量，默认 20")
+    parser.add_argument("--max-values", type=int, default=6, help="每个差异字段最多展示的取值数量，默认 6")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出完整结果")
     parser.add_argument("--no-progress", action="store_true", help="关闭读取进度显示")
     args = parser.parse_args()
@@ -184,17 +263,22 @@ def main():
     if result["cache_header_count"]:
         print(f"已排除缓存头记录: {result['cache_header_count']} 条")
     print(f"去重后 eid 数: {result['unique_eid_count']}")
+    if result["identical_eid_count"]:
+        print(f"字段完全相同的 eid（不计为重复）: {result['identical_eid_count']} 个，"
+              f"涉及 {result['identical_alarm_count']} 条告警")
     print()
 
     if not result["duplicates"]:
-        print("✅ 未发现相同 eid 的告警")
+        print("✅ 未发现字段存在差异的相同 eid 告警")
         return
 
-    print(f"⚠️ 发现 {result['duplicate_eid_count']} 个重复 eid，"
+    print(f"⚠️ 发现 {result['duplicate_eid_count']} 个重复 eid（字段存在差异），"
           f"共涉及 {result['duplicate_alarm_count']} 条告警:")
     for item in result["duplicates"][: args.top]:
-        first_time = f"（首次: {item['first_time']}）" if item["first_time"] else ""
+        first_time = f"，首次: {item['first_time']}" if item["first_time"] else ""
         print(f"  eid={item['eid']}: {item['count']} 条{first_time}")
+        for field, values in item["varying_fields"].items():
+            print(f"      - {field}: {_format_values(values, args.max_values)}")
     remaining = len(result["duplicates"]) - args.top
     if remaining > 0:
         print(f"  ... 还有 {remaining} 个重复 eid（使用 --json 或 --top 查看全部）")
