@@ -2365,6 +2365,7 @@
                     <button onclick="toggleMapConnections()" id="toggleConnectionsBtn" class="active">📡 显示连接</button>
                     <button onclick="clearMapSelection()" id="clearMapSelBtn">✕ 清除选择</button>
                     <button onclick="toggleSiteNeighborMode()" id="mapSiteNeighborBtn" class="warning">🧭 邻居扩展</button>
+                    <button onclick="solidifyNeighbors()" id="solidifyNeighborsBtn" style="display:none;" title="退出邻居模式但保留当前扩展的邻居为候选；之后点击邻居设备可勾选为根因设备并并入故障组">📌 固化邻居</button>
                 </div>
 
                 <div class="distance-stats" id="distanceStats">
@@ -4573,10 +4574,17 @@
                 return;
             }
             if (!confirm('确定清除当前故障组的全部根因标注（共 ' + count + ' 项）吗？')) return;
+            // 先把因标根因而并入的扩展设备移除（否则会留下“无根因的孤儿设备”被一起保存）
+            const addedIds = Object.keys((graphData.ne_info) || {}).filter(function(id) {
+                return graphData.ne_info[id] && graphData.ne_info[id].added_via_neighbor_expansion;
+            });
+            addedIds.forEach(function(id) { removeAddedNeighbor(id); });
             graphData.root_cause_annotations = {};
+            if (addedIds.length) setBaseCurrentGraph(currentNodes, currentLinks);   // 同步基础图，避免再开关邻居模式复活已删设备
             // 关闭可能打开的弹窗，避免里面残留已勾选的根因复选框
             if (map) map.closePopup();
             closeAlarmPopup();
+            if (addedIds.length) renderMap({ preserveViewport: true });   // 有设备被移除，重绘地图
             onRootCauseChanged();   // 刷新地图高亮 + 侧栏列表（清空后面板会自动隐藏）+ 自动保存 + 回写
             updateAutoSaveStatus('已清除当前故障组的全部根因标注');
         }
@@ -4694,11 +4702,46 @@
             handleSiteNeighborModeToggle(!siteNeighborModeEnabled);
         }
 
+        // 「固化邻居」按钮：仅在邻居模式且已扩展出邻居时显示
+        function updateSolidifyBtn() {
+            const btn = document.getElementById('solidifyNeighborsBtn');
+            if (!btn) return;
+            const hasExpanded = siteNeighborModeEnabled && (currentNodes || []).some(function(n) { return n.isNeighborExpanded; });
+            btn.style.display = hasExpanded ? '' : 'none';
+        }
+
+        // 固化：退出邻居模式但保留已扩展的邻居为候选（不还原基础图），之后可点击它们标根因
+        function solidifyNeighbors() {
+            if (!siteNeighborModeEnabled || !(currentNodes || []).some(function(n) { return n.isNeighborExpanded; })) {
+                updateAutoSaveStatus('当前没有可固化的扩展邻居', true);
+                return;
+            }
+            // 把扩展候选登记进 allNodes，使其可被选中/弹窗/标注（暂不进 ne_info；勾根因时才并入）
+            (currentNodes || []).forEach(function(n) {
+                if (n.isNeighborExpanded && !allNodes.find(function(a) { return a.id === n.id; })) {
+                    allNodes.push(Object.assign({}, n, { alarm: [], alarm_count: 0 }));
+                }
+            });
+            siteNeighborModeEnabled = false;
+            siteNeighborAnchorNodes.clear();
+            const checkbox = document.getElementById('siteNeighborModeCheckbox');
+            if (checkbox) checkbox.checked = false;
+            const mapBtn = document.getElementById('mapSiteNeighborBtn');
+            if (mapBtn) { mapBtn.classList.remove('active'); mapBtn.classList.add('warning'); }
+            updateMapModeIndicator();
+            updateSiteNeighborSelectionUI();
+            setBaseCurrentGraph(currentNodes, currentLinks);   // 固化态作为新基础图，再开关邻居模式不会冲掉它
+            renderMap({ preserveViewport: true });
+            renderNodeList();   // 同步侧栏设备列表/徽标，避免固化后状态滞后
+            updateAutoSaveStatus('已固化邻居为候选：点击邻居设备并勾选「根因设备」即可并入故障组');
+        }
+
         function updateSiteNeighborSelectionUI() {
             const countEl = document.getElementById('siteNeighborSelectedCount');
             if (countEl) {
                 countEl.textContent = String(siteNeighborAnchorNodes.size);
             }
+            updateSolidifyBtn();
         }
 
         function clearSiteNeighborSelection() {
@@ -5030,6 +5073,7 @@
                 map.fitBounds(group.getBounds().pad(0.1));
             }
             applyDeviceTypeFilterToMap();
+            updateSolidifyBtn();
         }
 
         // 新增：仅更新地图上的选中状态，不重新渲染整个地图（需求2的核心实现）
@@ -5340,6 +5384,122 @@
             onRootCauseChanged();
         }
 
+        // 把一个扩展候选邻居并入故障组：写进 graphData.ne_info（带 added_via_neighbor_expansion 标记），
+        // 只持久化它与“原生组设备”的直连边（与其它候选的边不保留，可能成为孤立设备——按设计允许）。
+        function mergeNeighborIntoGroup(node) {
+            if (!graphData || !graphData.ne_info || !node) return;
+            const neId = node.id;
+            if (graphData.ne_info[neId]) return; // 已在 ne_info（已是组成员）：单组流程下不会发生，直接返回，不污染原始设备
+            // 正式成员 = 当前 active group 的 ne_list 成员（含已并入邻居）。
+            // 不用 baseCurrentNodes（含未并入候选），也不用整个 graphData.ne_info（多组文件里可能含非当前组设备）；
+            // 否则会把边持久化成指向“不属于当前故障组成员”的 link。
+            const memberGids = (activeGroups && activeGroups.size) ? Array.from(activeGroups) : Object.keys(graphData.group_info || {});
+            const nativeIds = new Set();
+            memberGids.forEach(function(gid) {
+                const gi = graphData.group_info && graphData.group_info[gid];
+                if (gi && Array.isArray(gi.ne_list)) gi.ne_list.forEach(function(id) { if (id !== neId) nativeIds.add(id); });
+            });
+            const link = {};
+            (currentLinks || []).forEach(function(l) {
+                const s = typeof l.source === 'object' ? l.source.id : l.source;
+                const t = typeof l.target === 'object' ? l.target.id : l.target;
+                let other = null;
+                if (s === neId) other = t; else if (t === neId) other = s;
+                if (other && nativeIds.has(other)) {
+                    link[other] = {
+                        connection_type: l.connection_type || '',
+                        topology: l.topology || '',
+                        added_via_neighbor_expansion: true
+                    };
+                }
+            });
+            graphData.ne_info[neId] = {
+                site_id: node.site_id || '', site_name: node.site_name || '',
+                type: node.type || '', network_type: node.network_type || '',
+                manufacturer: node.manufacturer || '', domain: node.domain || '',
+                name: node.name || neId, alarm: [],
+                latitude: node.latitude, longitude: node.longitude,
+                link: link, added_via_neighbor_expansion: true
+            };
+            // 原生成员侧也补一条反向 link，便于回写后重新加载时双向一致
+            Object.keys(link).forEach(function(member) {
+                const mInfo = graphData.ne_info[member];
+                if (mInfo) { if (!mInfo.link || typeof mInfo.link !== 'object') mInfo.link = {}; if (!mInfo.link[neId]) mInfo.link[neId] = link[member]; }
+            });
+            // 同步加入 allLinks：renderCurrentGroups 切换/重算时是从 allLinks 过滤边的，不加这里重渲染会丢边
+            Object.keys(link).forEach(function(member) {
+                const exists = allLinks.some(function(l) {
+                    const s = typeof l.source === 'object' ? l.source.id : l.source;
+                    const t = typeof l.target === 'object' ? l.target.id : l.target;
+                    return (s === neId && t === member) || (s === member && t === neId);
+                });
+                if (!exists) {
+                    allLinks.push({ source: neId, target: member, connection_type: link[member].connection_type || '', topology: link[member].topology || '', added_via_neighbor_expansion: true });
+                }
+            });
+            if (!allNodes.find(function(n) { return n.id === neId; })) {
+                allNodes.push(Object.assign({}, node, { alarm: [], alarm_count: 0, added_via_neighbor_expansion: true }));
+            }
+            node.added_via_neighbor_expansion = true;
+            node.isNeighborExpanded = false; // 由候选转为正式成员
+            // 同步 currentNodes 里的同一节点（渲染用的是 currentNodes，避免样式还停在“候选”）
+            const curNode = (currentNodes || []).find(function(n) { return n.id === neId; });
+            if (curNode && curNode !== node) { curNode.added_via_neighbor_expansion = true; curNode.isNeighborExpanded = false; }
+            // 加入当前组的 group_info.ne_list：renderCurrentGroups 按 ne_list 取节点，否则重渲染/重载会丢失该设备
+            const gids = (activeGroups && activeGroups.size) ? Array.from(activeGroups) : Object.keys(graphData.group_info || {});
+            gids.forEach(function(gid) {
+                const gi = graphData.group_info && graphData.group_info[gid];
+                if (!gi) return;
+                if (!Array.isArray(gi.ne_list)) gi.ne_list = [];
+                if (gi.ne_list.indexOf(neId) === -1) gi.ne_list.push(neId);
+                const site = node.site_id;
+                if (site) {
+                    if (!Array.isArray(gi.site_list)) gi.site_list = [];
+                    if (gi.site_list.indexOf(site) === -1) gi.site_list.push(site);
+                }
+            });
+        }
+
+        // 清除某并入邻居的根因后，把它从故障组移除。单组流程下，带 added_via_neighbor_expansion 标记的
+        // 都是本次扩展“新建进 ne_info”的合成设备（绝不会命中源数据里的原始设备），可安全彻底删除。
+        function removeAddedNeighbor(neId) {
+            if (!graphData || !graphData.ne_info) return;
+            const info = graphData.ne_info[neId];
+            if (!info || !info.added_via_neighbor_expansion) return;
+            const removedSite = info.site_id;
+            const touchesNe = function(l) {
+                const s = typeof l.source === 'object' ? l.source.id : l.source;
+                const t = typeof l.target === 'object' ? l.target.id : l.target;
+                return s === neId || t === neId;
+            };
+            delete graphData.ne_info[neId];
+            Object.keys(graphData.ne_info).forEach(function(k) {
+                const lk = graphData.ne_info[k].link;
+                if (lk && typeof lk === 'object' && lk[neId]) delete lk[neId];
+            });
+            allNodes = allNodes.filter(function(n) { return n.id !== neId; });
+            allLinks = allLinks.filter(function(l) { return !touchesNe(l); });
+            currentNodes = currentNodes.filter(function(n) { return n.id !== neId; });
+            currentLinks = currentLinks.filter(function(l) { return !touchesNe(l); });
+            filteredLinks = filteredLinks.filter(function(l) { return !touchesNe(l); });
+            if (graphData.root_cause_annotations) delete graphData.root_cause_annotations[neId];
+            // 从所有 group_info.ne_list 移除；site_list 仅当组内已无其它设备属于该站点时才移除
+            Object.keys(graphData.group_info || {}).forEach(function(gid) {
+                const gi = graphData.group_info[gid];
+                if (!gi) return;
+                if (Array.isArray(gi.ne_list)) {
+                    const i = gi.ne_list.indexOf(neId);
+                    if (i !== -1) gi.ne_list.splice(i, 1);
+                }
+                if (removedSite && Array.isArray(gi.site_list)) {
+                    const stillUsed = (gi.ne_list || []).some(function(id) {
+                        return graphData.ne_info[id] && graphData.ne_info[id].site_id === removedSite;
+                    });
+                    if (!stillUsed) { const si = gi.site_list.indexOf(removedSite); if (si !== -1) gi.site_list.splice(si, 1); }
+                }
+            });
+        }
+
         function onDeviceRootCauseToggle(neId, checked) {
             const node = allNodes.find(function(n) { return n.id === neId; });
             if (!node) return;
@@ -5350,6 +5510,24 @@
             }
             const entry = getNodeRootCauseEntry(node.id, true);
             if (entry) entry.device = !!checked;
+            // 候选邻居（还不在 ne_info 的真·新设备）被勾根因 → 并入故障组（单组流程：不在组⟺不在 ne_info）
+            let membershipChanged = false;
+            if (checked && graphData.ne_info && !graphData.ne_info[neId]) {
+                mergeNeighborIntoGroup(node);
+                membershipChanged = true;
+            }
+            // 取消并入邻居的根因且其再无任何根因 → 从故障组移除并重绘
+            const info = graphData.ne_info && graphData.ne_info[neId];
+            if (!checked && info && info.added_via_neighbor_expansion && !isRootCauseNode(node)) {
+                removeAddedNeighbor(neId);
+                closeAlarmPopup();
+                renderMap({ preserveViewport: true });
+                membershipChanged = true;
+            }
+            if (membershipChanged) {
+                setBaseCurrentGraph(currentNodes, currentLinks);   // 同步基础图，避免后续开关邻居模式冲掉并入设备
+                renderNodeList();   // 并入/移除改变了组成员，刷新侧栏列表
+            }
             onRootCauseChanged();
         }
 
@@ -6397,9 +6575,19 @@
         // 只写当前组那一小份，保存成本与“历史已标注组数”无关。
         function autoSaveResults() {
             if (!graphData || !originalGroupUuid) return;
+            // 把因标根因而并入的扩展设备一并存进本地，否则服务保存失败/刷新后只恢复“是根因”却没了设备本身
+            const addedNeighbors = {};
+            if (graphData.ne_info && typeof graphData.ne_info === 'object') {
+                Object.keys(graphData.ne_info).forEach(function(id) {
+                    if (graphData.ne_info[id] && graphData.ne_info[id].added_via_neighbor_expansion) {
+                        addedNeighbors[id] = graphData.ne_info[id];
+                    }
+                });
+            }
             const entry = {
                 root_cause_annotations: graphData.root_cause_annotations || {},
                 note: graphData.note || '',
+                added_neighbors: addedNeighbors,
                 updated_at: new Date().toISOString()
             };
             try {
@@ -6432,7 +6620,53 @@
         function buildServerWriteBackPayload() {
             const file = rcSourceFiles[originalGroupUuid];
             if (!file || !rcOriginalGroup) return null;
+            const curNeInfo = (graphData && graphData.ne_info) || {};
+            const origNeInfo = rcOriginalGroup.ne_info || {};
+            // 当前仍并入的扩展设备
+            const addedIds = Object.keys(curNeInfo).filter(function(id) {
+                return curNeInfo[id] && curNeInfo[id].added_via_neighbor_expansion;
+            });
+            // 原文件里曾是扩展设备、但现已从 ne_info 删除的（用户取消/清空）→ 需要从 group_info 一并删除
+            const removedIds = Object.keys(origNeInfo).filter(function(id) {
+                return origNeInfo[id] && origNeInfo[id].added_via_neighbor_expansion && !curNeInfo[id];
+            });
+            // 在原始 group_info 副本上做加/删（保留隐藏 NE，不直接写 graphData 的显示版）
+            let groupInfoOut = rcOriginalGroup.group_info;
+            if ((addedIds.length || removedIds.length) && groupInfoOut && typeof groupInfoOut === 'object') {
+                groupInfoOut = JSON.parse(JSON.stringify(groupInfoOut));
+                const rem = new Set(removedIds);
+                // 删除已取消的扩展设备、追加当前并入的扩展设备（单组：唯一组）
+                Object.keys(groupInfoOut).forEach(function(gid) {
+                    const gi = groupInfoOut[gid];
+                    if (!gi) return;
+                    if (!Array.isArray(gi.ne_list)) gi.ne_list = [];
+                    if (!Array.isArray(gi.site_list)) gi.site_list = [];
+                    if (removedIds.length) {
+                        gi.ne_list = gi.ne_list.filter(function(id) { return !rem.has(id); });
+                    }
+                    addedIds.forEach(function(id) {
+                        if (gi.ne_list.indexOf(id) === -1) gi.ne_list.push(id);
+                    });
+                    // site_list 增量调整：删除已取消设备且最终无设备使用的站点；追加并入设备的站点
+                    removedIds.forEach(function(id) {
+                        const site = origNeInfo[id] && origNeInfo[id].site_id;
+                        if (!site) return;
+                        const stillUsed = gi.ne_list.some(function(nid) {
+                            const ni = curNeInfo[nid] || origNeInfo[nid];
+                            return ni && ni.site_id === site;
+                        });
+                        if (!stillUsed) { const i = gi.site_list.indexOf(site); if (i !== -1) gi.site_list.splice(i, 1); }
+                    });
+                    addedIds.forEach(function(id) {
+                        const site = curNeInfo[id] && curNeInfo[id].site_id;
+                        if (site && gi.site_list.indexOf(site) === -1) gi.site_list.push(site);
+                    });
+                });
+            }
             const out = Object.assign({}, rcOriginalGroup, {
+                // 以当前 ne_info 为准，包含标根因时并入的邻居设备（带 added_via_neighbor_expansion 标记）
+                ne_info: (graphData && graphData.ne_info) || rcOriginalGroup.ne_info,
+                group_info: groupInfoOut,
                 root_cause_annotations: (graphData && graphData.root_cause_annotations) || {},
                 note: (graphData && graphData.note) || '',
                 note_updated_at: (graphData && graphData.note_updated_at) || new Date().toISOString()
@@ -6498,6 +6732,50 @@
             }
             if (entry.note !== undefined && entry.note !== null) {
                 group.note = entry.note;
+            }
+            // 扩展设备：本地工作副本是权威源（与 root_cause_annotations 同样“本地优先”）。
+            // entry.added_neighbors 存在（哪怕是 {}）时：先补回本地有的，再删掉“源文件里有、本地已没有”的（表达取消）。
+            // 不存在该字段时（旧格式 / 清过缓存）不动源文件，避免误删已保存的扩展设备。
+            if (entry.added_neighbors && typeof entry.added_neighbors === 'object') {
+                if (!group.ne_info || typeof group.ne_info !== 'object') group.ne_info = {};
+                const allGids = group.group_info ? Object.keys(group.group_info) : [];
+                // 1) 补回扩展设备本体 + 加入故障组 ne_list/site_list（在 loadOriginalFormat 之前；单组即加入这一个组）
+                Object.keys(entry.added_neighbors).forEach(function(neId) {
+                    if (!group.ne_info[neId]) group.ne_info[neId] = entry.added_neighbors[neId];
+                    const site = entry.added_neighbors[neId] && entry.added_neighbors[neId].site_id;
+                    allGids.forEach(function(gid) {
+                        const gi = group.group_info[gid];
+                        if (!gi) return;
+                        if (!Array.isArray(gi.ne_list)) gi.ne_list = [];
+                        if (gi.ne_list.indexOf(neId) === -1) gi.ne_list.push(neId);
+                        if (site) {
+                            if (!Array.isArray(gi.site_list)) gi.site_list = [];
+                            if (gi.site_list.indexOf(site) === -1) gi.site_list.push(site);
+                        }
+                    });
+                });
+                // 2) 删掉源文件里有、但本地工作副本里已没有的扩展设备（用户取消过），连 ne_list/site_list 一并清
+                const localSet = new Set(Object.keys(entry.added_neighbors));
+                Object.keys(group.ne_info).forEach(function(id) {
+                    const ni = group.ne_info[id];
+                    if (!ni || !ni.added_via_neighbor_expansion || localSet.has(id)) return;
+                    const removedSite = ni.site_id;
+                    delete group.ne_info[id];
+                    Object.keys(group.ne_info).forEach(function(k) {
+                        const lk = group.ne_info[k] && group.ne_info[k].link;
+                        if (lk && lk[id]) delete lk[id];
+                    });
+                    Object.keys(group.group_info || {}).forEach(function(gid) {
+                        const gi2 = group.group_info[gid];
+                        if (!gi2) return;
+                        if (Array.isArray(gi2.ne_list)) { const i = gi2.ne_list.indexOf(id); if (i !== -1) gi2.ne_list.splice(i, 1); }
+                        if (removedSite && Array.isArray(gi2.site_list)) {
+                            const stillUsed = (gi2.ne_list || []).some(function(nid) { return group.ne_info[nid] && group.ne_info[nid].site_id === removedSite; });
+                            if (!stillUsed) { const si = gi2.site_list.indexOf(removedSite); if (si !== -1) gi2.site_list.splice(si, 1); }
+                        }
+                    });
+                    if (group.root_cause_annotations) delete group.root_cause_annotations[id];
+                });
             }
         }
 
