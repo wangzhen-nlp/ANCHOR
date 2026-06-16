@@ -4380,6 +4380,7 @@
                 '来源故障组UUID': symptom['来源故障组UUID'] || symptom.source_group_uuid || '',
                 mhp_group_id: symptom.mhp_group_id || symptom['来源故障组UUID'] || symptom.source_group_uuid || '',
                 alarm_group_id: symptom.alarm_group_id || symptom['故障组ID'] || symptom.fault_group_id || '',
+                _case_alarm_seq: symptom._case_alarm_seq || '',
                 virtual: !!symptom.virtual,
                 latent: !!symptom.latent,
                 confidence: symptom.confidence,
@@ -4406,6 +4407,15 @@
             return index;
         }
 
+        function getAlarmOccurrenceKey(alarm) {
+            const seq = String(alarm && alarm._case_alarm_seq || '').trim();
+            if (seq) {
+                return 'seq:' + seq;
+            }
+            const alarmId = String(alarm && alarm.alarm_id || '').trim();
+            return alarmId ? 'alarm:' + alarmId : '';
+        }
+
         function getNeAlarmsFromInfo(neId, neInfo, symptomAlarmIndex) {
             const symptomAlarms = symptomAlarmIndex.get(neId) || [];
             if (!Array.isArray(neInfo && neInfo.alarm)) {
@@ -4414,16 +4424,16 @@
             if (symptomAlarms.length === 0) {
                 return neInfo.alarm;
             }
-            const symptomByAlarmId = new Map();
+            const symptomByOccurrence = new Map();
             symptomAlarms.forEach(function(alarm) {
-                const alarmId = String(alarm.alarm_id || '');
-                if (alarmId) {
-                    symptomByAlarmId.set(alarmId, alarm);
+                const occurrenceKey = getAlarmOccurrenceKey(alarm);
+                if (occurrenceKey) {
+                    symptomByOccurrence.set(occurrenceKey, alarm);
                 }
             });
             return neInfo.alarm.map(function(alarm) {
-                const alarmId = String(alarm && alarm.alarm_id || '');
-                const symptomAlarm = symptomByAlarmId.get(alarmId);
+                const occurrenceKey = getAlarmOccurrenceKey(alarm);
+                const symptomAlarm = occurrenceKey ? symptomByOccurrence.get(occurrenceKey) : null;
                 if (!symptomAlarm) return alarm;
                 return Object.assign({}, alarm, {
                     virtual: !!(alarm.virtual || symptomAlarm.virtual),
