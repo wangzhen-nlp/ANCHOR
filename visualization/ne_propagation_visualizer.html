@@ -2095,6 +2095,12 @@
                         <div class="alarm-meta-value alarm-meta-empty">无</div>
                     </div>
                 </div>
+                <div class="alarm-meta-row">
+                    <div class="alarm-meta-label">MHP group</div>
+                    <div class="alarm-meta-values" id="mhpGroupValues">
+                        <div class="alarm-meta-value alarm-meta-empty">无</div>
+                    </div>
+                </div>
                 <div class="alarm-meta-row alarm-group-partition">
                     <div class="alarm-meta-label">当前渲染告警按故障组划分</div>
                     <div class="alarm-meta-values alarm-group-partition-list" id="alarmGroupPartitionValues">
@@ -3246,6 +3252,11 @@
                 'alarm_group_id',
                 'group_id'
             ]));
+            renderAlarmMetaValues('mhpGroupValues', getGraphAlarmFieldValues(graphData, [
+                'mhp_group_id',
+                '来源故障组UUID',
+                'source_group_uuid'
+            ]));
         }
 
         // 高亮站点集合
@@ -4366,6 +4377,9 @@
                 matched_role: symptom.matched_role || '',
                 '工单号': symptom['工单号'] || '',
                 '故障组ID': symptom['故障组ID'] || symptom.fault_group_id || symptom.alarm_group_id || symptom.group_id || '',
+                '来源故障组UUID': symptom['来源故障组UUID'] || symptom.source_group_uuid || '',
+                mhp_group_id: symptom.mhp_group_id || symptom['来源故障组UUID'] || symptom.source_group_uuid || '',
+                alarm_group_id: symptom.alarm_group_id || symptom['故障组ID'] || symptom.fault_group_id || '',
                 virtual: !!symptom.virtual,
                 latent: !!symptom.latent,
                 confidence: symptom.confidence,
@@ -4704,6 +4718,7 @@
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
                         const ticketId = alarm['工单号'] || '-';
                         const faultGroup = getAlarmFaultGroupId(alarm);
+                        const mhpGroup = alarm.mhp_group_id || alarm['来源故障组UUID'] || alarm.source_group_uuid || '';
                         const faultGroupHtml = faultGroup
                             ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
                             : '<span>-</span>';
@@ -4715,6 +4730,7 @@
                             '</div>' +
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
+                            '<div style="font-size: 10px; color: #57606a;">MHP group: ' + escapeHtml(mhpGroup || '-') + '</div>' +
                             '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
                             '</div>';
                     }).join('');

@@ -625,6 +625,9 @@ def _build_visual_alarm_entry(record, site_id):
         "matched_role": normalize_text(record.get("matched_role", "")),
         "工单号": normalize_text(record.get("工单号", "")),
         "故障组ID": normalize_text(record.get("故障组ID", "")),
+        "来源故障组UUID": normalize_text(record.get("来源故障组UUID", "")),
+        "mhp_group_id": normalize_text(record.get("mhp_group_id", "")),
+        "alarm_group_id": normalize_text(record.get("alarm_group_id", "")),
     }
 
 
@@ -640,6 +643,9 @@ def _build_visual_symptom(record, site_id, ticket_id, matched_role):
         "time_str": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts is not None else "",
         "工单号": normalize_text(record.get("工单号", "")),
         "故障组ID": normalize_text(record.get("故障组ID", "")),
+        "来源故障组UUID": normalize_text(record.get("来源故障组UUID", "")),
+        "mhp_group_id": normalize_text(record.get("mhp_group_id", "")),
+        "alarm_group_id": normalize_text(record.get("alarm_group_id", "")),
         "告警清除时间": normalize_text(record.get("alarm_clear_time", "")) or normalize_text(record.get("告警清除时间", "")),
     }
     return symptom

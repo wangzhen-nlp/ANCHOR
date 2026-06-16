@@ -137,6 +137,7 @@ def _build_visual_indexes(visual_output, *, group_field, ne_to_domain=None):
                 group_sites.add(site_id)
                 evidence_record = dict(symptom)
                 evidence_record["来源故障组UUID"] = group_id
+                evidence_record["mhp_group_id"] = group_id
                 mhp_group_to_site_alarms[group_id][site_id].append(evidence_record)
 
             domain = _resolve_record_domain(symptom, ne_to_domain)
@@ -159,6 +160,9 @@ def _build_visual_indexes(visual_output, *, group_field, ne_to_domain=None):
                     alarm_group_to_sites[alarm_group_id].add(site_id)
                     evidence_record = dict(symptom)
                     evidence_record["故障组ID"] = alarm_group_id
+                    evidence_record["alarm_group_id"] = alarm_group_id
+                    evidence_record["mhp_group_id"] = group_id
+                    evidence_record["来源故障组UUID"] = group_id
                     alarm_group_to_site_alarms[alarm_group_id][site_id].append(evidence_record)
                 if domain:
                     alarm_group_alarm_domains[alarm_group_id].add(domain)
