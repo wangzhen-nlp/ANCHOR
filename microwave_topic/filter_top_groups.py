@@ -27,11 +27,10 @@ def _group_id(group):
     )
 
 
-def _group_metrics(group):
-    """返回排序元组 (有告警的站点数, 有告警的设备数, 告警数)，越大越靠前。
+def _alarm_stats(group):
+    """统计带告警的实体：返回 (有告警的站点集合, 有告警的设备集合, 告警数)。
 
-    只统计带告警的设备：设备的 alarm 列表非空才计入设备数，其所在站点计入站点数，
-    告警数为这些设备 alarm 列表长度之和。
+    只统计 alarm 列表非空的设备；其所在站点计入站点集合；告警数为这些设备 alarm 长度之和。
     """
     ne_info = group.get("ne_info") if isinstance(group.get("ne_info"), dict) else {}
     alarm_site_ids = set()
@@ -48,8 +47,19 @@ def _group_metrics(group):
         site_id = _normalize_text(entry.get("site_id", ""))
         if site_id:
             alarm_site_ids.add(site_id)
+    return alarm_site_ids, alarm_ne_ids, alarm_count
 
-    return (len(alarm_site_ids), len(alarm_ne_ids), alarm_count)
+
+def _group_metrics(group):
+    """返回排序元组 (有告警的站点数, 有告警的设备数, 告警数)，越大越靠前。"""
+    site_ids, ne_ids, alarm_count = _alarm_stats(group)
+    return (len(site_ids), len(ne_ids), alarm_count)
+
+
+def _site_signature(group):
+    """返回该组带告警站点集合的可哈希签名，用于判断两组站点是否完全相同。"""
+    site_ids, _, _ = _alarm_stats(group)
+    return frozenset(site_ids)
 
 
 def _load_groups_from_file(input_path):
@@ -87,12 +97,29 @@ def _load_groups_from_dir(input_dir):
 
 
 def _select_top_k(groups, top_k, key):
-    """按 metrics 元组从大到小排序取 top-k，平手时用 key（保证稳定可复现）破除。"""
-    indexed = list(enumerate(groups))
-    indexed.sort(key=lambda pair: (_group_metrics(key(pair[1])), -pair[0]), reverse=True)
+    """按 metrics 元组从大到小排序取 top-k，平手时用原始下标（保证稳定可复现）破除。
+
+    去重原则：若多组带告警的站点集合完全相同，只保留告警数最多的那个（平手取靠前的），
+    其余丢弃，不再补足 top-k（最终数量可能少于 k）。
+    """
+    # 先按站点签名去重：同一站点集合只保留告警数最多的（平手取原始下标靠前的）。
+    best_by_sites = {}
+    for idx, item in enumerate(groups):
+        group = key(item)
+        signature = _site_signature(group)
+        _, _, alarm_count = _alarm_stats(group)
+        # 选择键越大越优先：告警数大优先，平手时下标小优先（-idx 大）。
+        rank = (alarm_count, -idx)
+        if signature not in best_by_sites or rank > best_by_sites[signature][0]:
+            best_by_sites[signature] = (rank, idx, item)
+
+    survivors = [(idx, item) for _, idx, item in best_by_sites.values()]
+    # 再按 metrics 元组从大到小排序，平手用原始下标破除，保证稳定可复现。
+    survivors.sort(key=lambda pair: (_group_metrics(key(pair[1])), -pair[0]), reverse=True)
+
     if top_k is not None and top_k >= 0:
-        indexed = indexed[:top_k]
-    return [pair[1] for pair in indexed]
+        survivors = survivors[:top_k]
+    return [pair[1] for pair in survivors]
 
 
 def filter_groups(input_path, output_path, top_k, seed=None):
