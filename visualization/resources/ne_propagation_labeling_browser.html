@@ -606,8 +606,6 @@
         <div class="labeling-topbar">
             <button class="shell-btn primary" onclick="returnToOverview()">返回总览</button>
             <button class="shell-btn" onclick="toggleLabelingDrawer()">故障组列表</button>
-            <button class="shell-btn" id="shellPrevBtn" onclick="openAdjacentLabelingGroup(-1)">上一组</button>
-            <button class="shell-btn" id="shellNextBtn" onclick="openAdjacentLabelingGroup(1)">下一组</button>
             <div class="labeling-shell-title" id="labelingShellTitle">未选择故障组</div>
         </div>
         <iframe id="labelingFrame" class="labeling-frame" name="ne_labeling_detail" title="微波群障根因标注"></iframe>
@@ -824,23 +822,18 @@
             return getVisibleGroups().findIndex(group => groupUuidOf(group) === normalizedUuid);
         }
 
-        function updateLabelingShellChrome() {
+        function updateLabelingShellTitle() {
             const shellTitle = document.getElementById('labelingShellTitle');
-            const prevBtn = document.getElementById('shellPrevBtn');
-            const nextBtn = document.getElementById('shellNextBtn');
+            if (!shellTitle) return;
             const visibleGroups = getVisibleGroups();
             const visibleIndex = getVisibleGroupIndexByUuid(activeLabelingUuid);
-            if (shellTitle) {
-                if (!activeLabelingUuid) {
-                    shellTitle.textContent = '未选择故障组';
-                } else if (visibleIndex >= 0) {
-                    shellTitle.textContent = '故障组 ' + (visibleIndex + 1) + ' / ' + visibleGroups.length + '：' + activeLabelingUuid;
-                } else {
-                    shellTitle.textContent = '当前故障组：' + activeLabelingUuid + '（不在当前筛选结果中）';
-                }
+            if (!activeLabelingUuid) {
+                shellTitle.textContent = '未选择故障组';
+            } else if (visibleIndex >= 0) {
+                shellTitle.textContent = '故障组 ' + (visibleIndex + 1) + ' / ' + visibleGroups.length + '：' + activeLabelingUuid;
+            } else {
+                shellTitle.textContent = '当前故障组：' + activeLabelingUuid + '（不在当前筛选结果中）';
             }
-            if (prevBtn) prevBtn.disabled = visibleIndex <= 0;
-            if (nextBtn) nextBtn.disabled = visibleIndex < 0 || visibleIndex >= visibleGroups.length - 1;
         }
 
         function renderLabelingDrawerList() {
@@ -871,18 +864,8 @@
         function refreshLabelingShellState() {
             const shell = document.getElementById('labelingShell');
             if (!shell || !shell.classList.contains('is-open')) return;
-            updateLabelingShellChrome();
+            updateLabelingShellTitle();
             renderLabelingDrawerList();
-        }
-
-        function openAdjacentLabelingGroup(delta) {
-            const visibleGroups = getVisibleGroups();
-            const visibleIndex = getVisibleGroupIndexByUuid(activeLabelingUuid);
-            const nextIndex = visibleIndex + delta;
-            if (nextIndex < 0 || nextIndex >= visibleGroups.length) return;
-            const group = visibleGroups[nextIndex];
-            const index = faultGroups.indexOf(group);
-            if (index >= 0) openGroupDetail(index);
         }
 
         window.updateActiveLabelingGroup = function(groupUuid) {
