@@ -96,15 +96,25 @@ def _load_groups_from_dir(input_dir):
     return items
 
 
-def _select_top_k(groups, top_k, key):
+def _select_top_k(groups, top_k, key, min_sites=0):
     """按 metrics 元组从大到小排序取 top-k，平手时用原始下标（保证稳定可复现）破除。
 
-    去重原则：若多组带告警的站点集合完全相同，只保留告警数最多的那个（平手取靠前的），
+    过滤原则：
+    1. 带告警站点数小于 min_sites 的组先丢弃；
+    2. 若多组带告警的站点集合完全相同，只保留告警数最多的那个（平手取靠前的）；
     其余丢弃，不再补足 top-k（最终数量可能少于 k）。
     """
-    # 先按站点签名去重：同一站点集合只保留告警数最多的（平手取原始下标靠前的）。
-    best_by_sites = {}
+    # 1. 最少站点数过滤。
+    filtered = []
     for idx, item in enumerate(groups):
+        site_ids, _, _ = _alarm_stats(key(item))
+        if len(site_ids) >= min_sites:
+            filtered.append((idx, item))
+    dropped_by_min_sites = len(groups) - len(filtered)
+
+    # 2. 按站点签名去重：同一站点集合只保留告警数最多的（平手取原始下标靠前的）。
+    best_by_sites = {}
+    for idx, item in filtered:
         group = key(item)
         signature = _site_signature(group)
         _, _, alarm_count = _alarm_stats(group)
@@ -114,7 +124,7 @@ def _select_top_k(groups, top_k, key):
             best_by_sites[signature] = (rank, idx, item)
 
     survivors = [(idx, item) for _, idx, item in best_by_sites.values()]
-    dropped_by_dedup = len(groups) - len(survivors)
+    dropped_by_dedup = len(filtered) - len(survivors)
     # 再按 metrics 元组从大到小排序，平手用原始下标破除，保证稳定可复现。
     survivors.sort(key=lambda pair: (_group_metrics(key(pair[1])), -pair[0]), reverse=True)
 
@@ -123,18 +133,24 @@ def _select_top_k(groups, top_k, key):
         survivors = survivors[:top_k]
     dropped_by_topk = after_dedup - len(survivors)
 
-    stats = {"dropped_by_dedup": dropped_by_dedup, "dropped_by_topk": dropped_by_topk}
+    stats = {
+        "dropped_by_min_sites": dropped_by_min_sites,
+        "dropped_by_dedup": dropped_by_dedup,
+        "dropped_by_topk": dropped_by_topk,
+    }
     return [pair[1] for pair in survivors], stats
 
 
-def filter_groups(input_path, output_path, top_k, seed=None):
+def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
     input_path = Path(input_path)
     rng = random.Random(seed)
 
     if input_path.is_dir():
         items = _load_groups_from_dir(input_path)
         total = len(items)
-        selected, select_stats = _select_top_k(items, top_k, key=lambda item: item[1])
+        selected, select_stats = _select_top_k(
+            items, top_k, key=lambda item: item[1], min_sites=min_sites
+        )
         rng.shuffle(selected)
 
         out_dir = Path(output_path)
@@ -147,7 +163,9 @@ def filter_groups(input_path, output_path, top_k, seed=None):
     elif input_path.is_file():
         groups = _load_groups_from_file(input_path)
         total = len(groups)
-        selected, select_stats = _select_top_k(groups, top_k, key=lambda group: group)
+        selected, select_stats = _select_top_k(
+            groups, top_k, key=lambda group: group, min_sites=min_sites
+        )
         rng.shuffle(selected)
 
         out_path = Path(output_path)
@@ -168,9 +186,11 @@ def filter_groups(input_path, output_path, top_k, seed=None):
         "output_kind": output_kind,
         "input_group_count": total,
         "output_group_count": kept,
+        "dropped_by_min_sites": select_stats["dropped_by_min_sites"],
         "dropped_by_dedup": select_stats["dropped_by_dedup"],
         "dropped_by_topk": select_stats["dropped_by_topk"],
         "top_k": top_k,
+        "min_sites": min_sites,
         "seed": seed,
     }
 
@@ -182,6 +202,12 @@ def build_arg_parser():
     parser.add_argument("input", help="输入：故障组多行 JSONL 文件，或每组一个单行 jsonl 的目录")
     parser.add_argument("output", help="输出：文件输入对应文件，目录输入对应目录（不存在则新建）")
     parser.add_argument("-k", "--top-k", type=int, required=True, help="保留的故障组数量（top-k）")
+    parser.add_argument(
+        "--min-sites",
+        type=int,
+        default=0,
+        help="最少带告警站点数：带告警站点数小于该值的故障组直接丢弃，默认 0（不过滤）",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -196,7 +222,11 @@ def main():
     args = parser.parse_args()
     if args.top_k < 0:
         parser.error("--top-k 不能为负数")
-    stats = filter_groups(args.input, args.output, args.top_k, seed=args.seed)
+    if args.min_sites < 0:
+        parser.error("--min-sites 不能为负数")
+    stats = filter_groups(
+        args.input, args.output, args.top_k, seed=args.seed, min_sites=args.min_sites
+    )
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
 
