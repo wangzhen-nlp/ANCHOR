@@ -1220,11 +1220,17 @@
             return Object.values(groupInfo)[0] || {};
         }
 
+        // 标注时经邻居扩展并入的设备（带 added_via_neighbor_expansion），不计入故障组的站点/设备规模
+        function isAddedNeighborNe(neInfo, neId) {
+            return !!(neInfo[neId] && neInfo[neId].added_via_neighbor_expansion);
+        }
+
         function getSiteCount(group) {
             const primaryGroup = getPrimaryGroupInfo(group);
             const neInfo = group.ne_info || {};
             const siteIdsFromNodes = new Set();
             (primaryGroup.ne_list || []).forEach(neId => {
+                if (isAddedNeighborNe(neInfo, neId)) return;   // 排除并入的扩展设备
                 const siteId = String(neInfo[neId]?.site_id || '').trim();
                 if (siteId) {
                     siteIdsFromNodes.add(siteId);
@@ -1238,7 +1244,8 @@
 
         function getNodeCount(group) {
             const primaryGroup = getPrimaryGroupInfo(group);
-            return (primaryGroup.ne_list || []).length;
+            const neInfo = group.ne_info || {};
+            return (primaryGroup.ne_list || []).filter(neId => !isAddedNeighborNe(neInfo, neId)).length;
         }
 
         function getSymptomCount(group) {
