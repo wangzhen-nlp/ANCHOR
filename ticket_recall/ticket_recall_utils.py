@@ -20,41 +20,38 @@ UPPER_BOUND_EVIDENCE_BUCKETS = (
 
 
 def dedupe_alarm_records(records):
-    by_key = {}
-    order = []
+    seen = set()
     result = []
     for record in records:
         if not isinstance(record, dict):
             continue
-        alarm_id = extract_alarm_record_id(record)
-        if alarm_id:
-            key = (
-                "alarm_id",
-                alarm_id,
-                normalize_text(record.get("站点ID", "")) or normalize_text(record.get("site_id", "")) or normalize_text(record.get("node", "")),
-                normalize_text(record.get("告警源", "")) or normalize_text(record.get("alarm_source", "")),
-            )
-        else:
-            key = (
-                "fallback",
-                normalize_text(record.get("告警标题", "")) or normalize_text(record.get("alarm_type", "")),
-                normalize_text(record.get("告警首次发生时间", "")) or normalize_text(record.get("alarm_time", "")),
-                normalize_text(record.get("告警源", "")) or normalize_text(record.get("alarm_source", "")),
-                normalize_text(record.get("站点ID", "")) or normalize_text(record.get("site_id", "")) or normalize_text(record.get("node", "")),
-            )
-        if key not in by_key:
-            by_key[key] = dict(record)
-            order.append(key)
+        key = (
+            normalize_text(record.get("告警编码ID", "")),
+            normalize_text(record.get("故障组ID", "")),
+            normalize_text(record.get("来源故障组UUID", "")),
+            normalize_text(record.get("工单号", "")),
+            normalize_text(record.get("站点ID", "")),
+            normalize_text(record.get("关联站点ID", "")),
+            normalize_text(record.get("告警源", "")),
+            normalize_text(record.get("告警标题", "")),
+            normalize_text(record.get("告警首次发生时间", "")),
+            normalize_text(record.get("告警最后发生时间", "")),
+            normalize_text(record.get("告警清除时间", "")),
+            normalize_text(record.get("node", "")),
+            normalize_text(record.get("matched_role", "")),
+            normalize_text(record.get("_case_alarm_seq", "")),
+            normalize_text(record.get("alarm_id", "")),
+            normalize_text(record.get("alarm_type", "")),
+            normalize_text(record.get("alarm_time", "")),
+            normalize_text(record.get("site_id", "")),
+            normalize_text(record.get("alarm_source", "")),
+            normalize_text(record.get("mhp_group_id", "")),
+            normalize_text(record.get("alarm_group_id", "")),
+        )
+        if key in seen:
             continue
-        existing = by_key[key]
-        for field_name, value in record.items():
-            if not normalize_text(existing.get(field_name, "")) and normalize_text(value):
-                existing[field_name] = value
-        for field_name in ("故障组ID", "alarm_group_id", "来源故障组UUID", "mhp_group_id", "工单号"):
-            if normalize_text(record.get(field_name, "")) and not normalize_text(existing.get(field_name, "")):
-                existing[field_name] = record[field_name]
-    for key in order:
-        result.append(by_key[key])
+        seen.add(key)
+        result.append(record)
     return result
 
 
@@ -639,6 +636,7 @@ def _build_visual_alarm_entry(record, site_id):
         "来源故障组UUID": normalize_text(record.get("来源故障组UUID", "")),
         "mhp_group_id": normalize_text(record.get("mhp_group_id", "")),
         "alarm_group_id": normalize_text(record.get("alarm_group_id", "")),
+        "_case_alarm_seq": normalize_text(record.get("_case_alarm_seq", "")),
     }
 
 
@@ -657,6 +655,7 @@ def _build_visual_symptom(record, site_id, ticket_id, matched_role):
         "来源故障组UUID": normalize_text(record.get("来源故障组UUID", "")),
         "mhp_group_id": normalize_text(record.get("mhp_group_id", "")),
         "alarm_group_id": normalize_text(record.get("alarm_group_id", "")),
+        "_case_alarm_seq": normalize_text(record.get("_case_alarm_seq", "")),
         "告警清除时间": normalize_text(record.get("alarm_clear_time", "")) or normalize_text(record.get("告警清除时间", "")),
     }
     return symptom

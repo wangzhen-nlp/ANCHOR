@@ -135,57 +135,6 @@ def _symptom_to_visual_record_mhp(symptom):
     return record
 
 
-def _merge_nonempty_fields(target, source):
-    for key, value in (source or {}).items():
-        if target.get(key) in (None, "") and value not in (None, ""):
-            target[key] = value
-    for keys in (
-        ("故障组ID", "alarm_group_id", "fault_group_id"),
-        ("mhp_group_id", "来源故障组UUID", "source_group_uuid"),
-    ):
-        value = next(
-            (
-                item
-                for key in keys
-                for item in (source.get(key), target.get(key))
-                if item not in (None, "")
-            ),
-            "",
-        )
-        if value:
-            for key in keys:
-                if target.get(key) in (None, ""):
-                    target[key] = value
-    return target
-
-
-def _dedupe_visual_symptoms(symptoms):
-    by_key = {}
-    order = []
-    for symptom in symptoms or []:
-        if not isinstance(symptom, dict):
-            continue
-        is_virtual = bool(symptom.get("virtual")) or bool(symptom.get("latent"))
-        event_id = str(symptom.get("eid") or symptom.get("event_id") or "").strip()
-        alarm_source = str(symptom.get("alarm_source") or "").strip()
-        if event_id and alarm_source and not is_virtual:
-            key = ("real", alarm_source, event_id)
-        else:
-            key = (
-                "raw",
-                alarm_source,
-                event_id,
-                str(symptom.get("ts") or ""),
-                str(symptom.get("alarm") or symptom.get("alarm_title") or ""),
-            )
-        if key not in by_key:
-            by_key[key] = dict(symptom)
-            order.append(key)
-            continue
-        _merge_nonempty_fields(by_key[key], symptom)
-    return [by_key[key] for key in order]
-
-
 def group_to_visual_match_mhp(group, ne_graph_data=None):
     root_event = dict(group.get("root_event") or {})
     root_event_id = root_event.get("event_id", "")
@@ -203,9 +152,7 @@ def group_to_visual_match_mhp(group, ne_graph_data=None):
         "role_mapping": {"cascade": list(group.get("site_list") or [])},
         "uses_missing_topology": bool(prop_edges),
         "missing_topology_edges": prop_edges,
-        "symptoms": _dedupe_visual_symptoms(
-            [_symptom_to_visual_record_mhp(s) for s in group.get("symptoms") or []]
-        ),
+        "symptoms": [_symptom_to_visual_record_mhp(s) for s in group.get("symptoms") or []],
         "cascade_info": {
             "cascade_id": group.get("cascade_id"),
             "base_group_id": group.get("base_group_id", group.get("group_id", "")),
