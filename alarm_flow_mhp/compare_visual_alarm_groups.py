@@ -43,9 +43,14 @@ from ticket_recall.evaluation.compute_ultimate_group_alarm_group_metrics import 
     _resolve_record_domain,
 )
 from ticket_recall.ticket_recall_utils import (
+    build_visualization_case_record,
+    build_site_coord_index,
+    build_site_coord_index_from_site_graph,
+    build_site_to_ne_ids,
     build_ne_to_domain_map,
     build_site_has_domain_map,
     build_unrecalled_visualization_cases,
+    load_site_graph_data,
     load_ne_graph_data,
     write_jsonl_records,
 )
@@ -202,6 +207,32 @@ def _filter_metric_details_to_unrecalled(metric_result):
     return metric_result
 
 
+def _build_visualization_cases(details, method, *, ne_graph_data=None, case_scope="unrecalled"):
+    if case_scope == "unrecalled":
+        return build_unrecalled_visualization_cases(
+            details,
+            method,
+            ne_graph_data=ne_graph_data,
+        )
+    if case_scope != "all":
+        raise ValueError(f"unsupported case_scope: {case_scope}")
+
+    ne_graph_data = ne_graph_data or {}
+    site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
+    site_coord_index = build_site_coord_index(ne_graph_data)
+    site_coord_index.update(build_site_coord_index_from_site_graph(load_site_graph_data()))
+    return [
+        build_visualization_case_record(
+            detail,
+            method,
+            ne_graph_data=ne_graph_data,
+            site_to_ne_ids=site_to_ne_ids,
+            site_coord_index=site_coord_index,
+        )
+        for detail in details
+    ]
+
+
 def compare_visual_alarm_groups(
     visual_output,
     *,
@@ -216,6 +247,7 @@ def compare_visual_alarm_groups(
     loose=False,
     window_seconds=900,
     only_unrecalled_predictions=False,
+    case_scope="unrecalled",
     output_file=None,
     mhp_case_jsonl_output_file=None,
     alarm_group_case_jsonl_output_file=None,
@@ -310,6 +342,7 @@ def compare_visual_alarm_groups(
         "loose_mode": loose,
         "window_seconds": window_seconds,
         "virtual_symptoms_excluded": True,
+        "case_scope": case_scope,
         "mhp_group_count": len(indexes["mhp_group_to_sites"]),
         "alarm_group_count": len(indexes["alarm_group_to_sites"]),
         "real_symptom_count": indexes["real_symptom_count"],
@@ -329,15 +362,17 @@ def compare_visual_alarm_groups(
         indexes["alarm_group_to_site_alarms"],
         indexes["mhp_group_to_site_alarms"],
     )
-    mhp_case_records = build_unrecalled_visualization_cases(
+    mhp_case_records = _build_visualization_cases(
         mhp_case_details,
         "mhp_group_as_gold",
         ne_graph_data=ne_graph_data,
+        case_scope=case_scope,
     )
-    alarm_group_case_records = build_unrecalled_visualization_cases(
+    alarm_group_case_records = _build_visualization_cases(
         alarm_group_case_details,
         "alarm_group_as_gold",
         ne_graph_data=ne_graph_data,
+        case_scope=case_scope,
     )
 
     if mhp_case_jsonl_output_file:
@@ -440,6 +475,12 @@ def main():
         help="输出 JSON 中两类 details 仅保留召回率不足 100%% 的预测；平均指标仍基于全部样本计算",
     )
     parser.add_argument(
+        "--case-scope",
+        choices=("unrecalled", "all"),
+        default="unrecalled",
+        help="case JSONL 输出范围：unrecalled 只输出未满召回样本，all 输出全部样本。默认: unrecalled",
+    )
+    parser.add_argument(
         "--mhp-case-jsonl-output",
         default=None,
         help="MHP group 作为 gold 的未满召回样本可视化 jsonl；默认随主输出生成 sidecar，none 关闭",
@@ -481,6 +522,7 @@ def main():
         loose=args.loose,
         window_seconds=args.window_seconds,
         only_unrecalled_predictions=args.only_unrecalled_predictions,
+        case_scope=args.case_scope,
         output_file=None,
         mhp_case_jsonl_output_file=mhp_case_output,
         alarm_group_case_jsonl_output_file=alarm_case_output,
