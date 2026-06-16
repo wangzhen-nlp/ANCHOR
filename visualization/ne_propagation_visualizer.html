@@ -4409,10 +4409,10 @@
         function getNeAlarmsFromInfo(neId, neInfo, symptomAlarmIndex) {
             const symptomAlarms = symptomAlarmIndex.get(neId) || [];
             if (!Array.isArray(neInfo && neInfo.alarm)) {
-                return symptomAlarms;
+                return dedupeNodeAlarms(symptomAlarms);
             }
             if (symptomAlarms.length === 0) {
-                return neInfo.alarm;
+                return dedupeNodeAlarms(neInfo.alarm);
             }
             const symptomByAlarmId = new Map();
             symptomAlarms.forEach(function(alarm) {
@@ -4421,8 +4421,10 @@
                     symptomByAlarmId.set(alarmId, alarm);
                 }
             });
-            return neInfo.alarm.map(function(alarm) {
+            const neInfoAlarmIds = new Set();
+            const mergedAlarms = neInfo.alarm.map(function(alarm) {
                 const alarmId = String(alarm && alarm.alarm_id || '');
+                if (alarmId) neInfoAlarmIds.add(alarmId);
                 const symptomAlarm = symptomByAlarmId.get(alarmId);
                 if (!symptomAlarm) return alarm;
                 return Object.assign({}, alarm, {
@@ -4434,6 +4436,34 @@
                     virtual_source: alarm.virtual_source || symptomAlarm.virtual_source || ''
                 });
             });
+            symptomAlarms.forEach(function(alarm) {
+                const alarmId = String(alarm && alarm.alarm_id || '');
+                if (!alarmId || !neInfoAlarmIds.has(alarmId)) {
+                    mergedAlarms.push(alarm);
+                }
+            });
+            return dedupeNodeAlarms(mergedAlarms);
+        }
+
+        function dedupeNodeAlarms(alarms) {
+            const seen = new Set();
+            const result = [];
+            (alarms || []).forEach(function(alarm) {
+                if (!alarm || typeof alarm !== 'object') return;
+                const key = [
+                    alarm.alarm_id || alarm.eid || alarm.id || '',
+                    alarm.mhp_group_id || alarm['来源故障组UUID'] || alarm.source_group_uuid || '',
+                    getAlarmFaultGroupId(alarm),
+                    alarm.matched_role || '',
+                    alarm.site_id || '',
+                    alarm.alarm_time || alarm.time || alarm.time_str || alarm.ts || '',
+                    alarm.alarm_type || alarm.alarm || alarm.title || ''
+                ].map(function(value) { return String(value || '').trim(); }).join('|');
+                if (seen.has(key)) return;
+                seen.add(key);
+                result.push(alarm);
+            });
+            return result;
         }
 
         function handleSiteNeighborModeToggle(enabled) {
