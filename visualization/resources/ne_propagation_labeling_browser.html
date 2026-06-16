@@ -590,6 +590,14 @@
                 <span id="labelCounts" class="label-counts">已标注 0 ｜ 未标注 0</span>
             </div>
             <div class="filter-row">
+                <span class="site-filter-label">故障组</span>
+                <input id="groupFilterInput" class="site-filter-input" type="text" placeholder="输入故障组 ID，支持包含匹配">
+                <span class="site-filter-label">站点</span>
+                <input id="siteFilterInput" class="site-filter-input" type="text" placeholder="输入站点 ID，支持包含匹配">
+                <span class="site-filter-label">设备</span>
+                <input id="deviceFilterInput" class="site-filter-input" type="text" placeholder="输入设备 ID / 名称，支持包含匹配">
+            </div>
+            <div class="filter-row">
                 <span class="site-filter-label">备注过滤</span>
                 <input id="noteFilterInput" class="site-filter-input" type="text" placeholder="输入备注关键词，支持包含匹配">
             </div>
@@ -624,7 +632,9 @@
         let groupSourceFiles = {};   // uuid -> data/ 下源文件名（服务模式：传给标注页用于实时回写）
         let activeFilters = new Set(['all']);
         let ruleFilterQueries = [];
+        let groupFilterQuery = '';
         let siteFilterQuery = '';
+        let deviceFilterQuery = '';
         let ticketFilterQuery = '';
         let noteFilterQuery = '';  // 备注过滤查询
         let labelFilter = 'all';   // 标注状态过滤：all / labeled / unlabeled
@@ -830,7 +840,7 @@
             if (!activeLabelingUuid) {
                 shellTitle.textContent = '未选择故障组';
             } else if (visibleIndex >= 0) {
-                shellTitle.textContent = '故障组 ' + (visibleIndex + 1) + ' / ' + visibleGroups.length + '：' + activeLabelingUuid;
+                shellTitle.textContent = '故障组：' + activeLabelingUuid;
             } else {
                 shellTitle.textContent = '当前故障组：' + activeLabelingUuid + '（不在当前筛选结果中）';
             }
@@ -1128,6 +1138,67 @@
             return group.uuid || group.match_info?.uuid || '';
         }
 
+        function splitFilterTerms(query) {
+            return String(query || '')
+                .trim()
+                .toLowerCase()
+                .split(/[\s,，]+/)
+                .filter(Boolean);
+        }
+
+        function valuesMatchFilter(values, query) {
+            const terms = splitFilterTerms(query);
+            if (terms.length === 0) return true;
+            const haystack = (values || [])
+                .map(value => String(value ?? '').trim().toLowerCase())
+                .filter(Boolean);
+            if (haystack.length === 0) return false;
+            return terms.every(term => haystack.some(value => value.includes(term)));
+        }
+
+        function getGroupFilterValues(group) {
+            return mergeStringLists(
+                getGroupUuid(group),
+                group.match_info?.uuid,
+                getSymptomFieldValues(group, ['故障组ID'])
+            );
+        }
+
+        function getSiteFilterValues(group) {
+            const groupInfo = group.group_info || {};
+            const siteValues = [];
+            Object.values(groupInfo).forEach(info => {
+                if (info && Array.isArray(info.site_list)) {
+                    siteValues.push(...info.site_list);
+                }
+            });
+            const neInfo = group.ne_info || {};
+            Object.values(neInfo).forEach(node => {
+                if (node && node.site_id !== undefined && node.site_id !== null) {
+                    siteValues.push(node.site_id);
+                }
+            });
+            return mergeStringLists(siteValues);
+        }
+
+        function getDeviceFilterValues(group) {
+            const groupInfo = group.group_info || {};
+            const neInfo = group.ne_info || {};
+            const deviceValues = [];
+            Object.values(groupInfo).forEach(info => {
+                if (info && Array.isArray(info.ne_list)) {
+                    deviceValues.push(...info.ne_list);
+                }
+            });
+            Object.entries(neInfo).forEach(([neId, node]) => {
+                deviceValues.push(neId);
+                if (node && node.ne_id !== undefined && node.ne_id !== null) deviceValues.push(node.ne_id);
+                if (node && node.ne_name !== undefined && node.ne_name !== null) deviceValues.push(node.ne_name);
+                if (node && node.name !== undefined && node.name !== null) deviceValues.push(node.name);
+            });
+            return mergeStringLists(deviceValues);
+        }
+
         function getReferencedGroupUuidSet(groups) {
             const referenced = new Set();
             groups.forEach(group => {
@@ -1289,22 +1360,26 @@
                     }
                 }
 
-                if (!matchesAnyRuleFilter(group)) {
-                    return false;
-                }
+	                if (!matchesAnyRuleFilter(group)) {
+	                    return false;
+	                }
 
-                if (siteFilterQuery) {
-                    const groupInfo = group.group_info || {};
-                    const firstGroup = Object.values(groupInfo)[0] || {};
-                    const siteList = firstGroup.site_list || [];
-                    const query = siteFilterQuery.toLowerCase();
-                    if (!siteList.some(site => String(site).toLowerCase().includes(query))) {
-                        return false;
-                    }
-                }
+	                if (groupFilterQuery && !valuesMatchFilter(getGroupFilterValues(group), groupFilterQuery)) {
+	                    return false;
+	                }
 
-                if (ticketFilterQuery) {
-                    const ticketIds = getSymptomFieldValues(group, ['工单号']);
+	                if (siteFilterQuery) {
+	                    if (!valuesMatchFilter(getSiteFilterValues(group), siteFilterQuery)) {
+	                        return false;
+	                    }
+	                }
+
+	                if (deviceFilterQuery && !valuesMatchFilter(getDeviceFilterValues(group), deviceFilterQuery)) {
+	                    return false;
+	                }
+
+	                if (ticketFilterQuery) {
+	                    const ticketIds = getSymptomFieldValues(group, ['工单号']);
                     const query = ticketFilterQuery.toLowerCase();
                     if (!ticketIds.some(ticketId => String(ticketId).toLowerCase().includes(query))) {
                         return false;
@@ -1513,6 +1588,21 @@
                     }
                 });
         }
+
+        document.getElementById('groupFilterInput').addEventListener('input', function(event) {
+            groupFilterQuery = event.target.value.trim();
+            renderGroups();
+        });
+
+        document.getElementById('siteFilterInput').addEventListener('input', function(event) {
+            siteFilterQuery = event.target.value.trim();
+            renderGroups();
+        });
+
+        document.getElementById('deviceFilterInput').addEventListener('input', function(event) {
+            deviceFilterQuery = event.target.value.trim();
+            renderGroups();
+        });
 
         document.getElementById('noteFilterInput').addEventListener('input', function(event) {
             noteFilterQuery = event.target.value.trim();
