@@ -447,14 +447,19 @@ def _event_id(event, fallback_index):
 
 
 def _event_metadata_value(event, *keys):
-    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
-    for key in keys:
-        value = event.get(key, "")
-        if (value is None or str(value).strip() == "") and isinstance(alarm, dict):
-            value = alarm.get(key, "")
-        text = str(value or "").strip()
-        if text and text.lower() not in {"nan", "none", "null"}:
-            return text
+    if not isinstance(event, dict):
+        return ""
+    candidates = [event]
+    for nested_key in ("alarm", "raw_alarm", "source_alarm"):
+        nested = event.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for source in candidates:
+        for key in keys:
+            value = source.get(key, "")
+            text = str(value or "").strip()
+            if text and text.lower() not in {"nan", "none", "null"}:
+                return text
     return ""
 
 
@@ -470,7 +475,15 @@ def summarize_alarm_event(event, index):
         "alarm_type": alarm_type_from_title(event.get("alarm_title", "")),
         "is_clear": is_clear_alarm(alarm),
         "工单号": _event_metadata_value(event, "工单号", "ticket_id"),
-        "故障组ID": _event_metadata_value(event, "故障组ID", "fault_group_id", "group_id"),
+        "故障组ID": _event_metadata_value(
+            event,
+            "故障组ID",
+            "告警故障组ID",
+            "原始故障组ID",
+            "fault_group_id",
+            "alarm_group_id",
+            "native_group_id",
+        ),
         "告警清除时间": _event_metadata_value(event, "告警清除时间", "clear_time"),
     }
 

@@ -1210,6 +1210,9 @@ class MissingChainSampler:
             "is_clear": bool(m.get("is_clear", False)),
             "parent_event_id": eid_to_id.get(ev.parent, ""),
         }
+        for field_name in ("工单号", "故障组ID", "告警清除时间"):
+            if m.get(field_name):
+                summary[field_name] = m.get(field_name, "")
         if ev.is_missing():
             # Confidence of an imputed node = how confidently its children leaned
             # on it (mean child attach prob); 0 if somehow childless.
