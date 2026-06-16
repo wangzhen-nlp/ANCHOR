@@ -137,8 +137,8 @@ def _parse_time_arg(parser, value, name):
 def main():
     parser = argparse.ArgumentParser(description="检查告警里是否存在相同 eid 的情况")
     parser.add_argument("alarms", help="告警输入：支持 jsonl / csv / zip / 目录")
-    parser.add_argument("--start", help="时间段起点（含），如 '2026-06-01 00:00:00'")
-    parser.add_argument("--end", help="时间段终点（含），如 '2026-06-02 00:00:00'")
+    parser.add_argument("--start-time", help="时间段起点（含），如 '2026-06-01 00:00:00'")
+    parser.add_argument("--end-time", help="时间段终点（含），如 '2026-06-02 00:00:00'")
     parser.add_argument(
         "--time-field",
         default=DEFAULT_TIME_FIELD,
