@@ -4716,6 +4716,7 @@
                         const alarmTime = getAlarmDisplayTime(alarm);
                         const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                         const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
+                        const alarmId = alarm.alarm_id || alarm.eid || alarm.id || '-';
                         const ticketId = alarm['工单号'] || '-';
                         const faultGroup = getAlarmFaultGroupId(alarm);
                         const mhpGroup = alarm.mhp_group_id || alarm['来源故障组UUID'] || alarm.source_group_uuid || '';
@@ -4728,6 +4729,7 @@
                             '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
                                 '<span>' + alarmTitle + '</span>' + virtualBadge +
                             '</div>' +
+                            '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">告警ID: ' + escapeHtml(alarmId) + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
                             '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                             '<div style="font-size: 10px; color: #57606a;">MHP group: ' + escapeHtml(mhpGroup || '-') + '</div>' +
@@ -5015,8 +5017,10 @@
                 const description = alarm.description || alarm.alarm_desc || '-';
                 const time = getAlarmDisplayTime(alarm);
                 const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
+                const alarmId = alarm.alarm_id || alarm.eid || alarm.id || '-';
                 const ticketId = alarm['工单号'] || '-';
                 const faultGroup = getAlarmFaultGroupId(alarm);
+                const mhpGroup = alarm.mhp_group_id || alarm['来源故障组UUID'] || alarm.source_group_uuid || '';
                 const faultGroupHtml = faultGroup
                     ? renderAlarmGroupMarker(faultGroup, { size: 16 }) + '<span>' + escapeHtml(faultGroup) + '</span>'
                     : '<span>-</span>';
@@ -5054,8 +5058,10 @@
                         '<span style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: ' + severityColor + '; color: white;">' + severityText + '</span>' +
                     '</div>' +
                     '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">告警ID: ' + escapeHtml(alarmId) + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px;">MHP group: ' + escapeHtml(mhpGroup || '-') + '</div>' +
                     virtualMeta +
                     '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
                     '</div>';
