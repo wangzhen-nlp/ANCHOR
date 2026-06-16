@@ -155,10 +155,10 @@ def main():
     parser.add_argument("--no-progress", action="store_true", help="关闭读取进度显示")
     args = parser.parse_args()
 
-    start = _parse_time_arg(parser, args.start, "--start")
-    end = _parse_time_arg(parser, args.end, "--end")
+    start = _parse_time_arg(parser, args.start_time, "--start-time")
+    end = _parse_time_arg(parser, args.end_time, "--end-time")
     if start is not None and end is not None and start > end:
-        parser.error("--start 不能晚于 --end")
+        parser.error("--start-time 不能晚于 --end-time")
 
     result = check_duplicate_eid(
         args.alarms,
