@@ -4446,24 +4446,58 @@
         }
 
         function dedupeNodeAlarms(alarms) {
-            const seen = new Set();
+            const byKey = new Map();
+            const order = [];
             const result = [];
             (alarms || []).forEach(function(alarm) {
                 if (!alarm || typeof alarm !== 'object') return;
                 const key = [
                     alarm.alarm_id || alarm.eid || alarm.id || '',
-                    alarm.mhp_group_id || alarm['来源故障组UUID'] || alarm.source_group_uuid || '',
-                    getAlarmFaultGroupId(alarm),
-                    alarm.matched_role || '',
                     alarm.site_id || '',
                     alarm.alarm_time || alarm.time || alarm.time_str || alarm.ts || '',
                     alarm.alarm_type || alarm.alarm || alarm.title || ''
                 ].map(function(value) { return String(value || '').trim(); }).join('|');
-                if (seen.has(key)) return;
-                seen.add(key);
-                result.push(alarm);
+                if (!byKey.has(key)) {
+                    byKey.set(key, Object.assign({}, alarm));
+                    order.push(key);
+                    return;
+                }
+                mergeAlarmFields(byKey.get(key), alarm);
+            });
+            order.forEach(function(key) {
+                result.push(byKey.get(key));
             });
             return result;
+        }
+
+        function mergeAlarmFields(target, source) {
+            if (!target || !source) return target;
+            Object.keys(source).forEach(function(field) {
+                const current = target[field];
+                const incoming = source[field];
+                const hasCurrent = current !== null && current !== undefined && String(current).trim() !== '';
+                const hasIncoming = incoming !== null && incoming !== undefined && String(incoming).trim() !== '';
+                if (!hasCurrent && hasIncoming) {
+                    target[field] = incoming;
+                }
+            });
+            [
+                ['故障组ID', 'fault_group_id', 'alarm_group_id'],
+                ['mhp_group_id', '来源故障组UUID', 'source_group_uuid']
+            ].forEach(function(fields) {
+                const value = fields.map(function(field) {
+                    return source[field] || target[field] || '';
+                }).find(function(item) {
+                    return item !== null && item !== undefined && String(item).trim() !== '';
+                }) || '';
+                if (!value) return;
+                fields.forEach(function(field) {
+                    if (!target[field] || String(target[field]).trim() === '') {
+                        target[field] = value;
+                    }
+                });
+            });
+            return target;
         }
 
         function handleSiteNeighborModeToggle(enabled) {
