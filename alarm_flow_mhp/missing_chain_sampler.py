@@ -1101,7 +1101,11 @@ class MissingChainSampler:
             return r
 
         clusters: dict[int, list[SamplerEvent]] = {}
+        seen_eids = set()
         for eid in self._order:
+            if eid in seen_eids:
+                continue
+            seen_eids.add(eid)
             ev = self.events.get(eid)
             if ev is not None:
                 clusters.setdefault(_memo_root(eid), []).append(ev)
@@ -1246,8 +1250,37 @@ class MissingChainSampler:
         par = self.events.get(ev.parent) if ev.parent != -1 else None
         return bool(par is not None and par.is_missing())
 
+    def _dedupe_group_members(self, members: list[SamplerEvent]) -> list[SamplerEvent]:
+        by_key: dict[tuple, SamplerEvent] = {}
+        order: list[tuple] = []
+        for ev in members:
+            if ev.observed:
+                event_id = self._event_id(ev)
+                alarm_source = str((ev.meta or {}).get("alarm_source", "") or "")
+                if event_id and alarm_source:
+                    key = ("observed", alarm_source, event_id)
+                else:
+                    key = ("eid", ev.eid)
+            else:
+                key = ("missing", ev.eid)
+            if key not in by_key:
+                by_key[key] = ev
+                order.append(key)
+                continue
+            existing = by_key[key]
+            if self._meta_score(ev.meta) > self._meta_score(existing.meta):
+                by_key[key] = ev
+        return [by_key[key] for key in order]
+
+    @staticmethod
+    def _meta_score(meta: dict) -> int:
+        if not isinstance(meta, dict):
+            return 0
+        preferred = ("故障组ID", "工单号", "告警清除时间", "alarm_source", "site_id", "alarm_title")
+        return sum(1 for key in preferred if str(meta.get(key, "") or "").strip())
+
     def _build_group(self, members: list[SamplerEvent]) -> Optional[dict]:
-        members = sorted(members, key=lambda e: e.ts)
+        members = sorted(self._dedupe_group_members(members), key=lambda e: e.ts)
         real = [m for m in members if m.observed]
         if not real:
             return None                    # pure-missing cascade → drop (noise)
