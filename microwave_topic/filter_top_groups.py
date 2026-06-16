@@ -114,12 +114,17 @@ def _select_top_k(groups, top_k, key):
             best_by_sites[signature] = (rank, idx, item)
 
     survivors = [(idx, item) for _, idx, item in best_by_sites.values()]
+    dropped_by_dedup = len(groups) - len(survivors)
     # 再按 metrics 元组从大到小排序，平手用原始下标破除，保证稳定可复现。
     survivors.sort(key=lambda pair: (_group_metrics(key(pair[1])), -pair[0]), reverse=True)
 
+    after_dedup = len(survivors)
     if top_k is not None and top_k >= 0:
         survivors = survivors[:top_k]
-    return [pair[1] for pair in survivors]
+    dropped_by_topk = after_dedup - len(survivors)
+
+    stats = {"dropped_by_dedup": dropped_by_dedup, "dropped_by_topk": dropped_by_topk}
+    return [pair[1] for pair in survivors], stats
 
 
 def filter_groups(input_path, output_path, top_k, seed=None):
@@ -129,7 +134,7 @@ def filter_groups(input_path, output_path, top_k, seed=None):
     if input_path.is_dir():
         items = _load_groups_from_dir(input_path)
         total = len(items)
-        selected = _select_top_k(items, top_k, key=lambda item: item[1])
+        selected, select_stats = _select_top_k(items, top_k, key=lambda item: item[1])
         rng.shuffle(selected)
 
         out_dir = Path(output_path)
@@ -142,7 +147,7 @@ def filter_groups(input_path, output_path, top_k, seed=None):
     elif input_path.is_file():
         groups = _load_groups_from_file(input_path)
         total = len(groups)
-        selected = _select_top_k(groups, top_k, key=lambda group: group)
+        selected, select_stats = _select_top_k(groups, top_k, key=lambda group: group)
         rng.shuffle(selected)
 
         out_path = Path(output_path)
@@ -163,6 +168,8 @@ def filter_groups(input_path, output_path, top_k, seed=None):
         "output_kind": output_kind,
         "input_group_count": total,
         "output_group_count": kept,
+        "dropped_by_dedup": select_stats["dropped_by_dedup"],
+        "dropped_by_topk": select_stats["dropped_by_topk"],
         "top_k": top_k,
         "seed": seed,
     }
