@@ -446,6 +446,18 @@ def _event_id(event, fallback_index):
     return f"alarm-{fallback_index:06d}"
 
 
+def _event_metadata_value(event, *keys):
+    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
+    for key in keys:
+        value = event.get(key, "")
+        if (value is None or str(value).strip() == "") and isinstance(alarm, dict):
+            value = alarm.get(key, "")
+        text = str(value or "").strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return text
+    return ""
+
+
 def summarize_alarm_event(event, index):
     alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
     return {
@@ -457,6 +469,9 @@ def summarize_alarm_event(event, index):
         "alarm_title": str(event.get("alarm_title", "") or ""),
         "alarm_type": alarm_type_from_title(event.get("alarm_title", "")),
         "is_clear": is_clear_alarm(alarm),
+        "工单号": _event_metadata_value(event, "工单号", "ticket_id"),
+        "故障组ID": _event_metadata_value(event, "故障组ID", "fault_group_id", "group_id"),
+        "告警清除时间": _event_metadata_value(event, "告警清除时间", "clear_time"),
     }
 
 

@@ -114,7 +114,7 @@ def _symptom_to_visual_record_mhp(symptom):
     """Per-symptom visual record. ``matched_rule`` reflects the MHP namespace and
     marks imputed nodes with the missing rule so node-level filtering works."""
     is_virtual = bool(symptom.get("virtual", False))
-    return {
+    record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
         "alarm": symptom.get("alarm_title", ""),
@@ -129,6 +129,10 @@ def _symptom_to_visual_record_mhp(symptom):
         "matched_role": "cascade",
         "matched_role_key": "cascade",
     }
+    for field_name in ("工单号", "故障组ID", "告警清除时间"):
+        if symptom.get(field_name):
+            record[field_name] = symptom.get(field_name, "")
+    return record
 
 
 def group_to_visual_match_mhp(group, ne_graph_data=None):
