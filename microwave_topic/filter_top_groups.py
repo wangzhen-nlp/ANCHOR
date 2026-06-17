@@ -96,20 +96,38 @@ def _load_groups_from_dir(input_dir):
     return items
 
 
-def _select_top_k(groups, top_k, key, min_sites=0):
+def _select_top_k(groups, top_k, key, min_sites=0, debug_ids=None):
     """按 metrics 元组从大到小排序取 top-k，平手时用原始下标（保证稳定可复现）破除。
 
     过滤原则：
     1. 带告警站点数小于 min_sites 的组先丢弃；
     2. 若多组带告警的站点集合完全相同，只保留告警数最多的那个（平手取靠前的）；
     其余丢弃，不再补足 top-k（最终数量可能少于 k）。
+
+    debug_ids 非空时，额外记录这些故障组在每一阶段的去留及原因，便于排查为何被过滤。
     """
+    debug_ids = set(debug_ids or [])
+    # debug_trace[group_id] = {"stage": ..., "reason": ...}
+    debug_trace = {}
+
+    def _trace(group, stage, reason):
+        gid = _group_id(group)
+        if gid and gid in debug_ids:
+            debug_trace[gid] = {"故障组ID": gid, "阶段": stage, "原因": reason}
+
     # 1. 最少站点数过滤。
     filtered = []
     for idx, item in enumerate(groups):
-        site_ids, _, _ = _alarm_stats(key(item))
+        group = key(item)
+        site_ids, _, _ = _alarm_stats(group)
         if len(site_ids) >= min_sites:
             filtered.append((idx, item))
+        else:
+            _trace(
+                group,
+                "min_sites",
+                f"被过滤：带告警站点数 {len(site_ids)} < min_sites {min_sites}",
+            )
     dropped_by_min_sites = len(groups) - len(filtered)
 
     # 2. 按站点签名去重：同一站点集合只保留告警数最多的（平手取原始下标靠前的）。
@@ -124,24 +142,74 @@ def _select_top_k(groups, top_k, key, min_sites=0):
             best_by_sites[signature] = (rank, idx, item)
 
     survivors = [(idx, item) for _, idx, item in best_by_sites.values()]
+    # 去重阶段被丢弃的组：记录它败给了哪个组、告警数差距。
+    if debug_ids:
+        survivor_idx = {idx for idx, _ in survivors}
+        for idx, item in filtered:
+            if idx in survivor_idx:
+                continue
+            group = key(item)
+            signature = _site_signature(group)
+            _, _, alarm_count = _alarm_stats(group)
+            _, _, win_item = best_by_sites[signature]
+            win_group = key(win_item)
+            _, _, win_alarm = _alarm_stats(win_group)
+            _trace(
+                group,
+                "dedup",
+                f"被过滤：带告警站点集合与故障组 {_group_id(win_group) or '?'} 相同，"
+                f"但告警数 {alarm_count} 不如对方 {win_alarm}（平手时本组原始顺序靠后）",
+            )
     dropped_by_dedup = len(filtered) - len(survivors)
     # 再按 metrics 元组从大到小排序，平手用原始下标破除，保证稳定可复现。
     survivors.sort(key=lambda pair: (_group_metrics(key(pair[1])), -pair[0]), reverse=True)
 
     after_dedup = len(survivors)
     if top_k is not None and top_k >= 0:
-        survivors = survivors[:top_k]
+        kept_survivors = survivors[:top_k]
+        # top-k 截断阶段被丢弃的组：记录其排序名次与 metrics。
+        for rank_pos, (idx, item) in enumerate(survivors[top_k:], start=top_k + 1):
+            group = key(item)
+            _trace(
+                group,
+                "top_k",
+                f"被过滤：按 (站点数,设备数,告警数)={_group_metrics(group)} 排序后位列第 "
+                f"{rank_pos} 名，超出 top_k {top_k}",
+            )
+        survivors = kept_survivors
     dropped_by_topk = after_dedup - len(survivors)
+
+    # 标记成功保留的 debug 组。
+    if debug_ids:
+        for rank_pos, (idx, item) in enumerate(survivors, start=1):
+            group = key(item)
+            gid = _group_id(group)
+            if gid and gid in debug_ids:
+                debug_trace[gid] = {
+                    "故障组ID": gid,
+                    "阶段": "保留",
+                    "原因": f"已保留：排序第 {rank_pos} 名，metrics={_group_metrics(group)}",
+                }
+        # 输入里压根不存在的 debug id。
+        for gid in debug_ids:
+            if gid not in debug_trace:
+                debug_trace[gid] = {
+                    "故障组ID": gid,
+                    "阶段": "未找到",
+                    "原因": "输入中没有该故障组ID（请检查 ID 是否正确）",
+                }
 
     stats = {
         "dropped_by_min_sites": dropped_by_min_sites,
         "dropped_by_dedup": dropped_by_dedup,
         "dropped_by_topk": dropped_by_topk,
     }
+    if debug_ids:
+        stats["debug"] = [debug_trace[gid] for gid in debug_ids]
     return [pair[1] for pair in survivors], stats
 
 
-def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
+def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0, debug_ids=None):
     input_path = Path(input_path)
     rng = random.Random(seed)
 
@@ -149,7 +217,7 @@ def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
         items = _load_groups_from_dir(input_path)
         total = len(items)
         selected, select_stats = _select_top_k(
-            items, top_k, key=lambda item: item[1], min_sites=min_sites
+            items, top_k, key=lambda item: item[1], min_sites=min_sites, debug_ids=debug_ids
         )
         rng.shuffle(selected)
 
@@ -164,7 +232,7 @@ def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
         groups = _load_groups_from_file(input_path)
         total = len(groups)
         selected, select_stats = _select_top_k(
-            groups, top_k, key=lambda group: group, min_sites=min_sites
+            groups, top_k, key=lambda group: group, min_sites=min_sites, debug_ids=debug_ids
         )
         rng.shuffle(selected)
 
@@ -180,7 +248,7 @@ def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
     else:
         raise FileNotFoundError(f"输入路径不存在: {input_path}")
 
-    return {
+    result = {
         "input": str(input_path),
         "output": str(output_path),
         "output_kind": output_kind,
@@ -193,6 +261,9 @@ def filter_groups(input_path, output_path, top_k, seed=None, min_sites=0):
         "min_sites": min_sites,
         "seed": seed,
     }
+    if "debug" in select_stats:
+        result["debug"] = select_stats["debug"]
+    return result
 
 
 def build_arg_parser():
@@ -214,6 +285,15 @@ def build_arg_parser():
         default=None,
         help="打乱顺序用的随机种子，省略则每次随机；指定后结果可复现",
     )
+    parser.add_argument(
+        "--debug-group",
+        dest="debug_groups",
+        action="append",
+        default=None,
+        metavar="故障组ID",
+        help="调试：指定故障组ID（uuid/故障组ID），打印其在各过滤阶段的去留及原因；"
+        "可多次传入或用逗号分隔多个 ID",
+    )
     return parser
 
 
@@ -224,8 +304,21 @@ def main():
         parser.error("--top-k 不能为负数")
     if args.min_sites < 0:
         parser.error("--min-sites 不能为负数")
+    debug_ids = None
+    if args.debug_groups:
+        debug_ids = [
+            gid.strip()
+            for raw in args.debug_groups
+            for gid in raw.split(",")
+            if gid.strip()
+        ]
     stats = filter_groups(
-        args.input, args.output, args.top_k, seed=args.seed, min_sites=args.min_sites
+        args.input,
+        args.output,
+        args.top_k,
+        seed=args.seed,
+        min_sites=args.min_sites,
+        debug_ids=debug_ids,
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
