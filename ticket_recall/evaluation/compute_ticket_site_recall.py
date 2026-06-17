@@ -21,6 +21,7 @@ from ticket_recall.evaluation.recall_common import (
     _resolve_alarm_site_id,
 )
 from ticket_recall.ticket_recall_utils import (
+    alarm_record_identity_key,
     build_alarm_to_group_index,
     build_ne_to_domain_map,
     build_site_has_domain_map,
@@ -221,9 +222,10 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
             alarm_id = extract_alarm_record_id(record)
             if not alarm_id:
                 continue
+            alarm_key = alarm_record_identity_key(record)
             raw_groups = sorted({
                 _normalize_text(group_id)
-                for group_id in alarm_to_groups.get(alarm_id, ())
+                for group_id in alarm_to_groups.get(alarm_key, ())
                 if _normalize_text(group_id) and _normalize_text(group_id) not in excluded_groups
             })
             if not raw_groups:
@@ -288,10 +290,11 @@ def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_i
 
     result = {}
     for alarm_id in sorted(debug_alarm_ids):
+        fallback_key = ("alarm_id", alarm_id)
         result[alarm_id] = {
             "matched_groups": sorted({
                 _normalize_text(group_id)
-                for group_id in alarm_to_groups.get(alarm_id, ())
+                for group_id in alarm_to_groups.get(fallback_key, ())
                 if _normalize_text(group_id)
             }),
             "evidence_hits": alarm_presence.get(alarm_id, []),

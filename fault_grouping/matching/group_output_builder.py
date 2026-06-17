@@ -257,6 +257,10 @@ def build_group_output(
             field_value = symptom.get(field_name)
             if isinstance(field_value, list) and field_value:
                 alarm_output[field_name] = field_value
+        for field_name in ("occurrence_id", "_mhp_occurrence_id", "_case_alarm_seq"):
+            field_value = symptom.get(field_name)
+            if field_value not in (None, ""):
+                alarm_output[field_name] = field_value
         ne_alarms[ne_id].append(alarm_output)
         if include_eid_list and eid_list:
             ne_alarms[ne_id][-1]["alarm_id_list"] = eid_list
@@ -334,18 +338,66 @@ def build_group_output(
 
 def build_alarm_metadata_index(valid_alarms):
     alarm_metadata_index = {}
+    raw_occurrence_seq = 0
+
+    def normalize(value):
+        text = str(value or "").strip()
+        return "" if text.lower() in {"nan", "none", "null", "undefined"} else text
+
+    def is_clear_alarm_record(alarm):
+        return normalize(alarm.get("清除告警", "")).lower() in {"是", "yes", "true", "1", "y"}
+
+    def metadata_keys(event_id, site_id, alarm_source, alarm_title, ts, occurrence_id=""):
+        keys = []
+        normalized_event_id = normalize(event_id)
+        if not normalized_event_id:
+            return keys
+        normalized_site_id = normalize(site_id)
+        normalized_alarm_source = normalize(alarm_source)
+        normalized_occurrence_id = normalize(occurrence_id)
+        if normalized_occurrence_id:
+            keys.append((
+                "occurrence_id",
+                normalized_occurrence_id,
+                normalized_site_id,
+                normalized_alarm_source,
+                normalized_event_id,
+            ))
+        context = (
+            normalized_site_id,
+            normalized_alarm_source,
+            normalize(ts),
+            normalize(alarm_title),
+        )
+        if any(context):
+            keys.append(("alarm_context", normalized_event_id, *context))
+        keys.append(("alarm_id", normalized_event_id))
+        keys.append(normalized_event_id)
+        return keys
+
+    def merge_metadata(key, metadata):
+        existing = alarm_metadata_index.setdefault(key, {})
+        for field_name, value in metadata.items():
+            if value and not existing.get(field_name):
+                existing[field_name] = value
+
     for item in valid_alarms:
         alarm = item.get("alarm", {})
         event_id = alarm.get("告警编码ID", "")
         if not event_id:
             continue
 
-        existing = alarm_metadata_index.setdefault(event_id, {})
+        occurrence_id = ""
+        if not is_clear_alarm_record(alarm):
+            raw_occurrence_seq += 1
+            occurrence_id = f"raw-{raw_occurrence_seq}"
+
         field_aliases = {
             "工单号": ("工单号",),
             "故障组ID": ("故障组ID",),
             "告警清除时间": ("告警清除时间",),
         }
+        metadata = {}
         for field_name, aliases in field_aliases.items():
             value = ""
             for alias in aliases:
@@ -353,14 +405,66 @@ def build_alarm_metadata_index(valid_alarms):
                 if raw_value:
                     value = raw_value
                     break
-            if value and not existing.get(field_name):
-                existing[field_name] = value
+            if value:
+                metadata[field_name] = value
+
+        if not metadata:
+            continue
+
+        for key in metadata_keys(
+            event_id,
+            item.get("site_id", ""),
+            item.get("alarm_source", ""),
+            item.get("alarm_title", ""),
+            item.get("ts", ""),
+            occurrence_id=occurrence_id,
+        ):
+            merge_metadata(key, metadata)
 
     return alarm_metadata_index
 
 
 def enrich_match_symptoms(match, alarm_metadata_index, include_eid_list=False):
     enriched_symptoms = []
+
+    def normalize(value):
+        text = str(value or "").strip()
+        return "" if text.lower() in {"nan", "none", "null", "undefined"} else text
+
+    def lookup_metadata(symptom, event_id):
+        normalized_event_id = normalize(event_id)
+        if not normalized_event_id:
+            return {}
+        site_id = normalize(symptom.get("node", "")) or normalize(symptom.get("site_id", ""))
+        alarm_source = normalize(symptom.get("alarm_source", ""))
+        occurrence_id = normalize(symptom.get("occurrence_id", ""))
+        lookup_keys = []
+        if occurrence_id:
+            lookup_keys.append((
+                "occurrence_id",
+                occurrence_id,
+                site_id,
+                alarm_source,
+                normalized_event_id,
+            ))
+        context = (
+            site_id,
+            alarm_source,
+            normalize(symptom.get("ts", "")),
+            normalize(symptom.get("alarm", "")) or normalize(symptom.get("alarm_type", "")),
+        )
+        if any(context):
+            lookup_keys.append(("alarm_context", normalized_event_id, *context))
+        lookup_keys.extend([
+            ("alarm_id", normalized_event_id),
+            normalized_event_id,
+        ])
+        for key in lookup_keys:
+            metadata = alarm_metadata_index.get(key)
+            if metadata:
+                return metadata
+        return {}
+
     for symptom in match.get("symptoms", []):
         enriched_symptom = dict(symptom)
         for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts"):
@@ -378,7 +482,7 @@ def enrich_match_symptoms(match, alarm_metadata_index, include_eid_list=False):
         if event_id and not enriched_symptom.get("eid"):
             enriched_symptom["eid"] = event_id
         if event_id:
-            metadata = alarm_metadata_index.get(event_id, {})
+            metadata = lookup_metadata(enriched_symptom, event_id)
             for field_name in ("工单号", "故障组ID", "告警清除时间"):
                 if metadata.get(field_name) and not enriched_symptom.get(field_name):
                     enriched_symptom[field_name] = metadata[field_name]

@@ -187,16 +187,70 @@ def matches_expected_alarm(alarm_type, expected, alarm_source_domain=None):
     return isinstance(expected, Iterable) and alarm_type in expected
 
 
+def get_symptom_alarm_identity(symptom, use_alarm_period_cache=False):
+    if not isinstance(symptom, dict):
+        return None
+    for field_name in ("_case_alarm_seq", "_mhp_occurrence_id"):
+        value = symptom.get(field_name)
+        if value not in (None, ""):
+            return (field_name, str(value))
+    occurrence_id = symptom.get("occurrence_id")
+    if occurrence_id not in (None, ""):
+        return (
+            "occurrence_id",
+            str(occurrence_id),
+            str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
+            str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
+            str(symptom.get("eid", "") or symptom.get("alarm_id", "") or symptom.get("告警编码ID", "") or ""),
+            str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
+            str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
+        )
+    if use_alarm_period_cache:
+        segment_key = symptom.get("_segment_key")
+        if segment_key not in (None, ""):
+            return segment_key
+    alarm_key = symptom.get("eid") or symptom.get("alarm_id") or symptom.get("告警编码ID")
+    if alarm_key in (None, ""):
+        return None
+    return (
+        "alarm",
+        str(alarm_key),
+        str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
+        str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
+        str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
+        str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
+    )
+
+
+def get_symptom_strong_occurrence_identity(symptom):
+    if not isinstance(symptom, dict):
+        return None
+    for field_name in ("_case_alarm_seq", "_mhp_occurrence_id"):
+        value = symptom.get(field_name)
+        if value not in (None, ""):
+            return (field_name, str(value))
+    occurrence_id = symptom.get("occurrence_id")
+    if occurrence_id not in (None, ""):
+        return (
+            "occurrence_id",
+            str(occurrence_id),
+            str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
+            str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
+            str(symptom.get("eid", "") or symptom.get("alarm_id", "") or symptom.get("告警编码ID", "") or ""),
+            str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
+            str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
+        )
+    return None
+
+
 def get_match_alarm_keys(match_result, use_alarm_period_cache=False):
     alarm_keys = set()
     for symptom in match_result.get("symptoms", []):
-        if use_alarm_period_cache:
-            alarm_key = symptom.get("_segment_key")
-            if alarm_key in (None, ""):
-                alarm_key = symptom.get("eid")
-        else:
-            alarm_key = symptom.get("eid")
-        if alarm_key not in (None, ""):
+        alarm_key = get_symptom_alarm_identity(
+            symptom,
+            use_alarm_period_cache=use_alarm_period_cache,
+        )
+        if alarm_key is not None:
             alarm_keys.add(alarm_key)
     return alarm_keys
 
@@ -296,6 +350,11 @@ def _merge_interval_end(left_end_ts, right_end_ts):
 
 
 def symptoms_overlap(left_symptom, right_symptom):
+    left_occurrence = get_symptom_strong_occurrence_identity(left_symptom)
+    right_occurrence = get_symptom_strong_occurrence_identity(right_symptom)
+    if left_occurrence is not None and right_occurrence is not None and left_occurrence != right_occurrence:
+        return False
+
     if get_symptom_overlap_base_key(left_symptom) != get_symptom_overlap_base_key(right_symptom):
         return False
 
@@ -311,6 +370,11 @@ def symptoms_overlap(left_symptom, right_symptom):
 
 
 def symptom_covers(cover_symptom, target_symptom):
+    cover_occurrence = get_symptom_strong_occurrence_identity(cover_symptom)
+    target_occurrence = get_symptom_strong_occurrence_identity(target_symptom)
+    if cover_occurrence is not None and target_occurrence is not None and cover_occurrence != target_occurrence:
+        return False
+
     if get_symptom_overlap_base_key(cover_symptom) != get_symptom_overlap_base_key(target_symptom):
         return False
 
@@ -552,8 +616,8 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
             collected_symptoms.extend(source.get("symptoms", []))
         else:
             for symptom in source.get("symptoms", []):
-                alarm_key = symptom.get("eid")
-                if alarm_key in (None, ""):
+                alarm_key = get_symptom_alarm_identity(symptom, use_alarm_period_cache=False)
+                if alarm_key is None:
                     continue
                 existing_symptom = symptom_map.get(alarm_key)
                 if existing_symptom is None:
@@ -651,7 +715,8 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_a
                 start_ts, end_ts = get_symptom_interval(symptom)
                 if overlap_key is None or start_ts is None:
                     continue
-                overlap_key_to_entries[overlap_key].append((start_ts, end_ts, idx))
+                occurrence_identity = get_symptom_strong_occurrence_identity(symptom)
+                overlap_key_to_entries[overlap_key].append((start_ts, end_ts, idx, occurrence_identity))
 
         for entries in overlap_key_to_entries.values():
             if len(entries) < 2:
@@ -660,19 +725,29 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_a
             entries.sort(key=lambda item: (item[0], _interval_end_sort_value(item[1]), item[2]))
             component_head = None
             component_end_ts = None
-            for start_ts, end_ts, idx in entries:
+            component_occurrence_identity = None
+            for start_ts, end_ts, idx, occurrence_identity in entries:
                 if component_head is None:
                     component_head = idx
                     component_end_ts = end_ts
+                    component_occurrence_identity = occurrence_identity
                     continue
 
-                if start_ts <= _interval_end_sort_value(component_end_ts):
+                distinct_occurrences = (
+                    component_occurrence_identity is not None
+                    and occurrence_identity is not None
+                    and component_occurrence_identity != occurrence_identity
+                )
+                if start_ts <= _interval_end_sort_value(component_end_ts) and not distinct_occurrences:
                     union(component_head, idx, reason="alarm_overlap")
                     component_end_ts = _merge_interval_end(component_end_ts, end_ts)
+                    if component_occurrence_identity is None:
+                        component_occurrence_identity = occurrence_identity
                     continue
 
                 component_head = idx
                 component_end_ts = end_ts
+                component_occurrence_identity = occurrence_identity
     else:
         match_primary_keys = [get_match_alarm_keys(match, use_alarm_period_cache=False) for match in matches]
         eid_to_match_indexes = collections.defaultdict(list)

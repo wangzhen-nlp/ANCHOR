@@ -189,6 +189,8 @@ class OnlineCascade:
                     "target_index": int(event.index),
                     "source_event_id": parent.event_id,
                     "target_event_id": event.event_id,
+                    "source_occurrence_id": f"obs-{parent.index}",
+                    "target_occurrence_id": f"obs-{event.index}",
                     "source_type": parent.type_label,
                     "target_type": event.type_label,
                 }

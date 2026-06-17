@@ -42,6 +42,7 @@ class NodeRuleHelper:
             consumed_trigger_rules = ()
             raw_event_items = None
             raw_event_ts_list = None
+            occurrence_id = None
             consumed_cutoff_by_rule = {}
 
             if isinstance(cached_event, dict):
@@ -49,6 +50,7 @@ class NodeRuleHelper:
                 eid = cached_event.get("eid")
                 alarm = cached_event.get("alarm")
                 alarm_source = cached_event.get("alarm_source", "")
+                occurrence_id = cached_event.get("occurrence_id") or cached_event.get("_raw_event_occurrence_key")
                 consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
                 raw_event_items = cached_event.get("_raw_event_items")
                 raw_event_ts_list = cached_event.get("_raw_event_ts_list")
@@ -58,9 +60,12 @@ class NodeRuleHelper:
                 segment_end_ts = cached_event.get("_segment_end_ts")
             else:
                 try:
-                    ts, eid, alarm, alarm_source, consumed_trigger_rules = cached_event
+                    ts, eid, alarm, alarm_source, consumed_trigger_rules, occurrence_id = cached_event
                 except (TypeError, ValueError):
-                    continue
+                    try:
+                        ts, eid, alarm, alarm_source, consumed_trigger_rules = cached_event
+                    except (TypeError, ValueError):
+                        continue
                 segment_key = None
                 segment_start_ts = None
                 segment_end_ts = None
@@ -72,7 +77,7 @@ class NodeRuleHelper:
 
             if raw_event_items:
                 if raw_event_ts_list is None:
-                    raw_event_ts_list = tuple(raw_ts for _raw_event_id, raw_ts in raw_event_items)
+                    raw_event_ts_list = tuple(item[1] for item in raw_event_items)
                 cutoff_ts = None
                 if exclude_consumed_trigger_rule:
                     cutoff_ts = consumed_cutoff_by_rule.get(exclude_consumed_trigger_rule)
@@ -82,8 +87,13 @@ class NodeRuleHelper:
                 if cutoff_ts is not None:
                     left_idx = bisect_right(raw_event_ts_list, cutoff_ts, left_idx, right_idx)
 
-                for raw_event_id, raw_ts in raw_event_items[left_idx:right_idx]:
-                    matched_events.append({
+                for raw_item in raw_event_items[left_idx:right_idx]:
+                    if len(raw_item) >= 3:
+                        raw_event_id, raw_ts, raw_occurrence_id = raw_item[:3]
+                    else:
+                        raw_event_id, raw_ts = raw_item
+                        raw_occurrence_id = None
+                    matched_event = {
                         "node": physical_node,
                         "ts": raw_ts,
                         "eid": raw_event_id,
@@ -93,7 +103,10 @@ class NodeRuleHelper:
                         "_segment_key": segment_key,
                         "_segment_start_ts": segment_start_ts,
                         "_segment_end_ts": segment_end_ts,
-                    })
+                    }
+                    if raw_occurrence_id not in (None, ""):
+                        matched_event["occurrence_id"] = raw_occurrence_id
+                    matched_events.append(matched_event)
                 continue
 
             if ts is None:
@@ -103,7 +116,7 @@ class NodeRuleHelper:
             if ts < window_start or ts > window_end:
                 continue
 
-            matched_events.append({
+            matched_event = {
                 "node": physical_node,
                 "ts": ts,
                 "eid": eid,
@@ -113,7 +126,10 @@ class NodeRuleHelper:
                 "_segment_key": segment_key,
                 "_segment_start_ts": segment_start_ts,
                 "_segment_end_ts": segment_end_ts,
-            })
+            }
+            if occurrence_id not in (None, ""):
+                matched_event["occurrence_id"] = occurrence_id
+            matched_events.append(matched_event)
 
         return matched_events
 
@@ -575,12 +591,23 @@ class NodeRuleHelper:
                     deduped_events = []
                     seen_event_ids = set()
                     for event in collected_events:
-                        event_id = event.get("eid") or (
-                            event.get("node"),
-                            event.get("ts"),
-                            event.get("alarm"),
-                            event.get("alarm_source"),
-                        )
+                        event_id = event.get("_case_alarm_seq") or event.get("_mhp_occurrence_id")
+                        if not event_id and event.get("occurrence_id") not in (None, ""):
+                            event_id = (
+                                "occurrence_id",
+                                event.get("occurrence_id"),
+                                event.get("node"),
+                                event.get("alarm_source"),
+                                event.get("eid"),
+                            )
+                        if not event_id:
+                            event_id = (
+                                event.get("eid"),
+                                event.get("node"),
+                                event.get("ts"),
+                                event.get("alarm"),
+                                event.get("alarm_source"),
+                            )
                         if event_id in seen_event_ids:
                             continue
                         seen_event_ids.add(event_id)

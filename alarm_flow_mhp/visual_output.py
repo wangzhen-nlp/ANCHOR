@@ -30,6 +30,16 @@ from alarm_flow_brunch.visual_output import (
 from alarm_flow_mhp.missing_chain_sampler import MHP_RULE, MHP_VIRTUAL_RULE
 
 
+def _symptom_occurrence_id_mhp(symptom):
+    occurrence_id = str(symptom.get("occurrence_id", "") or "").strip()
+    if occurrence_id:
+        return occurrence_id
+    index = symptom.get("index")
+    if index not in (None, ""):
+        return f"obs-{index}"
+    return ""
+
+
 def _classify_mhp_edge(ne_graph_data, source_symptom, target_symptom):
     """Topology relation of a parent→child edge, MHP-labelled. Same structure as
     BRUNCH's classifier; only the relation strings carry the MHP namespace."""
@@ -54,18 +64,25 @@ def _mhp_propagation_edges(group, ne_graph_data):
     inferred propagation — including edges through imputed missing nodes."""
     if not ne_graph_data:
         return []
-    symptoms_by_event_id = {
-        str(s.get("event_id", "") or ""): s
-        for s in group.get("symptoms") or []
-        if s.get("event_id")
-    }
+    symptoms_by_key = {}
+    for symptom in group.get("symptoms") or []:
+        occurrence_id = str(symptom.get("occurrence_id", "") or "")
+        event_id = str(symptom.get("event_id", "") or "")
+        if occurrence_id:
+            symptoms_by_key[("occurrence", occurrence_id)] = symptom
+        if event_id and ("event", event_id) not in symptoms_by_key:
+            symptoms_by_key[("event", event_id)] = symptom
     edges = []
     seen = set()
     for edge in group.get("edges") or []:
         src_id = str(edge.get("source_event_id", "") or "")
         tgt_id = str(edge.get("target_event_id", "") or "")
-        src = symptoms_by_event_id.get(src_id)
-        tgt = symptoms_by_event_id.get(tgt_id)
+        src_occurrence_id = str(edge.get("source_occurrence_id", "") or "")
+        tgt_occurrence_id = str(edge.get("target_occurrence_id", "") or "")
+        src_key = ("occurrence", src_occurrence_id) if src_occurrence_id else ("event", src_id)
+        tgt_key = ("occurrence", tgt_occurrence_id) if tgt_occurrence_id else ("event", tgt_id)
+        src = symptoms_by_key.get(src_key)
+        tgt = symptoms_by_key.get(tgt_key)
         if not src or not tgt:
             continue
         src_ne = str(src.get("alarm_source", "") or "")
@@ -75,7 +92,15 @@ def _mhp_propagation_edges(group, ne_graph_data):
         if _has_direct_ne_link(ne_graph_data, src_ne, tgt_ne):
             continue
         relation, hops = _classify_mhp_edge(ne_graph_data, src, tgt)
-        key = (src_id, tgt_id, src_ne, tgt_ne, relation)
+        key = (
+            src_id,
+            tgt_id,
+            src_occurrence_id,
+            tgt_occurrence_id,
+            src_ne,
+            tgt_ne,
+            relation,
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -89,6 +114,8 @@ def _mhp_propagation_edges(group, ne_graph_data):
             "target_ne": tgt_ne,
             "source_event_id": src_id,
             "target_event_id": tgt_id,
+            "source_occurrence_id": str(edge.get("source_occurrence_id", "") or ""),
+            "target_occurrence_id": str(edge.get("target_occurrence_id", "") or ""),
             "source_alarm": src.get("alarm_title", ""),
             "target_alarm": tgt.get("alarm_title", ""),
             "source_type": edge.get("source_type", ""),
@@ -114,6 +141,7 @@ def _symptom_to_visual_record_mhp(symptom):
     """Per-symptom visual record. ``matched_rule`` reflects the MHP namespace and
     marks imputed nodes with the missing rule so node-level filtering works."""
     is_virtual = bool(symptom.get("virtual", False))
+    occurrence_id = _symptom_occurrence_id_mhp(symptom)
     record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
@@ -121,6 +149,8 @@ def _symptom_to_visual_record_mhp(symptom):
         "alarm_type": symptom.get("alarm_type", ""),
         "ts": symptom.get("ts"),
         "eid": symptom.get("event_id", ""),
+        "occurrence_id": occurrence_id,
+        "_mhp_occurrence_id": occurrence_id,
         "virtual": is_virtual,
         "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),

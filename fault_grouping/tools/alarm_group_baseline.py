@@ -104,9 +104,13 @@ def event_group_ids(event, group_field):
     return _parse_group_ids(raw)
 
 
-def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data):
+def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data, occurrence_id=""):
     site_id = event_site(event, ne_graph_data)
     ne_id = event_ne(event)
+    occurrence_id = (
+        str(occurrence_id or "").strip()
+        or _value(event, "occurrence_id", "_mhp_occurrence_id", "_case_alarm_seq")
+    )
     return {
         "node": site_id,
         "site_id": site_id,
@@ -115,6 +119,7 @@ def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data):
         "alarm_type": _value(event, "alarm_type", "alarm_title", "告警标题", "alarm", "title"),
         "ts": event_ts(event),
         "eid": _value(event, "eid", "event_id", "告警编码ID", "alarm_id"),
+        "occurrence_id": occurrence_id,
         "matched_role": "alarm_group_baseline",
         "matched_rule": "alarm_group_baseline",
         "工单号": _value(event, "工单号", "ticket_id"),
@@ -136,10 +141,19 @@ def build_baseline_records(events, *, group_field, ne_graph_data=None, min_group
     for group_id, group_events in grouped.items():
         if len(group_events) < min_group_events:
             continue
-        symptoms = [
-            alarm_to_baseline_symptom(event, group_field=group_field, ne_graph_data=ne_graph_data)
-            for event in group_events
-        ]
+        symptoms = []
+        for event_index, event in enumerate(group_events):
+            occurrence_id = _value(event, "occurrence_id", "_mhp_occurrence_id", "_case_alarm_seq")
+            if not occurrence_id:
+                occurrence_id = f"alarm-baseline-{group_id}-{event_index}"
+            symptoms.append(
+                alarm_to_baseline_symptom(
+                    event,
+                    group_field=group_field,
+                    ne_graph_data=ne_graph_data,
+                    occurrence_id=occurrence_id,
+                )
+            )
         symptoms.sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))
         timestamps = [s["ts"] for s in symptoms if s.get("ts") is not None]
         group_uuid = f"alarm-baseline-{group_id}"

@@ -2,7 +2,12 @@ import uuid
 
 from datetime import datetime
 
-from fault_grouping.temporal_engine.utils import clone_instance_with_updates, qualify_role_key
+from fault_grouping.temporal_engine.utils import (
+    clone_instance_with_updates,
+    get_symptom_alarm_identity,
+    get_symptom_strong_occurrence_identity,
+    qualify_role_key,
+)
 
 
 class TemporalGraphEngineEvaluatorMixin:
@@ -1062,7 +1067,10 @@ class TemporalGraphEngineEvaluatorMixin:
             seen_curr_event_ids = set()
             for target_phys in curr_valid_targets:
                 for event in source_events_by_target.get(target_phys, curr_events):
-                    event_id = event.get("eid") or (
+                    event_id = get_symptom_alarm_identity(
+                        event,
+                        use_alarm_period_cache=self.use_alarm_period_cache,
+                    ) or (
                         event.get("node"),
                         event.get("ts"),
                         event.get("alarm"),
@@ -1335,13 +1343,13 @@ class TemporalGraphEngineEvaluatorMixin:
         event_enriched["eid_list"] = [hit_event_id] if hit_event_id not in (None, "") else []
 
         if not self.use_alarm_period_cache:
-            alarm_key = hit_event_id
-            if alarm_key in (None, ""):
+            alarm_key = get_symptom_alarm_identity(event_enriched, use_alarm_period_cache=False)
+            if alarm_key is None:
                 return
             symptoms_by_key[alarm_key] = event_enriched
             return
 
-        source_segment_key = (
+        source_segment_key = get_symptom_strong_occurrence_identity(event_enriched) or (
             event.get("_segment_key")
             or event.get("eid")
             or (event.get("node"), event.get("ts"), event.get("alarm"), event.get("alarm_source"))

@@ -2701,7 +2701,9 @@
                         edge.sample_id || '',
                         edge.inferred_hops || '',
                         edge.source_event_id || '',
-                        edge.target_event_id || ''
+                        edge.target_event_id || '',
+                        edge.source_occurrence_id || '',
+                        edge.target_occurrence_id || ''
                     ].join('|');
                     if (!sourceKey || !targetKey || seen.has(key)) return;
                     seen.add(key);
@@ -2765,7 +2767,9 @@
                     edge.sample_id || '',
                     edge.inferred_hops || '',
                     edge.source_event_id || '',
-                    edge.target_event_id || ''
+                    edge.target_event_id || '',
+                    edge.source_occurrence_id || '',
+                    edge.target_occurrence_id || ''
                 ].join('|');
                 if (linkSet && linkSet.has(key)) return;
                 if (linkSet) linkSet.add(key);
@@ -2788,6 +2792,8 @@
                     target_ne: targetNe,
                     source_event_id: edge.source_event_id || '',
                     target_event_id: edge.target_event_id || '',
+                    source_occurrence_id: edge.source_occurrence_id || '',
+                    target_occurrence_id: edge.target_occurrence_id || '',
                     source_alarm: edge.source_alarm || '',
                     target_alarm: edge.target_alarm || '',
                     source_type: edge.source_type || '',
@@ -4381,6 +4387,9 @@
                 mhp_group_id: symptom.mhp_group_id || symptom['来源故障组UUID'] || symptom.source_group_uuid || '',
                 alarm_group_id: symptom.alarm_group_id || symptom['故障组ID'] || symptom.fault_group_id || '',
                 _case_alarm_seq: symptom._case_alarm_seq || '',
+                occurrence_id: symptom.occurrence_id || '',
+                _mhp_occurrence_id: symptom._mhp_occurrence_id || symptom.occurrence_id || '',
+                _raw_alarm_occurrence_id: symptom._raw_alarm_occurrence_id || '',
                 virtual: !!symptom.virtual,
                 latent: !!symptom.latent,
                 confidence: symptom.confidence,
@@ -4411,6 +4420,14 @@
             const seq = String(alarm && alarm._case_alarm_seq || '').trim();
             if (seq) {
                 return 'seq:' + seq;
+            }
+            const mhpOccurrenceId = String(alarm && (alarm._mhp_occurrence_id || alarm.occurrence_id) || '').trim();
+            if (mhpOccurrenceId) {
+                return 'occ:' + mhpOccurrenceId;
+            }
+            const rawAlarmOccurrenceId = String(alarm && alarm._raw_alarm_occurrence_id || '').trim();
+            if (rawAlarmOccurrenceId) {
+                return 'raw:' + rawAlarmOccurrenceId;
             }
             const alarmId = String(alarm && alarm.alarm_id || '').trim();
             return alarmId ? 'alarm:' + alarmId : '';
@@ -5431,6 +5448,9 @@
                 html += '<div class="link-row"><span class="link-label">站点关系:</span><span class="link-value">' + escapeHtml(link.source_site || '-') + ' → ' + escapeHtml(link.target_site || '-') + '</span></div>';
                 if (link.source_event_id || link.target_event_id) {
                     html += '<div class="link-row"><span class="link-label">事件传播:</span><span class="link-value">' + escapeHtml(link.source_event_id || '-') + ' → ' + escapeHtml(link.target_event_id || '-') + '</span></div>';
+                }
+                if (link.source_occurrence_id || link.target_occurrence_id) {
+                    html += '<div class="link-row"><span class="link-label">事件实例:</span><span class="link-value">' + escapeHtml(link.source_occurrence_id || '-') + ' → ' + escapeHtml(link.target_occurrence_id || '-') + '</span></div>';
                 }
                 if (link.source_alarm || link.target_alarm) {
                     html += '<div class="link-row"><span class="link-label">告警传播:</span><span class="link-value">' + escapeHtml(link.source_alarm || '-') + ' → ' + escapeHtml(link.target_alarm || '-') + '</span></div>';
@@ -6487,6 +6507,9 @@
                         fault_group_id: getAlarmFaultGroupId(alarm),
                         alarm_id: alarm.alarm_id || alarm.eid || alarm.id || '',
                         alarm_id_list: alarm.alarm_id_list || alarm.eid_list || [],
+                        occurrence_id: alarm.occurrence_id || '',
+                        mhp_occurrence_id: alarm._mhp_occurrence_id || alarm.occurrence_id || '',
+                        raw_alarm_occurrence_id: alarm._raw_alarm_occurrence_id || '',
                         alarm_type: alarm.alarm_type || alarm.alarm || alarm.title || '',
                         severity: alarm.severity || alarm.alarm_level || '',
                         time: getAlarmDisplayTime(alarm),

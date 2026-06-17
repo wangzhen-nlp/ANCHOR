@@ -25,6 +25,7 @@ from ticket_recall.evaluation.recall_common import (
 )
 from ticket_recall.evaluation.compute_ticket_site_recall_upper_bound import _should_skip_alarm
 from ticket_recall.ticket_recall_utils import (
+    alarm_record_identity_key,
     build_alarm_to_group_index,
     build_ne_to_domain_map,
     build_site_has_domain_map,
@@ -251,9 +252,10 @@ def _build_potential_evidence_debug_info(site_evidence, alarm_to_groups, exclude
             alarm_id = extract_alarm_record_id(record)
             if not alarm_id:
                 continue
+            alarm_key = alarm_record_identity_key(record)
             indexed_groups = sorted({
                 _normalize_text(group_id)
-                for group_id in alarm_to_groups.get(alarm_id, ())
+                for group_id in alarm_to_groups.get(alarm_key, ())
                 if _normalize_text(group_id)
             })
             raw_groups = sorted({
@@ -330,10 +332,11 @@ def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_i
 
     result = {}
     for alarm_id in sorted(debug_alarm_ids):
+        fallback_key = ("alarm_id", alarm_id)
         result[alarm_id] = {
             "matched_groups": sorted({
                 _normalize_text(group_id)
-                for group_id in alarm_to_groups.get(alarm_id, ())
+                for group_id in alarm_to_groups.get(fallback_key, ())
                 if _normalize_text(group_id)
             }),
             "evidence_hits": alarm_presence.get(alarm_id, []),
@@ -381,6 +384,34 @@ def _print_debug_site_group_lookup(debug_site_group_lookup):
 def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenced_group_ids=None, allowed_site_ids=None):
     if not debug_group_ids:
         return {}
+
+    def symptom_alarm_key(record):
+        case_alarm_seq = _normalize_text(record.get("_case_alarm_seq", ""))
+        if case_alarm_seq:
+            return ("case_seq", case_alarm_seq)
+        mhp_occurrence_id = _normalize_text(record.get("_mhp_occurrence_id", ""))
+        if mhp_occurrence_id:
+            return ("mhp_occurrence", mhp_occurrence_id)
+        occurrence_id = _normalize_text(record.get("occurrence_id", ""))
+        if occurrence_id:
+            return (
+                "occurrence",
+                occurrence_id,
+                record.get("site_id", ""),
+                record.get("alarm_source", ""),
+                record.get("alarm_id", ""),
+                record.get("alarm_time", "") or record.get("time_str", "") or record.get("ts", ""),
+                record.get("alarm", "") or record.get("alarm_type", "") or record.get("告警标题", ""),
+            )
+        return (
+            record.get("site_id", ""),
+            record.get("alarm_id", ""),
+            record.get("alarm", ""),
+            record.get("ts", ""),
+            record.get("alarm_source", ""),
+            record.get("matched_role", ""),
+            record.get("ticket_id", ""),
+        )
 
     normalized_group_ids = {
         _normalize_text(group_id)
@@ -467,6 +498,9 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
                 "alarm_source": _normalize_text(symptom.get("alarm_source", "")) or _normalize_text(symptom.get("告警源", "")),
                 "matched_role": _normalize_text(symptom.get("matched_role", "")),
                 "ticket_id": _normalize_text(symptom.get("工单号", "")),
+                "_case_alarm_seq": _normalize_text(symptom.get("_case_alarm_seq", "")),
+                "occurrence_id": _normalize_text(symptom.get("occurrence_id", "")),
+                "_mhp_occurrence_id": _normalize_text(symptom.get("_mhp_occurrence_id", "")),
             })
         for group_id in sorted(related_only_group_ids):
             result[group_id]["present_in_related_group_uuids"] = True
@@ -500,28 +534,12 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
                 if _normalize_text(site_id)
             })
             existing_alarm_keys = {
-                (
-                    item.get("site_id", ""),
-                    item.get("alarm_id", ""),
-                    item.get("alarm", ""),
-                    item.get("ts", ""),
-                    item.get("alarm_source", ""),
-                    item.get("matched_role", ""),
-                    item.get("ticket_id", ""),
-                )
+                symptom_alarm_key(item)
                 for item in result[group_id]["symptom_alarms"]
                 if isinstance(item, dict)
             }
             for symptom_alarm in symptom_alarms:
-                alarm_key = (
-                    symptom_alarm.get("site_id", ""),
-                    symptom_alarm.get("alarm_id", ""),
-                    symptom_alarm.get("alarm", ""),
-                    symptom_alarm.get("ts", ""),
-                    symptom_alarm.get("alarm_source", ""),
-                    symptom_alarm.get("matched_role", ""),
-                    symptom_alarm.get("ticket_id", ""),
-                )
+                alarm_key = symptom_alarm_key(symptom_alarm)
                 if alarm_key in existing_alarm_keys:
                     continue
                 existing_alarm_keys.add(alarm_key)

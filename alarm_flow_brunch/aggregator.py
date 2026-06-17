@@ -226,17 +226,55 @@ def _event_id(event, fallback_index):
     return f"alarm-{fallback_index:06d}"
 
 
+def _event_occurrence_id(event, fallback_index):
+    if isinstance(event, dict):
+        value = event.get("occurrence_id") or event.get("_mhp_occurrence_id")
+        value = str(value or "").strip()
+        if value:
+            return value
+    return f"obs-{fallback_index}"
+
+
+def _event_metadata_value(event, *keys):
+    if not isinstance(event, dict):
+        return ""
+    candidates = [event]
+    for nested_key in ("alarm", "raw_alarm", "source_alarm"):
+        nested = event.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for source in candidates:
+        for key in keys:
+            value = source.get(key, "")
+            text = str(value or "").strip()
+            if text and text.lower() not in {"nan", "none", "null"}:
+                return text
+    return ""
+
+
 def summarize_alarm_event(event, index):
     alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
     return {
         "index": int(index),
         "event_id": _event_id(event, index),
+        "occurrence_id": _event_occurrence_id(event, index),
         "ts": float(event.get("ts", 0.0)),
         "site_id": str(event.get("site_id", "") or ""),
         "alarm_source": str(event.get("alarm_source", "") or ""),
         "alarm_title": str(event.get("alarm_title", "") or ""),
         "alarm_type": alarm_type_from_title(event.get("alarm_title", "")),
         "is_clear": is_clear_alarm(alarm),
+        "工单号": _event_metadata_value(event, "工单号", "ticket_id"),
+        "故障组ID": _event_metadata_value(
+            event,
+            "故障组ID",
+            "告警故障组ID",
+            "原始故障组ID",
+            "fault_group_id",
+            "alarm_group_id",
+            "native_group_id",
+        ),
+        "告警清除时间": _event_metadata_value(event, "告警清除时间", "clear_time"),
     }
 
 
@@ -692,6 +730,8 @@ def _group_records(sequence, result, *, min_group_events=1):
                     "target_index": child_index,
                     "source_event_id": _event_id(sequence.events[parent_index], parent_index),
                     "target_event_id": _event_id(sequence.events[child_index], child_index),
+                    "source_occurrence_id": _event_occurrence_id(sequence.events[parent_index], parent_index),
+                    "target_occurrence_id": _event_occurrence_id(sequence.events[child_index], child_index),
                     "source_type": sequence.type_labels[parent_index],
                     "target_type": sequence.type_labels[child_index],
                 }
@@ -734,6 +774,8 @@ def _edge_records(sequence, result):
                 "target_index": target_index,
                 "source_event_id": _event_id(sequence.events[source_index], source_index),
                 "target_event_id": _event_id(sequence.events[target_index], target_index),
+                "source_occurrence_id": _event_occurrence_id(sequence.events[source_index], source_index),
+                "target_occurrence_id": _event_occurrence_id(sequence.events[target_index], target_index),
                 "source_type": sequence.type_labels[source_index],
                 "target_type": sequence.type_labels[target_index],
                 "source_event": summarize_alarm_event(sequence.events[source_index], source_index),

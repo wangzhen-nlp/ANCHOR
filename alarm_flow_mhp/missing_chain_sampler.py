@@ -440,7 +440,7 @@ class MissingChainSampler:
     def visual_snapshot_groups(self, age_sec: float, now_ts: Optional[float] = None) -> list[dict]:
         """Return visual-only snapshots for old live clusters without closing.
 
-        Snapshot history is matched by overlapping observed event ids so that a
+        Snapshot history is matched by overlapping observed occurrences so that a
         later snapshot/final output can point at the previous visual row through
         ``related_group_uuids`` even if Gibbs re-parenting changes the root id.
         """
@@ -1142,13 +1142,13 @@ class MissingChainSampler:
         return out
 
     def _members_observed_event_ids(self, members: list[SamplerEvent]) -> frozenset[str]:
-        return frozenset(self._event_id(m) for m in members if m.observed)
+        return frozenset(self._occurrence_id(m) for m in members if m.observed)
 
     def _group_observed_event_ids(self, group: dict) -> frozenset[str]:
         return frozenset(
-            str(s.get("event_id", "") or "")
+            str(s.get("occurrence_id", "") or s.get("event_id", "") or "")
             for s in group.get("symptoms") or []
-            if s.get("event_id") and not bool(s.get("virtual"))
+            if (s.get("occurrence_id") or s.get("event_id")) and not bool(s.get("virtual"))
         )
 
     def _related_visual_snapshot_uuids(self, observed_ids: frozenset[str]) -> set[str]:
@@ -1197,11 +1197,15 @@ class MissingChainSampler:
             return f"missing-{ev.eid}"
         return str(ev.meta.get("event_id") or f"obs-{ev.eid}")
 
+    def _occurrence_id(self, ev: SamplerEvent) -> str:
+        return f"missing-{ev.eid}" if ev.is_missing() else f"obs-{ev.eid}"
+
     def _event_summary(self, ev: SamplerEvent, eid_to_id: dict, child_probs: dict) -> dict:
         m = ev.meta or {}
         title = str(m.get("alarm_title", "") or m.get("type_label", "") or "")
         summary = {
             "event_id": self._event_id(ev),
+            "occurrence_id": self._occurrence_id(ev),
             "ts": float(ev.ts),
             "site_id": str(m.get("site_id", "") or ""),
             "alarm_source": str(m.get("alarm_source", "") or ""),
@@ -1272,6 +1276,8 @@ class MissingChainSampler:
                 edges.append({
                     "source_event_id": eid_to_id[m.parent],
                     "target_event_id": eid_to_id[m.eid],
+                    "source_occurrence_id": self._occurrence_id(par),
+                    "target_occurrence_id": self._occurrence_id(m),
                     "source_type": self._type_label(par),
                     "target_type": self._type_label(m),
                     "score": float(m.commit_parent_prob),

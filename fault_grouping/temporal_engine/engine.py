@@ -266,6 +266,7 @@ class TemporalGraphEngine(
         # 仅在 period 模式下使用；raw 模式保持为空。
         self.active_alarm_periods = collections.defaultdict(dict)
         self.active_event_to_period = collections.defaultdict(dict)
+        self._event_occurrence_seq = 0
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
@@ -434,8 +435,10 @@ class TemporalGraphEngine(
                             affected_rule_names=affected_rule_names
                         )
                 else:
+                    self._event_occurrence_seq += 1
+                    occurrence_id = f"raw-{self._event_occurrence_seq}"
                     self.event_cache[node].append(
-                        (ts, event_id, alarm_type, alarm_source, frozenset())
+                        (ts, event_id, alarm_type, alarm_source, frozenset(), occurrence_id)
                     )
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
@@ -483,12 +486,18 @@ class TemporalGraphEngine(
             alarm_type = event.get("alarm")
             alarm_source = event.get("alarm_source", "")
             consumed_trigger_rules = event.get("consumed_trigger_rules", ())
+            occurrence_id = event.get("occurrence_id") or event.get("_raw_event_occurrence_key")
         else:
-            ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
+            try:
+                ts, event_id, alarm_type, alarm_source, consumed_trigger_rules, occurrence_id = event
+            except (TypeError, ValueError):
+                ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
+                occurrence_id = None
         payload = {
             "node": node,
             "ts": ts,
             "event_id": event_id,
+            "occurrence_id": occurrence_id,
             "alarm_type": alarm_type,
             "alarm_source": alarm_source,
             "consumed_trigger_rules": sorted(consumed_trigger_rules),

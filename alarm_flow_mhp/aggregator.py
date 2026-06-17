@@ -463,11 +463,20 @@ def _event_metadata_value(event, *keys):
     return ""
 
 
+def _event_occurrence_id(event, fallback_index):
+    if isinstance(event, dict):
+        value = event.get("occurrence_id") or event.get("_mhp_occurrence_id")
+        if value not in (None, ""):
+            return str(value)
+    return f"obs-{int(fallback_index)}"
+
+
 def summarize_alarm_event(event, index):
     alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
     return {
         "index": int(index),
         "event_id": _event_id(event, index),
+        "occurrence_id": _event_occurrence_id(event, index),
         "ts": float(event.get("ts", 0.0)),
         "site_id": str(event.get("site_id", "") or ""),
         "alarm_source": str(event.get("alarm_source", "") or ""),

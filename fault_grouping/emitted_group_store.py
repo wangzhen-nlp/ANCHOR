@@ -5,8 +5,10 @@ from fault_grouping.temporal_engine.utils import (
     _role_key_for_merged_source,
     get_match_alarm_keys,
     get_match_symptom_overlap_keys,
+    get_symptom_alarm_identity,
     get_symptom_overlap_base_key,
     merge_overlapping_symptoms,
+    merge_symptom_role_metadata,
     symptom_covers,
     symptoms_overlap,
 )
@@ -222,8 +224,15 @@ class EmittedGroupStore:
 
             for symptom in previous_match.get("symptoms", []):
                 alarm_key = self._get_alarm_key(symptom)
-                if alarm_key is not None:
+                if alarm_key is None:
+                    continue
+                existing_symptom = symptom_map.get(alarm_key)
+                if existing_symptom is None:
                     symptom_map[alarm_key] = symptom
+                else:
+                    # 同一发生同时出现在当前组与历史组：保留当前轮的 symptom 为主，
+                    # 但合并历史组的 role/规则归属，避免丢失某一侧的命中信息。
+                    symptom_map[alarm_key] = merge_symptom_role_metadata(existing_symptom, symptom)
 
         merged["symptoms"] = list(symptom_map.values())
 
@@ -459,7 +468,4 @@ class EmittedGroupStore:
 
     @staticmethod
     def _get_alarm_key(symptom):
-        eid = symptom.get("eid")
-        if eid in (None, ""):
-            return None
-        return eid
+        return get_symptom_alarm_identity(symptom, use_alarm_period_cache=False)

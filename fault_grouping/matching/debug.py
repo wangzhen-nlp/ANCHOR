@@ -97,12 +97,18 @@ def format_debug_site_events(engine, site_id, limit=50):
             alarm_type = cached_event.get("alarm")
             alarm_source = cached_event.get("alarm_source", "")
             consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
+            occurrence_id = cached_event.get("occurrence_id") or cached_event.get("_raw_event_occurrence_key")
         else:
-            ts, eid, alarm_type, alarm_source, consumed_trigger_rules = cached_event
+            try:
+                ts, eid, alarm_type, alarm_source, consumed_trigger_rules, occurrence_id = cached_event
+            except (TypeError, ValueError):
+                ts, eid, alarm_type, alarm_source, consumed_trigger_rules = cached_event
+                occurrence_id = None
         formatted.append(
             {
                 "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                 "eid": eid,
+                "occurrence_id": occurrence_id,
                 "alarm": alarm_type,
                 "source": alarm_source,
                 "consumed_trigger_rules": sorted(consumed_trigger_rules),

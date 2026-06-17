@@ -20,6 +20,8 @@ from ticket_recall.evaluation.recall_common import (
     _resolve_alarm_site_id,
 )
 from ticket_recall.ticket_recall_utils import (
+    alarm_record_fallback_id_key,
+    alarm_record_identity_key,
     build_ne_to_domain_map,
     build_site_alarm_map_for_sites,
     build_site_has_domain_map,
@@ -157,10 +159,13 @@ def _build_ultimate_group_indexes(group_records, group_field, ne_to_domain=None)
                 evidence_record = dict(symptom)
                 evidence_record["来源故障组UUID"] = group_id
                 ultimate_group_to_site_alarms[group_id][site_id].append(evidence_record)
-            alarm_id = _extract_alarm_id(symptom)
-            if alarm_id:
-                ultimate_group_to_alarm_ids[group_id].add(alarm_id)
-                alarm_id_to_ultimate_groups[alarm_id].add(group_id)
+            alarm_key = alarm_record_identity_key(symptom)
+            if alarm_key is not None:
+                ultimate_group_to_alarm_ids[group_id].add(alarm_key)
+                alarm_id_to_ultimate_groups[alarm_key].add(group_id)
+            fallback_key = alarm_record_fallback_id_key(symptom)
+            if fallback_key is not None:
+                alarm_id_to_ultimate_groups[fallback_key].add(group_id)
             alarm_group_ids = _parse_group_ids(symptom.get(group_field, ""))
             for alarm_group_id in alarm_group_ids:
                 ultimate_group_to_alarm_groups[group_id].add(alarm_group_id)
@@ -203,7 +208,6 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
         if not group_ids:
             continue
 
-        alarm_id = _extract_alarm_id(alarm)
         domain = _extract_domain(alarm)
         if not domain:
             alarm_source = _normalize_text(alarm.get("告警源", ""))
@@ -220,10 +224,15 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
                 alarm_group_to_sites[group_id].add(site_id)
                 evidence_record = dict(alarm)
                 evidence_record["故障组ID"] = group_id
+                evidence_record["关联站点ID"] = site_id
                 alarm_group_to_site_alarms[group_id][site_id].append(evidence_record)
-            if alarm_id:
-                alarm_group_to_alarm_ids[group_id].add(alarm_id)
-                alarm_id_to_alarm_groups[alarm_id].add(group_id)
+            alarm_key = alarm_record_identity_key(evidence_record if site_id else alarm)
+            if alarm_key is not None:
+                alarm_group_to_alarm_ids[group_id].add(alarm_key)
+                alarm_id_to_alarm_groups[alarm_key].add(group_id)
+            fallback_key = alarm_record_fallback_id_key(evidence_record if site_id else alarm)
+            if fallback_key is not None:
+                alarm_id_to_alarm_groups[fallback_key].add(group_id)
 
     return (
         dict(alarm_group_to_sites),

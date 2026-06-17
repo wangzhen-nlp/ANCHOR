@@ -780,11 +780,21 @@ def _summary_of(e) -> dict:
     s = summarize_alarm_event(e.alarm, e.index)
     if e.ne:
         s["alarm_source"] = e.ne
+    alarm_payload = e.alarm.get("alarm", {}) if isinstance(e.alarm, dict) else {}
+    for field_name in ("工单号", "故障组ID", "告警清除时间"):
+        value = ""
+        if isinstance(e.alarm, dict):
+            value = e.alarm.get(field_name, "")
+        if not value and isinstance(alarm_payload, dict):
+            value = alarm_payload.get(field_name, "")
+        if value:
+            s[field_name] = value
     return s
 
 
 def _cascade_to_group(cascade: Cascade) -> dict:
     summaries = [_summary_of(e) for e in cascade.events]
+    summary_by_index = {e.index: s for e, s in zip(cascade.events, summaries)}
     # Root is the event whose parent_index == -1 (immigrant), or the earliest by ts
     root = next((e for e in cascade.events if e.parent_index == -1), cascade.events[0])
     root_summary = _summary_of(root)
@@ -797,10 +807,16 @@ def _cascade_to_group(cascade: Cascade) -> dict:
         if e.parent_index == -1 or e.parent_index not in idx_set:
             continue
         parent = by_index[e.parent_index]
+        parent_summary = summary_by_index.get(parent.index, {})
+        child_summary = summary_by_index.get(e.index, {})
         group_edges.append(
             {
                 "source_index": parent.index,
                 "target_index": e.index,
+                "source_event_id": parent_summary.get("event_id", ""),
+                "target_event_id": child_summary.get("event_id", ""),
+                "source_occurrence_id": parent_summary.get("occurrence_id", ""),
+                "target_occurrence_id": child_summary.get("occurrence_id", ""),
                 "source_type": parent.type_label,
                 "target_type": e.type_label,
                 "score": float(e.parent_score),
