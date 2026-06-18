@@ -4,7 +4,7 @@ from datetime import datetime
 from functools import lru_cache
 from operator import itemgetter
 
-from fault_grouping.alarm_events.identity import require_alarm_identity
+from fault_grouping.alarm_events.identity import require_alarm_identity, require_occurrence_uuid
 
 
 _SORT_ALARM_KEY = itemgetter("alarm_time", "alarm_id")
@@ -261,13 +261,10 @@ def build_group_output(
             field_value = symptom.get(field_name)
             if isinstance(field_value, list) and field_value:
                 alarm_output[field_name] = field_value
-        for field_name in (
-            "occurrence_uuid",
-            "_mhp_event_index",
-        ):
-            field_value = symptom.get(field_name)
-            if field_value not in (None, ""):
-                alarm_output[field_name] = field_value
+        alarm_output["occurrence_uuid"] = require_occurrence_uuid(symptom)
+        mhp_event_index = symptom.get("_mhp_event_index")
+        if mhp_event_index not in (None, ""):
+            alarm_output["_mhp_event_index"] = mhp_event_index
         ne_alarms[ne_id].append(alarm_output)
         if include_eid_list and eid_list:
             ne_alarms[ne_id][-1]["alarm_id_list"] = eid_list

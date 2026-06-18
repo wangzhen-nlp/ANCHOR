@@ -201,12 +201,10 @@ def get_symptom_strong_occurrence_identity(symptom):
 def get_match_alarm_keys(match_result, use_alarm_period_cache=False):
     alarm_keys = set()
     for symptom in match_result.get("symptoms", []):
-        alarm_key = get_symptom_alarm_identity(
+        alarm_keys.add(get_symptom_alarm_identity(
             symptom,
             use_alarm_period_cache=use_alarm_period_cache,
-        )
-        if alarm_key is not None:
-            alarm_keys.add(alarm_key)
+        ))
     return alarm_keys
 
 
@@ -305,9 +303,7 @@ def _merge_interval_end(left_end_ts, right_end_ts):
 
 
 def symptoms_overlap(left_symptom, right_symptom):
-    left_occurrence = get_symptom_strong_occurrence_identity(left_symptom)
-    right_occurrence = get_symptom_strong_occurrence_identity(right_symptom)
-    if left_occurrence is not None and right_occurrence is not None and left_occurrence != right_occurrence:
+    if get_symptom_strong_occurrence_identity(left_symptom) != get_symptom_strong_occurrence_identity(right_symptom):
         return False
 
     if get_symptom_overlap_base_key(left_symptom) != get_symptom_overlap_base_key(right_symptom):
@@ -325,9 +321,7 @@ def symptoms_overlap(left_symptom, right_symptom):
 
 
 def symptom_covers(cover_symptom, target_symptom):
-    cover_occurrence = get_symptom_strong_occurrence_identity(cover_symptom)
-    target_occurrence = get_symptom_strong_occurrence_identity(target_symptom)
-    if cover_occurrence is not None and target_occurrence is not None and cover_occurrence != target_occurrence:
+    if get_symptom_strong_occurrence_identity(cover_symptom) != get_symptom_strong_occurrence_identity(target_symptom):
         return False
 
     if get_symptom_overlap_base_key(cover_symptom) != get_symptom_overlap_base_key(target_symptom):

@@ -173,27 +173,33 @@ class EngineTests(unittest.TestCase):
             stream_config=StreamPolicyConfig(reorder_lag_sec=0),
             topology=topology,
         )
+        a1 = _alarm("a1", 100, "光路中断", "ne-a", "site-a")
+        a2 = _alarm("a2", 105, "光路中断", "ne-b", "site-b")
+        a3 = _alarm("a3", 5000, "电源异常", "ne-c", "site-c")
         items = [
             {
-                "alarm": _alarm("a1", 100, "光路中断", "ne-a", "site-a"),
+                "alarm": a1,
                 "site_id": "site-a",
                 "alarm_source": "ne-a",
                 "alarm_title": "光路中断",
                 "ts": 100,
+                "occurrence_uuid": a1["occurrence_uuid"],
             },
             {
-                "alarm": _alarm("a2", 105, "光路中断", "ne-b", "site-b"),
+                "alarm": a2,
                 "site_id": "site-b",
                 "alarm_source": "ne-b",
                 "alarm_title": "光路中断",
                 "ts": 105,
+                "occurrence_uuid": a2["occurrence_uuid"],
             },
             {
-                "alarm": _alarm("a3", 5000, "电源异常", "ne-c", "site-c"),
+                "alarm": a3,
                 "site_id": "site-c",
                 "alarm_source": "ne-c",
                 "alarm_title": "电源异常",
                 "ts": 5000,
+                "occurrence_uuid": a3["occurrence_uuid"],
             },
         ]
 

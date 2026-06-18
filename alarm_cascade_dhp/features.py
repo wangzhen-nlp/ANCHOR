@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import datetime
 
 from alarm_cascade_dhp.event_types import AlarmEvent
-from fault_grouping.alarm_events.identity import require_alarm_identity
+from fault_grouping.alarm_events.identity import require_alarm_identity, require_occurrence_uuid
 
 
 _TITLE_PIECES = re.compile(r"[A-Za-z0-9_.:/-]+|[\u4e00-\u9fff]+")
@@ -66,8 +66,7 @@ class AlarmFeatureBuilder:
 
     def from_match_rules_item(self, item):
         raw = dict(item.get("alarm") or {})
-        if item.get("occurrence_uuid") not in (None, ""):
-            raw["occurrence_uuid"] = item["occurrence_uuid"]
+        raw["occurrence_uuid"] = require_occurrence_uuid(item)
         title = _text(item.get("alarm_title")) or _first_text(raw, "告警标题", "alarm_title")
         source = _text(item.get("alarm_source")) or _first_text(raw, "告警源", "alarm_source")
         site_id = _text(item.get("site_id")) or _first_text(raw, "站点ID", "site_id")

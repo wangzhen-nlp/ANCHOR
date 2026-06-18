@@ -23,17 +23,15 @@ def _uuid(value):
         return str(uuid_module.uuid5(uuid_module.NAMESPACE_URL, f"test-emitted-group:{value}"))
 
 
-def _symptom(eid, ts, occurrence_uuid=None, node="S1", alarm_source="NE1", alarm="A"):
-    symptom = {
+def _symptom(eid, ts, occurrence_uuid, node="S1", alarm_source="NE1", alarm="A"):
+    return {
         "node": node,
         "alarm_source": alarm_source,
         "alarm": alarm,
         "eid": eid,
         "ts": ts,
+        "occurrence_uuid": _uuid(occurrence_uuid),
     }
-    if occurrence_uuid is not None:
-        symptom["occurrence_uuid"] = _uuid(occurrence_uuid)
-    return symptom
 
 
 def _period_symptom(eid, ts, occurrence_uuid, node="S1", alarm_source="NE1", alarm="A"):

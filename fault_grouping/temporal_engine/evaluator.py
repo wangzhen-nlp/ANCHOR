@@ -1344,8 +1344,6 @@ class TemporalGraphEngineEvaluatorMixin:
 
         if not self.use_alarm_period_cache:
             alarm_key = get_symptom_alarm_identity(event_enriched, use_alarm_period_cache=False)
-            if alarm_key is None:
-                return
             symptoms_by_key[alarm_key] = event_enriched
             return
 
