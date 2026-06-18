@@ -33,6 +33,7 @@
 import argparse
 import copy
 import json
+from fault_grouping.alarm_events.identity import input_occurrence_uuid, require_alarm_identity
 import sys
 import uuid
 from collections import defaultdict
@@ -180,56 +181,17 @@ def _normalize_alarm_time_value(value):
 def _build_alarm_instance_keys(
     alarm_ids,
     *,
-    site_id="",
-    alarm_source="",
-    alarm_time="",
-    alarm_title="",
-    occurrence_id="",
+    occurrence_uuid,
 ):
     keys = set()
-    normalized_site_id = _normalize_text(site_id)
-    normalized_alarm_source = _normalize_text(alarm_source)
-    normalized_alarm_time = _normalize_alarm_time_value(alarm_time)
-    normalized_alarm_title = _normalize_text(alarm_title)
-    normalized_occurrence_id = _normalize_text(occurrence_id)
-    context = (
-        normalized_site_id,
-        normalized_alarm_source,
-        normalized_alarm_time,
-        normalized_alarm_title,
-    )
-    has_context = any(context)
-
     for alarm_id in alarm_ids:
         normalized_alarm_id = _normalize_text(alarm_id)
         if not normalized_alarm_id:
             continue
-        if normalized_occurrence_id:
-            keys.add((
-                "occurrence_context",
-                normalized_occurrence_id,
-                normalized_alarm_id,
-                *context,
-            ))
-        if has_context:
-            keys.add(("alarm_context", normalized_alarm_id, *context))
-            if normalized_alarm_source and normalized_alarm_time and normalized_alarm_title:
-                keys.add((
-                    "alarm_source_time_title",
-                    normalized_alarm_id,
-                    normalized_alarm_source,
-                    normalized_alarm_time,
-                    normalized_alarm_title,
-                ))
-            if normalized_alarm_source and normalized_alarm_time:
-                keys.add((
-                    "alarm_source_time",
-                    normalized_alarm_id,
-                    normalized_alarm_source,
-                    normalized_alarm_time,
-                ))
-        else:
-            keys.add(("alarm_id", normalized_alarm_id))
+        keys.add(require_alarm_identity({
+            "eid": normalized_alarm_id,
+            "occurrence_uuid": occurrence_uuid,
+        }))
     return keys
 
 
@@ -240,29 +202,7 @@ def _extract_alarm_keys_from_symptom(symptom):
     alarm_ids.extend(symptom.get("eid_list") or [])
     return _build_alarm_instance_keys(
         alarm_ids,
-        site_id=(
-            symptom.get("node", "")
-            or symptom.get("site_id", "")
-            or symptom.get("关联站点ID", "")
-            or symptom.get("站点ID", "")
-        ),
-        alarm_source=symptom.get("alarm_source", "") or symptom.get("告警源", ""),
-        alarm_time=(
-            symptom.get("time_str", "")
-            or symptom.get("alarm_time", "")
-            or symptom.get("告警首次发生时间", "")
-            or symptom.get("ts", "")
-        ),
-        alarm_title=(
-            symptom.get("alarm", "")
-            or symptom.get("alarm_type", "")
-            or symptom.get("告警标题", "")
-        ),
-        occurrence_id=(
-            symptom.get("occurrence_id", "")
-            or symptom.get("_mhp_occurrence_id", "")
-            or symptom.get("_case_alarm_seq", "")
-        ),
+        occurrence_uuid=symptom.get("occurrence_uuid"),
     )
 
 
@@ -273,34 +213,7 @@ def _extract_alarm_keys_from_alarm_record(alarm_record, default_ne_id=""):
             or alarm_record.get("eid", "")
             or alarm_record.get("告警编码ID", "")
         ] + list(alarm_record.get("alarm_id_list") or []),
-        site_id=(
-            alarm_record.get("site_id", "")
-            or alarm_record.get("node", "")
-            or alarm_record.get("关联站点ID", "")
-            or alarm_record.get("站点ID", "")
-        ),
-        alarm_source=(
-            alarm_record.get("alarm_source", "")
-            or alarm_record.get("告警源", "")
-            or default_ne_id
-        ),
-        alarm_time=(
-            alarm_record.get("alarm_time", "")
-            or alarm_record.get("time_str", "")
-            or alarm_record.get("告警首次发生时间", "")
-            or alarm_record.get("ts", "")
-        ),
-        alarm_title=(
-            alarm_record.get("alarm_type", "")
-            or alarm_record.get("alarm", "")
-            or alarm_record.get("告警标题", "")
-        ),
-        occurrence_id=(
-            alarm_record.get("occurrence_id", "")
-            or alarm_record.get("_raw_alarm_occurrence_id", "")
-            or alarm_record.get("_mhp_occurrence_id", "")
-            or alarm_record.get("_case_alarm_seq", "")
-        ),
+        occurrence_uuid=alarm_record.get("occurrence_uuid"),
     )
 
 
@@ -361,12 +274,12 @@ def _load_alarm_groups(alarm_input, group_field="故障组ID"):
     """
     alarm_groups = defaultdict(list)
     print("扫描原始告警并分组...")
-    occurrence_seq = 0
-    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
-        occurrence_seq += 1
+    for occurrence_ordinal, alarm in enumerate(
+        stream_alarm_inputs(alarm_input, show_progress=True),
+        start=1,
+    ):
         alarm = dict(alarm)
-        if not _normalize_text(alarm.get("_raw_alarm_occurrence_id", "")):
-            alarm["_raw_alarm_occurrence_id"] = f"raw-alarm-{occurrence_seq}"
+        alarm["occurrence_uuid"] = input_occurrence_uuid(alarm_input, occurrence_ordinal)
         raw_group_value = alarm.get(group_field)
         group_ids = _parse_group_ids(raw_group_value)
         if not group_ids:
@@ -386,7 +299,7 @@ def _alarm_to_symptom(alarm, ne_graph_data=None):
         "alarm": _normalize_text(alarm.get("告警标题", "")),
         "ts": ts,
         "eid": _normalize_text(alarm.get("告警编码ID", "")),
-        "occurrence_id": _normalize_text(alarm.get("_raw_alarm_occurrence_id", "")),
+        "occurrence_uuid": alarm["occurrence_uuid"],
         "alarm_source": ne_id,
         "matched_role": "",
         "工单号": _normalize_text(alarm.get("工单号", "")),
@@ -426,7 +339,7 @@ def _build_ne_info_from_alarms(alarm_list, ne_graph_data=None, site_graph_data=N
         ne_graph_entry = ne_graph_data.get(ne_id, {}) if ne_id else {}
         ne_info[ne_id]["alarm"].append({
             "alarm_id": _normalize_text(alarm.get("告警编码ID", "")),
-            "occurrence_id": _normalize_text(alarm.get("_raw_alarm_occurrence_id", "")),
+            "occurrence_uuid": alarm["occurrence_uuid"],
             "alarm_type": _normalize_text(alarm.get("告警标题", "")),
             "alarm_time": _normalize_text(alarm.get("告警首次发生时间", "")),
             "alarm_clear_time": _normalize_text(alarm.get("告警清除时间", "")),
@@ -481,142 +394,11 @@ def _build_group_output_from_alarms(group_id, alarm_list, ne_graph_data=None, si
 
 
 def _symptom_merge_key(symptom):
-    matched_role = _normalize_text(symptom.get("matched_role", ""))
-    ticket_id = _normalize_text(symptom.get("工单号", ""))
-    alarm_group_id = _normalize_text(symptom.get("故障组ID", ""))
-    case_alarm_seq = _normalize_text(symptom.get("_case_alarm_seq", ""))
-    if case_alarm_seq:
-        return ("case_alarm_seq", case_alarm_seq, matched_role, ticket_id, alarm_group_id)
-    mhp_occurrence_id = _normalize_text(symptom.get("_mhp_occurrence_id", ""))
-    if mhp_occurrence_id:
-        return ("mhp_occurrence_id", mhp_occurrence_id, matched_role, ticket_id, alarm_group_id)
-    occurrence_id = _normalize_text(symptom.get("occurrence_id", ""))
-    if occurrence_id:
-        return (
-            "occurrence_id",
-            occurrence_id,
-            _normalize_text(symptom.get("node", "")),
-            _normalize_text(symptom.get("alarm_source", "")),
-            _normalize_text(symptom.get("eid", "")),
-            _normalize_text(symptom.get("time_str", ""))
-            or _normalize_text(symptom.get("alarm_time", ""))
-            or _normalize_text(symptom.get("告警首次发生时间", ""))
-            or _normalize_text(symptom.get("ts", "")),
-            _normalize_text(symptom.get("alarm", ""))
-            or _normalize_text(symptom.get("alarm_type", ""))
-            or _normalize_text(symptom.get("告警标题", "")),
-            matched_role,
-            ticket_id,
-            alarm_group_id,
-        )
-    eid_list = tuple(
-        eid for eid in (_normalize_text(x) for x in (symptom.get("eid_list") or []))
-        if eid
-    )
-    symptom_context = (
-        _normalize_text(symptom.get("node", "")),
-        _normalize_text(symptom.get("alarm_source", "")),
-        _normalize_text(symptom.get("time_str", ""))
-        or _normalize_text(symptom.get("alarm_time", ""))
-        or _normalize_text(symptom.get("告警首次发生时间", ""))
-        or _normalize_text(symptom.get("ts", "")),
-        _normalize_text(symptom.get("alarm", ""))
-        or _normalize_text(symptom.get("alarm_type", ""))
-        or _normalize_text(symptom.get("告警标题", "")),
-    )
-    if eid_list:
-        if any(symptom_context):
-            return ("eid_list_context", eid_list, *symptom_context, matched_role, ticket_id, alarm_group_id)
-        return ("eid_list", eid_list, matched_role, ticket_id, alarm_group_id)
-
-    eid = _normalize_text(symptom.get("eid", ""))
-    if eid:
-        if any(symptom_context):
-            return ("eid_context", eid, *symptom_context, matched_role, ticket_id, alarm_group_id)
-        return ("eid", eid, matched_role, ticket_id, alarm_group_id)
-
-    return (
-        "fallback",
-        _normalize_text(symptom.get("node", "")),
-        _normalize_text(symptom.get("alarm", "")),
-        symptom.get("ts"),
-        _normalize_text(symptom.get("alarm_source", "")),
-        matched_role,
-        ticket_id,
-        alarm_group_id,
-    )
+    return require_alarm_identity(symptom)
 
 
 def _alarm_record_merge_key(alarm_record):
-    matched_role = _normalize_text(alarm_record.get("matched_role", ""))
-    ticket_id = _normalize_text(alarm_record.get("工单号", ""))
-    alarm_group_id = _normalize_text(alarm_record.get("故障组ID", ""))
-    case_alarm_seq = _normalize_text(alarm_record.get("_case_alarm_seq", ""))
-    if case_alarm_seq:
-        return ("case_alarm_seq", case_alarm_seq, matched_role, ticket_id, alarm_group_id)
-    mhp_occurrence_id = _normalize_text(alarm_record.get("_mhp_occurrence_id", ""))
-    if mhp_occurrence_id:
-        return ("mhp_occurrence_id", mhp_occurrence_id, matched_role, ticket_id, alarm_group_id)
-    occurrence_id = _normalize_text(alarm_record.get("occurrence_id", ""))
-    if occurrence_id:
-        return (
-            "occurrence_id",
-            occurrence_id,
-            _normalize_text(alarm_record.get("site_id", "")),
-            _normalize_text(alarm_record.get("alarm_source", ""))
-            or _normalize_text(alarm_record.get("告警源", "")),
-            _normalize_text(alarm_record.get("alarm_id", "")),
-            _normalize_text(alarm_record.get("alarm_time", ""))
-            or _normalize_text(alarm_record.get("告警首次发生时间", ""))
-            or _normalize_text(alarm_record.get("time_str", ""))
-            or _normalize_text(alarm_record.get("ts", "")),
-            _normalize_text(alarm_record.get("alarm_type", ""))
-            or _normalize_text(alarm_record.get("alarm", ""))
-            or _normalize_text(alarm_record.get("告警标题", "")),
-            matched_role,
-            ticket_id,
-            alarm_group_id,
-        )
-    alarm_id_list = tuple(
-        alarm_id
-        for alarm_id in (_normalize_text(x) for x in (alarm_record.get("alarm_id_list") or []))
-        if alarm_id
-    )
-    alarm_context = (
-        _normalize_text(alarm_record.get("site_id", ""))
-        or _normalize_text(alarm_record.get("node", ""))
-        or _normalize_text(alarm_record.get("关联站点ID", ""))
-        or _normalize_text(alarm_record.get("站点ID", "")),
-        _normalize_text(alarm_record.get("alarm_source", ""))
-        or _normalize_text(alarm_record.get("告警源", "")),
-        _normalize_text(alarm_record.get("alarm_time", ""))
-        or _normalize_text(alarm_record.get("告警首次发生时间", ""))
-        or _normalize_text(alarm_record.get("time_str", ""))
-        or _normalize_text(alarm_record.get("ts", "")),
-        _normalize_text(alarm_record.get("alarm_type", ""))
-        or _normalize_text(alarm_record.get("alarm", ""))
-        or _normalize_text(alarm_record.get("告警标题", "")),
-    )
-    if alarm_id_list:
-        if any(alarm_context):
-            return ("alarm_id_list_context", alarm_id_list, *alarm_context, matched_role, ticket_id, alarm_group_id)
-        return ("alarm_id_list", alarm_id_list, matched_role, ticket_id, alarm_group_id)
-
-    alarm_id = _normalize_text(alarm_record.get("alarm_id", ""))
-    if alarm_id:
-        if any(alarm_context):
-            return ("alarm_id_context", alarm_id, *alarm_context, matched_role, ticket_id, alarm_group_id)
-        return ("alarm_id", alarm_id, matched_role, ticket_id, alarm_group_id)
-
-    return (
-        "fallback",
-        _normalize_text(alarm_record.get("alarm_type", "")),
-        _normalize_text(alarm_record.get("alarm_time", "")),
-        _normalize_text(alarm_record.get("site_id", "")),
-        matched_role,
-        ticket_id,
-        alarm_group_id,
-    )
+    return require_alarm_identity(alarm_record)
 
 
 def _merge_alarm_record_lists(existing_list, incoming_list):

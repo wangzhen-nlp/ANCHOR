@@ -6,6 +6,7 @@ from typing import Any
 @dataclass
 class AlarmEvent:
     event_id: str
+    occurrence_uuid: str
     ts: float
     alarm_title: str
     alarm_source: str
@@ -19,6 +20,7 @@ class AlarmEvent:
     def compact(self):
         return {
             "event_id": self.event_id,
+            "occurrence_uuid": self.occurrence_uuid,
             "ts": self.ts,
             "alarm_title": self.alarm_title,
             "alarm_source": self.alarm_source,

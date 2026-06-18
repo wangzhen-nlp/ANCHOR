@@ -75,6 +75,7 @@ import collections
 import logging
 import time
 
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.temporal_engine.utils import (
     matches_expected_alarm,
@@ -162,25 +163,25 @@ class ActiveTriggerTracker:
         # rule_name → {site: max_ts}   用于 O(1) 按规则迭代
         self._by_rule = collections.defaultdict(dict)
 
-    def add(self, site, rule_name, eid, ts):
+    def add(self, site, rule_name, identity, ts):
         """注册 eid 为 (site, rule) 的活跃 trigger 告警（d1 置为 True）。"""
         key = (site, rule_name)
-        self._active[key][eid] = ts
+        self._active[key][identity] = ts
         prev = self._by_rule[rule_name].get(site, 0.0)
         if ts > prev:
             self._by_rule[rule_name][site] = ts
 
-    def remove_eid_from_all(self, eid):
+    def remove_identity_from_all(self, identity):
         """
         从所有 (site, rule) 记录中删除 eid。
         返回被影响的 (site, rule_name) 列表。
         """
         affected = []
         for key in list(self._active):
-            if eid not in self._active[key]:
+            if identity not in self._active[key]:
                 continue
             site, rule_name = key
-            del self._active[key][eid]
+            del self._active[key][identity]
             affected.append(key)
             if not self._active[key]:
                 # eid 集合为空 → d1 = False，移除记录
@@ -366,6 +367,7 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         alarm_type,
         ts,
         event_id,
+        occurrence_uuid,
         alarm_source="",
         is_clear=False,
         collect_matches=False,
@@ -381,17 +383,28 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         - 告警清除后立即执行失效匹配
         """
         with self._lock:
+            identity = require_alarm_identity({
+                "eid": event_id,
+                "occurrence_uuid": occurrence_uuid,
+            })
             self.current_watermark = max(self.current_watermark, ts)
             self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
             # 先清理该站点过期缓存，再写入新事件
             self._prune_expired_raw_events_in_place(node, ts)
 
             if is_clear:
-                return self._handle_alarm_clear(node, event_id, ts)
+                return self._handle_alarm_clear(
+                    node,
+                    event_id,
+                    occurrence_uuid,
+                    alarm_type,
+                    alarm_source,
+                    ts,
+                )
 
             # 将告警写入 event_cache（与父类格式兼容）
             self.event_cache[node].append(
-                (ts, event_id, alarm_type, alarm_source, frozenset())
+                (ts, event_id, alarm_type, alarm_source, frozenset(), occurrence_uuid)
             )
 
             # 更新 TurboFlux d1 状态：若该告警满足某规则的 trigger 谓词，则记为活跃
@@ -401,7 +414,7 @@ class IncrementalFaultEngine(TemporalGraphEngine):
                     matches_expected_alarm(alarm_type, exp, alarm_source_domain)
                     for exp in expected_list
                 ):
-                    self._trigger_tracker.add(node, rule_name, event_id, ts)
+                    self._trigger_tracker.add(node, rule_name, identity, ts)
 
             # 告警插入使邻域支持状态可能改变：推进分代，失效支持缓存
             self._alarm_generation += 1
@@ -426,7 +439,15 @@ class IncrementalFaultEngine(TemporalGraphEngine):
     # 失效匹配：告警清除
     # ------------------------------------------------------------------
 
-    def _handle_alarm_clear(self, node, event_id, ts):
+    def _handle_alarm_clear(
+        self,
+        node,
+        event_id,
+        occurrence_uuid,
+        alarm_type,
+        alarm_source,
+        ts,
+    ):
         """
         处理告警清除事件（在 self._lock 内调用）：
 
@@ -435,8 +456,15 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         3. 在 EmittedGroupStore 中将含有该 eid 的历史组标为 tombstone
            （失效匹配：该告警已不活跃，关联的故障组不再有效）
         """
-        self._remove_cleared_events(node, event_id)
-        affected = self._trigger_tracker.remove_eid_from_all(event_id)
+        identity = (str(event_id), str(occurrence_uuid))
+        self._remove_cleared_events(
+            node,
+            event_id,
+            occurrence_uuid,
+            alarm_type=alarm_type,
+            alarm_source=alarm_source,
+        )
+        affected = self._trigger_tracker.remove_identity_from_all(identity)
         if affected:
             logger.debug(
                 "告警清除 eid=%s，从 %d 条 (site,rule) trigger 记录中移除",
@@ -446,10 +474,10 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         # 告警删除同样推进分代，失效支持缓存
         self._alarm_generation += 1
         # 失效匹配：标记含该 eid 的历史组为无效
-        self._invalidate_history_by_eid(event_id)
+        self._invalidate_history_by_identity(identity)
         return []
 
-    def _invalidate_history_by_eid(self, eid):
+    def _invalidate_history_by_identity(self, identity):
         """
         失效匹配核心：将 EmittedGroupStore 中含有 eid 的历史组标为 tombstone。
 
@@ -460,7 +488,7 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         - 当 tombstone 占比超过阈值时触发索引重建，防止内存泄漏
         """
         store = self.emitted_group_store
-        affected_indexes = set(store.eid_to_group_indexes.get(eid, ()))
+        affected_indexes = set(store.eid_to_group_indexes.get(identity, ()))
         if not affected_indexes:
             return
 
@@ -474,7 +502,7 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         if invalidated:
             logger.debug(
                 "失效匹配：eid=%s，置空 %d 条历史故障组",
-                eid,
+                identity,
                 invalidated,
             )
 

@@ -18,6 +18,7 @@ from alarm_flow_isahp.sequences import (
 from alarm_flow_isahp.ne_topology import NETopologyIndex
 from brunch import BRUNCH, BRUNCHConfig, EventCollection, HawkesParams
 from fault_grouping.alarm_events.io import is_clear_alarm
+from fault_grouping.alarm_events.identity import require_eid, require_occurrence_uuid
 from alarm_flow_brunch.region_filter import filter_alarm_events_by_regions, parse_regions
 
 
@@ -216,25 +217,6 @@ def load_alarm_brunch_artifact(path) -> AlarmBRUNCHArtifact:
         return AlarmBRUNCHArtifact.from_dict(json.load(stream))
 
 
-def _event_id(event, fallback_index):
-    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
-    for key in ("告警编码ID", "alarm_id", "event_id", "id"):
-        value = alarm.get(key) if key in alarm else event.get(key, "")
-        value = str(value or "").strip()
-        if value:
-            return value
-    return f"alarm-{fallback_index:06d}"
-
-
-def _event_occurrence_id(event, fallback_index):
-    if isinstance(event, dict):
-        value = event.get("occurrence_id") or event.get("_mhp_occurrence_id")
-        value = str(value or "").strip()
-        if value:
-            return value
-    return f"obs-{fallback_index}"
-
-
 def _event_metadata_value(event, *keys):
     if not isinstance(event, dict):
         return ""
@@ -256,8 +238,8 @@ def summarize_alarm_event(event, index):
     alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
     return {
         "index": int(index),
-        "event_id": _event_id(event, index),
-        "occurrence_id": _event_occurrence_id(event, index),
+        "event_id": require_eid(event),
+        "occurrence_uuid": require_occurrence_uuid(event),
         "ts": float(event.get("ts", 0.0)),
         "site_id": str(event.get("site_id", "") or ""),
         "alarm_source": str(event.get("alarm_source", "") or ""),
@@ -728,10 +710,10 @@ def _group_records(sequence, result, *, min_group_events=1):
                 {
                     "source_index": parent_index,
                     "target_index": child_index,
-                    "source_event_id": _event_id(sequence.events[parent_index], parent_index),
-                    "target_event_id": _event_id(sequence.events[child_index], child_index),
-                    "source_occurrence_id": _event_occurrence_id(sequence.events[parent_index], parent_index),
-                    "target_occurrence_id": _event_occurrence_id(sequence.events[child_index], child_index),
+                    "source_event_id": require_eid(sequence.events[parent_index]),
+                    "target_event_id": require_eid(sequence.events[child_index]),
+                    "source_occurrence_uuid": require_occurrence_uuid(sequence.events[parent_index]),
+                    "target_occurrence_uuid": require_occurrence_uuid(sequence.events[child_index]),
                     "source_type": sequence.type_labels[parent_index],
                     "target_type": sequence.type_labels[child_index],
                 }
@@ -772,10 +754,10 @@ def _edge_records(sequence, result):
             {
                 "source_index": source_index,
                 "target_index": target_index,
-                "source_event_id": _event_id(sequence.events[source_index], source_index),
-                "target_event_id": _event_id(sequence.events[target_index], target_index),
-                "source_occurrence_id": _event_occurrence_id(sequence.events[source_index], source_index),
-                "target_occurrence_id": _event_occurrence_id(sequence.events[target_index], target_index),
+                "source_event_id": require_eid(sequence.events[source_index]),
+                "target_event_id": require_eid(sequence.events[target_index]),
+                "source_occurrence_uuid": require_occurrence_uuid(sequence.events[source_index]),
+                "target_occurrence_uuid": require_occurrence_uuid(sequence.events[target_index]),
                 "source_type": sequence.type_labels[source_index],
                 "target_type": sequence.type_labels[target_index],
                 "source_event": summarize_alarm_event(sequence.events[source_index], source_index),

@@ -3,6 +3,8 @@ import uuid
 
 from collections.abc import Iterable
 
+from fault_grouping.alarm_events.identity import require_alarm_identity
+
 
 def _normalize_edge_directions(direction):
     if direction is None:
@@ -188,59 +190,12 @@ def matches_expected_alarm(alarm_type, expected, alarm_source_domain=None):
 
 
 def get_symptom_alarm_identity(symptom, use_alarm_period_cache=False):
-    if not isinstance(symptom, dict):
-        return None
-    for field_name in ("_case_alarm_seq", "_mhp_occurrence_id"):
-        value = symptom.get(field_name)
-        if value not in (None, ""):
-            return (field_name, str(value))
-    occurrence_id = symptom.get("occurrence_id")
-    if occurrence_id not in (None, ""):
-        return (
-            "occurrence_id",
-            str(occurrence_id),
-            str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
-            str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
-            str(symptom.get("eid", "") or symptom.get("alarm_id", "") or symptom.get("告警编码ID", "") or ""),
-            str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
-            str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
-        )
-    if use_alarm_period_cache:
-        segment_key = symptom.get("_segment_key")
-        if segment_key not in (None, ""):
-            return segment_key
-    alarm_key = symptom.get("eid") or symptom.get("alarm_id") or symptom.get("告警编码ID")
-    if alarm_key in (None, ""):
-        return None
-    return (
-        "alarm",
-        str(alarm_key),
-        str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
-        str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
-        str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
-        str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
-    )
+    del use_alarm_period_cache
+    return require_alarm_identity(symptom)
 
 
 def get_symptom_strong_occurrence_identity(symptom):
-    if not isinstance(symptom, dict):
-        return None
-    for field_name in ("_case_alarm_seq", "_mhp_occurrence_id"):
-        value = symptom.get(field_name)
-        if value not in (None, ""):
-            return (field_name, str(value))
-    occurrence_id = symptom.get("occurrence_id")
-    if occurrence_id not in (None, ""):
-        return (
-            "occurrence_id",
-            str(occurrence_id),
-            str(symptom.get("node", "") or symptom.get("site_id", "") or ""),
-            str(symptom.get("alarm_source", "") or symptom.get("告警源", "") or ""),
-            str(symptom.get("eid", "") or symptom.get("alarm_id", "") or symptom.get("告警编码ID", "") or ""),
-            str(symptom.get("ts", "") or symptom.get("alarm_time", "") or symptom.get("告警首次发生时间", "") or ""),
-            str(symptom.get("alarm", "") or symptom.get("alarm_type", "") or symptom.get("告警标题", "") or ""),
-        )
-    return None
+    return require_alarm_identity(symptom)
 
 
 def get_match_alarm_keys(match_result, use_alarm_period_cache=False):
@@ -410,17 +365,14 @@ def merge_symptom_records(existing_symptom, incoming_symptom):
     incoming_start_ts, incoming_end_ts = get_symptom_interval(incoming_symptom)
 
     if existing_start_ts is None:
-        merged = dict(incoming_symptom)
+        base_symptom, other_symptom = incoming_symptom, existing_symptom
     elif incoming_start_ts is None:
-        merged = dict(existing_symptom)
+        base_symptom, other_symptom = existing_symptom, incoming_symptom
     elif incoming_start_ts < existing_start_ts:
-        merged = dict(incoming_symptom)
+        base_symptom, other_symptom = incoming_symptom, existing_symptom
     else:
-        merged = dict(existing_symptom)
-
-    other_symptom = incoming_symptom if merged is not incoming_symptom else existing_symptom
-    if merged is existing_symptom:
-        other_symptom = incoming_symptom
+        base_symptom, other_symptom = existing_symptom, incoming_symptom
+    merged = dict(base_symptom)
 
     merged_start_ts_candidates = [
         ts for ts in (existing_start_ts, incoming_start_ts)
@@ -482,9 +434,22 @@ def merge_overlapping_symptoms(symptoms):
         if overlap_key is None or start_ts is None:
             passthrough_symptoms.append(dict(symptom))
             continue
-        grouped_symptoms[overlap_key].append(dict(symptom))
+        # 同一个 node/source/alarm 下可能存在重复 eid 的多次独立发生。
+        # occurrence 身份必须成为分组的一部分，否则 X/Y/X 交错排序时，
+        # 中间的 Y 会打断 X 的归并，最终把同一发生输出两次。
+        occurrence_identity = get_symptom_strong_occurrence_identity(symptom)
+        grouped_symptoms[(overlap_key, occurrence_identity)].append(dict(symptom))
 
-    merged_symptoms = list(passthrough_symptoms)
+    passthrough_by_identity = {}
+    for symptom in passthrough_symptoms:
+        identity = get_symptom_alarm_identity(symptom)
+        existing = passthrough_by_identity.get(identity)
+        passthrough_by_identity[identity] = (
+            symptom
+            if existing is None
+            else merge_symptom_role_metadata(existing, symptom)
+        )
+    merged_symptoms = list(passthrough_by_identity.values())
     for grouped_items in grouped_symptoms.values():
         grouped_items.sort(
             key=lambda symptom: (
@@ -617,8 +582,6 @@ def merge_match_component(component_matches, use_alarm_period_cache=False):
         else:
             for symptom in source.get("symptoms", []):
                 alarm_key = get_symptom_alarm_identity(symptom, use_alarm_period_cache=False)
-                if alarm_key is None:
-                    continue
                 existing_symptom = symptom_map.get(alarm_key)
                 if existing_symptom is None:
                     symptom_map[alarm_key] = symptom
@@ -680,11 +643,49 @@ def add_merge_stats(*stats_list):
     return total
 
 
+def normalize_match_symptoms(match, use_alarm_period_cache=False):
+    """去掉单个候选组内的重复发生，同时保留重复 eid 的不同 occurrence。"""
+    symptoms = match.get("symptoms", [])
+    if len(symptoms) <= 1:
+        return match
+
+    if use_alarm_period_cache:
+        normalized_symptoms = merge_overlapping_symptoms(symptoms)
+    else:
+        normalized_symptoms = []
+        symptom_indexes = {}
+        for symptom in symptoms:
+            alarm_key = get_symptom_alarm_identity(symptom, use_alarm_period_cache=False)
+            existing_idx = symptom_indexes.get(alarm_key)
+            if existing_idx is None:
+                symptom_indexes[alarm_key] = len(normalized_symptoms)
+                normalized_symptoms.append(symptom)
+            else:
+                normalized_symptoms[existing_idx] = merge_symptom_role_metadata(
+                    normalized_symptoms[existing_idx],
+                    symptom,
+                )
+
+    if len(normalized_symptoms) == len(symptoms) and all(
+        normalized is original
+        for normalized, original in zip(normalized_symptoms, symptoms)
+    ):
+        return match
+
+    normalized_match = dict(match)
+    normalized_match["symptoms"] = normalized_symptoms
+    return normalized_match
+
+
 def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_alarm_period_cache=False):
     """在同一轮收割内，先把共享 eid 或告警时段重叠的候选组合并后再输出。"""
     merge_stats = build_empty_merge_stats()
     if len(matches) <= 1:
-        return (matches, merge_stats) if return_stats else matches
+        normalized_matches = [
+            normalize_match_symptoms(match, use_alarm_period_cache=use_alarm_period_cache)
+            for match in matches
+        ]
+        return (normalized_matches, merge_stats) if return_stats else normalized_matches
 
     parent = list(range(len(matches)))
 
@@ -722,32 +723,45 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_a
             if len(entries) < 2:
                 continue
 
-            entries.sort(key=lambda item: (item[0], _interval_end_sort_value(item[1]), item[2]))
-            component_head = None
-            component_end_ts = None
-            component_occurrence_identity = None
-            for start_ts, end_ts, idx, occurrence_identity in entries:
-                if component_head is None:
-                    component_head = idx
-                    component_end_ts = end_ts
-                    component_occurrence_identity = occurrence_identity
-                    continue
+            entries_by_occurrence = collections.defaultdict(list)
+            anonymous_entries = []
+            for entry in entries:
+                if entry[3] is None:
+                    anonymous_entries.append(entry)
+                else:
+                    entries_by_occurrence[entry[3]].append(entry)
 
-                distinct_occurrences = (
-                    component_occurrence_identity is not None
-                    and occurrence_identity is not None
-                    and component_occurrence_identity != occurrence_identity
+            # 已有明确 occurrence 身份时，各身份独立扫描。不能用一条全局的
+            # component_head：不同 occurrence 交错排列会把同一发生的重叠链打断。
+            for same_occurrence_entries in [*entries_by_occurrence.values(), anonymous_entries]:
+                same_occurrence_entries.sort(
+                    key=lambda item: (item[0], _interval_end_sort_value(item[1]), item[2])
                 )
-                if start_ts <= _interval_end_sort_value(component_end_ts) and not distinct_occurrences:
+                component_head = None
+                component_end_ts = None
+                for start_ts, end_ts, idx, _occurrence_identity in same_occurrence_entries:
+                    if component_head is None or start_ts > _interval_end_sort_value(component_end_ts):
+                        component_head = idx
+                        component_end_ts = end_ts
+                        continue
                     union(component_head, idx, reason="alarm_overlap")
                     component_end_ts = _merge_interval_end(component_end_ts, end_ts)
-                    if component_occurrence_identity is None:
-                        component_occurrence_identity = occurrence_identity
-                    continue
 
-                component_head = idx
-                component_end_ts = end_ts
-                component_occurrence_identity = occurrence_identity
+            # 旧缓存可能没有 occurrence 身份；它与任意明确身份都兼容。通常这里
+            # 为空，因此主路径仍是 O(n log n)，仅对兼容旧数据做必要的交叉检查。
+            if anonymous_entries and entries_by_occurrence:
+                identified_entries = [
+                    entry
+                    for same_occurrence_entries in entries_by_occurrence.values()
+                    for entry in same_occurrence_entries
+                ]
+                for anonymous_start, anonymous_end, anonymous_idx, _ in anonymous_entries:
+                    for identified_start, identified_end, identified_idx, _ in identified_entries:
+                        if (
+                            anonymous_start <= _interval_end_sort_value(identified_end)
+                            and identified_start <= _interval_end_sort_value(anonymous_end)
+                        ):
+                            union(anonymous_idx, identified_idx, reason="alarm_overlap")
     else:
         match_primary_keys = [get_match_alarm_keys(match, use_alarm_period_cache=False) for match in matches]
         eid_to_match_indexes = collections.defaultdict(list)

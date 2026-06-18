@@ -12,6 +12,7 @@ if __package__ in (None, ""):
     ensure_repo_root(2)
 
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
+from fault_grouping.alarm_events.identity import input_occurrence_uuid
 from topology_resources import NE_GRAPH_JSON, resource_display
 
 
@@ -156,9 +157,9 @@ def _should_skip_alarm(alarm):
     return alarm_title in EXCLUDED_ALARM_TITLES
 
 
-def _build_alarm_evidence_record(alarm, resolved_site_id, ticket_field, source_field, occurrence_id=None):
+def _build_alarm_evidence_record(alarm, resolved_site_id, ticket_field, source_field, occurrence_uuid):
     record = {
-        "_raw_alarm_occurrence_id": _normalize_text(occurrence_id),
+        "occurrence_uuid": occurrence_uuid,
         "告警编码ID": _normalize_text(alarm.get("告警编码ID", "")),
         "告警标题": _normalize_text(alarm.get("告警标题", "")),
         "工单号": _normalize_text(alarm.get(ticket_field, "")),
@@ -441,7 +442,7 @@ def _collect_association_evidence(
         if _should_skip_alarm(alarm):
             continue
 
-        occurrence_id = f"raw-alarm-{alarm_index}"
+        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_index)
         resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site, site_field, source_field)
         if not resolved_site_id:
             continue
@@ -461,7 +462,7 @@ def _collect_association_evidence(
                         resolved_site_id,
                         ticket_field,
                         source_field,
-                        occurrence_id,
+                        occurrence_uuid,
                     )
                 evidence[ticket_id]["direct_site_alarms"][resolved_site_id].append(evidence_record)
 
@@ -476,7 +477,7 @@ def _collect_association_evidence(
                         resolved_site_id,
                         ticket_field,
                         source_field,
-                        occurrence_id,
+                        occurrence_uuid,
                     )
                 evidence[ticket_id]["inferred_site_alarms"][resolved_site_id].append(evidence_record)
 
@@ -494,7 +495,7 @@ def _collect_association_evidence(
                         resolved_site_id,
                         ticket_field,
                         source_field,
-                        occurrence_id,
+                        occurrence_uuid,
                     )
                 evidence[ticket_id]["ticket_recorded_range_site_alarms"][resolved_site_id].append(evidence_record)
 
@@ -530,9 +531,9 @@ def _build_recorded_range_site_sets(association_evidence):
     return recorded_range_site_sets
 
 
-def _build_debug_alarm_brief(alarm, resolved_site_id, ticket_field, source_field, time_field, occurrence_id=None):
+def _build_debug_alarm_brief(alarm, resolved_site_id, ticket_field, source_field, time_field, occurrence_uuid):
     record = {
-        "_raw_alarm_occurrence_id": _normalize_text(occurrence_id),
+        "occurrence_uuid": occurrence_uuid,
         "告警编码ID": _normalize_text(alarm.get("告警编码ID", "")),
         "告警标题": _normalize_text(alarm.get("告警标题", "")),
         "工单号": _normalize_text(alarm.get(ticket_field, "")),
@@ -641,7 +642,7 @@ def _build_recorded_range_debug_info(
         if _should_skip_alarm(alarm):
             continue
 
-        occurrence_id = f"raw-alarm-{alarm_index}"
+        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_index)
         resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site, site_field, source_field)
         if not resolved_site_id:
             continue
@@ -657,7 +658,7 @@ def _build_recorded_range_debug_info(
             ticket_field,
             source_field,
             time_field,
-            occurrence_id,
+            occurrence_uuid,
         )
 
         for ticket_id in candidate_tickets:

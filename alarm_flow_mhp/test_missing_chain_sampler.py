@@ -14,6 +14,8 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 import numpy as np
+import itertools
+import uuid
 
 from alarm_flow_mhp.missing_chain_sampler import (
     MHP_VIRTUAL_RULE,
@@ -23,6 +25,19 @@ from alarm_flow_mhp.missing_chain_sampler import (
     SamplerConfig,
 )
 from alarm_flow_mhp.dynamic_state import ObservedStateTimeline
+
+
+_OCCURRENCE_SEQ = itertools.count()
+
+
+def _ingest(sampler, ts, type_id, meta=None, **kwargs):
+    event_meta = dict(meta or {})
+    ordinal = next(_OCCURRENCE_SEQ)
+    event_meta.setdefault("event_id", f"test-event-{ordinal}")
+    event_meta["occurrence_uuid"] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"missing-chain-test:{ordinal}")
+    )
+    return sampler.ingest(ts, type_id, event_meta, **kwargs)
 
 
 # --- minimal fakes mimicking the feature-mode runtime scorers ---------------
@@ -155,8 +170,8 @@ def test_parent_gibbs_picks_strong_edge():
     s = MissingChainSampler(
         adapter, SamplerConfig(lag_sec=1e9, sweeps_per_tick=5, seed=1)
     )
-    s.ingest(0.0, 0)        # A
-    s.ingest(30.0, 1)       # B, 30s later
+    _ingest(s, 0.0, 0)        # A
+    _ingest(s, 30.0, 1)       # B, 30s later
     a = _events_of_type(s, 0)[0]
     b = _events_of_type(s, 1)[0]
     assert b.parent == a.eid, f"B should pick A, got parent={b.parent}"
@@ -176,7 +191,7 @@ def test_birth_explains_orphan_with_missing_parent():
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0, seed=2),
     )
-    s.ingest(100.0, 1)      # only B observed; S never observed
+    _ingest(s, 100.0, 1)      # only B observed; S never observed
     b = _events_of_type(s, 1)[0]
     missing = [e for e in s.events.values() if e.is_missing()]
     assert missing, "expected a missing parent to be born"
@@ -200,7 +215,7 @@ def test_multi_hop_chain():
             max_depth=4, seed=3,
         ),
     )
-    s.ingest(100.0, 2)      # only B observed
+    _ingest(s, 100.0, 2)      # only B observed
     depths = {e.type_id: e.depth for e in s.events.values() if e.is_missing()}
     assert any(e.depth >= 2 for e in s.events.values() if e.is_missing()), (
         f"expected a depth>=2 missing event, got {depths}"
@@ -223,7 +238,7 @@ def test_max_depth_caps_chain():
             max_depth=1, seed=4,
         ),
     )
-    s.ingest(100.0, 2)
+    _ingest(s, 100.0, 2)
     assert all(e.depth <= 1 for e in s.events.values()), "depth cap violated"
 
 
@@ -284,7 +299,7 @@ def test_orphan_and_missing_indices_stay_consistent():
         SamplerConfig(lag_sec=100.0, history_window_sec=300.0, sweeps_per_tick=10,
                       missing_log_prior=0.0, seed=21),
     )
-    s.ingest(100.0, 1, {"event_id": "B"})
+    _ingest(s, 100.0, 1, {"event_id": "B"})
 
     missing = [e for e in s.events.values() if e.is_missing()]
     assert missing, "expected an imputed missing event"
@@ -312,7 +327,7 @@ def test_strong_prior_suppresses_births():
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=-50.0, seed=6),
     )
-    s.ingest(100.0, 1)
+    _ingest(s, 100.0, 1)
     assert s._missing_count == 0, "strong prior should suppress imputation"
 
 
@@ -327,9 +342,9 @@ def test_close_emits_group_with_parent_linkage():
         adapter,
         SamplerConfig(lag_sec=100.0, history_window_sec=300.0, sweeps_per_tick=5, seed=7),
     )
-    s.ingest(0.0, 0, {"event_id": "A"})
-    s.ingest(30.0, 1, {"event_id": "B"})
-    groups = s.ingest(5000.0, 0, {"event_id": "C"})  # push A,B fully out of reach
+    _ingest(s, 0.0, 0, {"event_id": "A"})
+    _ingest(s, 30.0, 1, {"event_id": "B"})
+    groups = _ingest(s, 5000.0, 0, {"event_id": "C"})  # push A,B fully out of reach
     ab = [g for g in groups if g["event_count"] >= 2]
     assert ab, f"expected the A→B group to close, got {groups}"
     g = ab[0]
@@ -352,7 +367,7 @@ def test_group_includes_missing_events_with_markers():
         SamplerConfig(lag_sec=100.0, history_window_sec=300.0, sweeps_per_tick=10,
                       missing_log_prior=0.0, seed=9),
     )
-    s.ingest(100.0, 1, {"event_id": "B", "alarm_source": "ne1"})
+    _ingest(s, 100.0, 1, {"event_id": "B", "alarm_source": "ne1"})
     groups = s.flush()
     g = [grp for grp in groups if grp["virtual_event_count"] >= 1]
     assert g, f"expected a group containing an imputed missing event, got {groups}"
@@ -372,8 +387,8 @@ def test_flush_closes_everything():
         time_scale_sec=60.0,
     )
     s = MissingChainSampler(adapter, SamplerConfig(lag_sec=100.0, seed=8))
-    s.ingest(0.0, 0, {"event_id": "A"})
-    s.ingest(10.0, 1, {"event_id": "B"})
+    _ingest(s, 0.0, 0, {"event_id": "A"})
+    _ingest(s, 10.0, 1, {"event_id": "B"})
     groups = s.flush()
     total_real = sum(g["real_event_count"] for g in groups)
     assert total_real == 2, f"flush should emit both observed events, got {total_real}"
@@ -401,7 +416,7 @@ def test_feature_birth_imputes_missing_parent():
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0,
                       max_depth=1, seed=11),
     )
-    s.ingest(100.0, ("B", "n1"))         # orphan B on device n1
+    _ingest(s, 100.0, ("B", "n1"))         # orphan B on device n1
     missing = [e for e in s.events.values() if e.is_missing()]
     assert missing, "expected an imputed missing parent in feature mode"
     assert all(mt[0] == "S" for mt in (m.type_id for m in missing)), "parent type should be S"
@@ -416,7 +431,7 @@ def test_feature_multi_hop_chain():
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=30, missing_log_prior=0.0,
                       max_depth=4, seed=1),
     )
-    s.ingest(100.0, ("B", "n1"))
+    _ingest(s, 100.0, ("B", "n1"))
     assert any(e.depth >= 2 for e in s.events.values() if e.is_missing()), \
         "expected R→S→B multi-hop chain"
     assert any(e.type_id[0] == "R" for e in s.events.values() if e.is_missing())
@@ -460,8 +475,8 @@ def test_device_adapter_from_artifact_roundtrip():
     # outgoing-target index wired → compensator active
     assert adapter.outgoing_targets(0) == [1]
     s = MissingChainSampler(adapter, SamplerConfig(lag_sec=1e9, sweeps_per_tick=5, seed=1))
-    s.ingest(0.0, 0)
-    s.ingest(30.0, 1)
+    _ingest(s, 0.0, 0)
+    _ingest(s, 30.0, 1)
     b = [e for e in s.events.values() if e.type_id == 1][0]
     a = [e for e in s.events.values() if e.type_id == 0][0]
     assert b.parent == a.eid
@@ -483,7 +498,7 @@ def test_group_is_visual_output_compatible():
         SamplerConfig(lag_sec=100.0, history_window_sec=300.0, sweeps_per_tick=10,
                       missing_log_prior=0.0, seed=9),
     )
-    s.ingest(100.0, 1, {"event_id": "B", "alarm_source": "ne1", "site_id": "siteA",
+    _ingest(s, 100.0, 1, {"event_id": "B", "alarm_source": "ne1", "site_id": "siteA",
                         "alarm_title": "B-alarm", "alarm_type": "B"})
     groups = [g for g in s.flush() if g["virtual_event_count"] >= 1]
     assert groups, "expected a group with an imputed missing event"
@@ -526,8 +541,8 @@ def test_dynamic_feature_impute_uses_observed_source_mark():
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=3, max_births_per_sweep=0, seed=31),
     )
-    s.ingest(0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
-    s.ingest(20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
+    _ingest(s, 0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    _ingest(s, 20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
     src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
     tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
     assert tgt.parent == src.eid
@@ -556,7 +571,7 @@ def test_dynamic_feature_missing_sources_use_timeline_mark():
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=10, missing_log_prior=0.0,
                       max_depth=1, seed=41),
     )
-    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
+    _ingest(s, 100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(0, 0, 0))
     missing = [e for e in s.events.values() if e.is_missing()]
     assert missing, "expected timeline-backed dynamic missing parent"
     assert any(e.type_id == ("S", "n1") and e.src_mark == (0, 1, 0) for e in missing)
@@ -588,8 +603,8 @@ def test_source_target_dynamic_feature_uses_target_mark():
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=3, max_births_per_sweep=0, seed=51),
     )
-    s.ingest(0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
-    s.ingest(20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    _ingest(s, 0.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    _ingest(s, 20.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
     src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
     tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
     assert tgt.parent == src.eid
@@ -648,8 +663,8 @@ def test_source_target_time_slack_impute_accepts_late_parent():
     )
     # Child arrives first with target pre-state link=1. The source arrives 20s
     # later; time slack allows it to become the child's late parent.
-    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
-    s.ingest(120.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    _ingest(s, 100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    _ingest(s, 120.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
     src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
     tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
     assert tgt.parent == src.eid
@@ -689,8 +704,8 @@ def test_time_slack_rechecks_equal_timestamp_future_parent():
     )
     # B is processed first and has no parent yet. S arrives later in stream order
     # but with the same timestamp; dt=0 should be eligible after the reset pass.
-    s.ingest(100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
-    s.ingest(100.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
+    _ingest(s, 100.0, ("B", "n1"), {"event_id": "B"}, src_mark=(1, 0, 0))
+    _ingest(s, 100.0, ("S", "n1"), {"event_id": "S"}, src_mark=(0, 1, 0))
     src = [e for e in s.events.values() if e.type_id == ("S", "n1")][0]
     tgt = [e for e in s.events.values() if e.type_id == ("B", "n1")][0]
     assert tgt.parent == src.eid
@@ -754,8 +769,8 @@ def test_visual_snapshots_link_to_previous_versions_without_closing():
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=5, max_births_per_sweep=0, seed=43),
     )
-    s.ingest(0.0, 0, {"event_id": "A"})
-    s.ingest(10.0, 1, {"event_id": "B"})
+    _ingest(s, 0.0, 0, {"event_id": "A"})
+    _ingest(s, 10.0, 1, {"event_id": "B"})
     first = s.visual_snapshot_groups(5.0)
     assert len(first) == 1
     assert first[0]["group_id"].endswith(".snapshot-0001")
@@ -763,7 +778,7 @@ def test_visual_snapshots_link_to_previous_versions_without_closing():
     assert s.events, "snapshot must not close/remove live sampler events"
     assert s.visual_snapshot_groups(5.0) == []
 
-    s.ingest(20.0, 2, {"event_id": "C"})
+    _ingest(s, 20.0, 2, {"event_id": "C"})
     second = s.visual_snapshot_groups(5.0)
     assert len(second) == 1
     assert second[0]["related_group_uuids"] == [first[0]["group_id"]]
@@ -785,7 +800,7 @@ def test_visual_snapshot_can_use_external_stream_time_without_advancing_sampler(
         adapter,
         SamplerConfig(lag_sec=1e9, sweeps_per_tick=0, max_births_per_sweep=0, seed=44),
     )
-    s.ingest(0.0, 0, {"event_id": "A"})
+    _ingest(s, 0.0, 0, {"event_id": "A"})
     assert s.visual_snapshot_groups(5.0) == []
     snap = s.visual_snapshot_groups(5.0, now_ts=6.0)
     assert len(snap) == 1

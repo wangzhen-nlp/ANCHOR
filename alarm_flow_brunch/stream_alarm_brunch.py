@@ -27,10 +27,7 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
-from alarm_flow_brunch.aggregator import (
-    load_alarm_brunch_artifact,
-    summarize_alarm_event,
-)
+from alarm_flow_brunch.aggregator import load_alarm_brunch_artifact, summarize_alarm_event
 from alarm_flow_brunch.missing_intervals import (
     MissingIntervalTracker,
     load_missing_from_json,
@@ -47,6 +44,7 @@ from fault_grouping.alarm_events.io import (
     is_clear_alarm,
     parse_datetime_text,
 )
+from fault_grouping.alarm_events.identity import input_occurrence_uuid, new_occurrence_uuid
 from fault_grouping.alarm_events.sorted_cache import (
     is_sorted_alarm_cache_file,
     load_sorted_alarm_cache,
@@ -189,8 +187,8 @@ class OnlineCascade:
                     "target_index": int(event.index),
                     "source_event_id": parent.event_id,
                     "target_event_id": event.event_id,
-                    "source_occurrence_id": f"obs-{parent.index}",
-                    "target_occurrence_id": f"obs-{event.index}",
+                    "source_occurrence_uuid": parent.event["occurrence_uuid"],
+                    "target_occurrence_uuid": event.event["occurrence_uuid"],
                     "source_type": parent.type_label,
                     "target_type": event.type_label,
                 }
@@ -1170,6 +1168,7 @@ class OnlineBRUNCHAssigner:
             "alarm_source": alarm_source,
             "alarm_title": alarm_title,
             "alarm_type": alarm_type,
+            "occurrence_uuid": new_occurrence_uuid(),
         }
         # Latent virtuals get the much-lower latent_confidence so the
         # candidate score is heavily dampened relative to known virtuals;
@@ -1217,7 +1216,15 @@ def _write_json(path, payload):
         stream.write("\n")
 
 
-def _make_alarm_event(alarm, *, site_id, alarm_title, event_time_str, is_clear=False):
+def _make_alarm_event(
+    alarm,
+    *,
+    site_id,
+    alarm_title,
+    event_time_str,
+    occurrence_uuid,
+    is_clear=False,
+):
     event_alarm = dict(alarm)
     event_alarm["告警首次发生时间"] = event_time_str
     if is_clear:
@@ -1228,6 +1235,7 @@ def _make_alarm_event(alarm, *, site_id, alarm_title, event_time_str, is_clear=F
         "alarm_source": str(alarm.get("告警源", "") or "").strip(),
         "alarm_title": str(alarm_title or ""),
         "ts": parse_datetime_text(event_time_str, "告警时间").timestamp(),
+        "occurrence_uuid": occurrence_uuid,
     }
 
 
@@ -1241,6 +1249,7 @@ def _raw_alarm_to_events(
     end_ts=None,
     include_clear=False,
     clear_delay_sec=0.0,
+    occurrence_uuid,
 ):
     alarm_title = str(alarm.get("告警标题", "") or "")
     if alarm_title not in CRITICAL_ALARMS:
@@ -1268,6 +1277,7 @@ def _raw_alarm_to_events(
             site_id=site_id,
             alarm_title=alarm_title,
             event_time_str=first_occurrence_str,
+            occurrence_uuid=occurrence_uuid,
             is_clear=False,
         )
     ]
@@ -1284,6 +1294,7 @@ def _raw_alarm_to_events(
                 site_id=site_id,
                 alarm_title=alarm_title,
                 event_time_str=effective_clear_time_str,
+                occurrence_uuid=occurrence_uuid,
                 is_clear=True,
             )
         )
@@ -1329,7 +1340,11 @@ def _iter_stream_events(
     allowed_alarm_sources = (
         allowed_devices_for_regions(ne_graph_data, selected_regions) if selected_regions else None
     )
-    for alarm in stream_alarm_inputs(alarm_input, show_progress=show_progress):
+    for alarm_ordinal, alarm in enumerate(
+        stream_alarm_inputs(alarm_input, show_progress=show_progress),
+        start=1,
+    ):
+        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_ordinal)
         for event in _raw_alarm_to_events(
             alarm,
             valid_sites=valid_sites,
@@ -1339,6 +1354,7 @@ def _iter_stream_events(
             end_ts=end_ts,
             include_clear=include_clear,
             clear_delay_sec=clear_delay_sec,
+            occurrence_uuid=occurrence_uuid,
         ):
             yield event
 

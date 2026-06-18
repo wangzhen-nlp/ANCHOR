@@ -2,6 +2,7 @@ import json
 import io
 import tempfile
 import unittest
+import uuid
 
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -25,6 +26,7 @@ from alarm_cascade_dhp.visual_output import CascadeVisualOutputSession
 def _alarm(event_id, ts, title, source, site, **extra):
     alarm = {
         "event_id": event_id,
+        "occurrence_uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, f"dhp-test:{event_id}:{ts}")),
         "ts": ts,
         "告警标题": title,
         "告警源": source,

@@ -1349,11 +1349,7 @@ class TemporalGraphEngineEvaluatorMixin:
             symptoms_by_key[alarm_key] = event_enriched
             return
 
-        source_segment_key = get_symptom_strong_occurrence_identity(event_enriched) or (
-            event.get("_segment_key")
-            or event.get("eid")
-            or (event.get("node"), event.get("ts"), event.get("alarm"), event.get("alarm_source"))
-        )
+        source_segment_key = get_symptom_strong_occurrence_identity(event_enriched)
         event_enriched["_segment_start_ts"] = event["ts"]
         event_enriched["_segment_end_ts"] = event["ts"]
         event_enriched["_segment_key"] = self._build_output_symptom_interval_key(event_enriched)

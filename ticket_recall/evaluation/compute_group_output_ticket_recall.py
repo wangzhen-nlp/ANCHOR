@@ -9,6 +9,7 @@ if __package__ in (None, ""):
 
 from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import (
     _count_ticket_occurrences_in_alarms,
@@ -386,32 +387,7 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
         return {}
 
     def symptom_alarm_key(record):
-        case_alarm_seq = _normalize_text(record.get("_case_alarm_seq", ""))
-        if case_alarm_seq:
-            return ("case_seq", case_alarm_seq)
-        mhp_occurrence_id = _normalize_text(record.get("_mhp_occurrence_id", ""))
-        if mhp_occurrence_id:
-            return ("mhp_occurrence", mhp_occurrence_id)
-        occurrence_id = _normalize_text(record.get("occurrence_id", ""))
-        if occurrence_id:
-            return (
-                "occurrence",
-                occurrence_id,
-                record.get("site_id", ""),
-                record.get("alarm_source", ""),
-                record.get("alarm_id", ""),
-                record.get("alarm_time", "") or record.get("time_str", "") or record.get("ts", ""),
-                record.get("alarm", "") or record.get("alarm_type", "") or record.get("告警标题", ""),
-            )
-        return (
-            record.get("site_id", ""),
-            record.get("alarm_id", ""),
-            record.get("alarm", ""),
-            record.get("ts", ""),
-            record.get("alarm_source", ""),
-            record.get("matched_role", ""),
-            record.get("ticket_id", ""),
-        )
+        return require_alarm_identity(record)
 
     normalized_group_ids = {
         _normalize_text(group_id)
@@ -498,9 +474,7 @@ def _build_debug_group_site_lookup(group_output_input, debug_group_ids, referenc
                 "alarm_source": _normalize_text(symptom.get("alarm_source", "")) or _normalize_text(symptom.get("告警源", "")),
                 "matched_role": _normalize_text(symptom.get("matched_role", "")),
                 "ticket_id": _normalize_text(symptom.get("工单号", "")),
-                "_case_alarm_seq": _normalize_text(symptom.get("_case_alarm_seq", "")),
-                "occurrence_id": _normalize_text(symptom.get("occurrence_id", "")),
-                "_mhp_occurrence_id": _normalize_text(symptom.get("_mhp_occurrence_id", "")),
+                "occurrence_uuid": _normalize_text(symptom.get("occurrence_uuid", "")),
             })
         for group_id in sorted(related_only_group_ids):
             result[group_id]["present_in_related_group_uuids"] = True

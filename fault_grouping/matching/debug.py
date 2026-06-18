@@ -97,18 +97,14 @@ def format_debug_site_events(engine, site_id, limit=50):
             alarm_type = cached_event.get("alarm")
             alarm_source = cached_event.get("alarm_source", "")
             consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
-            occurrence_id = cached_event.get("occurrence_id") or cached_event.get("_raw_event_occurrence_key")
+            occurrence_uuid = cached_event.get("occurrence_uuid")
         else:
-            try:
-                ts, eid, alarm_type, alarm_source, consumed_trigger_rules, occurrence_id = cached_event
-            except (TypeError, ValueError):
-                ts, eid, alarm_type, alarm_source, consumed_trigger_rules = cached_event
-                occurrence_id = None
+            ts, eid, alarm_type, alarm_source, consumed_trigger_rules, occurrence_uuid = cached_event
         formatted.append(
             {
                 "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
                 "eid": eid,
-                "occurrence_id": occurrence_id,
+                "occurrence_uuid": occurrence_uuid,
                 "alarm": alarm_type,
                 "source": alarm_source,
                 "consumed_trigger_rules": sorted(consumed_trigger_rules),
@@ -142,7 +138,7 @@ def snapshot_debug_trigger_index(engine, site_id):
                 "seq": seq,
                 "alarm": alarm_type,
             }
-            for ts, eid, seq, alarm_type in trigger_events
+            for ts, eid, seq, alarm_type, _alarm_source, _occurrence_uuid in trigger_events
         ]
     return entries
 
@@ -281,7 +277,7 @@ def find_trigger_event_detail(engine, site_id, rule_name, trigger_anchor):
     with engine._lock:
         trigger_events = list(engine.trigger_event_index.get((site_id, rule_name), ()))
 
-    for event_ts, event_id, event_seq, alarm_type in trigger_events:
+    for event_ts, event_id, event_seq, alarm_type, _alarm_source, _occurrence_uuid in trigger_events:
         if event_ts == trigger_ts and event_seq == trigger_seq:
             return {
                 "alarm": alarm_type,

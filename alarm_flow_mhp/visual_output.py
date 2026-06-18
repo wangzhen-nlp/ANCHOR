@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 from fault_grouping.matching.group_output_builder import build_jsonl_match_output
+from fault_grouping.alarm_events.identity import require_occurrence_uuid
 from fault_grouping.site_topology import build_site_to_ne_ids
 
 # Reuse BRUNCH's rule-agnostic helpers (topology + virtual-flag mirroring).
@@ -28,16 +29,6 @@ from alarm_flow_brunch.visual_output import (
     load_json_object,
 )
 from alarm_flow_mhp.missing_chain_sampler import MHP_RULE, MHP_VIRTUAL_RULE
-
-
-def _symptom_occurrence_id_mhp(symptom):
-    occurrence_id = str(symptom.get("occurrence_id", "") or "").strip()
-    if occurrence_id:
-        return occurrence_id
-    index = symptom.get("index")
-    if index not in (None, ""):
-        return f"obs-{index}"
-    return ""
 
 
 def _classify_mhp_edge(ne_graph_data, source_symptom, target_symptom):
@@ -66,21 +57,20 @@ def _mhp_propagation_edges(group, ne_graph_data):
         return []
     symptoms_by_key = {}
     for symptom in group.get("symptoms") or []:
-        occurrence_id = str(symptom.get("occurrence_id", "") or "")
         event_id = str(symptom.get("event_id", "") or "")
-        if occurrence_id:
-            symptoms_by_key[("occurrence", occurrence_id)] = symptom
-        if event_id and ("event", event_id) not in symptoms_by_key:
-            symptoms_by_key[("event", event_id)] = symptom
+        occurrence_uuid = require_occurrence_uuid(symptom)
+        symptoms_by_key[(event_id, occurrence_uuid)] = symptom
     edges = []
     seen = set()
     for edge in group.get("edges") or []:
         src_id = str(edge.get("source_event_id", "") or "")
         tgt_id = str(edge.get("target_event_id", "") or "")
-        src_occurrence_id = str(edge.get("source_occurrence_id", "") or "")
-        tgt_occurrence_id = str(edge.get("target_occurrence_id", "") or "")
-        src_key = ("occurrence", src_occurrence_id) if src_occurrence_id else ("event", src_id)
-        tgt_key = ("occurrence", tgt_occurrence_id) if tgt_occurrence_id else ("event", tgt_id)
+        src_occurrence_uuid = str(edge["source_occurrence_uuid"])
+        tgt_occurrence_uuid = str(edge["target_occurrence_uuid"])
+        src_index = edge.get("source_index")
+        tgt_index = edge.get("target_index")
+        src_key = (src_id, src_occurrence_uuid)
+        tgt_key = (tgt_id, tgt_occurrence_uuid)
         src = symptoms_by_key.get(src_key)
         tgt = symptoms_by_key.get(tgt_key)
         if not src or not tgt:
@@ -93,10 +83,12 @@ def _mhp_propagation_edges(group, ne_graph_data):
             continue
         relation, hops = _classify_mhp_edge(ne_graph_data, src, tgt)
         key = (
+            str(src_index),
+            str(tgt_index),
             src_id,
             tgt_id,
-            src_occurrence_id,
-            tgt_occurrence_id,
+            src_occurrence_uuid,
+            tgt_occurrence_uuid,
             src_ne,
             tgt_ne,
             relation,
@@ -114,8 +106,10 @@ def _mhp_propagation_edges(group, ne_graph_data):
             "target_ne": tgt_ne,
             "source_event_id": src_id,
             "target_event_id": tgt_id,
-            "source_occurrence_id": str(edge.get("source_occurrence_id", "") or ""),
-            "target_occurrence_id": str(edge.get("target_occurrence_id", "") or ""),
+            "source_index": src_index,
+            "target_index": tgt_index,
+            "source_occurrence_uuid": src_occurrence_uuid,
+            "target_occurrence_uuid": tgt_occurrence_uuid,
             "source_alarm": src.get("alarm_title", ""),
             "target_alarm": tgt.get("alarm_title", ""),
             "source_type": edge.get("source_type", ""),
@@ -141,7 +135,6 @@ def _symptom_to_visual_record_mhp(symptom):
     """Per-symptom visual record. ``matched_rule`` reflects the MHP namespace and
     marks imputed nodes with the missing rule so node-level filtering works."""
     is_virtual = bool(symptom.get("virtual", False))
-    occurrence_id = _symptom_occurrence_id_mhp(symptom)
     record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
@@ -149,8 +142,8 @@ def _symptom_to_visual_record_mhp(symptom):
         "alarm_type": symptom.get("alarm_type", ""),
         "ts": symptom.get("ts"),
         "eid": symptom.get("event_id", ""),
-        "occurrence_id": occurrence_id,
-        "_mhp_occurrence_id": occurrence_id,
+        "occurrence_uuid": require_occurrence_uuid(symptom),
+        "_mhp_event_index": symptom.get("_mhp_event_index", symptom.get("index")),
         "virtual": is_virtual,
         "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),
@@ -216,10 +209,16 @@ def write_visual_groups_mhp(output_path, groups, *, ne_graph_path, site_graph_pa
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    latest_groups = {}
+    for group in groups:
+        group_id = group.get("group_id")
+        if group_id:
+            latest_groups[group_id] = group
     with path.open("w", encoding="utf-8") as handle:
-        for group in groups:
+        for group in latest_groups.values():
             match = group_to_visual_match_mhp(group, ne_graph_data=ne_graph_data)
-            if not match.get("uuid"):
+            group_id = match.get("uuid")
+            if not group_id:
                 continue
             record = build_jsonl_match_output(
                 match,
@@ -267,6 +266,8 @@ class AlarmMHPVisualOutputSession:
     def reset_output_file(self):
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.close()
+        self.emitted_group_ids.clear()
+        self.emitted_count = 0
         self._handle = self.output_path.open("w", encoding="utf-8")
 
     def close(self):
@@ -276,11 +277,15 @@ class AlarmMHPVisualOutputSession:
         self._handle = None
 
     def emit_groups(self, groups, *, finalization_reason):
-        writable_groups = [
-            group
-            for group in groups
-            if group.get("group_id") and group["group_id"] not in self.emitted_group_ids
-        ]
+        writable_by_id = {}
+        for group in groups:
+            group_id = group.get("group_id")
+            if not group_id or group_id in self.emitted_group_ids:
+                continue
+            # 同一批可能同时带旧快照和更新后的完整版本；保留最后一个，
+            # 避免“去重”反而漏掉新版新增的 occurrence。
+            writable_by_id[group_id] = group
+        writable_groups = list(writable_by_id.values())
         if not writable_groups:
             return 0
         if self._handle is None:

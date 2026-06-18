@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from fault_grouping.matching.group_output_builder import build_jsonl_match_output
+from fault_grouping.alarm_events.identity import require_alarm_identity, require_occurrence_uuid
 from fault_grouping.site_topology import build_site_to_ne_ids
 
 
@@ -18,16 +19,6 @@ def load_json_object(path):
         return json.load(handle)
 
 
-def _symptom_occurrence_id(symptom):
-    occurrence_id = str(symptom.get("occurrence_id", "") or "").strip()
-    if occurrence_id:
-        return occurrence_id
-    index = symptom.get("index")
-    if index not in (None, ""):
-        return f"obs-{index}"
-    return ""
-
-
 def _symptom_to_visual_record(symptom):
     record = {
         "node": symptom.get("site_id", ""),
@@ -36,7 +27,7 @@ def _symptom_to_visual_record(symptom):
         "alarm_type": symptom.get("alarm_type", ""),
         "ts": symptom.get("ts"),
         "eid": symptom.get("event_id", ""),
-        "occurrence_id": _symptom_occurrence_id(symptom),
+        "occurrence_uuid": require_occurrence_uuid(symptom),
         "virtual": bool(symptom.get("virtual", False)),
         "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),
@@ -62,33 +53,26 @@ def _attach_virtual_alarm_flags(record):
     symptoms = record.get("symptoms") or []
     by_key = {}
 
-    def _flag_keys(ne_id, alarm_id="", occurrence_id="", case_alarm_seq="", *, store=False):
-        keys = []
-        if case_alarm_seq:
-            keys.append(("seq", ne_id, case_alarm_seq))
-        if occurrence_id:
-            keys.append(("occ", ne_id, occurrence_id))
-        if alarm_id and (not store or not keys):
-            keys.append(("alarm", ne_id, alarm_id))
-        return keys
+    def _identity_text(value):
+        return "" if value in (None, "") else str(value)
+
+    def _flag_key(ne_id, alarm_id, occurrence_uuid):
+        if not ne_id:
+            return None
+        eid, normalized_uuid = require_alarm_identity({
+            "eid": alarm_id,
+            "occurrence_uuid": occurrence_uuid,
+        })
+        return ne_id, eid, normalized_uuid
 
     for symptom in symptoms:
         if not isinstance(symptom, dict) or not symptom.get("virtual"):
             continue
-        ne_id = str(symptom.get("alarm_source", "") or "")
-        alarm_id = str(symptom.get("eid", "") or "")
-        occurrence_id = str(
-            symptom.get("_mhp_occurrence_id", "") or symptom.get("occurrence_id", "") or ""
-        )
-        case_alarm_seq = str(symptom.get("_case_alarm_seq", "") or "")
-        keys = _flag_keys(
-            ne_id,
-            alarm_id,
-            occurrence_id,
-            case_alarm_seq,
-            store=True,
-        )
-        if not ne_id or not keys:
+        ne_id = _identity_text(symptom.get("alarm_source", ""))
+        alarm_id = _identity_text(symptom.get("eid", ""))
+        occurrence_uuid = _identity_text(symptom.get("occurrence_uuid", ""))
+        key = _flag_key(ne_id, alarm_id, occurrence_uuid)
+        if key is None:
             continue
         flags = {
             "virtual": True,
@@ -98,8 +82,7 @@ def _attach_virtual_alarm_flags(record):
             "confidence": symptom.get("confidence", 1.0),
             "virtual_source": symptom.get("virtual_source", ""),
         }
-        for key in keys:
-            by_key[key] = flags
+        by_key[key] = flags
 
     if not by_key:
         return record
@@ -112,16 +95,9 @@ def _attach_virtual_alarm_flags(record):
         for alarm in alarms:
             if not isinstance(alarm, dict):
                 continue
-            alarm_id = str(alarm.get("alarm_id", "") or "")
-            occurrence_id = str(
-                alarm.get("_mhp_occurrence_id", "") or alarm.get("occurrence_id", "") or ""
-            )
-            case_alarm_seq = str(alarm.get("_case_alarm_seq", "") or "")
-            flags = None
-            for key in _flag_keys(str(ne_id), alarm_id, occurrence_id, case_alarm_seq):
-                flags = by_key.get(key)
-                if flags:
-                    break
+            alarm_id = _identity_text(alarm.get("alarm_id", ""))
+            occurrence_uuid = _identity_text(alarm.get("occurrence_uuid", ""))
+            flags = by_key.get(_flag_key(str(ne_id), alarm_id, occurrence_uuid))
             if flags:
                 alarm.update(flags)
     return record
@@ -203,21 +179,18 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
         return []
     symptoms_by_key = {}
     for symptom in group.get("symptoms") or []:
-        occurrence_id = _symptom_occurrence_id(symptom)
         event_id = str(symptom.get("event_id", "") or "")
-        if occurrence_id:
-            symptoms_by_key[("occurrence", occurrence_id)] = symptom
-        if event_id and ("event", event_id) not in symptoms_by_key:
-            symptoms_by_key[("event", event_id)] = symptom
+        occurrence_uuid = require_occurrence_uuid(symptom)
+        symptoms_by_key[(event_id, occurrence_uuid)] = symptom
     missing_edges = []
     seen = set()
     for edge in group.get("edges") or []:
         source_event_id = str(edge.get("source_event_id", "") or "")
         target_event_id = str(edge.get("target_event_id", "") or "")
-        source_occurrence_id = str(edge.get("source_occurrence_id", "") or "")
-        target_occurrence_id = str(edge.get("target_occurrence_id", "") or "")
-        source_key = ("occurrence", source_occurrence_id) if source_occurrence_id else ("event", source_event_id)
-        target_key = ("occurrence", target_occurrence_id) if target_occurrence_id else ("event", target_event_id)
+        source_occurrence_uuid = str(edge["source_occurrence_uuid"])
+        target_occurrence_uuid = str(edge["target_occurrence_uuid"])
+        source_key = (source_event_id, source_occurrence_uuid)
+        target_key = (target_event_id, target_occurrence_uuid)
         source_symptom = symptoms_by_key.get(source_key)
         target_symptom = symptoms_by_key.get(target_key)
         if not source_symptom or not target_symptom:
@@ -237,8 +210,8 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
         key = (
             source_event_id,
             target_event_id,
-            source_occurrence_id,
-            target_occurrence_id,
+            source_occurrence_uuid,
+            target_occurrence_uuid,
             source_ne,
             target_ne,
             relation,
@@ -260,8 +233,8 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
                 "target_ne": target_ne,
                 "source_event_id": source_event_id,
                 "target_event_id": target_event_id,
-                "source_occurrence_id": source_occurrence_id,
-                "target_occurrence_id": target_occurrence_id,
+                "source_occurrence_uuid": source_occurrence_uuid,
+                "target_occurrence_uuid": target_occurrence_uuid,
                 "source_alarm": source_symptom.get("alarm_title", ""),
                 "target_alarm": target_symptom.get("alarm_title", ""),
                 "source_type": edge.get("source_type", ""),

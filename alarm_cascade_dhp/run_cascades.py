@@ -14,6 +14,7 @@ from alarm_cascade_dhp.engine import AlarmCascadeEngine
 from alarm_cascade_dhp.profiling import PhaseTimer, enable_engine_profiling
 from alarm_cascade_dhp.visual_output import CascadeVisualOutputSession
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from fault_grouping.alarm_events.identity import input_occurrence_uuid
 from alarm_tools.progress_utils import ProgressBar
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON
 
@@ -373,9 +374,13 @@ def _iter_input_alarm_records(args, timer, show_progress=None):
     if show_progress is None:
         show_progress = args.show_progress
     alarm_stream = iter(stream_alarm_inputs(args.alarms, show_progress=show_progress))
+    alarm_ordinal = 0
     while True:
         try:
-            yield _next_alarm(alarm_stream, timer)
+            alarm = dict(_next_alarm(alarm_stream, timer))
+            alarm_ordinal += 1
+            alarm["occurrence_uuid"] = input_occurrence_uuid(args.alarms, alarm_ordinal)
+            yield alarm
         except StopIteration:
             break
 

@@ -578,6 +578,7 @@ def _cascade_sort_key(cascade_id):
 def _visual_symptom(event):
     symptom = {
         "eid": event.event_id,
+        "occurrence_uuid": event.occurrence_uuid,
         "ts": event.ts,
         "node": event.site_id,
         "alarm": event.alarm_title,

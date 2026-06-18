@@ -34,6 +34,7 @@ from alarm_flow_isahp.sequences import (
 from alarm_flow_brunch.region_filter import filter_alarm_events_by_regions, parse_regions
 from alarm_flow_isahp.ne_topology import NETopologyIndex
 from fault_grouping.alarm_events.io import is_clear_alarm
+from fault_grouping.alarm_events.identity import require_eid, require_occurrence_uuid
 from mhp import (
     EventCollection,
     MHPConfig,
@@ -436,16 +437,6 @@ def _region_filter_events(
     )
 
 
-def _event_id(event, fallback_index):
-    alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
-    for key in ("告警编码ID", "alarm_id", "event_id", "id"):
-        value = alarm.get(key) if key in alarm else event.get(key, "")
-        value = str(value or "").strip()
-        if value:
-            return value
-    return f"alarm-{fallback_index:06d}"
-
-
 def _event_metadata_value(event, *keys):
     if not isinstance(event, dict):
         return ""
@@ -463,20 +454,12 @@ def _event_metadata_value(event, *keys):
     return ""
 
 
-def _event_occurrence_id(event, fallback_index):
-    if isinstance(event, dict):
-        value = event.get("occurrence_id") or event.get("_mhp_occurrence_id")
-        if value not in (None, ""):
-            return str(value)
-    return f"obs-{int(fallback_index)}"
-
-
 def summarize_alarm_event(event, index):
     alarm = event.get("alarm", {}) if isinstance(event, dict) else {}
     return {
         "index": int(index),
-        "event_id": _event_id(event, index),
-        "occurrence_id": _event_occurrence_id(event, index),
+        "event_id": require_eid(event),
+        "occurrence_uuid": require_occurrence_uuid(event),
         "ts": float(event.get("ts", 0.0)),
         "site_id": str(event.get("site_id", "") or ""),
         "alarm_source": str(event.get("alarm_source", "") or ""),

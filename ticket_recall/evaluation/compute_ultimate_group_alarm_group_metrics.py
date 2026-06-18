@@ -11,6 +11,7 @@ if __package__ in (None, ""):
 
 from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
+from fault_grouping.alarm_events.identity import input_occurrence_uuid
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import _extract_group_id, _extract_group_sites
 from ticket_recall.evaluation.recall_common import (
@@ -20,7 +21,6 @@ from ticket_recall.evaluation.recall_common import (
     _resolve_alarm_site_id,
 )
 from ticket_recall.ticket_recall_utils import (
-    alarm_record_fallback_id_key,
     alarm_record_identity_key,
     build_ne_to_domain_map,
     build_site_alarm_map_for_sites,
@@ -163,9 +163,6 @@ def _build_ultimate_group_indexes(group_records, group_field, ne_to_domain=None)
             if alarm_key is not None:
                 ultimate_group_to_alarm_ids[group_id].add(alarm_key)
                 alarm_id_to_ultimate_groups[alarm_key].add(group_id)
-            fallback_key = alarm_record_fallback_id_key(symptom)
-            if fallback_key is not None:
-                alarm_id_to_ultimate_groups[fallback_key].add(group_id)
             alarm_group_ids = _parse_group_ids(symptom.get(group_field, ""))
             for alarm_group_id in alarm_group_ids:
                 ultimate_group_to_alarm_groups[group_id].add(alarm_group_id)
@@ -203,7 +200,12 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     alarm_group_alarm_domains = defaultdict(set)
     alarm_group_has_offline = defaultdict(bool)
     alarm_id_to_alarm_groups = defaultdict(set)
-    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+    for alarm_ordinal, alarm in enumerate(
+        stream_alarm_inputs(alarm_input, show_progress=True),
+        start=1,
+    ):
+        alarm = dict(alarm)
+        alarm["occurrence_uuid"] = input_occurrence_uuid(alarm_input, alarm_ordinal)
         group_ids = _parse_group_ids(alarm.get(group_field, ""))
         if not group_ids:
             continue
@@ -230,9 +232,6 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
             if alarm_key is not None:
                 alarm_group_to_alarm_ids[group_id].add(alarm_key)
                 alarm_id_to_alarm_groups[alarm_key].add(group_id)
-            fallback_key = alarm_record_fallback_id_key(evidence_record if site_id else alarm)
-            if fallback_key is not None:
-                alarm_id_to_alarm_groups[fallback_key].add(group_id)
 
     return (
         dict(alarm_group_to_sites),

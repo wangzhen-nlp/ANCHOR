@@ -37,7 +37,6 @@ if __package__ in (None, ""):
 import numpy as np
 
 from alarm_flow_brunch.region_filter import parse_regions
-from alarm_flow_brunch.visual_output import AlarmBRUNCHVisualOutputSession
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
 from alarm_flow_isahp.sequences import alarm_type_label, event_type_label
 from alarm_flow_mhp.aggregator import (
@@ -50,6 +49,7 @@ from alarm_flow_mhp.topology_relation_prior import (
     parse_topology_relation_prior,
     topology_relation_weights,
 )
+from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
 from fault_grouping.alarm_events.io import is_clear_alarm
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON, resource_display
 
@@ -123,6 +123,19 @@ class Cascade:
 
     def event_count(self) -> int:
         return len(self.events)
+
+    def dedupe_events(self):
+        """按流内 occurrence index 清理重复引用，不按业务 eid 合并。"""
+        seen_indexes = set()
+        unique_events = []
+        for event in self.events:
+            if event.index in seen_indexes:
+                continue
+            seen_indexes.add(event.index)
+            unique_events.append(event)
+        if len(unique_events) != len(self.events):
+            self.events = unique_events
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -511,19 +524,27 @@ class StreamMHPAssigner:
 
     def _merge_cascades(self, keep_id: int, drop_id: int) -> Cascade:
         if keep_id == drop_id and keep_id in self.cascades:
-            return self.cascades[keep_id]
+            return self.cascades[keep_id].dedupe_events()
         keep = self.cascades.get(keep_id)
         drop = self.cascades.get(drop_id)
         if keep is None and drop is None:
             return self._new_cascade()
         if keep is None:
-            return drop
+            return drop.dedupe_events()
         if drop is None:
-            return keep
+            return keep.dedupe_events()
+        keep.dedupe_events()
+        keep_event_indexes = {event.index for event in keep.events}
+        drop_event_indexes = {event.index for event in drop.events}
         for ev in list(drop.events):
             keep.add(ev)
         keep.snapshot_seq = max(keep.snapshot_seq, drop.snapshot_seq)
-        keep.last_snapshot_event_indexes |= drop.last_snapshot_event_indexes
+        if drop_event_indexes - keep_event_indexes:
+            # 两个旧快照的成员并集不等于“合并后的 cascade 已经输出过”。
+            # 清空后允许 snapshot_ready_groups 立即产出完整合并版本。
+            keep.last_snapshot_event_indexes = set()
+        else:
+            keep.last_snapshot_event_indexes |= drop.last_snapshot_event_indexes
         keep.snapshot_frontier_uuids |= drop.snapshot_frontier_uuids
         keep.snapshot_related_uuids |= drop.snapshot_related_uuids
         self.cascades.pop(drop_id, None)
@@ -815,8 +836,8 @@ def _cascade_to_group(cascade: Cascade) -> dict:
                 "target_index": e.index,
                 "source_event_id": parent_summary.get("event_id", ""),
                 "target_event_id": child_summary.get("event_id", ""),
-                "source_occurrence_id": parent_summary.get("occurrence_id", ""),
-                "target_occurrence_id": child_summary.get("occurrence_id", ""),
+                "source_occurrence_uuid": parent_summary["occurrence_uuid"],
+                "target_occurrence_uuid": child_summary["occurrence_uuid"],
                 "source_type": parent.type_label,
                 "target_type": e.type_label,
                 "score": float(e.parent_score),
@@ -1946,7 +1967,7 @@ def main():
     )
     last_visual_snapshot_check_ts = -np.inf
     if args.visual_output:
-        visual_output = AlarmBRUNCHVisualOutputSession.from_files(
+        visual_output = AlarmMHPVisualOutputSession.from_files(
             args.visual_output,
             args.ne_graph,
             args.site_graph,

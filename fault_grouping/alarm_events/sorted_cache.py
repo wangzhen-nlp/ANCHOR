@@ -2,9 +2,20 @@ import json
 import zipfile
 from datetime import datetime
 
+from fault_grouping.alarm_events.identity import require_alarm_identity
 
-SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v1"
+
+SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v2"
 SORTED_ALARM_CACHE_MEMBER = "sorted_alarms.jsonl"
+
+
+def _require_cached_alarm_identity(item):
+    alarm = item.get("alarm") if isinstance(item, dict) else None
+    eid = alarm.get("告警编码ID") if isinstance(alarm, dict) else None
+    return require_alarm_identity({
+        "eid": eid,
+        "occurrence_uuid": item.get("occurrence_uuid") if isinstance(item, dict) else None,
+    })
 
 
 def build_sorted_alarm_cache_metadata(**kwargs):
@@ -80,6 +91,7 @@ def _iter_sorted_alarm_cache_lines(path):
 def _write_sorted_alarm_cache_jsonl(stream, sorted_alarms, header):
     stream.write(json.dumps(header, ensure_ascii=False) + "\n")
     for item in sorted_alarms:
+        _require_cached_alarm_identity(item)
         stream.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
@@ -94,6 +106,7 @@ def write_sorted_alarm_cache(path, sorted_alarms, metadata=None):
             with zf.open(zip_member, "w") as raw:
                 raw.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
                 for item in sorted_alarms:
+                    _require_cached_alarm_identity(item)
                     raw.write((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
     else:
         with open(path, "w", encoding="utf-8") as fw:
@@ -123,7 +136,9 @@ def load_sorted_alarm_cache(path, show_progress=False):
         line = line.strip()
         if not line:
             continue
-        alarms.append(json.loads(line))
+        item = json.loads(line)
+        _require_cached_alarm_identity(item)
+        alarms.append(item)
         if show_progress and idx % 100000 == 0:
             print(f"  已加载排序告警 {idx} 条...")
 

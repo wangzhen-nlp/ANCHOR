@@ -59,6 +59,7 @@ from alarm_flow_mhp.topology_relation_prior import (
     relation_weight,
     topology_relation_weights,
 )
+from fault_grouping.alarm_events.identity import new_occurrence_uuid, require_eid, require_occurrence_uuid
 
 
 NEG_INF = float("-inf")
@@ -390,7 +391,7 @@ class MissingChainSampler:
         self.committed_count = 0
         self.closed_group_count = 0
         self._visual_snapshot_seq = 0
-        self._visual_snapshot_history: dict[frozenset[str], set[str]] = {}
+        self._visual_snapshot_history: dict[frozenset[tuple], set[str]] = {}
 
     # ---- public API ------------------------------------------------------
 
@@ -415,8 +416,11 @@ class MissingChainSampler:
         self.now = ts
         # type_id is an opaque hashable key (int in device mode, (alarm_type,
         # ne) tuple in feature mode) — never coerced here.
+        observed_meta = dict(meta or {})
+        require_eid(observed_meta)
+        require_occurrence_uuid(observed_meta)
         ev = self._new_event(ts=ts, type_id=type_id, observed=True,
-                             meta=dict(meta or {}), depth=0, src_mark=src_mark)
+                             meta=observed_meta, depth=0, src_mark=src_mark)
         self._insert_ordered(ev)
         self._reset_votes_for_future_candidate(ev)
         self._gibbs_parent(ev)            # initial assignment
@@ -450,13 +454,15 @@ class MissingChainSampler:
         cutoff = now - float(age_sec)
         clusters = self._live_clusters()
         out: list[dict] = []
+        snapshot_history = dict(self._visual_snapshot_history)
+        history_updates = []
         for members in clusters.values():
             if not members:
                 continue
             observed_ids = self._members_observed_event_ids(members)
             if not observed_ids:
                 continue
-            if self._visual_snapshot_history.get(observed_ids):
+            if snapshot_history.get(observed_ids):
                 continue
             observed_start = min(m.ts for m in members if m.observed)
             if observed_start > cutoff:
@@ -464,7 +470,12 @@ class MissingChainSampler:
             group = self._build_group(members)
             if group is None:
                 continue
-            related = self._related_visual_snapshot_uuids(observed_ids)
+            related = {
+                uuid
+                for prior_ids, uuids in snapshot_history.items()
+                if observed_ids & prior_ids
+                for uuid in uuids
+            }
             self._visual_snapshot_seq += 1
             base_group_id = group["group_id"]
             snapshot_group_id = f"{base_group_id}.snapshot-{self._visual_snapshot_seq:04d}"
@@ -472,8 +483,9 @@ class MissingChainSampler:
             group["group_id"] = snapshot_group_id
             group["related_group_uuids"] = sorted(related)
             group["snapshot_seq"] = self._visual_snapshot_seq
-            self._replace_visual_snapshot_history(observed_ids, snapshot_group_id, related)
+            history_updates.append((observed_ids, snapshot_group_id, related))
             out.append(group)
+        self._replace_visual_snapshot_history_batch(history_updates)
         return out
 
     # ---- event bookkeeping ----------------------------------------------
@@ -519,6 +531,9 @@ class MissingChainSampler:
         return vals
 
     def _new_event(self, *, ts, type_id, observed, meta, depth, src_mark=None) -> SamplerEvent:
+        meta = dict(meta or {})
+        if not observed:
+            meta["occurrence_uuid"] = new_occurrence_uuid()
         ev = SamplerEvent(eid=self._next_eid, ts=ts, type_id=type_id,
                           observed=observed, meta=meta, depth=depth,
                           src_mark=self._normalise_src_mark(src_mark))
@@ -1141,26 +1156,39 @@ class MissingChainSampler:
                 self._remove_event(m)
         return out
 
-    def _members_observed_event_ids(self, members: list[SamplerEvent]) -> frozenset[str]:
-        return frozenset(self._occurrence_id(m) for m in members if m.observed)
-
-    def _group_observed_event_ids(self, group: dict) -> frozenset[str]:
-        return frozenset(
-            str(s.get("occurrence_id", "") or s.get("event_id", "") or "")
-            for s in group.get("symptoms") or []
-            if (s.get("occurrence_id") or s.get("event_id")) and not bool(s.get("virtual"))
+    def _observed_snapshot_identity(self, ev: SamplerEvent):
+        meta = ev.meta or {}
+        return (
+            self._occurrence_uuid(ev),
+            str(meta.get("index", ev.eid)),
+            self._event_id(ev),
+            float(ev.ts),
+            str(meta.get("site_id", "") or ""),
+            str(meta.get("alarm_source", "") or ""),
         )
 
-    def _related_visual_snapshot_uuids(self, observed_ids: frozenset[str]) -> set[str]:
-        if not observed_ids:
-            return set()
-        related: set[str] = set()
-        for prior_ids, uuids in self._visual_snapshot_history.items():
-            if observed_ids & prior_ids:
-                related.update(uuids)
-        return related
+    @staticmethod
+    def _summary_snapshot_identity(summary):
+        return (
+            str(summary["occurrence_uuid"]),
+            str(summary.get("index", "")),
+            str(summary.get("event_id", "") or ""),
+            float(summary.get("ts", 0.0)),
+            str(summary.get("site_id", "") or ""),
+            str(summary.get("alarm_source", "") or ""),
+        )
 
-    def _pop_related_visual_snapshot_uuids(self, observed_ids: frozenset[str]) -> set[str]:
+    def _members_observed_event_ids(self, members: list[SamplerEvent]) -> frozenset[tuple]:
+        return frozenset(self._observed_snapshot_identity(m) for m in members if m.observed)
+
+    def _group_observed_event_ids(self, group: dict) -> frozenset[tuple]:
+        return frozenset(
+            self._summary_snapshot_identity(s)
+            for s in group.get("symptoms") or []
+            if s.get("occurrence_uuid") and not bool(s.get("virtual"))
+        )
+
+    def _pop_related_visual_snapshot_uuids(self, observed_ids: frozenset[tuple]) -> set[str]:
         if not observed_ids:
             return set()
         related: set[str] = set()
@@ -1173,39 +1201,47 @@ class MissingChainSampler:
             related.update(self._visual_snapshot_history.pop(prior_ids, set()))
         return related
 
-    def _replace_visual_snapshot_history(
-        self,
-        observed_ids: frozenset[str],
-        uuid: str,
-        related_uuids: Optional[set[str]] = None,
-    ):
-        if not observed_ids or not uuid:
+    def _replace_visual_snapshot_history_batch(self, updates):
+        """原子更新一轮快照历史，确保拆分后的每个新组都能关联同一旧版本。"""
+        updates = list(updates or [])
+        if not updates:
+            return
+        updated_observed_sets = [
+            observed_ids
+            for observed_ids, uuid, _related in updates
+            if observed_ids and uuid
+        ]
+        if not updated_observed_sets:
             return
         stale = [
             prior_ids
             for prior_ids in self._visual_snapshot_history
-            if observed_ids & prior_ids
+            if any(prior_ids & observed_ids for observed_ids in updated_observed_sets)
         ]
         for prior_ids in stale:
             self._visual_snapshot_history.pop(prior_ids, None)
-        self._visual_snapshot_history[observed_ids] = set(related_uuids or set()) | {uuid}
+        for observed_ids, uuid, related_uuids in updates:
+            if observed_ids and uuid:
+                self._visual_snapshot_history[observed_ids] = set(related_uuids or set()) | {uuid}
 
     # ---- group / event serialization (brunch-compatible) -----------------
 
     def _event_id(self, ev: SamplerEvent) -> str:
         if ev.is_missing():
             return f"missing-{ev.eid}"
-        return str(ev.meta.get("event_id") or f"obs-{ev.eid}")
+        return require_eid(ev.meta)
 
-    def _occurrence_id(self, ev: SamplerEvent) -> str:
-        return f"missing-{ev.eid}" if ev.is_missing() else f"obs-{ev.eid}"
+    def _occurrence_uuid(self, ev: SamplerEvent) -> str:
+        return require_occurrence_uuid(ev.meta)
 
     def _event_summary(self, ev: SamplerEvent, eid_to_id: dict, child_probs: dict) -> dict:
         m = ev.meta or {}
         title = str(m.get("alarm_title", "") or m.get("type_label", "") or "")
         summary = {
+            "index": m.get("index", ev.eid),
+            "_mhp_event_index": f"sampler-{ev.eid}",
             "event_id": self._event_id(ev),
-            "occurrence_id": self._occurrence_id(ev),
+            "occurrence_uuid": self._occurrence_uuid(ev),
             "ts": float(ev.ts),
             "site_id": str(m.get("site_id", "") or ""),
             "alarm_source": str(m.get("alarm_source", "") or ""),
@@ -1257,6 +1293,10 @@ class MissingChainSampler:
             return None                    # pure-missing cascade → drop (noise)
         virtual = [m for m in members if m.is_missing()]
         eid_to_id = {m.eid: self._event_id(m) for m in members}
+        eid_to_index = {
+            m.eid: f"sampler-{m.eid}"
+            for m in members
+        }
         # child attach-prob aggregation for missing-event confidence
         child_probs: dict[int, list] = {}
         for m in members:
@@ -1274,10 +1314,12 @@ class MissingChainSampler:
             if m.parent != -1 and m.parent in eid_to_id:
                 par = self.events[m.parent]
                 edges.append({
+                    "source_index": eid_to_index[m.parent],
+                    "target_index": eid_to_index[m.eid],
                     "source_event_id": eid_to_id[m.parent],
                     "target_event_id": eid_to_id[m.eid],
-                    "source_occurrence_id": self._occurrence_id(par),
-                    "target_occurrence_id": self._occurrence_id(m),
+                    "source_occurrence_uuid": self._occurrence_uuid(par),
+                    "target_occurrence_uuid": self._occurrence_uuid(m),
                     "source_type": self._type_label(par),
                     "target_type": self._type_label(m),
                     "score": float(m.commit_parent_prob),

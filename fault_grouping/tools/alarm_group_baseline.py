@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 
 from ticket_recall.evaluation.recall_common import _parse_group_ids
+from fault_grouping.alarm_events.identity import require_occurrence_uuid
 
 
 def load_json_if_exists(path):
@@ -104,13 +105,9 @@ def event_group_ids(event, group_field):
     return _parse_group_ids(raw)
 
 
-def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data, occurrence_id=""):
+def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data):
     site_id = event_site(event, ne_graph_data)
     ne_id = event_ne(event)
-    occurrence_id = (
-        str(occurrence_id or "").strip()
-        or _value(event, "occurrence_id", "_mhp_occurrence_id", "_case_alarm_seq")
-    )
     return {
         "node": site_id,
         "site_id": site_id,
@@ -119,7 +116,7 @@ def alarm_to_baseline_symptom(event, *, group_field, ne_graph_data, occurrence_i
         "alarm_type": _value(event, "alarm_type", "alarm_title", "告警标题", "alarm", "title"),
         "ts": event_ts(event),
         "eid": _value(event, "eid", "event_id", "告警编码ID", "alarm_id"),
-        "occurrence_id": occurrence_id,
+        "occurrence_uuid": require_occurrence_uuid(event),
         "matched_role": "alarm_group_baseline",
         "matched_rule": "alarm_group_baseline",
         "工单号": _value(event, "工单号", "ticket_id"),
@@ -142,16 +139,12 @@ def build_baseline_records(events, *, group_field, ne_graph_data=None, min_group
         if len(group_events) < min_group_events:
             continue
         symptoms = []
-        for event_index, event in enumerate(group_events):
-            occurrence_id = _value(event, "occurrence_id", "_mhp_occurrence_id", "_case_alarm_seq")
-            if not occurrence_id:
-                occurrence_id = f"alarm-baseline-{group_id}-{event_index}"
+        for event in group_events:
             symptoms.append(
                 alarm_to_baseline_symptom(
                     event,
                     group_field=group_field,
                     ne_graph_data=ne_graph_data,
-                    occurrence_id=occurrence_id,
                 )
             )
         symptoms.sort(key=lambda s: (s.get("ts") is None, s.get("ts") or float("inf"), s.get("eid", "")))

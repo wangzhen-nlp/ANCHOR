@@ -192,8 +192,14 @@ class EmittedGroupStore:
         symptom_map = {}
         for symptom in merged["symptoms"]:
             alarm_key = self._get_alarm_key(symptom)
-            if alarm_key is not None:
+            existing_symptom = symptom_map.get(alarm_key)
+            if existing_symptom is None:
                 symptom_map[alarm_key] = symptom
+            else:
+                symptom_map[alarm_key] = merge_symptom_role_metadata(
+                    existing_symptom,
+                    symptom,
+                )
 
         merged_group_indexes = set()
         related_group_uuids = set()
@@ -224,8 +230,6 @@ class EmittedGroupStore:
 
             for symptom in previous_match.get("symptoms", []):
                 alarm_key = self._get_alarm_key(symptom)
-                if alarm_key is None:
-                    continue
                 existing_symptom = symptom_map.get(alarm_key)
                 if existing_symptom is None:
                     symptom_map[alarm_key] = symptom

@@ -2,9 +2,9 @@ import re
 
 from collections import Counter
 from datetime import datetime
-from itertools import count
 
 from alarm_cascade_dhp.event_types import AlarmEvent
+from fault_grouping.alarm_events.identity import require_alarm_identity
 
 
 _TITLE_PIECES = re.compile(r"[A-Za-z0-9_.:/-]+|[\u4e00-\u9fff]+")
@@ -63,10 +63,11 @@ class AlarmFeatureBuilder:
         self.topology = topology
         self.topology_context_hops = topology_context_hops
         self.topology_context_limit = topology_context_limit
-        self._fallback_ids = count(1)
 
     def from_match_rules_item(self, item):
         raw = dict(item.get("alarm") or {})
+        if item.get("occurrence_uuid") not in (None, ""):
+            raw["occurrence_uuid"] = item["occurrence_uuid"]
         title = _text(item.get("alarm_title")) or _first_text(raw, "告警标题", "alarm_title")
         source = _text(item.get("alarm_source")) or _first_text(raw, "告警源", "alarm_source")
         site_id = _text(item.get("site_id")) or _first_text(raw, "站点ID", "site_id")
@@ -91,14 +92,17 @@ class AlarmFeatureBuilder:
             site_id = self.topology.resolve_site(site_id, source)
         ts = _parse_timestamp(ts_value)
         event_id = _first_text(raw, "告警编码ID", "event_id", "alarm_id")
-        if not event_id:
-            event_id = f"alarm-event-{next(self._fallback_ids)}"
         domain = _first_text(raw, "网络专业", "告警源专业", "专业", "network_domain")
         if self.topology is not None:
             domain = self.topology.resolve_domain(source, domain)
         event_key = self._event_key(raw, title, source, site_id)
+        event_id, occurrence_uuid = require_alarm_identity({
+            "eid": event_id,
+            "occurrence_uuid": raw.get("occurrence_uuid"),
+        })
         return AlarmEvent(
             event_id=event_id,
+            occurrence_uuid=occurrence_uuid,
             ts=ts,
             alarm_title=title,
             alarm_source=source,

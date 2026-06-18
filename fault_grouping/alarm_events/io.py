@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from fault_grouping.alarm_events.identity import input_occurrence_uuid, require_occurrence_uuid
 from fault_grouping.alarm_events.sorted_cache import load_sorted_alarm_cache
 
 
@@ -30,20 +31,31 @@ def is_clear_alarm(alarm):
     return str(clear_value).strip().lower() in {"是", "yes", "true", "1", "y"}
 
 
-def append_alarm_event(valid_alarms, alarm, site_id, alarm_title, event_time_str, is_clear=False):
+def append_alarm_event(
+    valid_alarms,
+    alarm,
+    site_id,
+    alarm_title,
+    event_time_str,
+    occurrence_uuid,
+    is_clear=False,
+):
     dt_obj = parse_datetime_text(event_time_str, "告警时间")
     event_alarm = dict(alarm)
     event_alarm["告警首次发生时间"] = event_time_str
     if is_clear:
         event_alarm["清除告警"] = "是"
 
-    valid_alarms.append({
+    event = {
         "alarm": event_alarm,
         "site_id": site_id,
         "alarm_source": alarm.get("告警源", ""),
         "alarm_title": alarm_title,
-        "ts": dt_obj.timestamp()
-    })
+        "ts": dt_obj.timestamp(),
+        "occurrence_uuid": occurrence_uuid,
+    }
+    require_occurrence_uuid(event)
+    valid_alarms.append(event)
 
 
 def apply_clear_delay(first_occurrence_str, clear_time_str, clear_delay_sec):
@@ -114,12 +126,14 @@ def load_valid_alarms(
         if end_ts is not None and first_occurrence_ts > end_ts:
             continue
 
+        occurrence_uuid = input_occurrence_uuid(alarm_file_path, processed_count)
         append_alarm_event(
             valid_alarms,
             alarm,
             site_id,
             alarm_title,
             first_occurrence_str,
+            occurrence_uuid,
             is_clear=False
         )
         normal_alarm_count += 1
@@ -137,6 +151,7 @@ def load_valid_alarms(
                 site_id,
                 alarm_title,
                 effective_clear_time_str,
+                occurrence_uuid,
                 is_clear=True
             )
             clear_alarm_count += 1

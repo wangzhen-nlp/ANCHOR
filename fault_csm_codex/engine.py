@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from datetime import datetime
 
 from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.temporal_engine.utils import build_pattern_adj
 
 
@@ -49,16 +50,18 @@ class ActiveAlarmIndex:
 
     def __init__(self, alarm_source_domain_map=None):
         self.by_site = collections.defaultdict(list)
-        self.by_eid = {}
+        self.by_identity = {}
         self.expire_heap = []
         self.alarm_source_domain_map = alarm_source_domain_map or {}
         self.change_seq = 0
 
-    def add(self, site_id, alarm_type, ts, eid, alarm_source="", expire_ts=None):
+    def add(self, site_id, alarm_type, ts, eid, occurrence_uuid, alarm_source="", expire_ts=None):
+        identity = require_alarm_identity({"eid": eid, "occurrence_uuid": occurrence_uuid})
         event = {
             "node": site_id,
             "ts": ts,
             "eid": eid,
+            "occurrence_uuid": occurrence_uuid,
             "alarm": alarm_type,
             "alarm_source": alarm_source,
             "alarm_source_domain": self.alarm_source_domain_map.get(alarm_source, ""),
@@ -66,19 +69,23 @@ class ActiveAlarmIndex:
         if expire_ts is not None:
             event["expire_ts"] = float(expire_ts)
         self.by_site[site_id].append(event)
-        self.by_eid[eid] = event
+        self.by_identity[identity] = event
         if expire_ts is not None:
-            heapq.heappush(self.expire_heap, (float(expire_ts), eid))
+            heapq.heappush(self.expire_heap, (float(expire_ts), identity))
         self.change_seq += 1
         return event
 
-    def remove(self, eid):
-        event = self.by_eid.pop(eid, None)
+    def remove(self, eid, occurrence_uuid):
+        identity = require_alarm_identity({"eid": eid, "occurrence_uuid": occurrence_uuid})
+        event = self.by_identity.pop(identity, None)
         if not event:
             return None
         site_events = self.by_site.get(event["node"])
         if site_events:
-            self.by_site[event["node"]] = [item for item in site_events if item.get("eid") != eid]
+            self.by_site[event["node"]] = [
+                item for item in site_events
+                if require_alarm_identity(item) != identity
+            ]
             if not self.by_site[event["node"]]:
                 self.by_site.pop(event["node"], None)
         self.change_seq += 1
@@ -96,7 +103,7 @@ class ActiveAlarmIndex:
         removed = []
         for event in events:
             if event["ts"] < cutoff:
-                self.by_eid.pop(event.get("eid"), None)
+                self.by_identity.pop(require_alarm_identity(event), None)
                 removed.append(event)
             else:
                 kept.append(event)
@@ -111,11 +118,11 @@ class ActiveAlarmIndex:
     def expire_until(self, current_ts):
         expired = []
         while self.expire_heap and self.expire_heap[0][0] <= current_ts:
-            expire_ts, eid = heapq.heappop(self.expire_heap)
-            event = self.by_eid.get(eid)
+            expire_ts, identity = heapq.heappop(self.expire_heap)
+            event = self.by_identity.get(identity)
             if not event or event.get("expire_ts") != expire_ts:
                 continue
-            removed = self.remove(eid)
+            removed = self.remove(*identity)
             if removed:
                 expired.append(removed)
         return expired
@@ -284,7 +291,7 @@ class SitePredicate:
         result = []
         seen = set()
         for event in events:
-            key = event.get("eid") or (event.get("node"), event.get("ts"), event.get("alarm"), event.get("alarm_source"))
+            key = require_alarm_identity(event)
             if key in seen:
                 continue
             seen.add(key)
@@ -457,12 +464,13 @@ class DynamicFaultGraph:
         self.topology = topology
         self.active_alarms = active_alarms
 
-    def insert_alarm(self, site_id, alarm_type, ts, eid, alarm_source="", expire_ts=None):
+    def insert_alarm(self, site_id, alarm_type, ts, eid, occurrence_uuid, alarm_source="", expire_ts=None):
         event = self.active_alarms.add(
             site_id,
             alarm_type,
             ts,
             eid,
+            occurrence_uuid,
             alarm_source=alarm_source,
             expire_ts=expire_ts,
         )
@@ -470,15 +478,15 @@ class DynamicFaultGraph:
             "alarm_edge": {
                 "kind": "HAS_ALARM",
                 "src": site_id,
-                "dst": event.get("eid"),
+                "dst": require_alarm_identity(event),
                 "site": site_id,
                 "alarm": event,
                 "label": alarm_type,
             },
         }
 
-    def delete_alarm(self, eid):
-        event = self.active_alarms.remove(eid)
+    def delete_alarm(self, eid, occurrence_uuid):
+        event = self.active_alarms.remove(eid, occurrence_uuid)
         if not event:
             return None
         return event
@@ -1604,6 +1612,8 @@ class FaultCSMEngine:
         alarm_type = item["alarm_title"]
         ts = float(item["ts"])
         eid = alarm.get("告警编码ID", "")
+        occurrence_uuid = item.get("occurrence_uuid")
+        require_alarm_identity({"eid": eid, "occurrence_uuid": occurrence_uuid})
         alarm_source = item.get("alarm_source", "")
         self.watermark = max(self.watermark, ts)
         raw_matches = []
@@ -1624,7 +1634,7 @@ class FaultCSMEngine:
             )
 
         if self._is_clear(alarm):
-            deleted_event = self.graph.delete_alarm(eid)
+            deleted_event = self.graph.delete_alarm(eid, occurrence_uuid)
             self._handle_invalidated_events([deleted_event])
             if deleted_event:
                 self._invalidate_stream_dynamic_cache()
@@ -1643,6 +1653,7 @@ class FaultCSMEngine:
             alarm_type,
             ts,
             eid,
+            occurrence_uuid,
             alarm_source=alarm_source,
             expire_ts=expire_ts,
         )
@@ -1690,13 +1701,13 @@ class FaultCSMEngine:
         return []
 
     def _handle_invalidated_events(self, events):
-        eids = {
-            event.get("eid")
+        identities = {
+            require_alarm_identity(event)
             for event in events
             if event and event.get("eid")
         }
-        if eids:
-            self.history.invalidate_by_eids(eids)
+        if identities:
+            self.history.invalidate_by_identities(identities)
 
     def _enumerate_after_alarm_invalidations(self, invalidated_events, ts, eval_cache):
         """Re-match locally after alarm deletion/expiry.
@@ -1709,18 +1720,18 @@ class FaultCSMEngine:
         if not impacted_sites:
             return []
         matches = []
-        seen_active_eids = set()
+        seen_active_identities = set()
         for impacted_site in sorted(impacted_sites):
             for active_event in self.active_alarms.by_site.get(impacted_site, ()):
                 active_eid = active_event.get("eid")
-                if active_eid and active_eid in seen_active_eids:
+                active_identity = require_alarm_identity(active_event)
+                if active_identity in seen_active_identities:
                     continue
-                if active_eid:
-                    seen_active_eids.add(active_eid)
+                seen_active_identities.add(active_identity)
                 updated_alarm_edge = {
                     "kind": "HAS_ALARM",
                     "src": active_event.get("node"),
-                    "dst": active_eid,
+                    "dst": active_identity,
                     "site": active_event.get("node"),
                     "alarm": active_event,
                     "label": active_event.get("alarm"),
@@ -2305,7 +2316,7 @@ class FaultCSMEngine:
                     symptom = dict(event)
                     symptom["matched_role"] = role
                     symptom["time_str"] = datetime.fromtimestamp(event["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-                    symptoms[eid] = symptom
+                    symptoms[require_alarm_identity(symptom)] = symptom
         if not symptoms:
             return None
         inferred_roots = {
@@ -2347,7 +2358,7 @@ class CSMGroupStore:
         self.rules = rules_config
         self.default_ttl = default_ttl
         self.groups = []
-        self.eid_to_group = collections.defaultdict(set)
+        self.identity_to_group = collections.defaultdict(set)
 
     def finalize(self, matches, current_ts):
         self.prune(current_ts)
@@ -2368,11 +2379,11 @@ class CSMGroupStore:
             self.groups = kept
             self._rebuild_index()
 
-    def invalidate_by_eids(self, eids):
+    def invalidate_by_identities(self, identities):
         related_indexes = {
             idx
-            for eid in eids
-            for idx in self.eid_to_group.get(eid, ())
+            for identity in identities
+            for idx in self.identity_to_group.get(identity, ())
             if 0 <= idx < len(self.groups) and self.groups[idx] is not None
         }
         if not related_indexes:
@@ -2383,13 +2394,13 @@ class CSMGroupStore:
         return len(related_indexes)
 
     def merge(self, match):
-        eids = self._match_eids(match)
-        if not eids:
+        identities = self._match_identities(match)
+        if not identities:
             return match, set(), True
         related_indexes = {
             idx
-            for eid in eids
-            for idx in self.eid_to_group.get(eid, ())
+            for identity in identities
+            for idx in self.identity_to_group.get(identity, ())
             if 0 <= idx < len(self.groups) and self.groups[idx] is not None
         }
         if not related_indexes:
@@ -2401,14 +2412,14 @@ class CSMGroupStore:
             "merged_rules": set(match.get("merged_rules", [match.get("rule")])),
             "inferred_roots": copy.deepcopy(match.get("inferred_roots", {})),
             "role_mapping": copy.deepcopy(match.get("role_mapping", {})),
-            "symptoms": {symptom.get("eid"): symptom for symptom in match.get("symptoms", []) if symptom.get("eid")},
+            "symptoms": {require_alarm_identity(symptom): symptom for symptom in match.get("symptoms", [])},
             "_expire_ts_hint": match.get("_expire_ts_hint"),
         }
         fully_contained = False
         for idx in related_indexes:
             previous = self.groups[idx]["match"]
-            previous_eids = self._match_eids(previous)
-            if eids.issubset(previous_eids):
+            previous_identities = self._match_identities(previous)
+            if identities.issubset(previous_identities):
                 fully_contained = True
             merged["merged_rules"].update(previous.get("merged_rules", [previous.get("rule")]))
             for role, nodes in previous.get("role_mapping", {}).items():
@@ -2418,8 +2429,7 @@ class CSMGroupStore:
                 merged["inferred_roots"].setdefault(role, [])
                 merged["inferred_roots"][role] = sorted(set(merged["inferred_roots"][role]) | set(nodes))
             for symptom in previous.get("symptoms", []):
-                if symptom.get("eid"):
-                    merged["symptoms"][symptom["eid"]] = symptom
+                merged["symptoms"][require_alarm_identity(symptom)] = symptom
 
         result = dict(merged)
         result["merged_rules"] = sorted(rule for rule in result["merged_rules"] if rule)
@@ -2437,23 +2447,22 @@ class CSMGroupStore:
         item = {"match": match, "expire_ts": expire_ts}
         self.groups.append(item)
         idx = len(self.groups) - 1
-        for eid in self._match_eids(match):
-            self.eid_to_group[eid].add(idx)
+        for identity in self._match_identities(match):
+            self.identity_to_group[identity].add(idx)
         if len(related_indexes) > 64:
             self._rebuild_index()
 
     def _rebuild_index(self):
-        self.eid_to_group.clear()
+        self.identity_to_group.clear()
         for idx, item in enumerate(self.groups):
             if item is None:
                 continue
-            for eid in self._match_eids(item["match"]):
-                self.eid_to_group[eid].add(idx)
+            for identity in self._match_identities(item["match"]):
+                self.identity_to_group[identity].add(idx)
 
     @staticmethod
-    def _match_eids(match):
+    def _match_identities(match):
         return {
-            symptom.get("eid")
+            require_alarm_identity(symptom)
             for symptom in match.get("symptoms", [])
-            if symptom.get("eid")
         }

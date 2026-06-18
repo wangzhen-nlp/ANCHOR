@@ -5,6 +5,7 @@ import time
 import threading
 
 from fault_grouping.emitted_group_store import EmittedGroupStore
+from fault_grouping.alarm_events.identity import require_occurrence_uuid
 from fault_grouping.node_rule_helper import NodeRuleHelper
 from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from fault_grouping.temporal_engine.alarm_period import TemporalGraphEngineAlarmPeriodMixin
@@ -266,7 +267,6 @@ class TemporalGraphEngine(
         # 仅在 period 模式下使用；raw 模式保持为空。
         self.active_alarm_periods = collections.defaultdict(dict)
         self.active_event_to_period = collections.defaultdict(dict)
-        self._event_occurrence_seq = 0
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = 3600
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
@@ -392,10 +392,25 @@ class TemporalGraphEngine(
         # 当 heap 脏条目过多时触发重建的倍率阈值
         self._pending_heap_rebuild_factor = 3
 
-    def process_event(self, node, alarm_type, ts, event_id, alarm_source="", is_clear=False, collect_matches=False, register_trigger=True):
+    def process_event(
+        self,
+        node,
+        alarm_type,
+        ts,
+        event_id,
+        occurrence_uuid,
+        alarm_source="",
+        is_clear=False,
+        collect_matches=False,
+        register_trigger=True,
+    ):
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
         with self._lock:
+            occurrence_uuid = require_occurrence_uuid({
+                "eid": event_id,
+                "occurrence_uuid": occurrence_uuid,
+            })
             # 1. 当前仍保留事件时间水印，便于离线按事件时间回放。
             self.current_watermark = max(self.current_watermark, ts)
             self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
@@ -410,8 +425,20 @@ class TemporalGraphEngine(
             if self.use_alarm_period_cache:
                 if is_clear:
                     # 清除事件只按 event_id 删除对应实例，并联动修正 trigger / pending 状态。
-                    self._remove_cleared_events(node, event_id)
-                    affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
+                    self._remove_cleared_events(
+                        node,
+                        event_id,
+                        occurrence_uuid,
+                        alarm_type=alarm_type,
+                        alarm_source=alarm_source,
+                    )
+                    affected_rule_names = self._remove_cleared_trigger_events(
+                        node,
+                        event_id,
+                        occurrence_uuid,
+                        alarm_type=alarm_type,
+                        alarm_source=alarm_source,
+                    )
                     if affected_rule_names:
                         self._refresh_pending_triggers_for_node(
                             node,
@@ -423,22 +450,33 @@ class TemporalGraphEngine(
                         alarm_type,
                         ts,
                         event_id,
+                        occurrence_uuid,
                         alarm_source=alarm_source,
                     )
             else:
                 if is_clear:
-                    self._remove_cleared_events(node, event_id)
-                    affected_rule_names = self._remove_cleared_trigger_events(node, event_id)
+                    self._remove_cleared_events(
+                        node,
+                        event_id,
+                        occurrence_uuid,
+                        alarm_type=alarm_type,
+                        alarm_source=alarm_source,
+                    )
+                    affected_rule_names = self._remove_cleared_trigger_events(
+                        node,
+                        event_id,
+                        occurrence_uuid,
+                        alarm_type=alarm_type,
+                        alarm_source=alarm_source,
+                    )
                     if affected_rule_names:
                         self._refresh_pending_triggers_for_node(
                             node,
                             affected_rule_names=affected_rule_names
                         )
                 else:
-                    self._event_occurrence_seq += 1
-                    occurrence_id = f"raw-{self._event_occurrence_seq}"
                     self.event_cache[node].append(
-                        (ts, event_id, alarm_type, alarm_source, frozenset(), occurrence_id)
+                        (ts, event_id, alarm_type, alarm_source, frozenset(), occurrence_uuid)
                     )
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
@@ -452,7 +490,9 @@ class TemporalGraphEngine(
                         trigger_key = (node, rule_name)
                         self._trigger_seq += 1
                         trigger_seq = self._trigger_seq
-                        self.trigger_event_index[trigger_key].append((ts, event_id, trigger_seq, alarm_type))
+                        self.trigger_event_index[trigger_key].append(
+                            (ts, event_id, trigger_seq, alarm_type, str(alarm_source or ""), occurrence_uuid)
+                        )
                         # 如果这段时间内已经触发过，就不更新时间，以“第一声警报”为准
                         if trigger_key not in self.pending_triggers:
                             self._set_pending_trigger(trigger_key, ts, trigger_seq)
@@ -486,18 +526,14 @@ class TemporalGraphEngine(
             alarm_type = event.get("alarm")
             alarm_source = event.get("alarm_source", "")
             consumed_trigger_rules = event.get("consumed_trigger_rules", ())
-            occurrence_id = event.get("occurrence_id") or event.get("_raw_event_occurrence_key")
+            occurrence_uuid = event.get("occurrence_uuid")
         else:
-            try:
-                ts, event_id, alarm_type, alarm_source, consumed_trigger_rules, occurrence_id = event
-            except (TypeError, ValueError):
-                ts, event_id, alarm_type, alarm_source, consumed_trigger_rules = event
-                occurrence_id = None
+            ts, event_id, alarm_type, alarm_source, consumed_trigger_rules, occurrence_uuid = event
         payload = {
             "node": node,
             "ts": ts,
             "event_id": event_id,
-            "occurrence_id": occurrence_id,
+            "occurrence_uuid": occurrence_uuid,
             "alarm_type": alarm_type,
             "alarm_source": alarm_source,
             "consumed_trigger_rules": sorted(consumed_trigger_rules),
@@ -782,7 +818,19 @@ class TemporalGraphEngine(
         if not trigger_events:
             self.trigger_event_index.pop(trigger_key, None)
 
-    def _remove_cleared_trigger_events(self, node, event_id):
+    @staticmethod
+    def _unpack_trigger_event(trigger_event):
+        event_ts, event_id, event_seq, alarm_type, alarm_source, occurrence_uuid = trigger_event
+        return event_ts, event_id, event_seq, alarm_type, str(alarm_source or ""), occurrence_uuid
+
+    def _remove_cleared_trigger_events(
+        self,
+        node,
+        event_id,
+        occurrence_uuid,
+        alarm_type=None,
+        alarm_source=None,
+    ):
         """按 event_id 从 trigger 索引中移除已清除的触发事件。
 
         返回值是“当前 pending anchor 也被清掉”的 rule 名集合。只有这些 rule
@@ -801,12 +849,30 @@ class TemporalGraphEngine(
 
             current_pending_anchor = self.pending_triggers.get(trigger_key)
             kept = collections.deque()
-            for event_ts, indexed_event_id, indexed_seq, indexed_alarm_type in trigger_events:
-                if indexed_event_id == event_id:
+            target_alarm_source = None if alarm_source is None else str(alarm_source or "")
+            for trigger_event in trigger_events:
+                (
+                    event_ts,
+                    indexed_event_id,
+                    indexed_seq,
+                    indexed_alarm_type,
+                    indexed_alarm_source,
+                    indexed_occurrence_uuid,
+                ) = self._unpack_trigger_event(trigger_event)
+                matches_clear = (
+                    indexed_event_id == event_id
+                    and indexed_occurrence_uuid == occurrence_uuid
+                    and (alarm_type is None or indexed_alarm_type == alarm_type)
+                    and (
+                        target_alarm_source is None
+                        or indexed_alarm_source == target_alarm_source
+                    )
+                )
+                if matches_clear:
                     if current_pending_anchor == (event_ts, indexed_seq):
                         affected_rule_names.add(rule_name)
                     continue
-                kept.append((event_ts, indexed_event_id, indexed_seq, indexed_alarm_type))
+                kept.append(trigger_event)
 
             if kept:
                 self.trigger_event_index[trigger_key] = kept
@@ -844,7 +910,10 @@ class TemporalGraphEngine(
             return None
 
         _lower_bound_ts, lower_bound_seq = lower_bound_anchor
-        for event_ts, _event_id, event_seq, _alarm_type in trigger_events:
+        for trigger_event in trigger_events:
+            event_ts, _event_id, event_seq, _alarm_type, _alarm_source, _occurrence_uuid = (
+                self._unpack_trigger_event(trigger_event)
+            )
             if event_seq > lower_bound_seq:
                 return event_ts, event_seq
         return None
