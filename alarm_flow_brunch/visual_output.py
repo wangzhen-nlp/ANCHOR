@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from fault_grouping.matching.group_output_builder import build_jsonl_match_output
-from fault_grouping.alarm_events.identity import require_alarm_identity, require_occurrence_uuid
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.site_topology import build_site_to_ne_ids
 
 
@@ -20,14 +20,15 @@ def load_json_object(path):
 
 
 def _symptom_to_visual_record(symptom):
+    eid, occurrence_uuid = require_alarm_identity(symptom)
     record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
         "alarm": symptom.get("alarm_title", ""),
         "alarm_type": symptom.get("alarm_type", ""),
         "ts": symptom.get("ts"),
-        "eid": symptom.get("event_id", ""),
-        "occurrence_uuid": require_occurrence_uuid(symptom),
+        "eid": eid,
+        "occurrence_uuid": occurrence_uuid,
         "virtual": bool(symptom.get("virtual", False)),
         "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),
@@ -179,16 +180,19 @@ def _brunch_missing_topology_edges(group, ne_graph_data):
         return []
     symptoms_by_key = {}
     for symptom in group.get("symptoms") or []:
-        event_id = str(symptom.get("event_id", "") or "")
-        occurrence_uuid = require_occurrence_uuid(symptom)
+        event_id, occurrence_uuid = require_alarm_identity(symptom)
         symptoms_by_key[(event_id, occurrence_uuid)] = symptom
     missing_edges = []
     seen = set()
     for edge in group.get("edges") or []:
-        source_event_id = str(edge.get("source_event_id", "") or "")
-        target_event_id = str(edge.get("target_event_id", "") or "")
-        source_occurrence_uuid = str(edge["source_occurrence_uuid"])
-        target_occurrence_uuid = str(edge["target_occurrence_uuid"])
+        source_event_id, source_occurrence_uuid = require_alarm_identity({
+            "eid": edge.get("source_event_id"),
+            "occurrence_uuid": edge.get("source_occurrence_uuid"),
+        })
+        target_event_id, target_occurrence_uuid = require_alarm_identity({
+            "eid": edge.get("target_event_id"),
+            "occurrence_uuid": edge.get("target_occurrence_uuid"),
+        })
         source_key = (source_event_id, source_occurrence_uuid)
         target_key = (target_event_id, target_occurrence_uuid)
         source_symptom = symptoms_by_key.get(source_key)

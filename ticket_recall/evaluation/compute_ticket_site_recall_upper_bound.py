@@ -12,7 +12,7 @@ if __package__ in (None, ""):
     ensure_repo_root(2)
 
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
-from fault_grouping.alarm_events.identity import input_occurrence_uuid
+from fault_grouping.alarm_events.identity import alarm_content_uuid
 from topology_resources import NE_GRAPH_JSON, resource_display
 
 
@@ -438,11 +438,11 @@ def _collect_association_evidence(
         for site_id in site_ids:
             recorded_range_site_tickets[site_id].add(ticket_id)
 
-    for alarm_index, alarm in enumerate(stream_alarm_inputs(alarm_input, show_progress=True), start=1):
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         if _should_skip_alarm(alarm):
             continue
 
-        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_index)
+        occurrence_uuid = alarm_content_uuid(alarm)
         resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site, site_field, source_field)
         if not resolved_site_id:
             continue
@@ -638,11 +638,11 @@ def _build_recorded_range_debug_info(
     if not site_to_debug_tickets:
         return debug_info
 
-    for alarm_index, alarm in enumerate(stream_alarm_inputs(alarm_input, show_progress=True), start=1):
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         if _should_skip_alarm(alarm):
             continue
 
-        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_index)
+        occurrence_uuid = alarm_content_uuid(alarm)
         resolved_site_id = _resolve_alarm_site_id(alarm, ne_to_site, site_field, source_field)
         if not resolved_site_id:
             continue

@@ -270,6 +270,7 @@ def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_i
         return {}
 
     alarm_presence = {alarm_id: [] for alarm_id in sorted(debug_alarm_ids)}
+    matched_groups_by_alarm_id = defaultdict(set)
     for ticket_id in sorted(ticket_sites):
         upper_site_evidence = upper_bound_index.get(ticket_id, {}).get("site_evidence", {})
         if not isinstance(upper_site_evidence, dict):
@@ -282,21 +283,25 @@ def _build_debug_alarm_group_lookup(debug_alarm_ids, ticket_sites, upper_bound_i
                 alarm_id = extract_alarm_record_id(record)
                 if alarm_id not in debug_alarm_ids:
                     continue
+                alarm_identity = alarm_record_identity_key(record)
+                matched_groups = sorted({
+                    _normalize_text(group_id)
+                    for group_id in alarm_to_groups.get(alarm_identity, ())
+                    if _normalize_text(group_id)
+                })
+                matched_groups_by_alarm_id[alarm_id].update(matched_groups)
                 alarm_presence[alarm_id].append({
                     "ticket_id": ticket_id,
                     "site_id": _normalize_text(site_id),
                     "alarm_title": _normalize_text(record.get("告警标题", "")) or _normalize_text(record.get("alarm", "")),
+                    "occurrence_uuid": alarm_identity[1],
+                    "matched_groups": matched_groups,
                 })
 
     result = {}
     for alarm_id in sorted(debug_alarm_ids):
-        fallback_key = ("alarm_id", alarm_id)
         result[alarm_id] = {
-            "matched_groups": sorted({
-                _normalize_text(group_id)
-                for group_id in alarm_to_groups.get(fallback_key, ())
-                if _normalize_text(group_id)
-            }),
+            "matched_groups": sorted(matched_groups_by_alarm_id.get(alarm_id, ())),
             "evidence_hits": alarm_presence.get(alarm_id, []),
         }
     return result

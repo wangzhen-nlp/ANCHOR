@@ -718,16 +718,12 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_a
                 continue
 
             entries_by_occurrence = collections.defaultdict(list)
-            anonymous_entries = []
             for entry in entries:
-                if entry[3] is None:
-                    anonymous_entries.append(entry)
-                else:
-                    entries_by_occurrence[entry[3]].append(entry)
+                entries_by_occurrence[entry[3]].append(entry)
 
-            # 已有明确 occurrence 身份时，各身份独立扫描。不能用一条全局的
+            # 各 occurrence 身份独立扫描。不能用一条全局的
             # component_head：不同 occurrence 交错排列会把同一发生的重叠链打断。
-            for same_occurrence_entries in [*entries_by_occurrence.values(), anonymous_entries]:
+            for same_occurrence_entries in entries_by_occurrence.values():
                 same_occurrence_entries.sort(
                     key=lambda item: (item[0], _interval_end_sort_value(item[1]), item[2])
                 )
@@ -740,22 +736,6 @@ def merge_match_batch(matches, site_merge_helper=None, return_stats=False, use_a
                         continue
                     union(component_head, idx, reason="alarm_overlap")
                     component_end_ts = _merge_interval_end(component_end_ts, end_ts)
-
-            # 旧缓存可能没有 occurrence 身份；它与任意明确身份都兼容。通常这里
-            # 为空，因此主路径仍是 O(n log n)，仅对兼容旧数据做必要的交叉检查。
-            if anonymous_entries and entries_by_occurrence:
-                identified_entries = [
-                    entry
-                    for same_occurrence_entries in entries_by_occurrence.values()
-                    for entry in same_occurrence_entries
-                ]
-                for anonymous_start, anonymous_end, anonymous_idx, _ in anonymous_entries:
-                    for identified_start, identified_end, identified_idx, _ in identified_entries:
-                        if (
-                            anonymous_start <= _interval_end_sort_value(identified_end)
-                            and identified_start <= _interval_end_sort_value(anonymous_end)
-                        ):
-                            union(anonymous_idx, identified_idx, reason="alarm_overlap")
     else:
         match_primary_keys = [get_match_alarm_keys(match, use_alarm_period_cache=False) for match in matches]
         eid_to_match_indexes = collections.defaultdict(list)

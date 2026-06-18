@@ -6,16 +6,25 @@ import uuid
 from pathlib import Path
 
 from alarm_flow_brunch.aggregator import summarize_alarm_event as summarize_brunch_alarm_event
-from alarm_flow_brunch.visual_output import _symptom_to_visual_record
+from alarm_flow_brunch.visual_output import (
+    _brunch_missing_topology_edges,
+    _symptom_to_visual_record,
+)
 from alarm_flow_mhp.aggregator import summarize_alarm_event as summarize_mhp_alarm_event
 from alarm_flow_mhp.missing_chain_sampler import MissingChainSampler
-from alarm_flow_mhp.visual_output import _symptom_to_visual_record_mhp
+from alarm_flow_mhp.visual_output import (
+    _mhp_propagation_edges,
+    _symptom_to_visual_record_mhp,
+)
+from alarm_tools.check_duplicate_eid import check_duplicate_eid
+from alarm_tools.count_alarms import count_alarms
 from fault_grouping.alarm_events.identity import (
-    input_occurrence_uuid,
+    alarm_content_uuid,
     require_alarm_identity,
 )
 from fault_grouping.alarm_events.io import load_valid_alarms
 from fault_grouping.alarm_events.sorted_cache import (
+    is_sorted_alarm_cache_file,
     load_sorted_alarm_cache,
     write_sorted_alarm_cache,
 )
@@ -25,8 +34,18 @@ from fault_grouping.matching.group_output_builder import (
 )
 from fault_grouping.node_rule_helper import NodeRuleHelper
 from fault_grouping.temporal_engine.alarm_period import TemporalGraphEngineAlarmPeriodMixin
+from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.temporal_engine.utils import get_match_alarm_keys, merge_match_batch
+from fault_grouping.tools.alarm_group_baseline import alarm_to_baseline_symptom
+from fault_csm_claude.engine import IncrementalFaultEngine
 from fault_csm_codex.engine import ActiveAlarmIndex, CSMGroupStore
+from microwave_topic.group_alarms_by_fault_group import group_alarms
+from ticket_recall.evaluation.compute_group_output_ticket_recall import (
+    _build_debug_alarm_group_lookup as build_group_output_debug_alarm_lookup,
+)
+from ticket_recall.evaluation.compute_ticket_site_recall import (
+    _build_debug_alarm_group_lookup as build_ticket_site_debug_alarm_lookup,
+)
 from ticket_recall.ticket_recall_utils import dedupe_alarm_records
 
 
@@ -64,10 +83,13 @@ class DummyAlarmPeriodEngine(TemporalGraphEngineAlarmPeriodMixin):
 
 
 class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
-    def test_input_uuid_is_stable_per_source_and_ordinal(self):
-        first = input_occurrence_uuid("alarms.jsonl", 1)
-        self.assertEqual(first, input_occurrence_uuid("alarms.jsonl", 1))
-        self.assertNotEqual(first, input_occurrence_uuid("alarms.jsonl", 2))
+    def test_input_uuid_is_stable_for_canonical_alarm_content(self):
+        alarm = {"eid": "E", "nested": {"b": 2, "a": 1}}
+        reordered = {"nested": {"a": 1, "b": 2}, "eid": "E"}
+        first = alarm_content_uuid(alarm)
+        self.assertEqual(first, alarm_content_uuid(reordered))
+        self.assertEqual(first, alarm_content_uuid({**alarm, "occurrence_uuid": occurrence("ignored")}))
+        self.assertNotEqual(first, alarm_content_uuid({**alarm, "eid": "OTHER"}))
         uuid.UUID(first)
 
     def test_loader_adds_uuid_once_and_clear_reuses_it(self):
@@ -81,7 +103,9 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "alarms.jsonl"
+            copied_path = Path(tmpdir) / "copied-alarms.jsonl"
             path.write_text(json.dumps(raw, ensure_ascii=False) + "\n", encoding="utf-8")
+            copied_path.write_text(json.dumps(raw, ensure_ascii=False) + "\n", encoding="utf-8")
             _processed, events, normal_count, clear_count = load_valid_alarms(
                 path,
                 {"A"},
@@ -89,9 +113,30 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
                 {},
                 show_progress=False,
             )
+            _processed, copied_events, _normal_count, _clear_count = load_valid_alarms(
+                copied_path,
+                {"A"},
+                {"S1"},
+                {},
+                show_progress=False,
+            )
         self.assertEqual((normal_count, clear_count), (1, 1))
         self.assertEqual(events[0]["occurrence_uuid"], events[1]["occurrence_uuid"])
-        self.assertEqual(events[0]["occurrence_uuid"], input_occurrence_uuid(path, 1))
+        self.assertEqual(events[0]["occurrence_uuid"], copied_events[0]["occurrence_uuid"])
+        self.assertEqual(events[0]["occurrence_uuid"], alarm_content_uuid(raw))
+
+    def test_loader_rejects_alarm_without_eid(self):
+        raw = {
+            "告警标题": "A",
+            "告警源": "NE1",
+            "站点ID": "S1",
+            "告警首次发生时间": "2026-01-01 00:00:00",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "alarms.jsonl"
+            path.write_text(json.dumps(raw, ensure_ascii=False) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "required eid"):
+                load_valid_alarms(path, {"A"}, {"S1"}, {}, show_progress=False)
 
     def test_identity_requires_eid_and_valid_uuid(self):
         uid = occurrence("required")
@@ -100,6 +145,43 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
             require_alarm_identity({"eid": "E"})
         with self.assertRaises(ValueError):
             require_alarm_identity({"eid": "E", "occurrence_uuid": "obs-1"})
+
+    def test_temporal_engine_enforces_and_normalizes_complete_identity_at_ingress(self):
+        engine = TemporalGraphEngine({}, {}, {})
+        uid = occurrence("engine-ingress")
+        with self.assertRaisesRegex(ValueError, "required eid"):
+            engine.process_event("S1", "A", 1, None, uid, register_trigger=False)
+        self.assertFalse(engine.event_cache)
+
+        engine.process_event("S1", "A", 1, 0, "{" + uid.upper() + "}", register_trigger=False)
+        cached = engine.event_cache["S1"][0]
+        self.assertEqual((cached[1], cached[5]), ("0", uid))
+
+    def test_incremental_engine_uses_normalized_identity_for_cache_and_clear(self):
+        engine = IncrementalFaultEngine({}, {}, {})
+        uid = occurrence("incremental-ingress")
+        decorated_uuid = "{" + uid.upper() + "}"
+        engine.process_event("S1", "A", 1, 0, decorated_uuid, register_trigger=False)
+        cached = engine.event_cache["S1"][0]
+        self.assertEqual((cached[1], cached[5]), ("0", uid))
+        engine.process_event("S1", "A", 2, 0, decorated_uuid, is_clear=True, register_trigger=False)
+        self.assertFalse(engine.event_cache.get("S1"))
+
+    def test_baseline_requires_and_normalizes_complete_identity(self):
+        uid = occurrence("baseline")
+        source = {
+            "eid": 0,
+            "occurrence_uuid": "{" + uid.upper() + "}",
+            "故障组ID": "G",
+        }
+        result = alarm_to_baseline_symptom(source, group_field="故障组ID", ne_graph_data={})
+        self.assertEqual((result["eid"], result["occurrence_uuid"]), ("0", uid))
+        with self.assertRaisesRegex(ValueError, "required eid"):
+            alarm_to_baseline_symptom(
+                {"occurrence_uuid": uid, "故障组ID": "G"},
+                group_field="故障组ID",
+                ne_graph_data={},
+            )
 
     def test_mhp_and_brunch_preserve_the_same_uuid(self):
         uid = occurrence("summary")
@@ -123,6 +205,22 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
             record = build(source)
             self.assertEqual(record["occurrence_uuid"], uid)
             self.assertNotIn("occurrence_id", record)
+
+    def test_visual_edges_reject_invalid_occurrence_uuid(self):
+        first = occurrence("edge-1")
+        second = occurrence("edge-2")
+        group = {
+            "symptoms": [symptom("E1", first), symptom("E2", second)],
+            "edges": [{
+                "source_event_id": "E1",
+                "target_event_id": "E2",
+                "source_occurrence_uuid": "not-a-uuid",
+                "target_occurrence_uuid": second,
+            }],
+        }
+        for build_edges in (_mhp_propagation_edges, _brunch_missing_topology_edges):
+            with self.assertRaisesRegex(ValueError, "invalid occurrence_uuid"):
+                build_edges(group, {"NE1": {}})
 
     def test_duplicate_eid_different_uuid_is_not_merged(self):
         left = {"uuid": "L", "rule": "r", "symptoms": [symptom("E", occurrence("left"))]}
@@ -209,16 +307,71 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
         ]
         self.assertEqual(len(dedupe_alarm_records(rows)), 2)
 
+    def test_debug_alarm_lookup_resolves_groups_by_complete_identity(self):
+        uid = occurrence("debug-lookup")
+        upper_bound_index = {
+            "T": {"site_evidence": {"S1": [{"alarm_id": "E", "occurrence_uuid": uid}]}}
+        }
+        alarm_to_groups = {("E", uid): {"G"}}
+        for build_lookup in (
+            build_group_output_debug_alarm_lookup,
+            build_ticket_site_debug_alarm_lookup,
+        ):
+            result = build_lookup({"E"}, {"T": ["S1"]}, upper_bound_index, alarm_to_groups)
+            self.assertEqual(result["E"]["matched_groups"], ["G"])
+            self.assertEqual(result["E"]["evidence_hits"][0]["occurrence_uuid"], uid)
+
     def test_sorted_cache_roundtrip_requires_uuid(self):
         uid = occurrence("cache")
-        event = {"alarm": {"告警编码ID": "E"}, "occurrence_uuid": uid, "ts": 1}
+        event = {
+            "alarm": {"告警编码ID": "E", "故障组ID": "G"},
+            "occurrence_uuid": uid,
+            "ts": 1,
+        }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "alarms.jsonl"
-            write_sorted_alarm_cache(path, [event])
-            _metadata, loaded = load_sorted_alarm_cache(path)
+            metadata = write_sorted_alarm_cache(path, [event])
+            self.assertEqual(metadata["cache_type"], "fault_grouping.sorted_alarms.v3")
+            self.assertEqual(metadata["alarm_identity_scheme"], "eid+canonical-json-uuid5:v1")
+            loaded_metadata, loaded = load_sorted_alarm_cache(path)
+            self.assertEqual(loaded_metadata["alarm_identity_scheme"], metadata["alarm_identity_scheme"])
             self.assertEqual(loaded[0]["occurrence_uuid"], uid)
+            self.assertEqual(count_alarms(path, show_progress=False)["alarm_count"], 1)
+            self.assertEqual(
+                check_duplicate_eid(path, show_progress=False)["cache_header_count"],
+                1,
+            )
+            grouped, group_stats = group_alarms(
+                path,
+                ne_graph="",
+                site_graph="",
+                visual_output=False,
+            )
+            self.assertEqual(([group["故障组ID"] for group in grouped], group_stats["grouped_alarm_count"]), (["G"], 1))
             with self.assertRaises(ValueError):
                 write_sorted_alarm_cache(Path(tmpdir) / "invalid.jsonl", [{"alarm": {"告警编码ID": "E"}}])
+
+            old_path = Path(tmpdir) / "old-v2.jsonl"
+            old_path.write_text(
+                json.dumps({"cache_type": "fault_grouping.sorted_alarms.v2"}) + "\n"
+                + json.dumps(event, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(is_sorted_alarm_cache_file(old_path))
+            with self.assertRaisesRegex(ValueError, "当前身份方案"):
+                load_sorted_alarm_cache(old_path)
+            for consume_old_cache in (
+                lambda: count_alarms(old_path, show_progress=False),
+                lambda: check_duplicate_eid(old_path, show_progress=False),
+                lambda: group_alarms(
+                    old_path,
+                    ne_graph="",
+                    site_graph="",
+                    visual_output=False,
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "不支持的排序告警缓存格式"):
+                    consume_old_cache()
 
     def test_missing_event_gets_uuid_at_creation(self):
         sampler = MissingChainSampler(object())

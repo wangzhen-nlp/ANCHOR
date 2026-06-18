@@ -17,19 +17,15 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from fault_grouping.alarm_events.sorted_cache import consume_sorted_alarm_cache_header
 
 
 # 与 alarm_flow_mhp/aggregator.py 的 _event_id 保持一致的 eid 候选字段
 DEFAULT_EID_FIELDS = ["告警编码ID", "alarm_id", "event_id", "id"]
 DEFAULT_TIME_FIELD = "告警首次发生时间"
-SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v1"
 MISSING = "<缺失>"
 
 _TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d")
-
-
-def _is_sorted_alarm_cache_header(record):
-    return isinstance(record, dict) and record.get("cache_type") == SORTED_ALARM_CACHE_TYPE
 
 
 def _parse_time(value):
@@ -101,7 +97,7 @@ def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_F
     counted_count = 0
 
     for alarm in stream_alarm_inputs(alarms_input, show_progress=show_progress):
-        if _is_sorted_alarm_cache_header(alarm):
+        if consume_sorted_alarm_cache_header(alarm):
             cache_header_count += 1
             continue
         processed_count += 1
@@ -129,7 +125,7 @@ def check_duplicate_eid(alarms_input, eid_fields=None, time_field=DEFAULT_TIME_F
     }
     if candidate_eids:
         for alarm in stream_alarm_inputs(alarms_input, show_progress=show_progress):
-            if _is_sorted_alarm_cache_header(alarm):
+            if consume_sorted_alarm_cache_header(alarm):
                 continue
             if not _passes_time_filter(alarm, time_field, start, end):
                 continue

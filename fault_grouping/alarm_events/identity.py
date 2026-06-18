@@ -1,18 +1,38 @@
+import json
 import uuid
-from pathlib import Path
+
+
+ALARM_CONTENT_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    "fault-grouping:alarm-content:v1",
+)
+ALARM_IDENTITY_SCHEME = "eid+canonical-json-uuid5:v1"
+_IDENTITY_INTERNAL_FIELDS = frozenset({"occurrence_uuid"})
 
 
 def new_occurrence_uuid():
     return str(uuid.uuid4())
 
 
-def deterministic_occurrence_uuid(namespace, ordinal):
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{namespace}:{ordinal}"))
-
-
-def input_occurrence_uuid(source, ordinal):
-    source_id = str(Path(source).expanduser().resolve())
-    return deterministic_occurrence_uuid(f"alarm-input:{source_id}", int(ordinal))
+def alarm_content_uuid(record):
+    if not isinstance(record, dict):
+        raise ValueError("alarm record must be a dict")
+    identity_record = {
+        key: value
+        for key, value in record.items()
+        if key not in _IDENTITY_INTERNAL_FIELDS
+    }
+    try:
+        canonical_json = json.dumps(
+            identity_record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alarm record cannot be serialized as canonical JSON") from exc
+    return str(uuid.uuid5(ALARM_CONTENT_NAMESPACE, canonical_json))
 
 
 def require_occurrence_uuid(record):

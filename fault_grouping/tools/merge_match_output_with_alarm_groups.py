@@ -33,7 +33,7 @@
 import argparse
 import copy
 import json
-from fault_grouping.alarm_events.identity import input_occurrence_uuid, require_alarm_identity
+from fault_grouping.alarm_events.identity import alarm_content_uuid, require_alarm_identity
 import sys
 import uuid
 from collections import defaultdict
@@ -274,12 +274,9 @@ def _load_alarm_groups(alarm_input, group_field="故障组ID"):
     """
     alarm_groups = defaultdict(list)
     print("扫描原始告警并分组...")
-    for occurrence_ordinal, alarm in enumerate(
-        stream_alarm_inputs(alarm_input, show_progress=True),
-        start=1,
-    ):
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         alarm = dict(alarm)
-        alarm["occurrence_uuid"] = input_occurrence_uuid(alarm_input, occurrence_ordinal)
+        alarm["occurrence_uuid"] = alarm_content_uuid(alarm)
         raw_group_value = alarm.get(group_field)
         group_ids = _parse_group_ids(raw_group_value)
         if not group_ids:

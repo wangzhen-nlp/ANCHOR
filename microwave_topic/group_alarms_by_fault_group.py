@@ -13,6 +13,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from alarm_tools.alarm_inputs import list_alarm_filepaths, stream_alarm_file
+from fault_grouping.alarm_events.sorted_cache import consume_sorted_alarm_cache_header
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
@@ -86,10 +87,6 @@ def _build_ne_domain_map(ne_graph):
         if domain:
             domain_map[_normalize_text(ne_id)] = domain
     return domain_map
-
-
-def _is_sorted_alarm_cache_header(record):
-    return isinstance(record, dict) and record.get("cache_type") == "fault_grouping.sorted_alarms.v1"
 
 
 def _unwrap_alarm(record):
@@ -226,7 +223,7 @@ def group_alarms(
 
         for record in stream_alarm_file(filepath, show_progress=False):
             stats["input_count"] += 1
-            if _is_sorted_alarm_cache_header(record):
+            if consume_sorted_alarm_cache_header(record):
                 continue
 
             alarm, wrapper = _unwrap_alarm(record)

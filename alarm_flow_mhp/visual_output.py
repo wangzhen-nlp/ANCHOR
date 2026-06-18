@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 from fault_grouping.matching.group_output_builder import build_jsonl_match_output
-from fault_grouping.alarm_events.identity import require_occurrence_uuid
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.site_topology import build_site_to_ne_ids
 
 # Reuse BRUNCH's rule-agnostic helpers (topology + virtual-flag mirroring).
@@ -57,16 +57,19 @@ def _mhp_propagation_edges(group, ne_graph_data):
         return []
     symptoms_by_key = {}
     for symptom in group.get("symptoms") or []:
-        event_id = str(symptom.get("event_id", "") or "")
-        occurrence_uuid = require_occurrence_uuid(symptom)
+        event_id, occurrence_uuid = require_alarm_identity(symptom)
         symptoms_by_key[(event_id, occurrence_uuid)] = symptom
     edges = []
     seen = set()
     for edge in group.get("edges") or []:
-        src_id = str(edge.get("source_event_id", "") or "")
-        tgt_id = str(edge.get("target_event_id", "") or "")
-        src_occurrence_uuid = str(edge["source_occurrence_uuid"])
-        tgt_occurrence_uuid = str(edge["target_occurrence_uuid"])
+        src_id, src_occurrence_uuid = require_alarm_identity({
+            "eid": edge.get("source_event_id"),
+            "occurrence_uuid": edge.get("source_occurrence_uuid"),
+        })
+        tgt_id, tgt_occurrence_uuid = require_alarm_identity({
+            "eid": edge.get("target_event_id"),
+            "occurrence_uuid": edge.get("target_occurrence_uuid"),
+        })
         src_index = edge.get("source_index")
         tgt_index = edge.get("target_index")
         src_key = (src_id, src_occurrence_uuid)
@@ -135,14 +138,15 @@ def _symptom_to_visual_record_mhp(symptom):
     """Per-symptom visual record. ``matched_rule`` reflects the MHP namespace and
     marks imputed nodes with the missing rule so node-level filtering works."""
     is_virtual = bool(symptom.get("virtual", False))
+    eid, occurrence_uuid = require_alarm_identity(symptom)
     record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
         "alarm": symptom.get("alarm_title", ""),
         "alarm_type": symptom.get("alarm_type", ""),
         "ts": symptom.get("ts"),
-        "eid": symptom.get("event_id", ""),
-        "occurrence_uuid": require_occurrence_uuid(symptom),
+        "eid": eid,
+        "occurrence_uuid": occurrence_uuid,
         "_mhp_event_index": symptom.get("_mhp_event_index", symptom.get("index")),
         "virtual": is_virtual,
         "latent": bool(symptom.get("latent", False)),

@@ -383,10 +383,11 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         - 告警清除后立即执行失效匹配
         """
         with self._lock:
-            identity = require_alarm_identity({
+            event_id, occurrence_uuid = require_alarm_identity({
                 "eid": event_id,
                 "occurrence_uuid": occurrence_uuid,
             })
+            identity = (event_id, occurrence_uuid)
             self.current_watermark = max(self.current_watermark, ts)
             self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
             # 先清理该站点过期缓存，再写入新事件
@@ -456,7 +457,10 @@ class IncrementalFaultEngine(TemporalGraphEngine):
         3. 在 EmittedGroupStore 中将含有该 eid 的历史组标为 tombstone
            （失效匹配：该告警已不活跃，关联的故障组不再有效）
         """
-        identity = (str(event_id), str(occurrence_uuid))
+        identity = require_alarm_identity({
+            "eid": event_id,
+            "occurrence_uuid": occurrence_uuid,
+        })
         self._remove_cleared_events(
             node,
             event_id,

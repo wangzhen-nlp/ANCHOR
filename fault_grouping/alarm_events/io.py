@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
-from fault_grouping.alarm_events.identity import input_occurrence_uuid, require_occurrence_uuid
+from fault_grouping.alarm_events.identity import alarm_content_uuid, require_alarm_identity
 from fault_grouping.alarm_events.sorted_cache import load_sorted_alarm_cache
 
 
@@ -54,7 +54,8 @@ def append_alarm_event(
         "ts": dt_obj.timestamp(),
         "occurrence_uuid": occurrence_uuid,
     }
-    require_occurrence_uuid(event)
+    eid, event["occurrence_uuid"] = require_alarm_identity(event)
+    event_alarm["告警编码ID"] = eid
     valid_alarms.append(event)
 
 
@@ -126,7 +127,7 @@ def load_valid_alarms(
         if end_ts is not None and first_occurrence_ts > end_ts:
             continue
 
-        occurrence_uuid = input_occurrence_uuid(alarm_file_path, processed_count)
+        occurrence_uuid = alarm_content_uuid(alarm)
         append_alarm_event(
             valid_alarms,
             alarm,

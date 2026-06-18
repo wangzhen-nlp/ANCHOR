@@ -11,13 +11,7 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_tools.alarm_inputs import list_alarm_filepaths, stream_alarm_file
-
-
-SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v1"
-
-
-def _is_sorted_alarm_cache_header(record):
-    return isinstance(record, dict) and record.get("cache_type") == SORTED_ALARM_CACHE_TYPE
+from fault_grouping.alarm_events.sorted_cache import consume_sorted_alarm_cache_header
 
 
 def count_alarms(alarms_input, show_progress=True):
@@ -31,7 +25,7 @@ def count_alarms(alarms_input, show_progress=True):
         file_count = 0
         for record in stream_alarm_file(filepath, show_progress=show_progress,
                                         file_index=file_index, total_files=total_files):
-            if _is_sorted_alarm_cache_header(record):
+            if consume_sorted_alarm_cache_header(record):
                 cache_header_count += 1
                 continue
             file_count += 1

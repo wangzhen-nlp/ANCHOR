@@ -11,7 +11,7 @@ if __package__ in (None, ""):
 
 from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
-from fault_grouping.alarm_events.identity import input_occurrence_uuid
+from fault_grouping.alarm_events.identity import alarm_content_uuid
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import _extract_group_id, _extract_group_sites
 from ticket_recall.evaluation.recall_common import (
@@ -200,12 +200,9 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     alarm_group_alarm_domains = defaultdict(set)
     alarm_group_has_offline = defaultdict(bool)
     alarm_id_to_alarm_groups = defaultdict(set)
-    for alarm_ordinal, alarm in enumerate(
-        stream_alarm_inputs(alarm_input, show_progress=True),
-        start=1,
-    ):
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
         alarm = dict(alarm)
-        alarm["occurrence_uuid"] = input_occurrence_uuid(alarm_input, alarm_ordinal)
+        alarm["occurrence_uuid"] = alarm_content_uuid(alarm)
         group_ids = _parse_group_ids(alarm.get(group_field, ""))
         if not group_ids:
             continue

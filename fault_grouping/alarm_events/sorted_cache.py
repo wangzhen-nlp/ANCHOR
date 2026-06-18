@@ -2,10 +2,10 @@ import json
 import zipfile
 from datetime import datetime
 
-from fault_grouping.alarm_events.identity import require_alarm_identity
+from fault_grouping.alarm_events.identity import ALARM_IDENTITY_SCHEME, require_alarm_identity
 
 
-SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v2"
+SORTED_ALARM_CACHE_TYPE = "fault_grouping.sorted_alarms.v3"
 SORTED_ALARM_CACHE_MEMBER = "sorted_alarms.jsonl"
 
 
@@ -21,8 +21,27 @@ def _require_cached_alarm_identity(item):
 def build_sorted_alarm_cache_metadata(**kwargs):
     metadata = dict(kwargs)
     metadata["cache_type"] = SORTED_ALARM_CACHE_TYPE
+    metadata["alarm_identity_scheme"] = ALARM_IDENTITY_SCHEME
     metadata["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return metadata
+
+
+def is_sorted_alarm_cache_header(record):
+    return (
+        isinstance(record, dict)
+        and record.get("cache_type") == SORTED_ALARM_CACHE_TYPE
+        and record.get("alarm_identity_scheme") == ALARM_IDENTITY_SCHEME
+    )
+
+
+def consume_sorted_alarm_cache_header(record):
+    """Return True for the current cache header and reject older cache schemas."""
+    if is_sorted_alarm_cache_header(record):
+        return True
+    cache_type = record.get("cache_type") if isinstance(record, dict) else None
+    if str(cache_type or "").startswith("fault_grouping.sorted_alarms."):
+        raise ValueError(f"不支持的排序告警缓存格式: {cache_type}")
+    return False
 
 
 def is_sorted_alarm_cache_file(path):
@@ -43,7 +62,7 @@ def is_sorted_alarm_cache_file(path):
             record = json.loads(first_line)
         except json.JSONDecodeError:
             return False
-        return record.get("cache_type") == SORTED_ALARM_CACHE_TYPE
+        return is_sorted_alarm_cache_header(record)
 
     try:
         with open(path, "r", encoding="utf-8") as fr:
@@ -59,7 +78,7 @@ def is_sorted_alarm_cache_file(path):
     except json.JSONDecodeError:
         return False
 
-    return record.get("cache_type") == SORTED_ALARM_CACHE_TYPE
+    return is_sorted_alarm_cache_header(record)
 
 
 def _find_sorted_alarm_cache_member(zf):
@@ -129,8 +148,8 @@ def load_sorted_alarm_cache(path, show_progress=False):
         raise ValueError(f"排序告警缓存为空: {path}")
 
     metadata = json.loads(first_line)
-    if metadata.get("cache_type") != SORTED_ALARM_CACHE_TYPE:
-        raise ValueError(f"不是有效的排序告警缓存: {path}")
+    if not is_sorted_alarm_cache_header(metadata):
+        raise ValueError(f"不是当前身份方案的有效排序告警缓存: {path}")
 
     for idx, line in enumerate(line_iter, start=1):
         line = line.strip()

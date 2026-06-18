@@ -5,7 +5,7 @@ import time
 import threading
 
 from fault_grouping.emitted_group_store import EmittedGroupStore
-from fault_grouping.alarm_events.identity import require_occurrence_uuid
+from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.node_rule_helper import NodeRuleHelper
 from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
 from fault_grouping.temporal_engine.alarm_period import TemporalGraphEngineAlarmPeriodMixin
@@ -407,7 +407,7 @@ class TemporalGraphEngine(
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
         with self._lock:
-            occurrence_uuid = require_occurrence_uuid({
+            event_id, occurrence_uuid = require_alarm_identity({
                 "eid": event_id,
                 "occurrence_uuid": occurrence_uuid,
             })

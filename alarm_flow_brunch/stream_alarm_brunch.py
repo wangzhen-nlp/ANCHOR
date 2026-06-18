@@ -44,7 +44,7 @@ from fault_grouping.alarm_events.io import (
     is_clear_alarm,
     parse_datetime_text,
 )
-from fault_grouping.alarm_events.identity import input_occurrence_uuid, new_occurrence_uuid
+from fault_grouping.alarm_events.identity import alarm_content_uuid, new_occurrence_uuid
 from fault_grouping.alarm_events.sorted_cache import (
     is_sorted_alarm_cache_file,
     load_sorted_alarm_cache,
@@ -1340,11 +1340,8 @@ def _iter_stream_events(
     allowed_alarm_sources = (
         allowed_devices_for_regions(ne_graph_data, selected_regions) if selected_regions else None
     )
-    for alarm_ordinal, alarm in enumerate(
-        stream_alarm_inputs(alarm_input, show_progress=show_progress),
-        start=1,
-    ):
-        occurrence_uuid = input_occurrence_uuid(alarm_input, alarm_ordinal)
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=show_progress):
+        occurrence_uuid = alarm_content_uuid(alarm)
         for event in _raw_alarm_to_events(
             alarm,
             valid_sites=valid_sites,
