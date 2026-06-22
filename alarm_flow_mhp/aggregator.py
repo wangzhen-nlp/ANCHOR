@@ -86,6 +86,13 @@ class AlarmMHPConfig:
     """Configuration for alarm-flow MHP aggregation."""
 
     type_fields: tuple = ("alarm_source", "alarm_type")
+    # Which type field identifies the topological entity for the topology prior /
+    # consistency report / feature-mode node lookups. "alarm_source" (default) =
+    # per-device topology over the NE graph; "site_id" = per-site topology over a
+    # site graph (same structure). Must be one of type_fields.
+    # Empty means infer from type_fields: prefer alarm_source for backwards
+    # compatibility, otherwise use site_id. Explicit values always win.
+    topology_node_field: str = ""
     history_window_sec: float = 900.0
     # Timestamp jitter tolerance used by training and inherited by stream
     # inference. A candidate parent can be up to this many seconds later than
@@ -164,6 +171,24 @@ class AlarmMHPConfig:
     def __post_init__(self):
         object.__setattr__(self, "regions", parse_regions(self.regions))
         sequence_config = self.sequence_config()
+        type_fields = tuple(self.type_fields)
+        node_field = str(self.topology_node_field or "").strip()
+        if not node_field:
+            if "alarm_source" in type_fields:
+                node_field = "alarm_source"
+            elif "site_id" in type_fields:
+                node_field = "site_id"
+            else:
+                raise ValueError(
+                    "cannot infer topology_node_field: type_fields must contain "
+                    "alarm_source or site_id, or topology_node_field must be set explicitly"
+                )
+            object.__setattr__(self, "topology_node_field", node_field)
+        if node_field not in type_fields:
+            raise ValueError(
+                f"topology_node_field={node_field!r} must be one of "
+                f"type_fields {type_fields} (it is parsed from the type label)"
+            )
         if self.time_slack_sec < 0:
             raise ValueError("time_slack_sec must be >= 0")
         if self.late_penalty_half_life_sec <= 0:
@@ -904,6 +929,20 @@ def train_alarm_mhp(
     )
     _emit_progress(progress_callback, "region_filter", **region_filter_stats)
 
+    domain_filter_stats = {"enabled": False}
+    if "device_domain" in tuple(config.type_fields):
+        if ne_graph_data is None:
+            raise ValueError(
+                "device_domain in type_fields requires ne_graph_data so unsupported "
+                "device domains can be filtered consistently"
+            )
+        from alarm_flow_isahp.event_domain import filter_and_annotate_device_domain
+
+        sorted_alarm_events, domain_filter_stats = filter_and_annotate_device_domain(
+            sorted_alarm_events, ne_graph_data
+        )
+        _emit_progress(progress_callback, "domain_filter", **domain_filter_stats)
+
     vocabs, considered_event_count = build_alarm_vocabs(sorted_alarm_events, sequence_config)
     _emit_progress(
         progress_callback,
@@ -930,8 +969,6 @@ def train_alarm_mhp(
     dyn_exposure_2d = None
     dyn_feature_names = None
     if config.edge_mode == "feature" and config.dynamic_alpha != "off":
-        if config.dynamic_alpha == "source_target" and "alarm_source" not in tuple(config.type_fields):
-            raise ValueError("dynamic_alpha='source_target' requires alarm_source in type_fields")
         from alarm_flow_mhp.dynamic_state import (
             ObservedStateTimeline,
             build_event_states,
@@ -939,15 +976,14 @@ def train_alarm_mhp(
             combo_bits as _combo_bits,
         )
         from alarm_flow_mhp.feature_spec import (
-            _type_field_indices,
-            parse_label_ne_at,
+            parse_label_entity_at,
             runtime_ne_at,
         )
         ev_state_full = build_event_states(
             sorted_alarm_events,
             sequence.events,
             is_clear=lambda e: is_clear_alarm(e.get("alarm", {})),
-            device_of=lambda e: runtime_ne_at(e, config.type_fields)[0],
+            device_of=lambda e: runtime_ne_at(e, config.type_fields, config.topology_node_field)[0],
             alarm_type_of=lambda e: alarm_type_from_title(e.get("alarm_title", "")),
         )
         combo_full = states_to_combo(ev_state_full)
@@ -1030,9 +1066,11 @@ def train_alarm_mhp(
     if config.edge_mode == "feature":
         if ne_graph_data is None:
             raise ValueError("edge_mode='feature' requires ne_graph_data (NE graph) for device attributes")
-        from ne_link_learning.core import build_graph_context
+        from alarm_flow_mhp.feature_spec import build_node_context
 
-        feature_graph_context = build_graph_context(ne_graph_data)
+        # device mode → NE-keyed context; site mode → site-keyed context whose
+        # per-site attributes are aggregated from the NE graph.
+        feature_graph_context = build_node_context(ne_graph_data, config.topology_node_field)
 
     if config.topology_prior_boost > 0 and topology_index is not None:
         topo_prior_flat, topo_prior_score = build_topology_pairs(
@@ -1041,6 +1079,7 @@ def train_alarm_mhp(
             topology_index,
             max_hops=config.topology_prior_max_hops,
             min_score=config.topology_prior_min_score,
+            node_field=config.topology_node_field,
         )
         if verbose:
             print(
@@ -1054,6 +1093,8 @@ def train_alarm_mhp(
 
     feat_at_vocab = None
     feat_mu_spec = None
+    feat_domain_vocab = []
+    feat_node_domains = {}
 
     def write_best_checkpoint(best_result: MHPResult, trace_entry: dict) -> bool:
         # Called by EM whenever train LL hits a new best (≈ every iter, since EM
@@ -1117,6 +1158,7 @@ def train_alarm_mhp(
                 ),
                 "considered_event_count": considered_event_count,
                 "region_filter": region_filter_stats,
+                "domain_filter": domain_filter_stats,
                 "sequence_stats": sequence_stats,
                 "modeled_event_count": train_events.n + (val_events.n if val_events else 0),
                 "train_event_count": train_events.n,
@@ -1141,7 +1183,8 @@ def train_alarm_mhp(
                     if best_result.feature_kernel is not None else None
                 ),
                 "feature_runtime": (
-                    _build_feature_runtime(best_result, vocabs, config, feat_at_vocab, feat_mu_spec)
+                    _build_feature_runtime(best_result, vocabs, config, feat_at_vocab, feat_mu_spec,
+                                           domain_vocab=feat_domain_vocab, node_domains=feat_node_domains)
                     if config.edge_mode == "feature"
                     else None
                 ),
@@ -1207,7 +1250,7 @@ def train_alarm_mhp(
             print("[train] edge_mode=feature → building candidate pair features ...", flush=True)
         from alarm_flow_mhp.feature_spec import build_mu_features
 
-        cand_t, cand_s, phi, feat_names, feat_at_vocab, feat_type_group, cand_topo_score = build_candidate_features(
+        cand_t, cand_s, phi, feat_names, feat_at_vocab, feat_type_group, cand_topo_score, feat_domain_vocab = build_candidate_features(
             train_events,
             vocabs,
             config.type_fields,
@@ -1219,10 +1262,14 @@ def train_alarm_mhp(
             time_slack=mhp_config.time_slack,
             topo_max_hops=config.feature_topo_max_hops,
             topo_min_score=config.feature_topo_min_score,
+            node_field=config.topology_node_field,
         )
+        feat_node_domains = dict(getattr(feature_graph_context, "node_domains", {}) or {})
         # Parameterized inductive μ: ψ(u) single-type features (alarm_type +
         # ne_type/vendor/domain from the NE graph), μ=softplus(w_μ·ψ).
-        mu_phi, mu_spec = build_mu_features(vocabs, config.type_fields, feature_graph_context)
+        mu_phi, mu_spec = build_mu_features(
+            vocabs, config.type_fields, feature_graph_context, node_field=config.topology_node_field
+        )
         feat_mu_spec = mu_spec
         if verbose:
             print(
@@ -1241,23 +1288,24 @@ def train_alarm_mhp(
         if config.dynamic_alpha == "source_target":
             state_timeline = ObservedStateTimeline()
             for ev in sorted(sorted_alarm_events, key=lambda e: float(e.get("ts", 0.0))):
-                ne, _ = runtime_ne_at(ev, config.type_fields)
+                ne, _ = runtime_ne_at(ev, config.type_fields, config.topology_node_field)
                 state_timeline.ingest(
                     float(ev.get("ts", 0.0)),
                     ne,
                     alarm_type_from_title(ev.get("alarm_title", "")),
                     is_clear_alarm(ev.get("alarm", {})),
                 )
-            src_idx, at_idx = _type_field_indices(config.type_fields)
             type_ne = np.asarray(
                 [
-                    parse_label_ne_at(label, src_idx, at_idx)[0]
+                    parse_label_entity_at(
+                        label, config.type_fields, config.topology_node_field
+                    )[0]
                     for label in vocabs.type_vocab.labels
                 ],
                 dtype=object,
             )
             train_event_objs = sequence.events[: train_events.n]
-            train_event_ne = [runtime_ne_at(ev, config.type_fields)[0] for ev in train_event_objs]
+            train_event_ne = [runtime_ne_at(ev, config.type_fields, config.topology_node_field)[0] for ev in train_event_objs]
             train_abs_times = [float(t) for t in sequence.times[: train_events.n]]
             dyn_exposure_2d = _build_source_target_dynamic_exposure(
                 train_events,
@@ -1424,6 +1472,7 @@ def train_alarm_mhp(
         vocabs,
         config.type_fields,
         topology_index,
+        node_field=config.topology_node_field,
     )
     topology_report_seconds = time.monotonic() - t0
     if topology_report is not None and verbose:
@@ -1435,6 +1484,7 @@ def train_alarm_mhp(
     training_metadata = {
         "considered_event_count": considered_event_count,
         "region_filter": region_filter_stats,
+        "domain_filter": domain_filter_stats,
         "sequence_stats": sequence_stats,
         "modeled_event_count": train_events.n + (val_events.n if val_events else 0),
         "train_event_count": train_events.n,
@@ -1471,7 +1521,8 @@ def train_alarm_mhp(
             result.feature_kernel.to_dict() if result.feature_kernel is not None else None
         ),
         "feature_runtime": (
-            _build_feature_runtime(result, vocabs, config, feat_at_vocab, feat_mu_spec)
+            _build_feature_runtime(result, vocabs, config, feat_at_vocab, feat_mu_spec,
+                                   domain_vocab=feat_domain_vocab, node_domains=feat_node_domains)
             if config.edge_mode == "feature"
             else None
         ),
@@ -1603,7 +1654,8 @@ def _format_bucket_label(lo_sec: float, hi_sec: float) -> str:
     return f"{fmt(lo_sec)}-{fmt(hi_sec)}"
 
 
-def _build_feature_runtime(result, vocabs, config, at_vocab, mu_spec=None):
+def _build_feature_runtime(result, vocabs, config, at_vocab, mu_spec=None,
+                           domain_vocab=None, node_domains=None):
     """Runtime info for feature-mode inference:
       - α: feature_kernel (stored separately)
       - μ: the parameterized μ kernel (w_μ) + its MuFeatureSpec (category vocabs)
@@ -1634,6 +1686,12 @@ def _build_feature_runtime(result, vocabs, config, at_vocab, mu_spec=None):
     mu_by_at = {at: (float(np.mean(v)) if v else global_med) for at, v in at_to_mus.items()}
     return {
         "at_vocab": list(at_vocab or []),
+        # φ domain vocab (site×domain mode); empty in device/NE mode → legacy φ.
+        "domain_vocab": list(domain_vocab or []),
+        # topo node → present device domains, for missing-parent candidate
+        # enumeration at inference (site×domain mode).
+        "node_domains": {str(k): list(v) for k, v in (node_domains or {}).items()},
+        "topology_node_field": config.topology_node_field,
         "mu_by_alarm_type": mu_by_at,       # fallback when NE attrs missing
         "mu_default": global_med,
         "beta": float(config.beta_shared_value),
@@ -1669,7 +1727,7 @@ def _ne_pair_topo_score(source_ne: str, target_ne: str, topology_index) -> float
     return 0.0
 
 
-def build_topology_pairs(vocabs, type_fields, topology_index, *, max_hops, min_score):
+def build_topology_pairs(vocabs, type_fields, topology_index, *, max_hops, min_score, node_field="alarm_source"):
     """Build the sparse topology prior: (flat_index, score) for every
     topologically-related (target_type, source_type) pair among active types.
 
@@ -1686,9 +1744,9 @@ def build_topology_pairs(vocabs, type_fields, topology_index, *, max_hops, min_s
     labels = vocabs.type_vocab.labels
     M = len(labels)
     try:
-        src_field_idx = tuple(type_fields).index("alarm_source")
+        src_field_idx = tuple(type_fields).index(node_field)
     except ValueError:
-        # No NE field in the type → topology prior is meaningless
+        # No topology-node field in the type → topology prior is meaningless
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
 
     def _ne_of(label):
@@ -1747,6 +1805,7 @@ def _topology_consistency_report(
     topology_index,
     *,
     top_k: int = 20,
+    node_field: str = "alarm_source",
 ):
     """Classify each learned edge by its topological relationship.
 
@@ -1759,7 +1818,7 @@ def _topology_consistency_report(
         return None
     # Type field positions
     try:
-        src_field_idx = type_fields.index("alarm_source")
+        src_field_idx = type_fields.index(node_field)
     except ValueError:
         src_field_idx = None
     labels = vocabs.type_vocab.labels

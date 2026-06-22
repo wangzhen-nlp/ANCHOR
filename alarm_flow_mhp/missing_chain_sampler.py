@@ -54,6 +54,7 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Protocol, runtime_checkable
 
+from alarm_flow_mhp.feature_spec import make_entity, split_entity, topo_node_of
 from alarm_flow_mhp.topology_relation_prior import (
     classify_topology_relation,
     relation_weight,
@@ -1433,6 +1434,9 @@ class FeatureKernelAdapter:
         self._at_vocab = [a for a, _ in sorted(at_to_id.items(), key=lambda kv: kv[1])]
         self._topo = getattr(feature_scorer, "topology_index", None)
         self._node_infos = getattr(feature_scorer, "node_infos", {}) or {}
+        # topo node -> present device domains (site×domain mode); empty → device
+        # mode, where the feature entity IS the topology node (no domain split).
+        self._node_domains = getattr(feature_scorer, "node_domains", {}) or {}
         self.n_dynamic = int(getattr(feature_scorer, "n_dynamic", 0) or 0)
         self.source_mark_dim = min(self.n_dynamic, 3)
         if candidate_max_hops is not None:
@@ -1458,7 +1462,9 @@ class FeatureKernelAdapter:
             _t_at, t_ne = tgt_key
         except Exception:
             return 1.0
-        relation = classify_topology_relation(s_ne, t_ne, self._topo, self._node_infos)
+        relation = classify_topology_relation(
+            topo_node_of(s_ne), topo_node_of(t_ne), self._topo, self._node_infos
+        )
         return relation_weight(self.topology_relation_prior, relation)
 
     def _relation_weights_for_target(self, source_types, target_type):
@@ -1468,9 +1474,9 @@ class FeatureKernelAdapter:
             _t_at, t_ne = target_type
         except Exception:
             return None
-        source_nes = [s[1] for s in source_types]
+        source_nes = [topo_node_of(s[1]) for s in source_types]
         return topology_relation_weights(
-            source_nes, t_ne, self._topo, self._node_infos, self.topology_relation_prior
+            source_nes, topo_node_of(t_ne), self._topo, self._node_infos, self.topology_relation_prior
         )
 
     def _relation_weights_for_source(self, source_type, target_nes):
@@ -1482,11 +1488,12 @@ class FeatureKernelAdapter:
             return None
         import numpy as np
 
+        s_node = topo_node_of(s_ne)
         return np.asarray(
             [
                 relation_weight(
                     self.topology_relation_prior,
-                    classify_topology_relation(s_ne, t_ne, self._topo, self._node_infos),
+                    classify_topology_relation(s_node, topo_node_of(t_ne), self._topo, self._node_infos),
                 )
                 for t_ne in target_nes
             ],
@@ -1570,20 +1577,39 @@ class FeatureKernelAdapter:
                 self._envelope_mark = np.ones(self.n_dynamic, dtype=np.float64)
         return np.tile(self._envelope_mark, (n, 1))
 
-    def _neighbors(self, ne: str) -> list:
-        cached = self._neighbor_cache.get(ne)
+    def _neighbors(self, node: str) -> list:
+        """Topology neighbors of a TOPOLOGY node (NE or site)."""
+        cached = self._neighbor_cache.get(node)
         if cached is not None:
             return cached
         out: list = []
         if self._topo is not None:
             hops = getattr(self._topo, "undirected_hops", None)
             if hops:
-                out = [n for n in hops.get(ne, {}).keys() if n and n != ne]
-        self._neighbor_cache[ne] = out
+                out = [n for n in hops.get(node, {}).keys() if n and n != node]
+        self._neighbor_cache[node] = out
         return out
 
+    def _entities_at(self, node: str) -> list:
+        """Feature entities present at a topology node. In site×domain mode this
+        fans the node out to one entity per present device domain; in device mode
+        (no domain split) the entity IS the node."""
+        doms = self._node_domains.get(node)
+        if doms:
+            return [make_entity(node, d) for d in doms]
+        return [node]
+
     def _candidate_nes(self, ne: str) -> list:
-        return [ne] + self._neighbors(ne)
+        """Candidate feature entities for a missing parent of/at entity ``ne``:
+        the entities co-located at its topology node + those at topology
+        neighbors (bounded by the index reach)."""
+        node = topo_node_of(ne)
+        cand = list(self._entities_at(node))
+        for nbr in self._neighbors(node):
+            cand.extend(self._entities_at(nbr))
+        if ne not in cand:          # the entity's own domain may be unlisted
+            cand.insert(0, ne)
+        return cand
 
     def _alpha(self, src_key, tgt_key, source_mark=None, target_mark=None) -> float:
         mark = self._mark_tuple(source_mark, target_mark)
@@ -1843,13 +1869,17 @@ class FeatureKernelAdapter:
 
     def type_meta(self, type_key) -> dict:
         at, ne = type_key
-        info = self._node_infos.get(ne)
+        node = topo_node_of(ne)             # NE (device mode) or site (site mode)
+        _, domain = split_entity(ne)
+        info = self._node_infos.get(node)
         site = getattr(info, "site_id", "") if info is not None else ""
+        label = f"{site or node} | {domain} | {at}" if domain else f"{node} | {at}"
         return {
             "alarm_type": at,
-            "alarm_source": ne,
-            "type_label": f"{ne} | {at}",
-            "site_id": site or "",
+            "alarm_source": node,
+            "device_domain": domain,
+            "type_label": label,
+            "site_id": site or (node if domain else ""),
         }
 
 
@@ -1859,7 +1889,8 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
                                   source_mark_at=None,
                                   target_mark_at=None,
                                   cache_max_entries=200_000,
-                                  topology_relation_prior=None) -> FeatureKernelAdapter:
+                                  topology_relation_prior=None,
+                                  topology_graph_path=None) -> FeatureKernelAdapter:
     """Build a :class:`FeatureKernelAdapter` from a feature-mode artifact.
 
     Mirrors the scorer construction in ``stream_alarm_mhp.main`` so the imputed
@@ -1869,9 +1900,10 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
     if getattr(artifact.config, "edge_mode", "device") != "feature":
         raise ValueError("feature_adapter_from_artifact requires edge_mode='feature'")
     from mhp.feature_kernel import FeatureKernel
-    from alarm_flow_mhp.feature_spec import MuFeatureSpec, RuntimeFeatureScorer, RuntimeMuScorer
+    from alarm_flow_mhp.feature_spec import (
+        MuFeatureSpec, RuntimeFeatureScorer, RuntimeMuScorer, build_node_context,
+    )
     from alarm_flow_isahp.ne_topology import NETopologyIndex
-    from ne_link_learning.core import build_graph_context
     from topology_tools.region_utils import load_ne_graph
 
     md = artifact.training_metadata or {}
@@ -1879,10 +1911,14 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
     rt = md.get("feature_runtime") or {}
     if fk is None:
         raise ValueError("feature-mode artifact missing feature_kernel")
+    node_field = getattr(artifact.config, "topology_node_field", "alarm_source")
     ne_graph_data = load_ne_graph(ne_graph_path)
-    graph_ctx = build_graph_context(ne_graph_data)
+    # device mode → NE-keyed context; site mode → site-keyed (matches training).
+    graph_ctx = build_node_context(ne_graph_data, node_field)
     infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
-    topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
+    # Site-node models score topology over the site graph (same structure).
+    topo_graph_data = load_ne_graph(topology_graph_path) if topology_graph_path else ne_graph_data
+    topo_idx = NETopologyIndex.from_graph(topo_graph_data, max_hops=infer_hops)
     dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
     n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
     feature_scorer = RuntimeFeatureScorer(
@@ -1892,6 +1928,8 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         topology_index=topo_idx,
         beta=float(rt.get("beta", 1.0)),
         n_dynamic=n_dynamic,
+        domain_vocab=rt.get("domain_vocab", []),
+        node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
     )
     mu_scorer = None
     mu_fk = rt.get("mu_kernel")

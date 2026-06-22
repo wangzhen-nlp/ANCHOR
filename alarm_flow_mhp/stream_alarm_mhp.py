@@ -38,6 +38,10 @@ import numpy as np
 
 from alarm_flow_brunch.region_filter import parse_regions
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
+from alarm_flow_isahp.event_domain import (
+    DEVICE_DOMAIN_FIELD,
+    filter_and_annotate_device_domain,
+)
 from alarm_flow_isahp.sequences import alarm_type_label, event_type_label
 from alarm_flow_mhp.aggregator import (
     AlarmMHPConfig,
@@ -51,7 +55,7 @@ from alarm_flow_mhp.topology_relation_prior import (
 )
 from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
 from fault_grouping.alarm_events.io import is_clear_alarm
-from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, SITE_GRAPH_JSON, resource_display
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
 EPS = 1e-12
@@ -497,9 +501,11 @@ class StreamMHPAssigner:
         b = self._feat_beta
         scores = alpha * b * np.exp(-b * dts_eff) * late_weight
         if self._topology_relation_prior:
+            from alarm_flow_mhp.feature_spec import topo_node_of
+
             scores *= topology_relation_weights(
-                src_nes,
-                target_event.ne,
+                [topo_node_of(ne) for ne in src_nes],
+                topo_node_of(target_event.ne),
                 self._topology_index,
                 self._node_infos,
                 self._topology_relation_prior,
@@ -623,7 +629,11 @@ class StreamMHPAssigner:
             from alarm_flow_isahp.sequences import alarm_type_from_title
             from alarm_flow_mhp.feature_spec import runtime_ne_at
 
-            dev, _ = runtime_ne_at(alarm_event, self.artifact.config.type_fields)
+            dev, _ = runtime_ne_at(
+                alarm_event,
+                self.artifact.config.type_fields,
+                self.artifact.config.topology_node_field,
+            )
             atype_state = alarm_type_from_title(alarm_event.get("alarm_title", ""))
             snap = self._state_tracker.snapshot_then_apply(dev, atype_state, is_clear)
             src_mark = (int(snap[0]), int(snap[1]), int(snap[2]))
@@ -650,7 +660,11 @@ class StreamMHPAssigner:
             type_label = event_type_label(alarm_event, self.artifact.config.type_fields)
             type_id = self.vocabs.type_vocab.get(type_label)
             type_id = -1 if type_id is None else int(type_id)
-            ne, atype_feat = runtime_ne_at(alarm_event, self.artifact.config.type_fields)
+            ne, atype_feat = runtime_ne_at(
+                alarm_event,
+                self.artifact.config.type_fields,
+                self.artifact.config.topology_node_field,
+            )
             # use the label-parsed alarm type for features/μ (consistent with
             # training's at_vocab / mu_by_alarm_type keys)
             atype = atype_feat or atype
@@ -797,10 +811,15 @@ def _summary_of(e) -> dict:
     canonical device id the model/topology keyed on (``e.ne`` from
     runtime_ne_at) — summarize_alarm_event reads the raw, unstripped field,
     which can diverge from the NE-graph keys and mis-classify topology edges.
-    Mirrors the impute path's `if ne: meta["alarm_source"] = ne`."""
+    Mirrors the impute path's `if ne: meta["alarm_source"] = ne`. In site×domain
+    mode e.ne is a composite entity (site + domain); we do NOT write that into
+    alarm_source (it is not a device id) — the raw alarm_source is kept."""
+    from alarm_flow_mhp.feature_spec import split_entity
+
     s = summarize_alarm_event(e.alarm, e.index)
-    if e.ne:
-        s["alarm_source"] = e.ne
+    node, domain = split_entity(e.ne) if e.ne else ("", "")
+    if node and not domain:
+        s["alarm_source"] = node
     alarm_payload = e.alarm.get("alarm", {}) if isinstance(e.alarm, dict) else {}
     for field_name in ("工单号", "故障组ID", "告警清除时间"):
         value = ""
@@ -1157,6 +1176,12 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             ),
             cache_max_entries=int(getattr(args, "impute_cache_max", 200_000)),
             topology_relation_prior=stream_config.topology_relation_prior,
+            # site_id-node model scores topology over the site graph.
+            topology_graph_path=(
+                args.site_graph
+                if getattr(artifact.config, "topology_node_field", "alarm_source") == "site_id"
+                else None
+            ),
         )
     else:
         if getattr(artifact.params, "kernel_type", "exp") != "exp":
@@ -1202,6 +1227,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
         )
 
     type_fields = artifact.config.type_fields
+    node_field = artifact.config.topology_node_field
     groups: list = []
     dropped = {"clear": 0, "no_type": 0, "unknown_type": 0}
     processed = 0
@@ -1251,7 +1277,7 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
         is_clear = is_clear_alarm(alarm.get("alarm", {}) if isinstance(alarm, dict) else {})
         src_mark = None
         if dynamic_mode:
-            dev, _ = runtime_ne_at_fn(alarm, type_fields)
+            dev, _ = runtime_ne_at_fn(alarm, type_fields, node_field)
             atype_state = alarm_type_from_title_fn(alarm.get("alarm_title", ""))
             src_mark = state_timeline.ingest(
                 float(alarm.get("ts", 0.0)), dev, atype_state, is_clear
@@ -1268,14 +1294,17 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
             continue
         meta = summarize_alarm_event(alarm, i)
         if feature_mode:
-            from alarm_flow_mhp.feature_spec import runtime_ne_at
+            from alarm_flow_mhp.feature_spec import runtime_ne_at, split_entity
 
-            ne, atype_feat = runtime_ne_at(alarm, type_fields)
+            ne, atype_feat = runtime_ne_at(alarm, type_fields, node_field)
             at = atype_feat or atype
             type_key = (at, ne)
             meta["alarm_type"] = at
-            if ne:
-                meta["alarm_source"] = ne
+            # ne is the feature entity (site+domain composite in site×domain mode);
+            # only write a bare node into alarm_source, never the composite.
+            node, domain = split_entity(ne)
+            if node and not domain:
+                meta["alarm_source"] = node
         else:
             type_label = event_type_label(alarm, type_fields)
             tid = artifact.vocabs.type_vocab.get(type_label)
@@ -1334,7 +1363,12 @@ def main():
     parser.add_argument(
         "--site-graph",
         default=SITE_GRAPH_JSON,
-        help=f"Site metadata for --visual-output. Default: {resource_display('site_graph.json')}.",
+        help=(
+            "Site graph (site -> {{..., link}}). Used for --visual-output site "
+            "metadata, to filter raw alarm inputs to known sites, AND, for a "
+            f"site_id-node model, to build the topology index. "
+            f"Default: {resource_display('site_graph.json')}."
+        ),
     )
     parser.add_argument(
         "--visual-ne-scope",
@@ -1473,11 +1507,6 @@ def main():
             "Drop baseline alarm groups smaller than this. Default: same as "
             "the effective stream --min-group-events."
         ),
-    )
-    parser.add_argument(
-        "--topo",
-        default=SITE_GRAPH_BY_NE_JSON,
-        help=f"Site topology for raw alarm inputs. Default: {resource_display('site_graph_by_ne.json')}.",
     )
     parser.add_argument(
         "--ne-graph",
@@ -1726,7 +1755,7 @@ def main():
         print(f"[stream] loading alarms: {args.alarms}", flush=True)
     alarm_events, alarm_metadata = load_ordered_alarm_events(
         args.alarms,
-        topo_path=args.topo,
+        topo_path=args.site_graph,
         ne_graph_path=args.ne_graph,
         start_time=args.start_time or None,
         end_time=args.end_time or None,
@@ -1735,6 +1764,26 @@ def main():
     )
     if not args.quiet:
         print(f"[stream] loaded alarm events: {len(alarm_events)}", flush=True)
+
+    # device_domain is a type field derived from the NE graph; it MUST be stamped
+    # onto inference events with the SAME annotation training used, or the rebuilt
+    # type labels carry <empty> domains and never match the trained vocabulary.
+    if DEVICE_DOMAIN_FIELD in tuple(run_config.type_fields):
+        from topology_tools.region_utils import load_ne_graph
+
+        alarm_events, domain_filter_stats = filter_and_annotate_device_domain(
+            alarm_events, load_ne_graph(args.ne_graph)
+        )
+        if not args.quiet:
+            print(
+                "[stream] domain filter: "
+                f"domains={domain_filter_stats['supported_domains']}, "
+                f"events={domain_filter_stats['kept_event_count']}/"
+                f"{domain_filter_stats['input_event_count']}, "
+                f"dropped={domain_filter_stats['dropped_event_count']} "
+                f"{domain_filter_stats['dropped_by_domain']}",
+                flush=True,
+            )
 
     stream_config = StreamConfig.from_artifact_config(
         run_config,
@@ -1900,7 +1949,7 @@ def main():
             RuntimeMuScorer,
         )
         from alarm_flow_isahp.ne_topology import NETopologyIndex
-        from ne_link_learning.core import build_graph_context
+        from alarm_flow_mhp.feature_spec import build_node_context
         from topology_tools.region_utils import load_ne_graph
 
         md = artifact.training_metadata or {}
@@ -1908,17 +1957,26 @@ def main():
         rt = md.get("feature_runtime") or {}
         if fk is None:
             raise ValueError("feature-mode artifact missing feature_kernel")
+        node_field = artifact.config.topology_node_field
         if not args.quiet:
             print("[stream] feature mode: loading NE graph + building live-α scorer ...", flush=True)
         ne_graph_data = load_ne_graph(args.ne_graph)
-        graph_ctx = build_graph_context(ne_graph_data)
+        # device mode → NE-keyed context; site mode → site-keyed (attrs aggregated
+        # from the NE graph), matching training's build_node_context.
+        graph_ctx = build_node_context(ne_graph_data, node_field)
+        # Topology index: site-node models score topology over the site graph
+        # (same structure); must match what training used.
+        infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
+        if node_field == "site_id":
+            topo_graph_data = load_ne_graph(args.site_graph)
+        else:
+            topo_graph_data = ne_graph_data
         # Build the index with the SAME reach training used for feature
         # candidate generation — otherwise pairs beyond this many hops would get
         # topo_score=0 at inference, diverging from the trained φ.
-        infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
-        topo_idx = NETopologyIndex.from_graph(ne_graph_data, max_hops=infer_hops)
+        topo_idx = NETopologyIndex.from_graph(topo_graph_data, max_hops=infer_hops)
         if not args.quiet:
-            print(f"[stream] topology index max_hops={infer_hops} (from artifact.config)", flush=True)
+            print(f"[stream] topology index max_hops={infer_hops}, node_field={node_field}", flush=True)
         # Dynamic α: source = 3 bits; source_target = source 3 + target 3.
         dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
         n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
@@ -1929,6 +1987,8 @@ def main():
             topology_index=topo_idx,
             beta=float(rt.get("beta", 1.0)),
             n_dynamic=n_dynamic,
+            domain_vocab=rt.get("domain_vocab", []),
+            node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
         )
         if not args.quiet:
             print(

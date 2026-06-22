@@ -24,9 +24,10 @@ from alarm_flow_brunch.region_filter import (
     parse_regions,
 )
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
+from alarm_flow_isahp.event_domain import DEVICE_DOMAIN_FIELD
 from alarm_flow_isahp.ne_topology import NETopologyIndex
 from alarm_flow_isahp.sequences import parse_type_fields
-from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_BY_NE_JSON, resource_display
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
 def _progress_enabled(args):
@@ -54,6 +55,17 @@ def _training_progress(stage, payload):
                 f"[train] region filter: disabled; events={payload.get('input_event_count', 0)}",
                 flush=True,
             )
+        return
+    if stage == "domain_filter":
+        print(
+            "[train] domain filter: "
+            f"domains={payload.get('supported_domains', [])}, "
+            f"events={payload.get('kept_event_count', 0)}/"
+            f"{payload.get('input_event_count', 0)}, "
+            f"dropped={payload.get('dropped_event_count', 0)} "
+            f"{payload.get('dropped_by_domain', {})}",
+            flush=True,
+        )
         return
     if stage == "vocab":
         print(
@@ -106,6 +118,7 @@ def _parse_bucket_edges(text):
 def _build_config(args):
     return AlarmMHPConfig(
         type_fields=parse_type_fields(args.type_fields),
+        topology_node_field=args.topology_node_field,
         history_window_sec=args.history_window_sec,
         time_slack_sec=args.time_slack_sec,
         late_penalty_half_life_sec=args.late_penalty_half_life_sec,
@@ -202,9 +215,13 @@ def main():
         help="Disable best-so-far checkpoint writing during training.",
     )
     parser.add_argument(
-        "--topo",
-        default=SITE_GRAPH_BY_NE_JSON,
-        help=f"Site topology for raw alarm inputs. Default: {resource_display('site_graph_by_ne.json')}.",
+        "--site-graph",
+        default=SITE_GRAPH_JSON,
+        help=(
+            "Site graph (site -> {{..., link}}). Used to filter raw alarm inputs "
+            "to known sites AND, for a site_id-node model, to build the topology "
+            f"index. Default: {resource_display('site_graph.json')}."
+        ),
     )
     parser.add_argument(
         "--ne-graph",
@@ -217,7 +234,22 @@ def main():
     parser.add_argument(
         "--type-fields",
         default="alarm_source,alarm_type",
-        help="Comma-separated alarm fields defining the type.",
+        help=(
+            "Comma-separated alarm fields defining the event type. Supported: "
+            "alarm_source, alarm_type, site_id, alarm_title, device_domain. "
+            "Default device×alarm_type: 'alarm_source,alarm_type'. Site×domain×type "
+            "mode: 'site_id,device_domain,alarm_type'."
+        ),
+    )
+    parser.add_argument(
+        "--topology-node-field",
+        default="",
+        help=(
+            "Which type field is the topological entity for the topology "
+            "prior / consistency report. 'alarm_source' = per-device over the "
+            "NE graph; 'site_id' = per-site over --site-graph. Default: infer "
+            "alarm_source when present, otherwise site_id."
+        ),
     )
     parser.add_argument("--history-window-sec", type=float, default=900.0)
     parser.add_argument(
@@ -462,7 +494,7 @@ def main():
     _print_progress("[train] loading alarms...", args)
     alarm_events, alarm_metadata = load_ordered_alarm_events(
         args.alarms,
-        topo_path=args.topo,
+        topo_path=args.site_graph,
         ne_graph_path=args.ne_graph,
         start_time=args.start_time or None,
         end_time=args.end_time or None,
@@ -474,22 +506,35 @@ def main():
 
     topology_index = None
     ne_graph_data = None
-    # Feature mode needs the NE graph for device attributes — force-load it.
-    need_graph = args.load_topology or config.edge_mode == "feature"
+    # The NE graph is needed for: topology/feature reporting, feature-mode device
+    # attributes, AND device_domain enrichment of the event type (look up each
+    # device's domain bucket).
+    uses_device_domain = DEVICE_DOMAIN_FIELD in tuple(config.type_fields)
+    need_graph = args.load_topology or config.edge_mode == "feature" or uses_device_domain
     if need_graph:
         _print_progress(f"[train] loading NE graph: {args.ne_graph}", args)
         ne_graph_data = load_ne_graph(args.ne_graph)
         if config.regions:
             ne_graph_data, _stats = filter_ne_graph_by_regions(ne_graph_data, config.regions)
+        # Domain annotation + supported-domain filtering is centralized in
+        # train_alarm_mhp so direct API callers and this CLI behave identically.
         # The index must reach at least as far as the topology prior / feature
         # candidate generation needs.
         index_hops = max(args.topology_max_hops, args.topology_prior_max_hops, config.feature_topo_max_hops)
+        # Topology node granularity: per-device uses the NE graph; a site_id node
+        # uses the site graph (same structure). The index class is structure-agnostic.
+        if config.topology_node_field == "site_id":
+            _print_progress(f"[train] loading site graph for topology: {args.site_graph}", args)
+            topology_graph_data = load_ne_graph(args.site_graph)
+        else:
+            topology_graph_data = ne_graph_data
         _print_progress(
-            f"[train] building topology index (max_hops={index_hops}) ...",
+            f"[train] building topology index (max_hops={index_hops}, "
+            f"node_field={config.topology_node_field}) ...",
             args,
         )
         topology_index = NETopologyIndex.from_graph(
-            ne_graph_data,
+            topology_graph_data,
             max_hops=index_hops,
         )
 

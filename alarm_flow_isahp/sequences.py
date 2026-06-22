@@ -4,7 +4,9 @@ from alarm_tools.alarm_types import LINK_ALARMS, OFFLINE_ALARMS, POWER_ALARMS
 from fault_grouping.alarm_events.io import is_clear_alarm
 
 
-SUPPORTED_TYPE_FIELDS = frozenset({"alarm_title", "alarm_type", "site_id", "alarm_source"})
+SUPPORTED_TYPE_FIELDS = frozenset(
+    {"alarm_title", "alarm_type", "site_id", "alarm_source", "device_domain"}
+)
 
 
 @dataclass(frozen=True)
