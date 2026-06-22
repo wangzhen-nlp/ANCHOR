@@ -136,34 +136,42 @@ class FeatureLayout:
         ``dom_u``/``dom_v`` are domain layout ids (see :meth:`domain_ids`); they
         are required iff this layout has a non-empty domain vocab.
         """
+        # φ is built in float32 (halves the (C, F) matrix, the dominant memory block
+        # at large candidate counts; 0/1 indicators + a topo score in [0,1] are
+        # exactly/near-exactly representable, and φ·w promotes to float64 so the dot
+        # product keeps full precision). Columns are written into a PREALLOCATED
+        # matrix in place rather than column_stack'd, so the 18 column arrays and the
+        # stacked output never coexist (which would ~double the peak). dom_u/dom_v
+        # stay int64 (they are ids, not features).
+        _F = np.float32
         C = len(at_u)
-        cols = [np.ones(C)]
+        phi = np.empty((C, self.n_features), dtype=_F)
+        j = 0
+        phi[:, j] = 1.0; j += 1
         for a in range(self.n_at):
             for b in range(self.n_at):
-                cols.append(((at_u == a) & (at_v == b)).astype(np.float64))
-        same_at = ((at_u == at_v) & (at_u >= 0)).astype(np.float64)
-        topo = np.asarray(topo, dtype=np.float64)
-        same_site = np.asarray(same_site, dtype=np.float64)
-        cols += [
-            same_at,
-            topo,
-            np.asarray(is_same_ne, dtype=np.float64),
-            same_site,
-            np.asarray(same_vendor, dtype=np.float64),
-            np.asarray(same_netype, dtype=np.float64),
-            topo * same_at,
-            topo * same_site,
-        ]
+                phi[:, j] = (at_u == a) & (at_v == b); j += 1
+        same_at = ((at_u == at_v) & (at_u >= 0)).astype(_F)
+        topo = np.asarray(topo, dtype=_F)
+        same_site = np.asarray(same_site, dtype=_F)
+        phi[:, j] = same_at; j += 1
+        phi[:, j] = topo; j += 1
+        phi[:, j] = np.asarray(is_same_ne, dtype=_F); j += 1
+        phi[:, j] = same_site; j += 1
+        phi[:, j] = np.asarray(same_vendor, dtype=_F); j += 1
+        phi[:, j] = np.asarray(same_netype, dtype=_F); j += 1
+        phi[:, j] = topo * same_at; j += 1
+        phi[:, j] = topo * same_site; j += 1
         if self.n_dom:
             if dom_u is None or dom_v is None:
                 raise ValueError("domain ids required: this FeatureLayout has a domain vocab")
             dom_u = np.asarray(dom_u, dtype=np.int64)
             dom_v = np.asarray(dom_v, dtype=np.int64)
-            cols.append((((dom_u == dom_v) & (dom_u >= 0)).astype(np.float64)))
+            phi[:, j] = (dom_u == dom_v) & (dom_u >= 0); j += 1
             for a in range(self.n_dom):
                 for b in range(self.n_dom):
-                    cols.append(((dom_u == a) & (dom_v == b)).astype(np.float64))
-        return np.column_stack(cols)
+                    phi[:, j] = (dom_u == a) & (dom_v == b); j += 1
+        return phi
 
 
 class MuFeatureSpec:
@@ -470,6 +478,28 @@ def _topo_score(source_ne, target_ne, topology_index, cache):
     return score
 
 
+def _factorize_attr(arr):
+    """Map an (M,) object attribute array to int64 codes (−1 for empty/None) plus
+    the code→value list. Lets per-candidate same-* comparisons run as vectorized
+    integer ops on gathered codes instead of O(C) Python loops over object cells."""
+    n = len(arr)
+    codes = np.full(n, -1, dtype=np.int64)
+    mapping = {}
+    values = []
+    for i in range(n):
+        v = arr[i]
+        s = "" if v is None else str(v)
+        if not s:
+            continue
+        c = mapping.get(s)
+        if c is None:
+            c = len(values)
+            mapping[s] = c
+            values.append(s)
+        codes[i] = c
+    return codes, values
+
+
 def _build_type_attributes(vocabs, type_fields, graph_context, node_field="alarm_source"):
     """Per-type-id attribute arrays parsed from the vocab labels + node graph.
 
@@ -534,10 +564,20 @@ def _build_type_attributes(vocabs, type_fields, graph_context, node_field="alarm
 
 
 def _collect_cooccurred_pairs(events: EventCollection, window, max_hist, chunk_size, time_slack=0.0):
-    """Distinct (target_type, source_type) flat keys that co-occur in a window."""
+    """Distinct (target_type, source_type) flat keys that co-occur in a window, as
+    a sorted int64 array.
+
+    Per-chunk uniques are folded into a running global-unique array, collapsed
+    whenever the pending batch grows to ~its current size. Type-pairs repeat
+    heavily across chunks, so this keeps peak memory bounded by the RESULT size
+    (8 bytes/key) rather than the sum over all chunks — and avoids the ~50 bytes/
+    key overhead of a Python set."""
     M = events.M
-    keys = set()
     N = events.n
+    acc = np.zeros(0, dtype=np.int64)        # global-unique so far (sorted)
+    pending = []                             # chunk uniques not yet folded in
+    pending_n = 0
+    floor = 2_000_000                        # don't collapse for trivially small batches
     for cs in range(0, N, chunk_size):
         ce = min(cs + chunk_size, N)
         _, _, pair_dt, ptd, psd, _, _ = _build_chunk_pair_arrays(
@@ -545,9 +585,15 @@ def _collect_cooccurred_pairs(events: EventCollection, window, max_hist, chunk_s
         )
         if pair_dt.size == 0:
             continue
-        flat = (ptd.astype(np.int64) * M + psd.astype(np.int64))
-        keys.update(np.unique(flat).tolist())
-    return keys
+        pending.append(np.unique(ptd.astype(np.int64) * M + psd.astype(np.int64)))
+        pending_n += pending[-1].size
+        if pending_n >= max(acc.size, floor):
+            acc = np.unique(np.concatenate([acc] + pending))
+            pending = []
+            pending_n = 0
+    if pending:
+        acc = np.unique(np.concatenate([acc] + pending))
+    return acc
 
 
 def build_candidate_features(
@@ -583,14 +629,19 @@ def build_candidate_features(
     dom_layout_id = layout.domain_ids(attrs["domain"])    # per-type domain φ id
 
     # --- candidate pair set ---
-    cooccur = _collect_cooccurred_pairs(
+    # Flat keys (target*M + source) accumulated as numpy arrays, deduped once at
+    # the end via np.unique — avoids a tens-of-millions-element Python set.
+    # _collect_cooccurred_pairs already returns int64; it goes straight into the
+    # list with no separate named reference (a `cooccur = ...` binding would keep
+    # the co-occurrence array alive through the φ build even after `del flat_parts`).
+    flat_parts = [_collect_cooccurred_pairs(
         events, history_window, max_history_events, chunk_size, time_slack
-    )
-    cand_keys = set(cooccur)
+    )]
 
     # topology pairs: group active types by TOPOLOGY NODE (NE, or site in
     # site×domain mode — entities at the same node, even across domains, are
-    # co-located), cross same-node + reachable nodes within hops.
+    # co-located), cross same-node + reachable nodes within hops. Each group's
+    # pairs are built as a vectorized cartesian product rather than per-pair adds.
     if topology_index is not None:
         node_to_types = defaultdict(list)
         for tid in range(M):
@@ -600,10 +651,9 @@ def build_candidate_features(
         undirected_hops = getattr(topology_index, "undirected_hops", {}) or {}
         topo_cache = {}
         for node_id, tids in node_to_types.items():
+            tids_arr = np.asarray(tids, dtype=np.int64)
             # same-node pairs (includes cross-domain at the same site)
-            for u in tids:
-                for v in tids:
-                    cand_keys.add(u * M + v)
+            flat_parts.append((tids_arr[:, None] * M + tids_arr[None, :]).ravel())
             # cross-node within hops
             for tgt_node, hop in undirected_hops.get(node_id, {}).items():
                 if hop > topo_max_hops or tgt_node == node_id:
@@ -615,43 +665,65 @@ def build_candidate_features(
                 score = _topo_score(node_id, tgt_node, topology_index, topo_cache)
                 if score < topo_min_score:
                     continue
-                for u in tgt_tids:        # target
-                    for v in tids:        # source
-                        cand_keys.add(u * M + v)
+                tgt_arr = np.asarray(tgt_tids, dtype=np.int64)      # target
+                flat_parts.append((tgt_arr[:, None] * M + tids_arr[None, :]).ravel())
 
-    if not cand_keys:
-        return (np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 0)), [],
+    cand_flat = np.unique(np.concatenate(flat_parts)) if flat_parts else np.zeros(0, np.int64)
+    if cand_flat.size == 0:
+        return (np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 0), np.float32), [],
                 list(attrs["at_vocab"]), at_id.copy(), np.zeros(0, np.float64), list(domain_vocab))
 
-    cand_flat = np.fromiter(cand_keys, dtype=np.int64, count=len(cand_keys))
-    cand_flat.sort()
     cand_t = (cand_flat // M).astype(np.int64)
     cand_s = (cand_flat % M).astype(np.int64)
     C = len(cand_t)
+    del cand_flat, flat_parts                        # candidate keys no longer needed
 
     # --- feature matrix φ via the shared FeatureLayout ---
+    # Vectorized topo score: evaluate _topo_score once per UNIQUE (src_node,
+    # tgt_node) pair, then gather to candidates (was an O(C) Python loop). The
+    # C-length scratch (pair key, reverse index) is freed before the φ build so it
+    # does not coexist with the (C, F) matrix.
+    node_str = np.empty(M, dtype=object)
+    for t in range(M):
+        node_str[t] = topo_node_of(ne[t])
+    node_codes, node_vals = _factorize_attr(node_str)   # (M,) — node arrays are small
+    base = len(node_vals) + 2
+    pair_key = (node_codes[cand_s] + 1) * base + (node_codes[cand_t] + 1)   # shifted codes (−1→0)
+    uniq, inv = np.unique(pair_key, return_inverse=True)
+    del pair_key
     topo_cache = {}
-    topo_vec = np.array(
-        [
-            _topo_score(topo_node_of(ne[cand_s[i]]), topo_node_of(ne[cand_t[i]]), topology_index, topo_cache)
-            for i in range(C)
-        ],
-        dtype=np.float64,
-    )
+    uniq_scores = np.empty(len(uniq), dtype=np.float64)
+    for j in range(len(uniq)):
+        pk = int(uniq[j])
+        s_code = pk // base - 1
+        t_code = pk % base - 1
+        s_node = node_vals[s_code] if s_code >= 0 else ""
+        t_node = node_vals[t_code] if t_code >= 0 else ""
+        uniq_scores[j] = _topo_score(s_node, t_node, topology_index, topo_cache)
+    topo_vec = uniq_scores[inv]                      # float64 (also returned as the topo prior)
+    del uniq, inv, uniq_scores
 
-    def _same(arr):
-        a = arr[cand_t]
-        b = arr[cand_s]
-        return np.array([1.0 if (a[i] and a[i] == b[i]) else 0.0 for i in range(C)], dtype=np.float64)
+    # Vectorized same-* : compare gathered integer codes (−1 = empty), reproducing
+    # the old "a is truthy AND a == b" semantics as (code_t >= 0) & (code_t == code_s).
+    # The per-type code arrays are length M (small); the gathered (C,) compares are
+    # transient inside build_matrix.
+    site_codes, _ = _factorize_attr(site)
+    vendor_codes, _ = _factorize_attr(vendor)
+    netype_codes, _ = _factorize_attr(netype)
+
+    def _same(codes):
+        a = codes[cand_t]
+        b = codes[cand_s]
+        return ((a >= 0) & (a == b)).astype(np.float32)
 
     phi = layout.build_matrix(
         at_u=at_id[cand_t],
         at_v=at_id[cand_s],
         topo=topo_vec,
         is_same_ne=(ne[cand_t] == ne[cand_s]),
-        same_site=_same(site),
-        same_vendor=_same(vendor),
-        same_netype=_same(netype),
+        same_site=_same(site_codes),
+        same_vendor=_same(vendor_codes),
+        same_netype=_same(netype_codes),
         dom_u=dom_layout_id[cand_t] if layout.n_dom else None,
         dom_v=dom_layout_id[cand_s] if layout.n_dom else None,
     )

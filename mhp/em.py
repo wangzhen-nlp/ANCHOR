@@ -1383,7 +1383,13 @@ def fit_mhp_feature(
 
     cand_targets = np.asarray(cand_targets, dtype=np.int64)
     cand_sources = np.asarray(cand_sources, dtype=np.int64)
-    cand_phi = np.asarray(cand_phi, dtype=np.float64)
+    # Keep φ in whatever float the builder produced (float32 by default). A blanket
+    # upcast to float64 here would (a) double the (C, F) memory and (b) hold a
+    # float32 + float64 copy simultaneously. φ·w promotes to float64 per-op, so
+    # precision of the dot product is unaffected; only accept float32/float64.
+    cand_phi = np.asarray(cand_phi)
+    if cand_phi.dtype not in (np.float32, np.float64):
+        cand_phi = cand_phi.astype(np.float64)
     C = len(cand_targets)
     if C == 0:
         raise ValueError("feature mode requires a non-empty candidate pair set")
