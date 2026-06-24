@@ -8,6 +8,7 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
+from alarm_tools.progress_utils import ProgressBar
 from topology_resources import (
     NE_GRAPH_JSON,
     SITE_DEVICE_COUNTS_JSON,
@@ -134,7 +135,17 @@ def _prepare_runtime_execution(parser, args, timer=None):
             end_ts,
         )
     with _phase("init.build_alarm_metadata_index"):
-        alarm_metadata_index = build_alarm_metadata_index(alarm_load_result.valid_alarms)
+        if args.no_output:
+            alarm_metadata_index = {}
+        else:
+            metadata_alarm_iter = alarm_load_result.valid_alarms
+            if args.stream_sorted_alarms:
+                metadata_alarm_iter = _iter_with_progress(
+                    alarm_load_result.valid_alarms,
+                    alarm_load_result.filtered_count,
+                    "构建告警元数据索引",
+                )
+            alarm_metadata_index = build_alarm_metadata_index(metadata_alarm_iter)
     print_alarm_load_summary(alarm_load_result)
     debug_targets = parse_debug_targets(args)
     with _phase("init.build_output_session"):
@@ -156,6 +167,16 @@ class _NullCtx:
         return self
     def __exit__(self, *exc):
         return False
+
+
+def _iter_with_progress(iterable, total, label):
+    progress = ProgressBar(total, label)
+    try:
+        for item in iterable:
+            yield item
+            progress.update()
+    finally:
+        progress.close()
 
 
 def _maybe_compute_ticket_recall(args):
