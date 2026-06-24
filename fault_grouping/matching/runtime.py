@@ -126,6 +126,8 @@ def validate_main_args(parser, args):
         and args.batch_merge_density_max_meters < args.batch_merge_density_min_meters
     ):
         parser.error("batch-merge-density-max-meters 不能小于 batch-merge-density-min-meters")
+    if args.no_output and args.compute_ticket_recall:
+        parser.error("--no-output 不能与 --compute-ticket-recall 同时使用，因为工单召回计算需要读取故障组输出文件")
     if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:
         parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
     if args.site_chains and not os.path.exists(args.site_chains):
@@ -222,6 +224,8 @@ def print_run_configuration(args, static_context, valid_alarm_titles):
         )
     if args.clear_delay_sec > 0:
         print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
+    if args.no_output:
+        print("故障组输出: 关闭（--no-output，仅统计不写 JSONL）")
     if args.batch_merge_site_hops > 0:
         print(f"批内站点邻接合并: 开启，hop={args.batch_merge_site_hops}")
     if args.batch_merge_density_knn > 0:

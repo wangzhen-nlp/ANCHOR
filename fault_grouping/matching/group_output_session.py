@@ -41,6 +41,8 @@ class MatchOutputSession:
     _fw: object = field(default=None, init=False, repr=False)
 
     def reset_output_file(self):
+        if getattr(self.args, "no_output", False):
+            return
         # 先关掉旧句柄（如果有），再截断文件并打开新句柄
         # 实际只在初始化阶段（单线程）调用，加锁是防御性写法
         with self.output_lock:
@@ -90,6 +92,14 @@ class MatchOutputSession:
 
     def write_matches(self, matches):
         with self.output_lock:
+            if getattr(self.args, "no_output", False):
+                if self.args.verbose_groups:
+                    for match in matches:
+                        generate_incident_report(match)
+                self.match_count += len(matches)
+                self.refresh_progress_extra_text()
+                return
+
             # 复用 reset_output_file 打开的持久 fd；fallback 仅用于异常路径（不应触达）。
             fw = self._fw
             if fw is None:

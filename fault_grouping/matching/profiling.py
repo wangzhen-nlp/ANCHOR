@@ -357,6 +357,17 @@ def enable_output_profiling(timer, output_session):
     def instrumented_write_matches(matches):
         t_outer = time.perf_counter()
         with output_session.output_lock:
+            if getattr(output_session.args, "no_output", False):
+                for match in matches:
+                    if output_session.args.verbose_groups:
+                        generate_incident_report(match)
+                output_session.match_count += len(matches)
+                t_p = time.perf_counter()
+                output_session.refresh_progress_extra_text()
+                timer._record("output.refresh_progress", time.perf_counter() - t_p)
+                timer._record("output.write_matches", time.perf_counter() - t_outer)
+                return
+
             output_lines = []
             for match in matches:
                 if output_session.args.verbose_groups:
