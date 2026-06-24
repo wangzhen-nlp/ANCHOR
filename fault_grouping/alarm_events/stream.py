@@ -38,7 +38,12 @@ def build_simulated_now_ts_getter(valid_alarms, speedup):
     if not valid_alarms:
         return time.time
 
-    simulated_start_ts = valid_alarms[0]["ts"]
+    if hasattr(valid_alarms, "first_ts"):
+        simulated_start_ts = valid_alarms.first_ts()
+    else:
+        simulated_start_ts = valid_alarms[0]["ts"]
+    if simulated_start_ts is None:
+        return time.time
     real_start_monotonic = time.monotonic()
 
     def get_now_ts():

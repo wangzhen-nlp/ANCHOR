@@ -41,7 +41,9 @@ from fault_grouping.site_merge_helper import (
     BatchSiteMergeHelper,
 )
 from fault_grouping.alarm_events.sorted_cache import (
+    SortedAlarmCacheStream,
     is_sorted_alarm_cache_file,
+    read_sorted_alarm_cache_header,
     write_sorted_alarm_cache,
 )
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
@@ -130,6 +132,16 @@ def validate_main_args(parser, args):
         parser.error("未指定 output；正常输出模式必须提供 output，或使用 --no-output 跳过故障组输出")
     if args.no_output and args.compute_ticket_recall:
         parser.error("--no-output 不能与 --compute-ticket-recall 同时使用，因为工单召回计算需要读取故障组输出文件")
+    if (
+        args.stream_sorted_alarms
+        and not args.sorted_alarms_input.strip()
+        and not is_sorted_alarm_cache_file(args.alarms)
+    ):
+        parser.error(
+            "--stream-sorted-alarms 只能用于排序告警缓存；"
+            "请先运行 fault_grouping/tools/prepare_sorted_alarms.py 生成缓存，"
+            "或通过 --sorted-alarms-input 指定缓存"
+        )
     if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:
         parser.error("启用 batch-merge-density-knn 时，batch-merge-density-scale 必须大于 0")
     if args.site_chains and not os.path.exists(args.site_chains):
@@ -344,7 +356,49 @@ def resolve_sorted_alarm_cache_input(parser, args):
 
 def load_alarm_data(args, parser, static_context, valid_alarm_titles, start_ts, end_ts):
     sorted_alarm_cache_input = resolve_sorted_alarm_cache_input(parser, args)
+    if args.stream_sorted_alarms and not sorted_alarm_cache_input:
+        parser.error(
+            "--stream-sorted-alarms 只能用于排序告警缓存；"
+            "请先运行 fault_grouping/tools/prepare_sorted_alarms.py 生成缓存，"
+            "或通过 --sorted-alarms-input 指定缓存"
+        )
     if sorted_alarm_cache_input:
+        if args.stream_sorted_alarms:
+            print(f"⚡ 流式读取排序告警缓存: {sorted_alarm_cache_input}")
+            load_start_time = time.time()
+            sorted_alarm_cache_metadata = read_sorted_alarm_cache_header(sorted_alarm_cache_input)
+            warn_sorted_alarm_cache_option_mismatch(sorted_alarm_cache_metadata, args)
+            valid_alarms = SortedAlarmCacheStream(
+                sorted_alarm_cache_input,
+                metadata=sorted_alarm_cache_metadata,
+            )
+            sort_elapsed = time.time() - load_start_time
+            normal_alarm_count = int(
+                sorted_alarm_cache_metadata.get(
+                    "cached_normal_alarm_count",
+                    sorted_alarm_cache_metadata.get("normal_alarm_count", 0),
+                )
+            )
+            clear_alarm_count = int(
+                sorted_alarm_cache_metadata.get(
+                    "cached_clear_alarm_count",
+                    sorted_alarm_cache_metadata.get("clear_alarm_count", 0),
+                )
+            )
+            processed_count = int(
+                sorted_alarm_cache_metadata.get(
+                    "processed_count",
+                    len(valid_alarms),
+                )
+            )
+            return AlarmLoadResult(
+                processed_count=processed_count,
+                valid_alarms=valid_alarms,
+                normal_alarm_count=normal_alarm_count,
+                clear_alarm_count=clear_alarm_count,
+                sort_elapsed=sort_elapsed,
+            )
+
         print(f"⚡ 直接加载排序告警缓存: {sorted_alarm_cache_input}")
         load_start_time = time.time()
         (

@@ -107,6 +107,61 @@ def _iter_sorted_alarm_cache_lines(path):
         yield from fr
 
 
+def read_sorted_alarm_cache_header(path):
+    line_iter = iter(_iter_sorted_alarm_cache_lines(path))
+    try:
+        first_line = next(line_iter).strip()
+    except StopIteration:
+        first_line = ""
+
+    if not first_line:
+        raise ValueError(f"排序告警缓存为空: {path}")
+
+    metadata = json.loads(first_line)
+    if not is_sorted_alarm_cache_header(metadata):
+        raise ValueError(f"不是当前身份方案的有效排序告警缓存: {path}")
+    return metadata
+
+
+def iter_sorted_alarm_cache_items(path, show_progress=False):
+    read_sorted_alarm_cache_header(path)
+    line_iter = iter(_iter_sorted_alarm_cache_lines(path))
+    next(line_iter, None)
+    for idx, line in enumerate(line_iter, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        _require_cached_alarm_identity(item)
+        yield item
+        if show_progress and idx % 100000 == 0:
+            print(f"  已流式读取排序告警 {idx} 条...")
+
+
+class SortedAlarmCacheStream:
+    def __init__(self, path, metadata=None):
+        self.path = path
+        self.metadata = metadata or read_sorted_alarm_cache_header(path)
+        self.alarm_count = int(self.metadata.get("alarm_count", 0))
+        self._first_ts = None
+        self._first_ts_loaded = False
+
+    def __len__(self):
+        return self.alarm_count
+
+    def __iter__(self):
+        return iter_sorted_alarm_cache_items(self.path)
+
+    def first_ts(self):
+        if not self._first_ts_loaded:
+            self._first_ts = None
+            for item in self:
+                self._first_ts = item.get("ts")
+                break
+            self._first_ts_loaded = True
+        return self._first_ts
+
+
 def _write_sorted_alarm_cache_jsonl(stream, sorted_alarms, header):
     stream.write(json.dumps(header, ensure_ascii=False) + "\n")
     for item in sorted_alarms:
@@ -135,30 +190,10 @@ def write_sorted_alarm_cache(path, sorted_alarms, metadata=None):
 
 
 def load_sorted_alarm_cache(path, show_progress=False):
-    metadata = None
     alarms = []
 
-    line_iter = iter(_iter_sorted_alarm_cache_lines(path))
-    try:
-        first_line = next(line_iter).strip()
-    except StopIteration:
-        first_line = ""
-
-    if not first_line:
-        raise ValueError(f"排序告警缓存为空: {path}")
-
-    metadata = json.loads(first_line)
-    if not is_sorted_alarm_cache_header(metadata):
-        raise ValueError(f"不是当前身份方案的有效排序告警缓存: {path}")
-
-    for idx, line in enumerate(line_iter, start=1):
-        line = line.strip()
-        if not line:
-            continue
-        item = json.loads(line)
-        _require_cached_alarm_identity(item)
+    metadata = read_sorted_alarm_cache_header(path)
+    for item in iter_sorted_alarm_cache_items(path, show_progress=show_progress):
         alarms.append(item)
-        if show_progress and idx % 100000 == 0:
-            print(f"  已加载排序告警 {idx} 条...")
 
     return metadata, alarms
