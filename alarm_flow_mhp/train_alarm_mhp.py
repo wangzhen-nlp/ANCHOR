@@ -151,6 +151,7 @@ def _build_config(args):
         max_active_sources_per_dim=args.max_active_sources_per_dim,
         branching_cap=args.branching_cap,
         stability_radius=args.stability_radius,
+        feature_spectral_cap=args.feature_spectral_cap,
         chunk_size=args.chunk_size,
         kernel_type=args.kernel_type,
         bucket_edges_sec=_parse_bucket_edges(args.bucket_edges_sec),
@@ -420,6 +421,15 @@ def main():
     parser.add_argument("--max-active-sources-per-dim", type=int, default=16)
     parser.add_argument("--branching-cap", type=float, default=0.9)
     parser.add_argument("--stability-radius", type=float, default=0.95)
+    parser.add_argument(
+        "--feature-spectral-cap",
+        action="store_true",
+        help="Feature mode: enforce ρ ≤ --stability-radius. Selection prefers the "
+             "val-best snapshot already at ρ ≤ target (no distortion); if none "
+             "qualifies, the val-best is rescaled (α × target/ρ, stored as the "
+             "kernel's alpha_scale) to guarantee it. OFF by default = warn only "
+             "(legacy; existing feature-mode runs unchanged).",
+    )
     parser.add_argument(
         "--chunk-size",
         type=int,

@@ -59,11 +59,18 @@ class FeatureKernel:
         Human-readable names, len F (for interpretability / serialization).
     l2 : float
         Ridge penalty λ on ||w||² (excluding the bias term, index 0).
+    alpha_scale : float
+        Global multiplier applied to every materialized α (default 1.0 = no-op).
+        Used by the opt-in spectral cap to enforce ρ ≤ target: since softplus is
+        NOT scale-equivariant the cap cannot be folded into w, so it is stored as
+        an explicit scalar applied here — the single point through which all
+        inference α (target-side, source-side, dynamic boosts) flows.
     """
 
     weights: np.ndarray
     feature_names: list = field(default_factory=list)
     l2: float = 1e-3
+    alpha_scale: float = 1.0
 
     def __post_init__(self):
         self.weights = np.asarray(self.weights, dtype=np.float64).reshape(-1)
@@ -75,16 +82,20 @@ class FeatureKernel:
         return int(len(self.weights))
 
     def alpha(self, phi: np.ndarray) -> np.ndarray:
-        """α = softplus(φ · w) for a (P, F) feature matrix → (P,) amplitudes."""
+        """α = alpha_scale · softplus(φ · w) for a (P, F) matrix → (P,) amplitudes."""
         if len(phi) == 0:
             return np.zeros(0, dtype=np.float64)
-        return softplus(phi @ self.weights)
+        a = softplus(phi @ self.weights)
+        if self.alpha_scale != 1.0:
+            a = a * self.alpha_scale
+        return a
 
     def to_dict(self) -> dict:
         return {
             "weights": self.weights.astype(float).tolist(),
             "feature_names": list(self.feature_names),
             "l2": float(self.l2),
+            "alpha_scale": float(self.alpha_scale),
         }
 
     @classmethod
@@ -94,6 +105,7 @@ class FeatureKernel:
             weights=np.asarray(payload.get("weights", ()), dtype=np.float64),
             feature_names=list(payload.get("feature_names", [])),
             l2=float(payload.get("l2", 1e-3)),
+            alpha_scale=float(payload.get("alpha_scale", 1.0)),
         )
 
 

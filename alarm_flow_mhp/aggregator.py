@@ -145,6 +145,13 @@ class AlarmMHPConfig:
     max_active_sources_per_dim: int = 16
     branching_cap: float = 0.9
     stability_radius: float = 0.95
+    # Opt-in spectral cap for FEATURE mode (default OFF = legacy warn-only). When
+    # ON: model selection prefers the val-best snapshot whose ρ ≤ stability_radius
+    # (no distortion); if none qualifies, the val-best overall is rescaled (α ×
+    # stability_radius/ρ, stored as FeatureKernel.alpha_scale) to guarantee ρ ≤
+    # stability_radius. The parametric path always caps; this brings feature mode
+    # to parity without changing existing feature-mode runs.
+    feature_spectral_cap: bool = False
     chunk_size: int = 20_000
     # Kernel shape. "exp" = single exponential (α·β·exp(-β·dt)); "piecewise" =
     # two-stage: exp fit selects edges, then box-basis EM learns per-bucket
@@ -1040,8 +1047,12 @@ def train_alarm_mhp(
     val_state = {
         "best_val_ll": -np.inf,
         "best_val_iter": -1,
-        "best_snapshot": None,     # MHPResult captured at the val-LL peak
+        "best_snapshot": None,     # val-LL peak among ELIGIBLE snapshots (ρ-gated if cap on)
         "patience_left": int(config.early_stop_patience),
+        # val-LL peak ignoring the ρ gate — fallback for the spectral-cap rescale
+        # when no snapshot satisfies ρ ≤ stability_radius.
+        "any_val_ll": -np.inf,
+        "any_snapshot": None,
     }
 
     def iter_callback(trace_entry: dict):
@@ -1105,26 +1116,44 @@ def train_alarm_mhp(
         # printed. "train" (default) → legacy: every train-best is the new best,
         # no early stop; val LL is computed only for the log line.
         select_on_val = use_val and config.selection_metric == "val"
+        # Opt-in spectral cap (feature mode): a snapshot is only ELIGIBLE as the
+        # deployable best if its ρ ≤ stability_radius. Off → no ρ gate (legacy).
+        cap_on = bool(config.feature_spectral_cap) and config.edge_mode == "feature"
         val_ll = None
         improved = True               # train metric → every train-best "improves"
+        eligible = True
         if use_val:
             from mhp.em import log_likelihood as mhp_ll
             val_ll = float(mhp_ll(val_events, best_result.params, config=mhp_config))
             val_ll_history.append(val_ll)
+        any_improved = False
         if select_on_val:
-            prev_best = val_state["best_val_ll"]
-            if np.isfinite(prev_best):
-                # Relative tolerance so tiny numerical wiggles don't count as
-                # improvement. (abs(prev_best) is finite here, so no NaN.)
-                improved = val_ll > prev_best + 1e-6 * abs(prev_best)
-            else:
-                # First evaluation: prev_best is -inf, and -inf + 1e-6*inf = NaN
-                # would make every comparison False. Any finite val LL improves.
-                improved = bool(np.isfinite(val_ll))
+            def _beats(ref):
+                # strict improvement w/ relative tol; -inf ref (first eval) → any
+                # finite val_ll improves (avoids -inf + 1e-6·inf = NaN → always False).
+                if np.isfinite(ref):
+                    return val_ll > ref + 1e-6 * abs(ref)
+                return bool(np.isfinite(val_ll))
+            # Overall val-best (ignores ρ). Drives early-stop (we OPTIMIZE val, so
+            # patience tracks val-overall, not the ρ gate) AND is the fallback
+            # target for the cap rescale when no ρ-eligible snapshot exists.
+            any_improved = _beats(val_state["any_val_ll"])
+            if any_improved:
+                val_state["any_val_ll"] = val_ll
+                val_state["any_snapshot"] = best_result
+            # Deployable best: with the cap on, require a REAL stationary model,
+            # 0 < ρ ≤ stability_radius. ρ == 0 is the cold-start "no active edges"
+            # sentinel — it must NOT qualify, else it locks in an empty model and
+            # blocks the rescale fallback.
+            _rho = trace_entry.get("spectral_radius")
+            eligible = (not cap_on) or (_rho is not None and 0.0 < _rho <= config.stability_radius)
+            improved = eligible and _beats(val_state["best_val_ll"])
             if improved:
                 val_state["best_val_ll"] = val_ll
                 val_state["best_val_iter"] = int(trace_entry.get("iter", -1))
                 val_state["best_snapshot"] = best_result
+            # Early stop on the optimized quantity (val overall), not the ρ gate.
+            if any_improved:
                 val_state["patience_left"] = int(config.early_stop_patience)
             else:
                 val_state["patience_left"] -= 1
@@ -1132,11 +1161,14 @@ def train_alarm_mhp(
             _it = int(trace_entry.get("iter", -1))
             _rho = trace_entry.get("spectral_radius")
             _rho_s = f" ρ={_rho:.3f}" if _rho is not None else ""
-            if select_on_val:
-                _flag = ("↑best" if improved
-                         else f"no-improve (patience {max(val_state['patience_left'], 0)})")
-            else:
+            if not select_on_val:
                 _flag = "(train-selected)"
+            elif improved:
+                _flag = "↑best"
+            elif cap_on and not eligible:
+                _flag = f"ρ>{config.stability_radius:g} excluded (patience {max(val_state['patience_left'], 0)})"
+            else:
+                _flag = f"no-improve (patience {max(val_state['patience_left'], 0)})"
             print(
                 f"[train]   iter={_it:3d} val_ll={val_ll:.2f}{_rho_s} "
                 f"(train_ll={best_result.log_likelihood:.2f}) {_flag}",
@@ -1208,16 +1240,20 @@ def train_alarm_mhp(
                     flush=True,
                 )
 
-        # Early stop: only when selecting on val and val LL has not improved for
-        # `early_stop_patience` snapshots. Train selection never early-stops.
+        # Early stop: only when selecting on val and val LL (overall) has not
+        # improved for `early_stop_patience` snapshots. Train selection never
+        # early-stops.
         if select_on_val and val_state["patience_left"] <= 0:
             if verbose:
-                print(
-                    f"[train]   val LL plateaued → early stop "
-                    f"(best val_ll={val_state['best_val_ll']:.2f} "
-                    f"@ iter {val_state['best_val_iter']})",
-                    flush=True,
-                )
+                if val_state["best_snapshot"] is not None:
+                    _msg = (f"best val_ll={val_state['best_val_ll']:.2f} "
+                            f"@ iter {val_state['best_val_iter']}")
+                else:
+                    # cap on + no ρ≤target snapshot: best_val_ll is still -inf, so
+                    # report the overall val-best (it gets spectral-capped at the end).
+                    _msg = (f"no ρ≤{config.stability_radius:g} snapshot; overall "
+                            f"val_ll={val_state['any_val_ll']:.2f} (will be spectral-capped)")
+                print(f"[train]   val LL plateaued → early stop ({_msg})", flush=True)
             return True
         return False
 
@@ -1357,19 +1393,9 @@ def train_alarm_mhp(
             iter_callback=iter_callback,
             best_callback=write_best_checkpoint,
         )
-        # Stationarity check (feature mode has no hard cap): warn if the
-        # materialized α matrix's spectral radius ≥ 1 → cluster-Poisson diverges.
-        if config.stability_radius > 0 and len(result.params.edge_alpha):
-            rho = result.params.spectral_radius()
-            if rho >= config.stability_radius and verbose:
-                print(
-                    f"[train] WARN: feature-mode α spectral radius ρ={rho:.3f} >= "
-                    f"{config.stability_radius}. No hard cap in feature mode — raise "
-                    f"--feature-l2 to shrink weights, or expect over-excitation. ",
-                    flush=True,
-                )
-            elif verbose:
-                print(f"[train] feature-mode α spectral radius ρ={rho:.3f} (< {config.stability_radius}, OK)", flush=True)
+        # Stationarity is reported below, AFTER val-selection + the optional
+        # spectral cap, so it reflects the actually-deployed model (not the
+        # train-final, which selection may replace).
     elif config.kernel_type == "piecewise":
         # Stage 1: exp-kernel fit selects the sparse active edge set + μ. The
         # topology prior applies HERE (edge selection); stage 2 only learns θ
@@ -1408,13 +1434,17 @@ def train_alarm_mhp(
             topo_prior_score=topo_prior_score,
         )
 
-    final_val_ll: Optional[float] = None
+    from mhp.em import log_likelihood as mhp_ll
+    cap_on = bool(config.feature_spectral_cap) and config.edge_mode == "feature"
+
+    # 1) Model selection: prefer the val-LL-optimal snapshot (captured live during
+    #    EM) over the train-final weights — the point of holding out data. With the
+    #    cap on and no ρ-eligible snapshot, fall back to the val-best overall (it is
+    #    rescaled in step 2). Keep the run's trace/iteration fields; swap params.
     if val_events is not None and val_events.n > 0:
-        # Prefer the val-LL-optimal snapshot (captured live during EM) over the
-        # final train-LL-optimal weights — that is the whole point of holding out
-        # data. Keep the completed run's trace/iteration/converged fields for the
-        # report; swap in the generalizing params/kernels.
         snap = val_state["best_snapshot"]
+        if snap is None and cap_on:
+            snap = val_state["any_snapshot"]
         if snap is not None and snap is not result:
             result = replace(
                 result,
@@ -1424,17 +1454,77 @@ def train_alarm_mhp(
                 feature_kernel=snap.feature_kernel,
                 mu_kernel=snap.mu_kernel,
             )
-            final_val_ll = float(val_state["best_val_ll"])
-            if verbose:
+            if verbose and val_state["best_snapshot"] is not None:
                 print(
                     f"[train] selected val-best snapshot from iter "
-                    f"{val_state['best_val_iter']}: val_ll={final_val_ll:.2f} "
+                    f"{val_state['best_val_iter']}: val_ll={float(val_state['best_val_ll']):.2f} "
                     f"(train_ll={result.log_likelihood:.2f})",
                     flush=True,
                 )
-        else:
-            from mhp.em import log_likelihood as mhp_ll
-            final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
+
+    # 2) Spectral cap (opt-in, feature mode). Idempotent: a no-op when the selected
+    #    model already has ρ ≤ stability_radius (the common case — B picked a stable
+    #    snapshot). Otherwise rescale α by stability_radius/ρ (ρ(c·A)=c·ρ(A), exact;
+    #    relative edge structure preserved) and bake the scale into the kernel so
+    #    inference — which recomputes α from w — applies the same cap. Works for any
+    #    selection metric (incl. train) and the no-val case.
+    if cap_on and len(result.params.edge_alpha):
+        rho = float(result.params.spectral_radius())
+        if rho > config.stability_radius:
+            scale = config.stability_radius / rho
+            capped_kernel = result.feature_kernel
+            if capped_kernel is not None:
+                capped_kernel = replace(capped_kernel, alpha_scale=capped_kernel.alpha_scale * scale)
+            result = replace(
+                result,
+                params=MHPParams.from_edges(
+                    M=len(result.params.mu),
+                    mu=result.params.mu,
+                    edge_targets=result.params.edge_targets,
+                    edge_sources=result.params.edge_sources,
+                    edge_alpha=result.params.edge_alpha * scale,
+                    edge_beta=result.params.edge_beta,
+                    edge_threshold=config.edge_threshold,
+                    max_active_sources_per_dim=config.max_active_sources_per_dim,
+                    beta_shared=True,
+                ),
+                feature_kernel=capped_kernel,
+            )
+            if verbose:
+                print(
+                    f"[train] WARN: spectral cap — no model reached ρ ≤ "
+                    f"{config.stability_radius:g}; rescaled α×{scale:.3f} "
+                    f"(ρ {rho:.3f} → {float(result.params.spectral_radius()):.3f}). Relative "
+                    f"structure kept; a denser-graph config (e.g. NE topology) may be the "
+                    f"deeper issue.",
+                    flush=True,
+                )
+
+    # 3) Stationarity report on the FINAL (selected + capped) model. Use a strict
+    #    >-with-eps threshold: the cap rescales to ρ == stability_radius exactly, so
+    #    a plain >= would mis-fire the WARN on a successfully-capped model.
+    if config.edge_mode == "feature" and config.stability_radius > 0 and len(result.params.edge_alpha):
+        rho = float(result.params.spectral_radius())
+        _eps = 1e-9
+        if rho > config.stability_radius + _eps:
+            if verbose:
+                # With the cap on, ρ > target is only reachable via numerical
+                # residue; don't tell the user to enable a flag that's already on.
+                _hint = ("(numerical residual after spectral cap)" if cap_on
+                         else "Raise --feature-l2, or enable --feature-spectral-cap to enforce it.")
+                print(
+                    f"[train] WARN: feature-mode α spectral radius ρ={rho:.3f} > "
+                    f"{config.stability_radius}. {_hint}",
+                    flush=True,
+                )
+        elif verbose:
+            _capped = " [spectral cap applied]" if (cap_on and result.feature_kernel is not None
+                                                    and result.feature_kernel.alpha_scale != 1.0) else ""
+            print(f"[train] feature-mode α spectral radius ρ={rho:.3f} (≤ {config.stability_radius}, OK){_capped}", flush=True)
+
+    final_val_ll: Optional[float] = None
+    if val_events is not None and val_events.n > 0:
+        final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
         if verbose:
             print(
                 f"[train] held-out val LL on last {val_events.n} events: {final_val_ll:.2f} "
@@ -1530,13 +1620,37 @@ def train_alarm_mhp(
         "hard_cascade_seconds": float(hard_cascade_seconds),
         "topology_report_seconds": float(topology_report_seconds),
     }
-    return AlarmMHPArtifact(
+    final_artifact = AlarmMHPArtifact(
         params=result.params,
         vocabs=vocabs,
         config=config,
         training_metadata=training_metadata,
         trace=result.trace,
     )
+    # Finalize the best checkpoint to the FINAL selected+capped model. Mid-training
+    # checkpoints wrote raw snapshots (before val-selection swap + spectral cap), so
+    # the sidecar could otherwise be uncapped — or absent, when the cap fell back to
+    # rescaling and no ρ-eligible snapshot was ever written. Overwriting here keeps
+    # the sidecar on the same final selected/capped model as --output (metadata is
+    # not bit-identical — see the log note below).
+    if best_checkpoint_path:
+        tmp_path = f"{best_checkpoint_path}.tmp"
+        save_alarm_mhp_artifact(tmp_path, final_artifact)
+        os.replace(tmp_path, best_checkpoint_path)
+        if verbose:
+            _capped = (result.feature_kernel is not None
+                       and getattr(result.feature_kernel, "alpha_scale", 1.0) != 1.0)
+            # The MODEL matches --output; metadata is not bit-identical (the CLI adds
+            # input/alarm_metadata to the --output artifact afterwards, and the
+            # mid-training checkpoint=True markers are gone). Those fields are
+            # final-only by design / unconsumed, so only claim model parity.
+            print(
+                f"[train] best checkpoint finalized → {best_checkpoint_path} "
+                f"(final selected{'+capped' if _capped else ''} model; "
+                f"same model as --output)",
+                flush=True,
+            )
+    return final_artifact
 
 
 def _cascade_size_stats_from_p_self(p_self: np.ndarray, dims: np.ndarray):

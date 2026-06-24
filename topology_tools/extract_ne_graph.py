@@ -31,13 +31,14 @@ from topology_resources import (
 from topology_tools.extract_site_graph import (
     PROGRESS_ROW_STEP,
     _keep_latest,
+    _report_duplicate_detail,
     _require_last_modified,
     iter_csv_dir_records,
     load_latest_link_records,
 )
 
 
-def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
+def load_ne_from_csv(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False) -> dict:
     """
     从SYS_NE加载NE信息；同 nativeId 按 last_Modified 取最新记录，不做字段合并
 
@@ -45,6 +46,7 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
         {nativeId: {domain, name, manufacturer, region_id, site_id, ...}}
     """
     records = {}
+    duplicates = defaultdict(int) if report_duplicates else None
 
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
@@ -66,12 +68,13 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR) -> dict:
             'site_id': (row.get('ne_site_id') or '').strip().upper(),
             'running_status': (row.get('running_status') or '').strip()
         }
-        _keep_latest(records, nativeId, last_modified, incoming)
+        _keep_latest(records, nativeId, last_modified, incoming, duplicates)
     progress.set(row_count)
     progress.close()
 
     ne_info = {key: payload for key, (_, payload) in records.items()}
     print(f"  读取 {row_count} 行，去重后 {len(ne_info)} 个NE")
+    _report_duplicate_detail(duplicates, 'nativeId')
     return ne_info
 
 
@@ -103,7 +106,7 @@ def load_site_info(site_graph_file: str = SITE_GRAPH_JSON) -> dict:
     return site_info
 
 
-def build_ne_graph(link_input: str) -> dict:
+def build_ne_graph(link_input: str, report_duplicates: bool = False) -> dict:
     """
     根据链路信息生成NE邻接图
 
@@ -125,7 +128,7 @@ def build_ne_graph(link_input: str) -> dict:
     link_count = 0
     mapped_count = 0
 
-    for record in load_latest_link_records(link_input):
+    for record in load_latest_link_records(link_input, report_duplicates):
         a_ne = (record.get('a_end_ne_nativeId') or '').strip().upper()
         z_ne = (record.get('z_end_ne_nativeId') or '').strip().upper()
         a_ne = a_ne or (record.get("a_end_ne_nativeId(')") or '').strip().upper()
@@ -181,11 +184,16 @@ def main():
         default=NE_GRAPH_JSON,
         help=f"输出 ne_graph.json，默认: {resource_display('ne_graph.json')}",
     )
+    parser.add_argument(
+        "--report-duplicates",
+        action="store_true",
+        help="打印 NE/链路 中重复 ID 的明细（默认仅汇总，不打印明细）",
+    )
     args = parser.parse_args()
 
     # 加载NE信息
     print("加载NE信息...")
-    ne_info = load_ne_from_csv(args.ne_dir)
+    ne_info = load_ne_from_csv(args.ne_dir, args.report_duplicates)
     print(f"  NE数量: {len(ne_info)}")
 
     # 加载站点信息
@@ -195,7 +203,7 @@ def main():
 
     # 生成节点传播图
     print("\n生成节点传播图...")
-    ne_links = build_ne_graph(args.link_input)
+    ne_links = build_ne_graph(args.link_input, args.report_duplicates)
 
     # 合并站点信息和链路信息
     ne_graph = {}

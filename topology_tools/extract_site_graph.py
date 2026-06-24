@@ -52,11 +52,26 @@ def _require_last_modified(record: dict, row_number: int, source: str) -> int:
         )
 
 
-def _keep_latest(records: dict, key: str, last_modified: int, payload) -> None:
-    """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。"""
+def _keep_latest(records: dict, key: str, last_modified: int, payload, duplicates: dict = None) -> None:
+    """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。
+
+    传入 duplicates(dict) 时，会累加重复 key 的额外出现次数，供明细报告使用。
+    """
     existing = records.get(key)
+    if existing is not None and duplicates is not None:
+        duplicates[key] += 1
     if existing is None or last_modified > existing[0]:
         records[key] = (last_modified, payload)
+
+
+def _report_duplicate_detail(duplicates: dict, label: str) -> None:
+    """打印重复 key 的明细（按重复次数降序）；duplicates 为空或 None 时不输出。"""
+    if not duplicates:
+        return
+    items = sorted(duplicates.items(), key=lambda kv: kv[1], reverse=True)
+    print(f"  检测到 {len(items)} 个{label}存在重复（已保留 last_Modified 最新记录）:")
+    for key, extra in items:
+        print(f"    {key}: {extra + 1} 条")
 
 
 def _parse_bool(value) -> bool:
@@ -64,7 +79,7 @@ def _parse_bool(value) -> bool:
     return text in {"1", "true", "t", "yes", "y", "是"}
 
 
-def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
+def load_ne_site_mapping(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False) -> dict:
     """
     从SYS_NE中加载nativeId -> ne_site_id的映射；同 nativeId 按 last_Modified 取最新记录
 
@@ -72,6 +87,7 @@ def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
         {nativeId: ne_site_id}
     """
     records = {}
+    duplicates = defaultdict(int) if report_duplicates else None
 
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
@@ -84,16 +100,17 @@ def load_ne_site_mapping(data_dir: str = SYS_NE_DIR) -> dict:
         ne_site_id = (row.get('ne_site_id') or '').strip().upper()
         if not (nativeId and ne_site_id):
             continue
-        _keep_latest(records, nativeId, last_modified, ne_site_id)
+        _keep_latest(records, nativeId, last_modified, ne_site_id, duplicates)
     progress.set(row_count)
     progress.close()
 
     mapping = {key: payload for key, (_, payload) in records.items()}
     print(f"  读取 {row_count} 行，去重后 {len(mapping)} 条映射")
+    _report_duplicate_detail(duplicates, 'nativeId')
     return mapping
 
 
-def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
+def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False) -> dict:
     """
     从SYS_SITE中加载站点信息；同 site_id 按 last_Modified 取最新记录，不做字段合并
 
@@ -101,6 +118,7 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
         {site_id: {longitude, latitude, site_type, region_id, is_hub}}
     """
     records = {}
+    duplicates = defaultdict(int) if report_duplicates else None
 
     progress = ProgressBar(0, "  读取站点记录")
     row_count = 0
@@ -120,12 +138,13 @@ def load_site_info(data_dir: str = SYS_SITE_DIR) -> dict:
             'region_id': (row.get('region_id') or '').strip(),
             'is_hub': _parse_bool(row.get('is_hub', '')),
         }
-        _keep_latest(records, site_id, last_modified, incoming)
+        _keep_latest(records, site_id, last_modified, incoming, duplicates)
     progress.set(row_count)
     progress.close()
 
     site_info = {key: payload for key, (_, payload) in records.items()}
     print(f"  读取 {row_count} 行，去重后 {len(site_info)} 个站点")
+    _report_duplicate_detail(duplicates, 'site_id')
     return site_info
 
 
@@ -207,13 +226,14 @@ def iter_link_records(link_input: str, progress: ProgressBar = None):
 LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
 
 
-def load_latest_link_records(link_input: str) -> list:
+def load_latest_link_records(link_input: str, report_duplicates: bool = False) -> list:
     """读取链路记录并按 last_Modified 去重：同一链路 ID 只保留最新记录。
 
     无法确定链路 ID 的记录不参与去重，原样保留。
     """
     records = {}
     no_key_records = []
+    duplicates = defaultdict(int) if report_duplicates else None
 
     progress = ProgressBar(0, "  读取链路记录")
     row_count = 0
@@ -230,16 +250,17 @@ def load_latest_link_records(link_input: str) -> list:
         if not key:
             no_key_records.append(record)
             continue
-        _keep_latest(records, key, last_modified, record)
+        _keep_latest(records, key, last_modified, record, duplicates)
     progress.set(row_count)
     progress.close()
 
     latest_records = [payload for _, payload in records.values()] + no_key_records
     print(f"  读取 {row_count} 行，去重后 {len(latest_records)} 条链路记录")
+    _report_duplicate_detail(duplicates, '链路ID')
     return latest_records
 
 
-def build_site_graph(link_input: str, ne_site_map: dict) -> dict:
+def build_site_graph(link_input: str, ne_site_map: dict, report_duplicates: bool = False) -> dict:
     """
     根据链路信息生成站点邻接图
 
@@ -259,7 +280,7 @@ def build_site_graph(link_input: str, ne_site_map: dict) -> dict:
     link_count = 0
     mapped_count = 0
 
-    for record in load_latest_link_records(link_input):
+    for record in load_latest_link_records(link_input, report_duplicates):
         a_ne = (record.get('a_end_ne_nativeId') or '').strip().upper()
         z_ne = (record.get('z_end_ne_nativeId') or '').strip().upper()
         a_ne = a_ne or (record.get("a_end_ne_nativeId(')") or '').strip().upper()
@@ -321,19 +342,24 @@ def main():
         default=SITE_GRAPH_JSON,
         help=f"输出站点图 JSON，默认: {resource_display('site_graph.json')}",
     )
+    parser.add_argument(
+        "--report-duplicates",
+        action="store_true",
+        help="打印 NE/站点/链路 中重复 ID 的明细（默认仅汇总，不打印明细）",
+    )
     args = parser.parse_args()
 
     # 加载NE到站点的映射
     print("加载NE站点映射...")
-    ne_site_map = load_ne_site_mapping(args.ne_dir)
+    ne_site_map = load_ne_site_mapping(args.ne_dir, args.report_duplicates)
 
     # 加载站点信息
     print("\n加载站点信息...")
-    site_info = load_site_info(args.site_dir)
+    site_info = load_site_info(args.site_dir, args.report_duplicates)
 
     # 生成站点传播图
     print("\n生成站点传播图...")
-    site_links = build_site_graph(args.link_input, ne_site_map)
+    site_links = build_site_graph(args.link_input, ne_site_map, args.report_duplicates)
 
     # 合并站点信息和链路信息
     result = {}
