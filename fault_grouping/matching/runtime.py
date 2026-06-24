@@ -126,6 +126,8 @@ def validate_main_args(parser, args):
         and args.batch_merge_density_max_meters < args.batch_merge_density_min_meters
     ):
         parser.error("batch-merge-density-max-meters 不能小于 batch-merge-density-min-meters")
+    if not args.no_output and not args.output:
+        parser.error("未指定 output；正常输出模式必须提供 output，或使用 --no-output 跳过故障组输出")
     if args.no_output and args.compute_ticket_recall:
         parser.error("--no-output 不能与 --compute-ticket-recall 同时使用，因为工单召回计算需要读取故障组输出文件")
     if args.batch_merge_density_knn > 0 and args.batch_merge_density_scale <= 0:

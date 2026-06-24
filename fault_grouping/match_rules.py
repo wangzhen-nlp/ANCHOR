@@ -55,7 +55,7 @@ class RuntimeExecutionPlan:
 def _build_arg_parser():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
-    parser.add_argument('output', type=str, help='output jsonl file')
+    parser.add_argument('output', type=str, nargs='?', help='output jsonl file；--no-output 时可省略')
     parser.add_argument('--topo', type=str, default=SITE_GRAPH_BY_NE_JSON, help=f'站点拓扑文件，默认: {resource_display("site_graph_by_ne.json")}；若传空值则退回为基于 ne_graph.json 原始连边自动构建')
     parser.add_argument('--site-chains', type=str, default='', help=f'可选 generate_site_chains.py 输出文件；提供后无 path 约束的上下游遍历优先使用预计算 hop，推荐: {resource_display("site_chains.json")}')
     parser.add_argument('--site-domain', type=str, default=SITE_DEVICE_COUNTS_JSON, help=f'站点画像文件，默认: {resource_display("site_device_counts.json")}')
