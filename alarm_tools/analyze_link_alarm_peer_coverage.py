@@ -26,8 +26,8 @@ def load_ne_ids(ne_graph_path):
     }
 
 
-def _print_missing_peer_debug(alarm, endpoints):
-    print("未找到 link 告警对端设备")
+def _print_missing_peer_debug(alarm, endpoints, index):
+    print(f"未找到 link 告警对端设备 #{index}")
     print(
         "原因: 设备+端口没有在 peer-index 记录里查到: "
         f"告警源={endpoints.local_ne or '<空>'}, "
@@ -43,9 +43,11 @@ def analyze_link_alarm_peer_coverage(
     ne_ids,
     show_progress=True,
     debug_missing_peer=False,
+    debug_missing_peer_limit=100,
 ):
     total_link_alarms = 0
     found_peer_in_ne_graph = 0
+    missing_peer_debug_count = 0
 
     for alarm in stream_alarm_inputs(alarms_input, show_progress=show_progress):
         if alarm.get("告警标题", "") not in LINK_ALARMS:
@@ -57,16 +59,25 @@ def analyze_link_alarm_peer_coverage(
             alarm_source=alarm.get("告警源", ""),
         )
         if debug_missing_peer and not endpoints.remote_ne:
-            _print_missing_peer_debug(alarm, endpoints)
-            raise SystemExit(1)
+            missing_peer_debug_count += 1
+            if missing_peer_debug_count <= debug_missing_peer_limit:
+                _print_missing_peer_debug(alarm, endpoints, missing_peer_debug_count)
+            if missing_peer_debug_count >= debug_missing_peer_limit:
+                print(f"已打印 {debug_missing_peer_limit} 条缺失 peer 的 link 告警，debug 模式退出")
+                raise SystemExit(1)
         if endpoints.remote_ne and endpoints.remote_ne in ne_ids:
             found_peer_in_ne_graph += 1
+
+    if debug_missing_peer and missing_peer_debug_count:
+        print(f"共发现 {missing_peer_debug_count} 条缺失 peer 的 link 告警，debug 模式退出")
+        raise SystemExit(1)
 
     ratio = found_peer_in_ne_graph / total_link_alarms if total_link_alarms else 0.0
     return {
         "total_link_alarms": total_link_alarms,
         "found_peer_in_ne_graph": found_peer_in_ne_graph,
         "ratio": ratio,
+        "missing_peer_debug_count": missing_peer_debug_count,
     }
 
 
@@ -93,9 +104,17 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="遇到第一条无法通过 告警源+物理端口 找到对端设备的 link 告警时，打印原因和完整告警字段后退出",
+        help="打印无法通过 告警源+物理端口 找到对端设备的 link 告警详情；默认最多 100 条后退出",
+    )
+    parser.add_argument(
+        "--debug-limit",
+        type=int,
+        default=100,
+        help="--debug 模式下最多打印多少条缺失 peer 的 link 告警，默认 100",
     )
     args = parser.parse_args()
+    if args.debug_limit <= 0:
+        parser.error("--debug-limit 必须大于 0")
 
     print(f"加载 peer-index: {args.link_peer_index}")
     peer_index = load_peer_index(args.link_peer_index)
@@ -110,6 +129,7 @@ def main():
         ne_ids,
         show_progress=not args.no_progress,
         debug_missing_peer=args.debug,
+        debug_missing_peer_limit=args.debug_limit,
     )
     print(f"link 告警总条数: {result['total_link_alarms']}")
     print(f"可找到 ne_graph 对端设备条数: {result['found_peer_in_ne_graph']}")

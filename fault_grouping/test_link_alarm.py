@@ -208,20 +208,22 @@ def test_analyze_link_alarm_peer_coverage_requires_remote_ne_in_ne_graph():
     assert result["ratio"] == 0.5
 
 
-def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peer_and_exits():
+def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peers_up_to_limit_and_exits():
     peer_index = _build_peer_index()
     with tempfile.TemporaryDirectory() as temp_dir:
         alarms_path = Path(temp_dir) / "alarms.jsonl"
-        alarm = {
-            "告警标题": "Link Down",
-            "告警源": "P1",
-            "物理端口": "PORT-NOT-IN-SYS-LINK",
-            "自定义字段": "debug-visible",
-        }
-        alarms_path.write_text(
-            json.dumps(alarm, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        alarms = [
+            {
+                "告警标题": "Link Down",
+                "告警源": "P1",
+                "物理端口": f"PORT-NOT-IN-SYS-LINK-{idx}",
+                "自定义字段": f"debug-visible-{idx}",
+            }
+            for idx in range(3)
+        ]
+        with alarms_path.open("w", encoding="utf-8") as fw:
+            for alarm in alarms:
+                fw.write(json.dumps(alarm, ensure_ascii=False) + "\n")
 
         output = io.StringIO()
         try:
@@ -232,18 +234,26 @@ def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peer_and_exits():
                     {"C1"},
                     show_progress=False,
                     debug_missing_peer=True,
+                    debug_missing_peer_limit=2,
                 )
         except SystemExit as exc:
             assert exc.code == 1
         else:
-            raise AssertionError("debug_missing_peer should exit on the first missing peer")
+            raise AssertionError("debug_missing_peer should exit after printing missing peers")
 
     debug_text = output.getvalue()
-    assert "未找到 link 告警对端设备" in debug_text
+    assert "未找到 link 告警对端设备 #1" in debug_text
+    assert "未找到 link 告警对端设备 #2" in debug_text
+    assert "未找到 link 告警对端设备 #3" not in debug_text
     assert "告警源=P1" in debug_text
-    assert "物理端口=PORT-NOT-IN-SYS-LINK" in debug_text
+    assert "物理端口=PORT-NOT-IN-SYS-LINK-0" in debug_text
+    assert "物理端口=PORT-NOT-IN-SYS-LINK-1" in debug_text
+    assert "PORT-NOT-IN-SYS-LINK-2" not in debug_text
     assert "自定义字段" in debug_text
-    assert "debug-visible" in debug_text
+    assert "debug-visible-0" in debug_text
+    assert "debug-visible-1" in debug_text
+    assert "debug-visible-2" not in debug_text
+    assert "已打印 2 条缺失 peer 的 link 告警" in debug_text
 
 
 def load_tests(_loader, _tests, _pattern):
