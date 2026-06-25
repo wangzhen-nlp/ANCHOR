@@ -1,9 +1,11 @@
 import csv
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -204,6 +206,44 @@ def test_analyze_link_alarm_peer_coverage_requires_remote_ne_in_ne_graph():
     assert result["total_link_alarms"] == 2
     assert result["found_peer_in_ne_graph"] == 1
     assert result["ratio"] == 0.5
+
+
+def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peer_and_exits():
+    peer_index = _build_peer_index()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        alarms_path = Path(temp_dir) / "alarms.jsonl"
+        alarm = {
+            "告警标题": "Link Down",
+            "告警源": "P1",
+            "物理端口": "PORT-NOT-IN-SYS-LINK",
+            "自定义字段": "debug-visible",
+        }
+        alarms_path.write_text(
+            json.dumps(alarm, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        output = io.StringIO()
+        try:
+            with redirect_stdout(output):
+                analyze_link_alarm_peer_coverage(
+                    str(alarms_path),
+                    peer_index,
+                    {"C1"},
+                    show_progress=False,
+                    debug_missing_peer=True,
+                )
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("debug_missing_peer should exit on the first missing peer")
+
+    debug_text = output.getvalue()
+    assert "未找到 link 告警对端设备" in debug_text
+    assert "告警源=P1" in debug_text
+    assert "物理端口=PORT-NOT-IN-SYS-LINK" in debug_text
+    assert "自定义字段" in debug_text
+    assert "debug-visible" in debug_text
 
 
 def load_tests(_loader, _tests, _pattern):

@@ -26,7 +26,24 @@ def load_ne_ids(ne_graph_path):
     }
 
 
-def analyze_link_alarm_peer_coverage(alarms_input, peer_index, ne_ids, show_progress=True):
+def _print_missing_peer_debug(alarm, endpoints):
+    print("未找到 link 告警对端设备")
+    print(
+        "原因: 设备+端口没有在 peer-index 记录里查到: "
+        f"告警源={endpoints.local_ne or '<空>'}, "
+        f"物理端口={endpoints.local_port or '<空>'}"
+    )
+    print("告警完整字段:")
+    print(json.dumps(alarm, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def analyze_link_alarm_peer_coverage(
+    alarms_input,
+    peer_index,
+    ne_ids,
+    show_progress=True,
+    debug_missing_peer=False,
+):
     total_link_alarms = 0
     found_peer_in_ne_graph = 0
 
@@ -39,6 +56,9 @@ def analyze_link_alarm_peer_coverage(alarms_input, peer_index, ne_ids, show_prog
             peer_index=peer_index,
             alarm_source=alarm.get("告警源", ""),
         )
+        if debug_missing_peer and not endpoints.remote_ne:
+            _print_missing_peer_debug(alarm, endpoints)
+            raise SystemExit(1)
         if endpoints.remote_ne and endpoints.remote_ne in ne_ids:
             found_peer_in_ne_graph += 1
 
@@ -70,6 +90,11 @@ def main():
         action="store_true",
         help="关闭读取进度显示",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="遇到第一条无法通过 告警源+物理端口 找到对端设备的 link 告警时，打印原因和完整告警字段后退出",
+    )
     args = parser.parse_args()
 
     print(f"加载 peer-index: {args.link_peer_index}")
@@ -84,6 +109,7 @@ def main():
         peer_index,
         ne_ids,
         show_progress=not args.no_progress,
+        debug_missing_peer=args.debug,
     )
     print(f"link 告警总条数: {result['total_link_alarms']}")
     print(f"可找到 ne_graph 对端设备条数: {result['found_peer_in_ne_graph']}")
