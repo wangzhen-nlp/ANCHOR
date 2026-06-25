@@ -4,13 +4,26 @@ from collections.abc import Iterable
 from datetime import datetime
 
 from alarm_tools.alarm_types import LINK_ALARMS
-from fault_grouping.link_alarm import link_alarm_points_to_site
 from fault_grouping.temporal_engine.utils import (
     clone_instance_with_updates,
     get_symptom_alarm_identity,
     get_symptom_strong_occurrence_identity,
     qualify_role_key,
 )
+from topology_tools.link_peer_index import resolve_link_alarm_endpoints_from_peer_index
+
+
+def link_alarm_points_to_site(alarm_info, target_site, ne_to_site, peer_index=None, alarm_source=""):
+    endpoints = resolve_link_alarm_endpoints_from_peer_index(
+        alarm_info,
+        peer_index=peer_index,
+        alarm_source=alarm_source,
+    )
+    if peer_index is None:
+        return None
+    if not endpoints.remote_ne:
+        return False
+    return str(ne_to_site.get(endpoints.remote_ne, "") or "").strip() == str(target_site or "").strip()
 
 
 class TemporalGraphEngineEvaluatorMixin:

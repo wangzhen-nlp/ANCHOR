@@ -116,16 +116,3 @@ def resolve_link_alarm_endpoints_from_peer_index(alarm_info, peer_index=None, al
         remote_ne=peer.ne_native_id,
         remote_port=peer.port_name,
     )
-
-
-def link_alarm_points_to_site(alarm_info, target_site, ne_to_site, peer_index=None, alarm_source=""):
-    endpoints = resolve_link_alarm_endpoints_from_peer_index(
-        alarm_info,
-        peer_index=peer_index,
-        alarm_source=alarm_source,
-    )
-    if peer_index is None:
-        return None
-    if not endpoints.remote_ne:
-        return False
-    return str(ne_to_site.get(endpoints.remote_ne, "") or "").strip() == str(target_site or "").strip()

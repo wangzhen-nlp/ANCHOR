@@ -46,7 +46,6 @@ from fault_grouping.alarm_events.sorted_cache import (
     read_sorted_alarm_cache_header,
     write_sorted_alarm_cache,
 )
-from fault_grouping.link_alarm import load_peer_index
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.site_topology import (
     apply_missing_topology_predictions,
@@ -55,6 +54,7 @@ from fault_grouping.site_topology import (
     load_missing_topology_predictions,
     load_site_chain_index,
 )
+from topology_tools.link_peer_index import load_peer_index
 
 
 @dataclass
@@ -153,7 +153,7 @@ def validate_main_args(parser, args):
     if not os.path.exists(args.link_peer_index):
         parser.error(
             f"link_peer_index 文件不存在: {args.link_peer_index}；"
-            "请先运行 fault_grouping/tools/build_link_peer_index.py 生成默认索引，"
+            "请先运行 topology_tools/build_link_peer_index.py 生成默认索引，"
             "或通过 --link-peer-index 指定已有索引"
         )
     return start_ts, end_ts

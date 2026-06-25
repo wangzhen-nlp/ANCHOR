@@ -9,16 +9,16 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fault_grouping.link_alarm import (
+from fault_grouping.temporal_engine.evaluator import link_alarm_points_to_site
+from topology_tools.link_peer_index import (
     LinkAlarmEndpoints,
     build_peer_index_from_sys_link,
-    link_alarm_points_to_site,
     resolve_link_alarm_endpoints,
     resolve_link_alarm_endpoints_from_peer_index,
 )
 from fault_grouping.rule_config import link_rule
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
-from fault_grouping.tools.analyze_link_alarm_peer_coverage import analyze_link_alarm_peer_coverage
+from alarm_tools.analyze_link_alarm_peer_coverage import analyze_link_alarm_peer_coverage
 
 
 def _write_sys_link_csv(path):

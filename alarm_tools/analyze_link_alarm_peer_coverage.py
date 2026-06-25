@@ -5,12 +5,15 @@ if __package__ in (None, ""):
     import sys
     from pathlib import Path
 
-    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from alarm_tools.alarm_types import LINK_ALARMS
-from fault_grouping.link_alarm import load_peer_index, resolve_link_alarm_endpoints_from_peer_index
 from topology_resources import LINK_PEER_INDEX_JSON, NE_GRAPH_JSON, resource_display
+from topology_tools.link_peer_index import (
+    load_peer_index,
+    resolve_link_alarm_endpoints_from_peer_index,
+)
 
 
 def load_ne_ids(ne_graph_path):
@@ -82,11 +85,9 @@ def main():
         ne_ids,
         show_progress=not args.no_progress,
     )
-
-    print("\n统计结果")
     print(f"link 告警总条数: {result['total_link_alarms']}")
-    print(f"找到对端且对端在 ne_graph 中的条数: {result['found_peer_in_ne_graph']}")
-    print(f"比例: {result['ratio']:.6f} ({result['ratio'] * 100:.2f}%)")
+    print(f"可找到 ne_graph 对端设备条数: {result['found_peer_in_ne_graph']}")
+    print(f"比例: {result['ratio']:.6f}")
 
 
 if __name__ == "__main__":

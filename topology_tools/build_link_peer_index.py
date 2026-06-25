@@ -4,10 +4,10 @@ if __package__ in (None, ""):
     import sys
     from pathlib import Path
 
-    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from fault_grouping.link_alarm import build_peer_index_from_sys_link, save_peer_index
 from topology_resources import LINK_PEER_INDEX_JSON, SYS_LINK_JSONL, resource_display
+from topology_tools.link_peer_index import build_peer_index_from_sys_link, save_peer_index
 
 
 def main():
