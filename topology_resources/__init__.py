@@ -28,6 +28,7 @@ SITE_GRAPH_BY_NE_JSON = resource_path("site_graph_by_ne.json")
 SITE_CHAINS_JSON = resource_path("site_chains.json")
 SITE_DEVICE_COUNTS_JSON = resource_path("site_device_counts.json")
 SYS_LINK_JSONL = resource_path("sys_link_1231.jsonl")
+LINK_PEER_INDEX_JSON = resource_path("link_peer_index.json")
 SYS_NE_DIR = resource_path("SYS_NE_0306")
 SYS_SITE_DIR = resource_path("SYS_SITE_0306")
 
@@ -44,6 +45,7 @@ __all__ = [
     "SITE_CHAINS_JSON",
     "SITE_DEVICE_COUNTS_JSON",
     "SYS_LINK_JSONL",
+    "LINK_PEER_INDEX_JSON",
     "SYS_NE_DIR",
     "SYS_SITE_DIR",
 ]

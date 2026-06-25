@@ -42,6 +42,8 @@ class NodeRuleHelper:
             consumed_trigger_rules = ()
             raw_event_items = None
             raw_event_ts_list = None
+            raw_event_payloads = None
+            alarm_payload = {}
             occurrence_uuid = None
             consumed_cutoff_by_rule = {}
 
@@ -54,6 +56,8 @@ class NodeRuleHelper:
                 consumed_trigger_rules = cached_event.get("consumed_trigger_rules", ())
                 raw_event_items = cached_event.get("_raw_event_items")
                 raw_event_ts_list = cached_event.get("_raw_event_ts_list")
+                raw_event_payloads = cached_event.get("_raw_event_payloads") or {}
+                alarm_payload = cached_event.get("alarm_payload") or {}
                 consumed_cutoff_by_rule = cached_event.get("_consumed_cutoff_by_rule") or {}
                 segment_key = cached_event.get("_segment_key")
                 segment_start_ts = cached_event.get("_segment_start_ts")
@@ -94,6 +98,7 @@ class NodeRuleHelper:
                         "_segment_start_ts": segment_start_ts,
                         "_segment_end_ts": segment_end_ts,
                         "occurrence_uuid": raw_occurrence_id,
+                        "alarm_payload": raw_event_payloads.get(raw_occurrence_id, {}),
                     }
                     matched_events.append(matched_event)
                 continue
@@ -116,6 +121,7 @@ class NodeRuleHelper:
                 "_segment_start_ts": segment_start_ts,
                 "_segment_end_ts": segment_end_ts,
                 "occurrence_uuid": occurrence_uuid,
+                "alarm_payload": alarm_payload,
             }
             matched_events.append(matched_event)
 

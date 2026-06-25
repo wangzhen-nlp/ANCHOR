@@ -14,6 +14,7 @@ from topology_resources import (
     SITE_DEVICE_COUNTS_JSON,
     SITE_GRAPH_JSON,
     SITE_GRAPH_BY_NE_JSON,
+    LINK_PEER_INDEX_JSON,
     resource_display,
 )
 from ticket_recall.evaluation.compute_group_output_ticket_recall import compute_group_output_ticket_recall
@@ -87,6 +88,7 @@ def _build_arg_parser():
     parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
     parser.add_argument('--no-output', action='store_true', help='只运行匹配与统计，不创建、不截断、不写入故障组输出 JSONL')
     parser.add_argument('--use-alarm-period-cache', action='store_true', help='可选：把 event_cache 切换为“设备告警时段”模式；默认关闭，保持旧版逐条活跃告警缓存逻辑')
+    parser.add_argument('--link-peer-index', type=str, default=LINK_PEER_INDEX_JSON, help=f'设备端口对端索引 JSON，默认: {resource_display("link_peer_index.json")}；link 告警必须指向模式关联站点')
     parser.add_argument('--missing-topology', type=str, default='', help='可选：site_relation_learning/infer.py --mode topology-errors 输出 JSONL；加载其中 error_type=missing 的高置信缺边作为弱拓扑补偿边')
     parser.add_argument('--missing-topology-min-score', type=float, default=0.95, help='加载 --missing-topology 时的最低 score 阈值；默认 0.95，与 infer.py --mode topology-errors 默认缺边阈值一致')
     parser.add_argument('--enable-support-pruning', action='store_true', help='可选：启用候选邻接 role 支撑剪枝；默认关闭以避免额外邻居扫描开销')

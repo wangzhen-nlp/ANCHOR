@@ -46,6 +46,7 @@ from fault_grouping.alarm_events.sorted_cache import (
     read_sorted_alarm_cache_header,
     write_sorted_alarm_cache,
 )
+from fault_grouping.link_alarm import load_peer_index
 from fault_grouping.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping.site_topology import (
     apply_missing_topology_predictions,
@@ -69,6 +70,7 @@ class LoadedStaticContext:
     site_to_ne_ids: dict
     ne_link_info_cache: dict
     missing_topology_edges: dict
+    link_peer_index: dict
 
 
 @dataclass
@@ -148,6 +150,12 @@ def validate_main_args(parser, args):
         parser.error(f"site_chains 文件不存在: {args.site_chains}")
     if args.missing_topology and not os.path.exists(args.missing_topology):
         parser.error(f"missing_topology 文件不存在: {args.missing_topology}")
+    if not os.path.exists(args.link_peer_index):
+        parser.error(
+            f"link_peer_index 文件不存在: {args.link_peer_index}；"
+            "请先运行 fault_grouping/tools/build_link_peer_index.py 生成默认索引，"
+            "或通过 --link-peer-index 指定已有索引"
+        )
     return start_ts, end_ts
 
 
@@ -213,6 +221,9 @@ def load_static_context(args):
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
     ne_link_info_cache = {}
     print(f"site -> NE 索引站点数: {len(site_to_ne_ids)}")
+    print(f"加载 link peer_index: {args.link_peer_index}")
+    link_peer_index = load_peer_index(args.link_peer_index)
+    print(f"link peer_index 记录数: {len(link_peer_index)}")
 
     return LoadedStaticContext(
         ne_graph_data=ne_graph_data,
@@ -226,6 +237,7 @@ def load_static_context(args):
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
         missing_topology_edges=missing_topology_edges,
+        link_peer_index=link_peer_index,
     )
 
 
@@ -336,6 +348,7 @@ def initialize_engine(args, static_context, rules_config, batch_site_merge_helpe
         missing_topology_edges=static_context.missing_topology_edges,
         ne_graph_data=static_context.ne_graph_data,
         site_to_ne_ids=static_context.site_to_ne_ids,
+        link_peer_index=static_context.link_peer_index,
     )
     print("✅ 引擎启动就绪，开始监听告警流...\n")
     return engine

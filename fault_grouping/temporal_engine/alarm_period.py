@@ -2,6 +2,30 @@ import collections
 
 class TemporalGraphEngineAlarmPeriodMixin:
     @staticmethod
+    def _cached_event_field(cached_event, field_name, tuple_index=None, default=None):
+        if isinstance(cached_event, dict):
+            return cached_event.get(field_name, default)
+        if tuple_index is None:
+            return default
+        try:
+            return cached_event[tuple_index]
+        except IndexError:
+            return default
+
+    @classmethod
+    def _cached_event_parts(cls, cached_event):
+        if isinstance(cached_event, dict):
+            return (
+                cached_event.get("ts"),
+                cached_event.get("eid"),
+                cached_event.get("alarm"),
+                cached_event.get("alarm_source", ""),
+                cached_event.get("consumed_trigger_rules", ()),
+                cached_event.get("occurrence_uuid"),
+            )
+        return cached_event
+
+    @staticmethod
     def _active_event_item(raw_occurrence_key, raw_value):
         event_id, ts = raw_value
         return raw_occurrence_key, event_id, ts
@@ -43,6 +67,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
 
     @staticmethod
     def _period_state_to_cached_event(node, period_state):
+        raw_event_payloads = dict(period_state.get("active_event_payloads", {}))
         raw_event_items = tuple(
             (raw_event_id, raw_ts, raw_occurrence_key)
             for raw_occurrence_key, raw_event_id, raw_ts in (
@@ -64,6 +89,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
             "_segment_end_ts": period_state.get("end_ts"),
             "_raw_event_items": raw_event_items,
             "_raw_event_ts_list": tuple(raw_item[1] for raw_item in raw_event_items),
+            "_raw_event_payloads": raw_event_payloads,
             "_consumed_cutoff_by_rule": dict(period_state.get("consumed_trigger_cutoff_by_rule", {})),
         }
 
@@ -134,6 +160,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
         event_id,
         occurrence_uuid,
         alarm_source="",
+        alarm_payload=None,
     ):
         period_key = self._make_alarm_period_key(alarm_type, alarm_source)
         periods = self.active_alarm_periods[node]
@@ -150,6 +177,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
                 "consumed_trigger_rules": frozenset(),
                 "consumed_trigger_cutoff_by_rule": {},
                 "active_event_ids": collections.OrderedDict(),
+                "active_event_payloads": {},
                 "_occurrence_seq": 0,
                 "latest_active_ts": ts,
                 "segment_key": "",
@@ -159,6 +187,9 @@ class TemporalGraphEngineAlarmPeriodMixin:
         if event_id not in (None, ""):
             active_event_ids = self._ensure_ordered_active_event_ids(period)
             active_event_ids[occurrence_uuid] = (event_id, ts)
+            period.setdefault("active_event_payloads", {})[occurrence_uuid] = (
+                alarm_payload if isinstance(alarm_payload, dict) else {}
+            )
             self.active_event_to_period[node][(str(event_id), occurrence_uuid)] = period_key
 
         if self._refresh_alarm_period_state(node, period):
@@ -170,7 +201,9 @@ class TemporalGraphEngineAlarmPeriodMixin:
         if not q:
             return
 
-        while q and (current_ts - q[0][0]) > self._get_event_ttl(q[0][2]):
+        while q and (
+            current_ts - self._cached_event_field(q[0], "ts", 0, 0)
+        ) > self._get_event_ttl(self._cached_event_field(q[0], "alarm", 2)):
             expired_event = q.popleft()
             self._log_debug_event_removal(node, expired_event, "ttl", current_ts=current_ts)
 
@@ -208,6 +241,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
                         (str(raw_event_id), raw_occurrence_key),
                         None,
                     )
+                period.get("active_event_payloads", {}).pop(raw_occurrence_key, None)
 
             if self._refresh_alarm_period_state(node, period):
                 continue
@@ -239,9 +273,9 @@ class TemporalGraphEngineAlarmPeriodMixin:
                 cached_eid,
                 cached_alarm_type,
                 cached_alarm_source,
-                consumed_trigger_rules,
+                _consumed_trigger_rules,
                 cached_occurrence_uuid,
-            ) = cached_event
+            ) = self._cached_event_parts(cached_event)
             matches_clear = (
                 event_id
                 and cached_eid == event_id
@@ -303,6 +337,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
         for occurrence_key, raw_event_id, _raw_ts in list(self._iter_active_event_items(active_event_ids)):
             if raw_event_id == event_id and occurrence_key == occurrence_uuid:
                 active_event_ids.pop(occurrence_key, None)
+                period.get("active_event_payloads", {}).pop(occurrence_key, None)
         self.active_event_to_period.get(node, {}).pop((str(event_id), occurrence_uuid), None)
         if active_event_ids:
             self._refresh_alarm_period_state(node, period)
@@ -406,7 +441,7 @@ class TemporalGraphEngineAlarmPeriodMixin:
                 cached_alarm_source,
                 consumed_trigger_rules,
                 cached_occurrence_uuid,
-            ) = cached_event
+            ) = self._cached_event_parts(cached_event)
             if (
                 cached_alarm_type == alarm_type
                 and str(cached_alarm_source or "") == target_alarm_source
@@ -430,14 +465,19 @@ class TemporalGraphEngineAlarmPeriodMixin:
                             cached_occurrence_uuid,
                         ))
                 updated_consumed_rules = frozenset(set(consumed_trigger_rules) | matched_rules)
-                kept.append((
-                    cached_ts,
-                    cached_eid,
-                    cached_alarm_type,
-                    cached_alarm_source,
-                    updated_consumed_rules,
-                    cached_occurrence_uuid,
-                ))
+                if isinstance(cached_event, dict):
+                    updated_event = dict(cached_event)
+                    updated_event["consumed_trigger_rules"] = updated_consumed_rules
+                    kept.append(updated_event)
+                else:
+                    kept.append((
+                        cached_ts,
+                        cached_eid,
+                        cached_alarm_type,
+                        cached_alarm_source,
+                        updated_consumed_rules,
+                        cached_occurrence_uuid,
+                    ))
                 continue
             kept.append(cached_event)
 

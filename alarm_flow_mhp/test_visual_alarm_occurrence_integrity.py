@@ -1,9 +1,14 @@
 import collections
 import json
+import os
+import sys
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alarm_flow_brunch.aggregator import summarize_alarm_event as summarize_brunch_alarm_event
 from alarm_flow_brunch.visual_output import (
@@ -66,6 +71,12 @@ def symptom(eid, occurrence_uuid, ts=1, **extra):
         "occurrence_uuid": occurrence_uuid,
         **extra,
     }
+
+
+def cached_event_identity(cached_event):
+    if isinstance(cached_event, dict):
+        return cached_event["eid"], cached_event["occurrence_uuid"]
+    return cached_event[1], cached_event[5]
 
 
 class DummyAlarmPeriodEngine(TemporalGraphEngineAlarmPeriodMixin):
@@ -155,7 +166,7 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
 
         engine.process_event("S1", "A", 1, 0, "{" + uid.upper() + "}", register_trigger=False)
         cached = engine.event_cache["S1"][0]
-        self.assertEqual((cached[1], cached[5]), ("0", uid))
+        self.assertEqual(cached_event_identity(cached), ("0", uid))
 
     def test_incremental_engine_uses_normalized_identity_for_cache_and_clear(self):
         engine = IncrementalFaultEngine({}, {}, {})
@@ -163,7 +174,7 @@ class AlarmOccurrenceIdentityContractTest(unittest.TestCase):
         decorated_uuid = "{" + uid.upper() + "}"
         engine.process_event("S1", "A", 1, 0, decorated_uuid, register_trigger=False)
         cached = engine.event_cache["S1"][0]
-        self.assertEqual((cached[1], cached[5]), ("0", uid))
+        self.assertEqual(cached_event_identity(cached), ("0", uid))
         engine.process_event("S1", "A", 2, 0, decorated_uuid, is_clear=True, register_trigger=False)
         self.assertFalse(engine.event_cache.get("S1"))
 

@@ -27,6 +27,7 @@ def process_alarm(engine, item, collect_matches=False, register_trigger=True):
         ts=item["ts"],
         event_id=alarm["告警编码ID"],
         occurrence_uuid=item["occurrence_uuid"],
+        alarm_payload=alarm,
         is_clear=is_clear_alarm(alarm),
         collect_matches=collect_matches,
         register_trigger=register_trigger

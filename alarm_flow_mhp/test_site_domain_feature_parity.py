@@ -10,6 +10,7 @@ Also checks device-mode φ is unchanged (no domain columns) and μ parity.
 
 import os
 import sys
+import unittest
 
 import numpy as np
 
@@ -269,10 +270,13 @@ def test_site_domain_source_target_dynamic_mode():
     ]
 
 
+def load_tests(_loader, _tests, _pattern):
+    suite = unittest.TestSuite()
+    for name, test_func in sorted(globals().items()):
+        if name.startswith("test_") and callable(test_func):
+            suite.addTest(unittest.FunctionTestCase(test_func, description=name))
+    return suite
+
+
 if __name__ == "__main__":
-    test_site_domain_source_target_dynamic_mode()
-    test_topology_node_field_is_inferred_compatibly()
-    test_domain_filter_keeps_only_modeled_domains()
-    test_device_mode_layout_unchanged()
-    test_site_domain_phi_alpha_parity()
-    print("All site×domain feature parity tests passed.")
+    unittest.main()

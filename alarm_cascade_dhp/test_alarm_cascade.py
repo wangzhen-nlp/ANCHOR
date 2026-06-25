@@ -1,11 +1,16 @@
 import json
 import io
+import os
+import sys
 import tempfile
 import unittest
 import uuid
 
 from contextlib import redirect_stdout
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alarm_cascade_dhp.config import AlarmDHPConfig, StreamPolicyConfig
 from alarm_cascade_dhp.engine import AlarmCascadeEngine

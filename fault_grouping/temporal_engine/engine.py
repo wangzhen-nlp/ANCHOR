@@ -4,10 +4,12 @@ import logging
 import time
 import threading
 
+from collections.abc import Iterable
+
 from fault_grouping.emitted_group_store import EmittedGroupStore
 from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.node_rule_helper import NodeRuleHelper
-from alarm_tools.alarm_types import CRITICAL_ALARMS, POWER_ALARMS
+from alarm_tools.alarm_types import CRITICAL_ALARMS, LINK_ALARMS, POWER_ALARMS
 from fault_grouping.temporal_engine.alarm_period import TemporalGraphEngineAlarmPeriodMixin
 from fault_grouping.temporal_engine.common import TemporalGraphEngineCommonMixin
 from fault_grouping.temporal_engine.constraints import TemporalGraphEngineConstraintMixin
@@ -39,6 +41,31 @@ class TemporalGraphEngine(
     TemporalGraphEngineAlarmPeriodMixin,
     TemporalGraphEngineTraversalMixin,
 ):
+    @staticmethod
+    def _expected_requires_link_alarm(expected):
+        if isinstance(expected, dict):
+            required_alarms = expected.get("required_alarms")
+        elif expected == "ANY":
+            required_alarms = None
+        else:
+            required_alarms = expected
+        return (
+            isinstance(required_alarms, Iterable)
+            and not isinstance(required_alarms, str)
+            and any(alarm in LINK_ALARMS for alarm in required_alarms)
+        )
+
+    @classmethod
+    def _rules_require_link_peer_index(cls, rules_config):
+        for rule in (rules_config or {}).values():
+            for node_cfg in (rule.get("nodes", {}) if isinstance(rule, dict) else {}).values():
+                for site_rule in node_cfg.get("site_rules", ()) if isinstance(node_cfg, dict) else ():
+                    if isinstance(site_rule, dict) and cls._expected_requires_link_alarm(
+                        site_rule.get("expected_alarms")
+                    ):
+                        return True
+        return False
+
     def _compile_rule_execution_plan(self, rule):
         """为单条规则预编译静态执行计划，避免每次评估重复构图和排边。"""
         nodes_cfg = rule.get("nodes", {})
@@ -231,6 +258,12 @@ class TemporalGraphEngine(
         self._anchor_ne_reachable_cache[cache_key] = result
         return result
 
+    def _compute_anchor_alarm_source_set(self, anchor_site, anchor_cfg):
+        return self._compute_anchor_ne_reachable_set(
+            anchor_site,
+            anchor_cfg.get("max_ne_hops", 1),
+        )
+
     def __init__(
         self,
         topo_downstream_map,
@@ -246,10 +279,13 @@ class TemporalGraphEngine(
         missing_topology_edges=None,
         ne_graph_data=None,
         site_to_ne_ids=None,
+        link_peer_index=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
         self.rules = rules_config
+        if self._rules_require_link_peer_index(self.rules) and not link_peer_index:
+            raise ValueError("规则包含必需 link 告警 role，必须提供 link_peer_index")
 
         # 建立正反向物理拓扑索引，供多向 BFS 搜索使用
         self.topo_down = topo_downstream_map
@@ -260,7 +296,7 @@ class TemporalGraphEngine(
         self.site_chain_index = self._normalize_site_chain_index(site_chain_index)
 
         # event_cache 的两种运行模式:
-        # - 默认(raw): 站点 -> deque[(ts, event_id, alarm_type, alarm_source, consumed_trigger_rules)]
+        # - 默认(raw): 站点 -> deque[事件 dict]，保留原始告警 payload 供后续端口/对端解析
         # - 可选(period): 站点 -> 活跃告警时段摘要 deque
         self.use_alarm_period_cache = bool(use_alarm_period_cache)
         self.event_cache = collections.defaultdict(collections.deque)
@@ -340,10 +376,20 @@ class TemporalGraphEngine(
         # ne_graph_data: {ne_id: {"site_id": ..., "link": {neighbor_ne_id: {...}}}}
         # site_to_ne_ids: {site_id: (ne_id, ...)}
         self._ne_graph_data = ne_graph_data or {}
+        self._ne_to_site = {}
+        for ne_id, info in self._ne_graph_data.items():
+            if not isinstance(info, dict):
+                continue
+            site_id = str(info.get("site_id", "") or "").strip()
+            if not site_id:
+                continue
+            self._ne_to_site[ne_id] = site_id
+            self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
         self._site_to_ne_ids = {
             site_id: tuple(ne_ids)
             for site_id, ne_ids in (site_to_ne_ids or {}).items()
         }
+        self._link_peer_index = link_peer_index or {}
         self._ne_adjacency = self._build_ne_adjacency()
         # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
         # 不含规则名，跨规则、跨 trigger 自动复用。
@@ -403,6 +449,7 @@ class TemporalGraphEngine(
         is_clear=False,
         collect_matches=False,
         register_trigger=True,
+        alarm_payload=None,
     ):
         """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
         """
@@ -452,6 +499,7 @@ class TemporalGraphEngine(
                         event_id,
                         occurrence_uuid,
                         alarm_source=alarm_source,
+                        alarm_payload=alarm_payload,
                     )
             else:
                 if is_clear:
@@ -475,9 +523,15 @@ class TemporalGraphEngine(
                             affected_rule_names=affected_rule_names
                         )
                 else:
-                    self.event_cache[node].append(
-                        (ts, event_id, alarm_type, alarm_source, frozenset(), occurrence_uuid)
-                    )
+                    self.event_cache[node].append({
+                        "ts": ts,
+                        "eid": event_id,
+                        "alarm": alarm_type,
+                        "alarm_source": alarm_source,
+                        "alarm_payload": alarm_payload if isinstance(alarm_payload, dict) else {},
+                        "consumed_trigger_rules": frozenset(),
+                        "occurrence_uuid": occurrence_uuid,
+                    })
 
             # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
             if not is_clear and register_trigger:

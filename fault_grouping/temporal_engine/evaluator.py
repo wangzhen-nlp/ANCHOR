@@ -1,7 +1,10 @@
 import uuid
 
+from collections.abc import Iterable
 from datetime import datetime
 
+from alarm_tools.alarm_types import LINK_ALARMS
+from fault_grouping.link_alarm import link_alarm_points_to_site
 from fault_grouping.temporal_engine.utils import (
     clone_instance_with_updates,
     get_symptom_alarm_identity,
@@ -727,6 +730,126 @@ class TemporalGraphEngineEvaluatorMixin:
             self._filter_events_by_supported_alarm_sources(target_events, target_supported_sources),
         )
 
+    def _get_required_link_alarm_set_for_role(self, phys_node, role_cfg, helper):
+        expected = helper.resolve_expected_alarms(
+            self.sites_domain_map.get(phys_node, {}),
+            role_cfg,
+        )
+        if isinstance(expected, dict):
+            required_alarms = expected.get("required_alarms")
+        elif expected == "ANY":
+            required_alarms = None
+        else:
+            required_alarms = expected
+        if not (
+            isinstance(required_alarms, Iterable)
+            and not isinstance(required_alarms, str)
+        ):
+            return frozenset()
+        return frozenset(alarm for alarm in required_alarms if alarm in LINK_ALARMS)
+
+    def _filter_link_role_events_for_related_site(
+        self,
+        phys_node,
+        role_cfg,
+        events,
+        related_site,
+        helper,
+    ):
+        required_link_alarms = self._get_required_link_alarm_set_for_role(
+            phys_node,
+            role_cfg,
+            helper,
+        )
+        if not required_link_alarms:
+            return list(events), True
+
+        required_link_events = [
+            event for event in events
+            if event.get("alarm") in required_link_alarms
+        ]
+        if not required_link_events:
+            return [], False
+
+        matched_link_event_ids = {
+            id(event)
+            for event in required_link_events
+            if link_alarm_points_to_site(
+                event.get("alarm_payload") or {},
+                related_site,
+                self._ne_to_site,
+                peer_index=self._link_peer_index,
+                alarm_source=event.get("alarm_source", ""),
+            ) is True
+        }
+        if not matched_link_event_ids:
+            return [], False
+
+        filtered_events = [
+            event for event in events
+            if event.get("alarm") not in required_link_alarms
+            or id(event) in matched_link_event_ids
+        ]
+        return filtered_events, True
+
+    def _apply_link_peer_site_filter_for_edge(
+        self,
+        curr_phys,
+        curr_events,
+        curr_role,
+        curr_cfg,
+        tgt_role,
+        tgt_cfg,
+        curr_valid_targets,
+        curr_events_by_target,
+        helper,
+        edge_trace=None,
+    ):
+        if not curr_valid_targets:
+            return curr_valid_targets, curr_events_by_target
+
+        filtered_targets = {}
+        filtered_curr_events_by_target = {}
+        failure_details = []
+
+        for target_phys, target_events in curr_valid_targets.items():
+            filtered_target_events, target_ok = self._filter_link_role_events_for_related_site(
+                target_phys,
+                tgt_cfg,
+                target_events,
+                curr_phys,
+                helper,
+            )
+            if not target_ok:
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{target_phys}: {tgt_role} 的 link 告警未指向 {curr_phys}"
+                    )
+                continue
+
+            source_events = curr_events_by_target.get(target_phys, curr_events)
+            filtered_source_events, source_ok = self._filter_link_role_events_for_related_site(
+                curr_phys,
+                curr_cfg,
+                source_events,
+                target_phys,
+                helper,
+            )
+            if not source_ok:
+                if edge_trace is not None:
+                    failure_details.append(
+                        f"{curr_phys}: {curr_role} 的 link 告警未指向 {target_phys}"
+                    )
+                continue
+
+            filtered_targets[target_phys] = filtered_target_events
+            filtered_curr_events_by_target[target_phys] = filtered_source_events
+
+        if edge_trace is not None and failure_details:
+            edge_trace["failures"].extend(failure_details[:4])
+
+        return filtered_targets, filtered_curr_events_by_target
+
     def _apply_mutual_alarm_source_ne_anchor_for_edge(
         self,
         curr_phys,
@@ -755,10 +878,10 @@ class TemporalGraphEngineEvaluatorMixin:
         filtered_targets = {}
         curr_events_by_target = {}
         failure_details = []
-        allowed_for_target = self._compute_anchor_ne_reachable_set(curr_phys, max_ne_hops)
+        allowed_for_target = self._compute_anchor_alarm_source_set(curr_phys, anchor_cfg)
 
         for target_phys, target_events in curr_valid_targets.items():
-            allowed_for_curr = self._compute_anchor_ne_reachable_set(target_phys, max_ne_hops)
+            allowed_for_curr = self._compute_anchor_alarm_source_set(target_phys, anchor_cfg)
 
             # target 侧不再重 validate：进入这里前 _validate_candidate_nodes_for_edge
             # 已经用 role-level allowed_alarm_source_nes 过滤过 target_events，并完成
@@ -940,6 +1063,18 @@ class TemporalGraphEngineEvaluatorMixin:
             validation_cache=validation_cache,
             edge_trace=edge_trace,
         )
+        curr_valid_targets, curr_events_by_target = self._apply_link_peer_site_filter_for_edge(
+            curr_phys,
+            curr_events,
+            curr_role,
+            curr_cfg,
+            tgt_role,
+            tgt_cfg,
+            curr_valid_targets,
+            curr_events_by_target,
+            helper,
+            edge_trace=edge_trace,
+        )
 
         if match_mode == "ALL" and not all_passed:
             if edge_trace is not None:
@@ -978,7 +1113,6 @@ class TemporalGraphEngineEvaluatorMixin:
         if not anchor_cfg:
             return None
         anchor_role = anchor_cfg["anchor_role"]
-        max_hops = anchor_cfg["max_ne_hops"]
         anchor_nodes = inst.get("roles", {}).get(anchor_role, {}).get("nodes", {})
         if not anchor_nodes:
             # anchor 尚未绑定（编译期 bind_order 校验排除该路径，这里保留防御性返回 None）
@@ -987,10 +1121,10 @@ class TemporalGraphEngineEvaluatorMixin:
         # 单 anchor 时直接复用 _compute_anchor_ne_reachable_set 的 frozenset，
         # 避免一次 set->frozenset 复制；多 anchor 时合并后再 frozenset。
         if len(anchor_sites) == 1:
-            return self._compute_anchor_ne_reachable_set(anchor_sites[0], max_hops)
+            return self._compute_anchor_alarm_source_set(anchor_sites[0], anchor_cfg)
         combined = None
         for anchor_site in anchor_sites:
-            reachable = self._compute_anchor_ne_reachable_set(anchor_site, max_hops)
+            reachable = self._compute_anchor_alarm_source_set(anchor_site, anchor_cfg)
             if reachable is None:
                 # 引擎未配置 NE 数据，直接降级为不过滤
                 return None

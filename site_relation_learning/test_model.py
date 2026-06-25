@@ -3,6 +3,8 @@
 
 from argparse import ArgumentParser
 from pathlib import Path
+import sys
+import unittest
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
@@ -145,6 +147,45 @@ def _derive_output_base(model_file, test_file):
     return model_path.parent / f"{model_path.stem}.{Path(test_file).stem}"
 
 
+class SiteRelationModelEvaluationTests(unittest.TestCase):
+    def test_merge_relation_collapses_directed_edges(self):
+        self.assertEqual(_merge_relation("downstream"), "downstream/upstream")
+        self.assertEqual(_merge_relation("upstream"), "downstream/upstream")
+        self.assertEqual(_merge_relation("bidirection"), "bidirection")
+        self.assertEqual(_merge_relation("unexpected"), "none")
+
+    def test_pair_rows_are_evaluated_after_direction_merge(self):
+        metrics = _evaluate_pair_rows_merged([
+            {"gold_relation": "downstream", "predicted_relation": "upstream"},
+            {"gold_relation": "bidirection", "predicted_relation": "none"},
+            {"gold_relation": "none", "predicted_relation": "none"},
+        ])
+
+        self.assertEqual(metrics["classes"], list(MERGED_RELATION_CLASSES))
+        self.assertEqual(metrics["pair_count"], 3)
+        self.assertEqual(metrics["confusion_matrix"][0][0], 1)
+        self.assertEqual(metrics["confusion_matrix"][1][2], 1)
+        self.assertEqual(metrics["confusion_matrix"][2][2], 1)
+
+    def test_domain_pair_key_defaults_missing_values(self):
+        self.assertEqual(
+            _domain_pair_key({"site_a_domain": "DATA", "site_b_domain": ""}),
+            "DATA__MISSING",
+        )
+
+    def test_output_base_is_derived_from_model_and_test_stems(self):
+        self.assertEqual(
+            str(_derive_output_base("/tmp/models/relation.json", "/data/holdout.jsonl")),
+            "/tmp/models/relation.holdout",
+        )
+
+    def test_script_entrypoint_runs_cli_only_for_model_arguments(self):
+        self.assertFalse(_should_run_cli(["test_model.py"]))
+        self.assertFalse(_should_run_cli(["test_model.py", "-v"]))
+        self.assertTrue(_should_run_cli(["test_model.py", "--model", "model.json"]))
+        self.assertTrue(_should_run_cli(["test_model.py", "--model=model.json"]))
+
+
 def _load_model(model_file):
     payload = load_json(model_file)
     classes = tuple(payload.get("classes") or RELATION_CLASSES)
@@ -234,5 +275,21 @@ def main():
     print(f"pair-level预测已输出到: {pair_predictions_output}")
 
 
+def _should_run_cli(argv):
+    cli_options = {
+        "--model",
+        "--test",
+        "--output",
+        "--predictions-output",
+        "--no-progress",
+        "--help",
+        "-h",
+    }
+    return any(arg in cli_options or arg.split("=", 1)[0] in cli_options for arg in argv[1:])
+
+
 if __name__ == "__main__":
-    main()
+    if _should_run_cli(sys.argv):
+        main()
+    else:
+        unittest.main()

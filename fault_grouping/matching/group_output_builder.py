@@ -403,7 +403,7 @@ def enrich_match_symptoms(match, alarm_metadata_index, include_eid_list=False):
 
     for symptom in match.get("symptoms", []):
         enriched_symptom = dict(symptom)
-        for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts"):
+        for internal_field in ("_segment_key", "_segment_start_ts", "_segment_end_ts", "alarm_payload"):
             enriched_symptom.pop(internal_field, None)
         if not include_eid_list:
             enriched_symptom.pop("eid_list", None)

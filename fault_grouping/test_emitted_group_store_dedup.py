@@ -1,6 +1,11 @@
+import os
+import sys
 import unittest
 import uuid as uuid_module
 import random
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fault_grouping.emitted_group_store import EmittedGroupStore
 from fault_grouping.temporal_engine.utils import (

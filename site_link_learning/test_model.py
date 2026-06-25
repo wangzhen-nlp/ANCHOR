@@ -3,6 +3,8 @@
 
 from argparse import ArgumentParser
 from pathlib import Path
+import sys
+import unittest
 
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
@@ -34,6 +36,24 @@ def _derive_eval_path(model_file, test_file):
 
 def _derive_prediction_path(model_file, test_file):
     return str(_derive_output_base(model_file, test_file)) + ".predictions.jsonl"
+
+
+class ModelEvaluationPathTests(unittest.TestCase):
+    def test_output_paths_are_derived_from_model_and_test_stems(self):
+        self.assertEqual(
+            _derive_eval_path("/tmp/models/site-link.json", "/data/holdout.jsonl"),
+            "/tmp/models/site-link.holdout.eval.json",
+        )
+        self.assertEqual(
+            _derive_prediction_path("/tmp/models/site-link.json", "/data/holdout.jsonl"),
+            "/tmp/models/site-link.holdout.predictions.jsonl",
+        )
+
+    def test_script_entrypoint_runs_cli_only_for_model_arguments(self):
+        self.assertFalse(_should_run_cli(["test_model.py"]))
+        self.assertFalse(_should_run_cli(["test_model.py", "-v"]))
+        self.assertTrue(_should_run_cli(["test_model.py", "--model", "model.json"]))
+        self.assertTrue(_should_run_cli(["test_model.py", "--model=model.json"]))
 
 
 def main():
@@ -113,5 +133,21 @@ def main():
     print(f"逐样本预测已输出到: {predictions_output}")
 
 
+def _should_run_cli(argv):
+    cli_options = {
+        "--model",
+        "--test",
+        "--output",
+        "--predictions-output",
+        "--threshold",
+        "--help",
+        "-h",
+    }
+    return any(arg in cli_options or arg.split("=", 1)[0] in cli_options for arg in argv[1:])
+
+
 if __name__ == "__main__":
-    main()
+    if _should_run_cli(sys.argv):
+        main()
+    else:
+        unittest.main()

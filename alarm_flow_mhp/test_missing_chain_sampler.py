@@ -8,6 +8,8 @@ pytest.
 
 from __future__ import annotations
 
+import unittest
+
 if __package__ in (None, ""):
     from _script_env import ensure_repo_root
 
@@ -808,13 +810,13 @@ def test_visual_snapshot_can_use_external_stream_time_without_advancing_sampler(
     assert s.events, "visual-only snapshot must not close/remove sampler events"
 
 
-def _run_all():
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    for t in tests:
-        t()
-        print(f"  ok  {t.__name__}")
-    print(f"\nAll {len(tests)} tests passed.")
+def load_tests(_loader, _tests, _pattern):
+    suite = unittest.TestSuite()
+    for name, test_func in sorted(globals().items()):
+        if name.startswith("test_") and callable(test_func):
+            suite.addTest(unittest.FunctionTestCase(test_func, description=name))
+    return suite
 
 
 if __name__ == "__main__":
-    _run_all()
+    unittest.main()
