@@ -75,11 +75,11 @@ def _build_peer_index():
         return build_peer_index_from_sys_link(str(csv_path))
 
 
-def test_resolve_link_alarm_endpoints_uses_alarm_source_and_physical_port():
+def test_resolve_link_alarm_endpoints_uses_alarm_source_and_physical_port_name():
     peer_index = _build_peer_index()
 
     endpoints = resolve_link_alarm_endpoints_from_peer_index(
-        {"告警源": "P1", "物理端口": "PORT-TO-CHILD"},
+        {"告警源": "P1", "物理端口名称": "PORT-TO-CHILD"},
         peer_index=peer_index,
     )
 
@@ -89,14 +89,20 @@ def test_resolve_link_alarm_endpoints_uses_alarm_source_and_physical_port():
         remote_ne="C1",
         remote_port="PORT-TO-PARENT",
     )
-    assert link_alarm_points_to_site(
+    old_field_endpoints = resolve_link_alarm_endpoints_from_peer_index(
         {"告警源": "P1", "物理端口": "PORT-TO-CHILD"},
+        peer_index=peer_index,
+    )
+    assert old_field_endpoints.remote_ne == ""
+    assert old_field_endpoints.local_port == ""
+    assert link_alarm_points_to_site(
+        {"告警源": "P1", "物理端口名称": "PORT-TO-CHILD"},
         "CHILD",
         {"C1": "CHILD"},
         peer_index=peer_index,
     ) is True
     assert link_alarm_points_to_site(
-        {"告警源": "P1", "物理端口": "PORT-TO-OTHER"},
+        {"告警源": "P1", "物理端口名称": "PORT-TO-OTHER"},
         "CHILD",
         {"O1": "OTHER"},
         peer_index=peer_index,
@@ -164,7 +170,7 @@ def _run_link_rule_with_port(port_name):
         f"parent-{port_name}",
         "00000000-0000-0000-0000-000000000001",
         alarm_source="P1",
-        alarm_payload={"告警源": "P1", "物理端口": port_name},
+        alarm_payload={"告警源": "P1", "物理端口名称": port_name},
     )
     return engine.process_event(
         "CHILD",
@@ -188,9 +194,9 @@ def test_analyze_link_alarm_peer_coverage_requires_remote_ne_in_ne_graph():
     with tempfile.TemporaryDirectory() as temp_dir:
         alarms_path = Path(temp_dir) / "alarms.jsonl"
         alarms = [
-            {"告警标题": "Link Down", "告警源": "P1", "物理端口": "PORT-TO-CHILD"},
-            {"告警标题": "Link Down", "告警源": "P1", "物理端口": "PORT-TO-OTHER"},
-            {"告警标题": "BTS Down", "告警源": "C1", "物理端口": ""},
+            {"告警标题": "Link Down", "告警源": "P1", "物理端口名称": "PORT-TO-CHILD"},
+            {"告警标题": "Link Down", "告警源": "P1", "物理端口名称": "PORT-TO-OTHER"},
+            {"告警标题": "BTS Down", "告警源": "C1", "物理端口名称": ""},
         ]
         with open(alarms_path, "w", encoding="utf-8") as fw:
             for alarm in alarms:
@@ -216,7 +222,7 @@ def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peers_up_to_limit
             {
                 "告警标题": "Link Down",
                 "告警源": "P1",
-                "物理端口": f"PORT-NOT-IN-SYS-LINK-{idx}",
+                "物理端口名称": f"PORT-NOT-IN-SYS-LINK-{idx}",
                 "自定义字段": f"debug-visible-{idx}",
             }
             for idx in range(3)
@@ -246,8 +252,8 @@ def test_analyze_link_alarm_peer_coverage_debug_prints_missing_peers_up_to_limit
     assert "未找到 link 告警对端设备 #2" in debug_text
     assert "未找到 link 告警对端设备 #3" not in debug_text
     assert "告警源=P1" in debug_text
-    assert "物理端口=PORT-NOT-IN-SYS-LINK-0" in debug_text
-    assert "物理端口=PORT-NOT-IN-SYS-LINK-1" in debug_text
+    assert "物理端口名称=PORT-NOT-IN-SYS-LINK-0" in debug_text
+    assert "物理端口名称=PORT-NOT-IN-SYS-LINK-1" in debug_text
     assert "PORT-NOT-IN-SYS-LINK-2" not in debug_text
     assert "自定义字段" in debug_text
     assert "debug-visible-0" in debug_text

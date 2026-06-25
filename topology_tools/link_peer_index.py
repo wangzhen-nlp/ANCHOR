@@ -89,7 +89,7 @@ def load_peer_index(path):
 def resolve_link_alarm_endpoints(alarm_info, alarm_source=""):
     """从 link 告警信息解析本端/对端设备。
 
-    本端设备来自告警源，本端端口来自物理端口；对端通过 peer_index 查询。
+    本端设备来自告警源，本端端口来自物理端口名称；对端通过 peer_index 查询。
     """
     return resolve_link_alarm_endpoints_from_peer_index(
         alarm_info,
@@ -101,7 +101,7 @@ def resolve_link_alarm_endpoints(alarm_info, alarm_source=""):
 def resolve_link_alarm_endpoints_from_peer_index(alarm_info, peer_index=None, alarm_source=""):
     alarm_info = alarm_info if isinstance(alarm_info, dict) else {}
     local_ne = str(alarm_source or alarm_info.get("告警源", "") or "").strip()
-    local_port = str(alarm_info.get("物理端口", "") or "").strip()
+    local_port = str(alarm_info.get("物理端口名称", "") or "").strip()
     if not peer_index or not local_ne or not local_port:
         return LinkAlarmEndpoints(local_ne=local_ne, local_port=local_port)
 

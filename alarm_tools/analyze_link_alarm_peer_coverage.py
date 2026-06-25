@@ -31,7 +31,7 @@ def _print_missing_peer_debug(alarm, endpoints, index):
     print(
         "原因: 设备+端口没有在 peer-index 记录里查到: "
         f"告警源={endpoints.local_ne or '<空>'}, "
-        f"物理端口={endpoints.local_port or '<空>'}"
+        f"物理端口名称={endpoints.local_port or '<空>'}"
     )
     print("告警完整字段:")
     print(json.dumps(alarm, ensure_ascii=False, indent=2, sort_keys=True))
@@ -104,7 +104,7 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="打印无法通过 告警源+物理端口 找到对端设备的 link 告警详情；默认最多 100 条后退出",
+        help="打印无法通过 告警源+物理端口名称 找到对端设备的 link 告警详情；默认最多 100 条后退出",
     )
     parser.add_argument(
         "--debug-limit",
