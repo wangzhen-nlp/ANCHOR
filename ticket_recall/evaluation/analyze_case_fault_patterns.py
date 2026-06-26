@@ -24,6 +24,14 @@ from topology_resources import NE_GRAPH_JSON, SITE_CHAINS_JSON, resource_display
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 ROUTER_DEVICE_DOMAINS = {"DATA"}
 OTHER_FAULT_PATTERNS = {"ip_ring_others"}
+ALARM_GROUP_ID_FIELDS = ("故障组ID", "fault_group_id", "alarm_group_id", "group_id")
+CASE_SITE_ALARM_MAP_FIELDS = (
+    "associated_site_alarms",
+    "missing_site_alarms",
+    "direct_site_alarms",
+    "inferred_site_alarms",
+    "ticket_recorded_range_site_alarms",
+)
 PATTERN_PRIORITY = {
     "ip_chain_single_link": 0,
     "ip_chain_multi_link": 1,
@@ -79,6 +87,93 @@ def count_jsonl_lines(path):
 def extract_record_uuid(record):
     match_info = as_dict(record.get("match_info"))
     return normalize_text(match_info.get("uuid") or record.get("uuid"))
+
+
+def iter_alarm_list(value):
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, dict):
+            yield item
+
+
+def iter_case_alarm_records(record):
+    yield from iter_alarm_list(record.get("symptoms", []))
+
+    for ne_meta in as_dict(record.get("ne_info")).values():
+        yield from iter_alarm_list(as_dict(ne_meta).get("alarm", []))
+
+    for field_name in CASE_SITE_ALARM_MAP_FIELDS:
+        for alarms in as_dict(record.get(field_name)).values():
+            yield from iter_alarm_list(alarms)
+
+
+def alarm_record_count_key(record):
+    if not isinstance(record, dict):
+        return None
+    for field_name in ("occurrence_uuid", "eid", "alarm_id", "告警编码ID", "event_id"):
+        value = normalize_text(record.get(field_name))
+        if value:
+            return field_name, value
+    try:
+        return "content", json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return "object_id", id(record)
+
+
+def has_alarm_group_id(record):
+    if not isinstance(record, dict):
+        return False
+    return bool(extract_alarm_group_ids(record))
+
+
+def extract_alarm_group_ids(record):
+    group_ids = []
+
+    def append_value(value):
+        if isinstance(value, list):
+            for item in value:
+                append_value(item)
+            return
+        for group_id in str(value or "").replace(";", ",").replace("，", ",").split(","):
+            normalized_group_id = normalize_text(group_id)
+            if normalized_group_id and normalized_group_id not in group_ids:
+                group_ids.append(normalized_group_id)
+
+    for field_name in ALARM_GROUP_ID_FIELDS:
+        append_value(record.get(field_name))
+    return group_ids
+
+
+def analyze_alarm_group_id_coverage(record):
+    seen = set()
+    alarm_count = 0
+    alarms_with_group_id_count = 0
+    common_group_id = ""
+    all_alarms_same_group_id = True
+    for alarm in iter_case_alarm_records(record):
+        alarm_key = alarm_record_count_key(alarm)
+        if alarm_key in seen:
+            continue
+        seen.add(alarm_key)
+        alarm_count += 1
+        group_ids = extract_alarm_group_ids(alarm)
+        if group_ids:
+            alarms_with_group_id_count += 1
+        if len(group_ids) != 1:
+            all_alarms_same_group_id = False
+            continue
+        if not common_group_id:
+            common_group_id = group_ids[0]
+        elif group_ids[0] != common_group_id:
+            all_alarms_same_group_id = False
+    return {
+        "alarm_count_for_group_id_coverage": alarm_count,
+        "alarms_with_group_id_count": alarms_with_group_id_count,
+        "all_alarms_have_group_id": bool(alarm_count and alarms_with_group_id_count == alarm_count),
+        "all_alarms_same_group_id": bool(alarm_count and all_alarms_same_group_id),
+        "common_alarm_group_id": common_group_id if alarm_count and all_alarms_same_group_id else "",
+    }
 
 
 def extract_case_sites(record):
@@ -668,6 +763,13 @@ def filter_other_patterns(analysis):
     return update_analysis_patterns(dict(analysis), filtered_patterns)
 
 
+def has_other_patterns(analysis):
+    patterns = analysis.get("patterns", [])
+    if not isinstance(patterns, list):
+        return False
+    return any(as_dict(pattern_info).get("pattern") in OTHER_FAULT_PATTERNS for pattern_info in patterns)
+
+
 def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
     site_ids = extract_case_sites(record)
     offline_sites = extract_offline_sites(record, ne_to_site) & set(site_ids)
@@ -678,8 +780,9 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
         relation_index,
     )
 
+    projected_components = projected_active_components_by_original_graph(site_ids, active_sites, relation_index)
     component_records = []
-    for component_sites in projected_active_components_by_original_graph(site_ids, active_sites, relation_index):
+    for component_sites in projected_components:
         component_record = classify_component(
             component_sites,
             active_unmanaged_sites,
@@ -696,7 +799,9 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
         "rule": normalize_text(as_dict(record.get("match_info")).get("rule") or record.get("rule")),
         "site_count": len(site_ids),
         "sites": site_ids,
+        "component_count": len(projected_components),
         "offline_sites": sorted(offline_sites),
+        "site_down_count": len(offline_sites),
         "router_device_sites": sorted(router_device_sites & set(site_ids)),
         "active_sites_after_absorption": sorted(active_sites),
         "absorbed_by": absorbed_by,
@@ -1040,7 +1145,19 @@ def main():
         "--filter-others",
         "--drop-others",
         action="store_true",
-        help="从 patterns、备注和统计中移除 others 类型模式（当前为 ip_ring_others），不丢弃原始 case 行",
+        help="过滤 others 类型模式（当前为 ip_ring_others）；若 case 过滤后没有剩余模式，则不写入输出",
+    )
+    parser.add_argument(
+        "--single-component-only",
+        "--one-component-only",
+        action="store_true",
+        help="只输出拆分后 component_count 为 1 的 case；多 component 即使只有一个匹配到模式也会过滤",
+    )
+    parser.add_argument(
+        "--min-site-down-count",
+        type=int,
+        default=0,
+        help="只输出断站数（包含 offline 告警的站点数）大于等于该值的 case，默认 0 表示不过滤",
     )
     args = parser.parse_args()
 
@@ -1058,12 +1175,29 @@ def main():
     total_cases = count_jsonl_lines(args.cases)
     progress = ProgressBar(total_cases, "分析 case 故障模式", min_interval=0.05)
     results = []
+    skipped_other_only_count = 0
+    skipped_multi_component_count = 0
+    skipped_min_site_down_count = 0
     with open(args.output, "w", encoding="utf-8") as output_file:
         try:
             for line_num, record in iter_jsonl_records(args.cases):
                 result = analyze_case_record(record, relation_index, ne_to_site, site_has_router_device)
+                if args.min_site_down_count > 0 and result.get("site_down_count", 0) < args.min_site_down_count:
+                    skipped_min_site_down_count += 1
+                    progress.update()
+                    continue
+                if args.single_component_only and result.get("component_count") != 1:
+                    skipped_multi_component_count += 1
+                    progress.update()
+                    continue
                 if args.filter_others:
+                    had_other_patterns = has_other_patterns(result)
                     result = filter_other_patterns(result)
+                    if had_other_patterns and not result.get("patterns"):
+                        skipped_other_only_count += 1
+                        progress.update()
+                        continue
+                result.update(analyze_alarm_group_id_coverage(record))
                 result["line_num"] = line_num
                 results.append(result)
                 output_record = result if args.analysis_only else build_augmented_case_record(
@@ -1078,8 +1212,19 @@ def main():
         finally:
             progress.close()
 
+    all_alarms_same_group_id_case_count = sum(
+        1 for result in results if result.get("all_alarms_same_group_id")
+    )
     summary = {
         "case_count": len(results),
+        "skipped_other_only_case_count": skipped_other_only_count,
+        "skipped_multi_component_case_count": skipped_multi_component_count,
+        "skipped_min_site_down_case_count": skipped_min_site_down_count,
+        "min_site_down_count": max(args.min_site_down_count, 0),
+        "all_alarms_same_group_id_case_count": all_alarms_same_group_id_case_count,
+        "all_alarms_same_group_id_case_ratio": (
+            all_alarms_same_group_id_case_count / len(results) if results else 0.0
+        ),
         "pattern_counts": summarize_patterns(results),
         "site_chains_used": bool(site_chains_path),
     }
