@@ -1175,6 +1175,7 @@ def main():
     total_cases = count_jsonl_lines(args.cases)
     progress = ProgressBar(total_cases, "分析 case 故障模式", min_interval=0.05)
     results = []
+    skipped_no_pattern_count = 0
     skipped_other_only_count = 0
     skipped_multi_component_count = 0
     skipped_min_site_down_count = 0
@@ -1197,6 +1198,10 @@ def main():
                         skipped_other_only_count += 1
                         progress.update()
                         continue
+                if not result.get("patterns"):
+                    skipped_no_pattern_count += 1
+                    progress.update()
+                    continue
                 result.update(analyze_alarm_group_id_coverage(record))
                 result["line_num"] = line_num
                 results.append(result)
@@ -1217,6 +1222,7 @@ def main():
     )
     summary = {
         "case_count": len(results),
+        "skipped_no_pattern_case_count": skipped_no_pattern_count,
         "skipped_other_only_case_count": skipped_other_only_count,
         "skipped_multi_component_case_count": skipped_multi_component_count,
         "skipped_min_site_down_case_count": skipped_min_site_down_count,
