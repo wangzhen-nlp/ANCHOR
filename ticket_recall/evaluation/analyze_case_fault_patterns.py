@@ -1175,47 +1175,58 @@ def main():
     total_cases = count_jsonl_lines(args.cases)
     progress = ProgressBar(total_cases, "分析 case 故障模式", min_interval=0.05)
     results = []
+    output_records = []
     skipped_no_pattern_count = 0
     skipped_other_only_count = 0
     skipped_multi_component_count = 0
     skipped_min_site_down_count = 0
-    with open(args.output, "w", encoding="utf-8") as output_file:
-        try:
-            for line_num, record in iter_jsonl_records(args.cases):
-                result = analyze_case_record(record, relation_index, ne_to_site, site_has_router_device)
-                if args.min_site_down_count > 0 and result.get("site_down_count", 0) < args.min_site_down_count:
-                    skipped_min_site_down_count += 1
-                    progress.update()
-                    continue
-                if args.single_component_only and result.get("component_count") != 1:
-                    skipped_multi_component_count += 1
-                    progress.update()
-                    continue
-                if args.filter_others:
-                    had_other_patterns = has_other_patterns(result)
-                    result = filter_other_patterns(result)
-                    if had_other_patterns and not result.get("patterns"):
-                        skipped_other_only_count += 1
-                        progress.update()
-                        continue
-                if not result.get("patterns"):
-                    skipped_no_pattern_count += 1
-                    progress.update()
-                    continue
-                result.update(analyze_alarm_group_id_coverage(record))
-                result["line_num"] = line_num
-                results.append(result)
-                output_record = result if args.analysis_only else build_augmented_case_record(
-                    record,
-                    result,
-                    ne_graph_data=ne_graph_data,
-                    site_to_ne_ids=site_to_ne_ids,
-                    site_has_router_device=site_has_router_device,
-                )
-                output_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+    try:
+        for line_num, record in iter_jsonl_records(args.cases):
+            result = analyze_case_record(record, relation_index, ne_to_site, site_has_router_device)
+            if args.min_site_down_count > 0 and result.get("site_down_count", 0) < args.min_site_down_count:
+                skipped_min_site_down_count += 1
                 progress.update()
-        finally:
-            progress.close()
+                continue
+            if args.single_component_only and result.get("component_count") != 1:
+                skipped_multi_component_count += 1
+                progress.update()
+                continue
+            if args.filter_others:
+                had_other_patterns = has_other_patterns(result)
+                result = filter_other_patterns(result)
+                if had_other_patterns and not result.get("patterns"):
+                    skipped_other_only_count += 1
+                    progress.update()
+                    continue
+            if not result.get("patterns"):
+                skipped_no_pattern_count += 1
+                progress.update()
+                continue
+            result.update(analyze_alarm_group_id_coverage(record))
+            result["line_num"] = line_num
+            results.append(result)
+            output_record = result if args.analysis_only else build_augmented_case_record(
+                record,
+                result,
+                ne_graph_data=ne_graph_data,
+                site_to_ne_ids=site_to_ne_ids,
+                site_has_router_device=site_has_router_device,
+            )
+            output_records.append((
+                int(result.get("alarm_count_for_group_id_coverage", 0) or 0),
+                line_num,
+                output_record,
+            ))
+            progress.update()
+    finally:
+        progress.close()
+
+    output_records.sort(
+        key=lambda item: (-item[0], item[1])
+    )
+    with open(args.output, "w", encoding="utf-8") as output_file:
+        for _alarm_count, _line_num, output_record in output_records:
+            output_file.write(json.dumps(output_record, ensure_ascii=False) + "\n")
 
     all_alarms_same_group_id_case_count = sum(
         1 for result in results if result.get("all_alarms_same_group_id")
