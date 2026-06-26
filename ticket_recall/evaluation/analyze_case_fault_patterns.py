@@ -23,6 +23,15 @@ from topology_resources import NE_GRAPH_JSON, SITE_CHAINS_JSON, resource_display
 
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 ROUTER_DEVICE_DOMAINS = {"DATA"}
+OTHER_FAULT_PATTERNS = {"ip_ring_others"}
+PATTERN_PRIORITY = {
+    "ip_chain_single_link": 0,
+    "ip_chain_multi_link": 1,
+    "ip_ring_single_upstream": 2,
+    "ip_ring_multi_upstream": 3,
+    "ip_ring_others": 4,
+    "unknown": 99,
+}
 
 
 def normalize_text(value):
@@ -608,6 +617,57 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
     }
 
 
+def update_analysis_patterns(analysis, component_records):
+    component_records = list(component_records)
+    primary_pattern = "none"
+    if component_records:
+        primary_pattern = min(
+            (item["pattern"] for item in component_records),
+            key=lambda pattern: PATTERN_PRIORITY.get(pattern, 99),
+        )
+    managed_sites = sorted({
+        site_id
+        for component in component_records
+        for site_id in component.get("managed_sites", [])
+    })
+    matched_unmanaged_sites = sorted({
+        site_id
+        for component in component_records
+        for site_id in component.get("unmanaged_sites", [])
+    })
+
+    analysis["pattern"] = primary_pattern
+    analysis["patterns"] = component_records
+    analysis["pattern_count"] = len(component_records)
+    analysis["active_unmanaged_sites"] = matched_unmanaged_sites
+    analysis["managed_sites"] = managed_sites
+    analysis["final_site"] = component_records[0].get("final_site", "") if len(component_records) == 1 else ""
+    analysis["final_managed_site"] = (
+        component_records[0].get("final_managed_site", "") if len(component_records) == 1 else ""
+    )
+    analysis["chains"] = [
+        chain
+        for component in component_records
+        for chain in component.get("chains", [])
+    ]
+    return analysis
+
+
+def filter_other_patterns(analysis):
+    patterns = analysis.get("patterns", [])
+    if not isinstance(patterns, list) or not patterns:
+        return analysis
+
+    filtered_patterns = [
+        pattern_info
+        for pattern_info in patterns
+        if as_dict(pattern_info).get("pattern") not in OTHER_FAULT_PATTERNS
+    ]
+    if len(filtered_patterns) == len(patterns):
+        return analysis
+    return update_analysis_patterns(dict(analysis), filtered_patterns)
+
+
 def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
     site_ids = extract_case_sites(record)
     offline_sites = extract_offline_sites(record, ne_to_site) & set(site_ids)
@@ -631,54 +691,18 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
             component_records.append(component_record)
     component_records.sort(key=lambda item: (item["pattern"], item["sites"]))
 
-    primary_pattern = "none"
-    if component_records:
-        pattern_priority = {
-            "ip_chain_single_link": 0,
-            "ip_chain_multi_link": 1,
-            "ip_ring_single_upstream": 2,
-            "ip_ring_multi_upstream": 3,
-            "ip_ring_others": 4,
-            "unknown": 99,
-        }
-        primary_pattern = min(
-            (item["pattern"] for item in component_records),
-            key=lambda pattern: pattern_priority.get(pattern, 99),
-        )
-    managed_sites = sorted({
-        site_id
-        for component in component_records
-        for site_id in component.get("managed_sites", [])
-    })
-    matched_unmanaged_sites = sorted({
-        site_id
-        for component in component_records
-        for site_id in component.get("unmanaged_sites", [])
-    })
-
-    return {
+    analysis = {
         "uuid": extract_record_uuid(record),
         "rule": normalize_text(as_dict(record.get("match_info")).get("rule") or record.get("rule")),
-        "pattern": primary_pattern,
-        "patterns": component_records,
-        "pattern_count": len(component_records),
         "site_count": len(site_ids),
         "sites": site_ids,
         "offline_sites": sorted(offline_sites),
         "router_device_sites": sorted(router_device_sites & set(site_ids)),
         "active_sites_after_absorption": sorted(active_sites),
-        "active_unmanaged_sites": matched_unmanaged_sites,
-        "managed_sites": managed_sites,
         "absorbed_by": absorbed_by,
         "absorb_steps": absorb_steps,
-        "final_site": component_records[0].get("final_site", "") if len(component_records) == 1 else "",
-        "final_managed_site": component_records[0].get("final_managed_site", "") if len(component_records) == 1 else "",
-        "chains": [
-            chain
-            for component in component_records
-            for chain in component.get("chains", [])
-        ],
     }
+    return update_analysis_patterns(analysis, component_records)
 
 
 def load_ne_graph(path):
@@ -1012,6 +1036,12 @@ def main():
     )
     parser.add_argument("--summary-output", help="可选输出模式计数摘要 JSON")
     parser.add_argument("--analysis-only", action="store_true", help="只输出模式分析结果，不保留原始 case 结构")
+    parser.add_argument(
+        "--filter-others",
+        "--drop-others",
+        action="store_true",
+        help="从 patterns、备注和统计中移除 others 类型模式（当前为 ip_ring_others），不丢弃原始 case 行",
+    )
     args = parser.parse_args()
 
     ne_graph_data = load_ne_graph(args.ne_graph)
@@ -1032,6 +1062,8 @@ def main():
         try:
             for line_num, record in iter_jsonl_records(args.cases):
                 result = analyze_case_record(record, relation_index, ne_to_site, site_has_router_device)
+                if args.filter_others:
+                    result = filter_other_patterns(result)
                 result["line_num"] = line_num
                 results.append(result)
                 output_record = result if args.analysis_only else build_augmented_case_record(
