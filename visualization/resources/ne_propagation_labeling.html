@@ -5599,6 +5599,15 @@
                     if (!stillUsed) { const si = gi.site_list.indexOf(removedSite); if (si !== -1) gi.site_list.splice(si, 1); }
                 }
             });
+            // 该设备已被移除：清除可能指向它的选中状态与页签跟踪，避免重绘后 selectedNode 残留，
+            // 导致悬浮处理误认为它仍选中而拦截其它节点的 popup。
+            pinnedNodePopups.delete(neId);
+            siteNeighborAnchorNodes.delete(neId);
+            multiSelectedNodes.delete(neId);
+            if (selectedNode === neId) {
+                selectedNode = null;
+                document.getElementById('detailPanel').classList.remove('show');
+            }
         }
 
         function onDeviceRootCauseToggle(neId, checked) {
