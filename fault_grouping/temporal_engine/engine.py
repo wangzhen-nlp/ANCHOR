@@ -9,6 +9,12 @@ from collections.abc import Iterable
 from fault_grouping.emitted_group_store import EmittedGroupStore
 from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.node_rule_helper import NodeRuleHelper
+from fault_grouping.time_config import (
+    DEFAULT_AGGREGATION_WAIT_SEC,
+    DEFAULT_EVENT_TTL_SEC,
+    DEFAULT_PERIODIC_HARVEST_INTERVAL_SEC,
+    DEFAULT_POWER_ALARM_TTL_SEC,
+)
 from alarm_tools.alarm_types import CRITICAL_ALARMS, LINK_ALARMS, POWER_ALARMS
 from fault_grouping.temporal_engine.alarm_period import TemporalGraphEngineAlarmPeriodMixin
 from fault_grouping.temporal_engine.common import TemporalGraphEngineCommonMixin
@@ -270,7 +276,7 @@ class TemporalGraphEngine(
         rules_config,
         site_domain_map,
         alarm_source_domain_map=None,
-        aggregation_wait_sec=420,
+        aggregation_wait_sec=DEFAULT_AGGREGATION_WAIT_SEC,
         site_merge_helper=None,
         site_chain_index=None,
         use_alarm_period_cache=False,
@@ -304,9 +310,9 @@ class TemporalGraphEngine(
         self.active_alarm_periods = collections.defaultdict(dict)
         self.active_event_to_period = collections.defaultdict(dict)
         # 默认告警缓存保留时长，单位秒
-        self.global_ttl = 3600
+        self.global_ttl = DEFAULT_EVENT_TTL_SEC
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
-        self.power_alarm_ttl = 10800
+        self.power_alarm_ttl = DEFAULT_POWER_ALARM_TTL_SEC
 
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
@@ -729,7 +735,12 @@ class TemporalGraphEngine(
             self.current_watermark = max(self.current_watermark, now_ts)
         return self._collect_pending_matches(force=False)
 
-    def start_periodic_harvest(self, interval_sec=10, on_matches=None, now_ts_getter=None):
+    def start_periodic_harvest(
+        self,
+        interval_sec=DEFAULT_PERIODIC_HARVEST_INTERVAL_SEC,
+        on_matches=None,
+        now_ts_getter=None,
+    ):
         """启动后台定时收割线程。
 
         on_matches 是一个可选 callback，后台线程每次收割出故障组后会把整批结果交给它。

@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Iterable
 
 from fault_grouping.alarm_events.identity import require_alarm_identity
+from fault_grouping.time_config import RULE_DEFAULT_EDGE_TIME_WINDOW_SEC
 
 
 def _normalize_edge_directions(direction):
@@ -67,7 +68,7 @@ def build_pattern_adj(edges_cfg):
         fwd_dir = _format_edge_directions(fwd_dirs)
         rev_dir = _format_edge_directions(rev_dirs)
         hops = edge.get("max_hops")
-        win = edge.get("time_window_sec", 300)
+        win = edge.get("time_window_sec", RULE_DEFAULT_EDGE_TIME_WINDOW_SEC)
         rev_win = win
         if isinstance(win, dict):
             rev_win = {
