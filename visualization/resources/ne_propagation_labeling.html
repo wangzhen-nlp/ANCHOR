@@ -3048,7 +3048,7 @@
         // 多页签支持：正常模式下点中 NE/边后该页签弹出，且不关闭其它已打开页签；
         // 仅再次点击该 NE/边（开关）、点击空白处、进入邻居扩展模式才关闭页签。
         const pinnedNodePopups = new Set(); // 已打开的设备页签（节点ID）
-        let edgePopups = []; // 已打开的边页签：{ key, source, target, popup }
+        let edgePopups = []; // 已打开的边页签：{ key, source, target, link, popup }
 
         let multiSelectMode = false;
         let multiSelectedNodes = new Set();
@@ -4895,7 +4895,15 @@
             const previousCenter = preserveViewport ? map.getCenter() : null;
             const previousZoom = preserveViewport ? map.getZoom() : null;
 
-            // 重绘会销毁所有 marker/popup，清空页签跟踪避免悬挂引用
+            // 重绘会销毁所有 marker/popup：先记录当前已打开的页签，重建后在原位置恢复
+            // （仅 preserveViewport，例如拖动/局部刷新时恢复；整体重载时不恢复）。
+            const popupsToRestore = preserveViewport ? Array.from(pinnedNodePopups) : [];
+            const edgePopupsToRestore = preserveViewport
+                ? edgePopups.map(function(ep) { return { source: ep.source, target: ep.target, link: ep.link }; })
+                : [];
+            edgePopups.slice().forEach(function(ep) {
+                if (map && ep.popup) { try { map.closePopup(ep.popup); } catch (e) {} }
+            });
             pinnedNodePopups.clear();
             edgePopups = [];
             currentEdgePopup = null;
@@ -4987,7 +4995,8 @@
                             _dragSiblings.push({ marker: mapMarkers[n.id], start: [ll.lat, ll.lng] });
                         }
                     });
-                    this.closePopup();
+                    // 不再在拖动开始时关闭页签：保留已打开页签，拖动结束重建后会恢复。
+                    // （关闭会触发 popupclose → 清除选中，导致拖动后丢失选中状态。）
                 });
                 marker.on('drag', function() {
                     if (!_dragStartLatLng) return;
@@ -5008,7 +5017,9 @@
                     const prev = siteDragOffsets[key] || [0, 0];
                     siteDragOffsets[key] = [prev[0] + dLat, prev[1] + dLng];
                     _dragSiteKey = null; _dragStartLatLng = null; _dragSiblings = [];
-                    renderMap({ preserveViewport: true });
+                    // 延迟到 Leaflet 完成拖动收尾后再重建：直接在 dragend 里 removeLayer 该 marker，
+                    // 会让正在拖动的图标 DOM 脱离图层成为"无法清除的副本"。setTimeout(0) 规避该问题。
+                    setTimeout(function() { renderMap({ preserveViewport: true }); }, 0);
                 });
 
                 // Popup 内容：绑定时仅放轻量占位（节点标题），完整内容在 popupopen 时懒构建。
@@ -5021,16 +5032,20 @@
                 marker.on('popupopen', function() {
                     const ll = this.getLatLng();
                     this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
+                    // 仅当用户明确点击 popup 的 × 关闭按钮时，才清除该 NE 的选中红框/告警详情。
+                    // （不放在通用 popupclose 里：拖拽/重绘/程序化 closePopup 也会触发 popupclose。）
+                    const popup = this.getPopup();
+                    const closeBtn = popup && popup._closeButton;
+                    if (closeBtn) {
+                        L.DomEvent.on(closeBtn, 'click', function() {
+                            if (selectedNode === node.id) clearNodeSelection();
+                            if (currentAlarmNodeId === node.id) closeAlarmPopup();
+                        });
+                    }
                 });
-                // 页签关闭时（含 popup 自带 × 按钮）同步页签跟踪；若关闭的是当前选中 NE，则一并清除选中红框/详情
+                // 页签关闭时只维护页签跟踪集合；选中状态的清除由上面的 × 按钮或显式 toggle 逻辑负责。
                 marker.on('popupclose', function() {
                     pinnedNodePopups.delete(node.id);
-                    if (selectedNode === node.id) {
-                        clearNodeSelection();
-                    }
-                    if (currentAlarmNodeId === node.id) {
-                        closeAlarmPopup();
-                    }
                 });
 
                 // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
@@ -5100,6 +5115,24 @@
             }
             applyDeviceTypeFilterToMap();
             updateSolidifyBtn();
+
+            // 恢复重建前已打开的页签（拖动/局部刷新后页签不丢失）
+            if (popupsToRestore.length) {
+                popupsToRestore.forEach(function(id) {
+                    const m = mapMarkers[id];
+                    if (m) {
+                        pinnedNodePopups.add(id);
+                        m.openPopup();
+                    }
+                });
+            }
+            if (edgePopupsToRestore.length) {
+                edgePopupsToRestore.forEach(function(e) {
+                    if (e.link && mapMarkers[e.source] && mapMarkers[e.target]) {
+                        showEdgeDetailPanel(e.link, e.source, e.target, null);
+                    }
+                });
+            }
         }
 
         // 新增：仅更新地图上的选中状态，不重新渲染整个地图（需求2的核心实现）
@@ -6144,6 +6177,7 @@
                     key: edgePairKey(sourceId, targetId),
                     source: sourceId,
                     target: targetId,
+                    link: link,
                     popup: edgePopup
                 };
                 edgePopup.on('remove', function() {
