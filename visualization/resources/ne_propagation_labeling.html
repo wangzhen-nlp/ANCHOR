@@ -4901,6 +4901,8 @@
             const edgePopupsToRestore = preserveViewport
                 ? edgePopups.map(function(ep) { return { source: ep.source, target: ep.target, link: ep.link }; })
                 : [];
+            // 关闭旧边 popup 会触发其 remove 回调 clearEdgeSelection()，先记录以便重建后恢复高亮
+            const selectedEdgeToRestore = preserveViewport ? selectedEdge : null;
             edgePopups.slice().forEach(function(ep) {
                 if (map && ep.popup) { try { map.closePopup(ep.popup); } catch (e) {} }
             });
@@ -5032,20 +5034,18 @@
                 marker.on('popupopen', function() {
                     const ll = this.getLatLng();
                     this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
-                    // 仅当用户明确点击 popup 的 × 关闭按钮时，才清除该 NE 的选中红框/告警详情。
-                    // （不放在通用 popupclose 里：拖拽/重绘/程序化 closePopup 也会触发 popupclose。）
+                    // 仅当用户明确点击 popup 的 × 关闭按钮时，才取消该 NE 的页签 + 选中红框/告警详情。
+                    // pinnedNodePopups 代表"用户想要打开的页签"，只能被显式关闭操作修改，
+                    // 不能被拖拽/重绘/程序化 closePopup 触发的 popupclose 误删（否则重绘后无法恢复页签）。
                     const popup = this.getPopup();
                     const closeBtn = popup && popup._closeButton;
                     if (closeBtn) {
                         L.DomEvent.on(closeBtn, 'click', function() {
+                            pinnedNodePopups.delete(node.id);
                             if (selectedNode === node.id) clearNodeSelection();
                             if (currentAlarmNodeId === node.id) closeAlarmPopup();
                         });
                     }
-                });
-                // 页签关闭时只维护页签跟踪集合；选中状态的清除由上面的 × 按钮或显式 toggle 逻辑负责。
-                marker.on('popupclose', function() {
-                    pinnedNodePopups.delete(node.id);
                 });
 
                 // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
@@ -5132,6 +5132,11 @@
                         showEdgeDetailPanel(e.link, e.source, e.target, null);
                     }
                 });
+            }
+            // 恢复选中边的高亮（重建时其 popup 的 remove 回调已清掉 selectedEdge 和样式）
+            if (selectedEdgeToRestore) {
+                selectedEdge = selectedEdgeToRestore;
+                applySelectedEdgeStyle(selectedEdge.data);
             }
         }
 
@@ -6030,21 +6035,25 @@
 
             // 设置新的边选择...
             selectedEdge = { source: sourceId, target: targetId, data: link };
-            
-            // 更新边样式...
+            applySelectedEdgeStyle(link); // 高亮选中边、其余恢复常态
+            showEdgeDetailPanel(link, sourceId, targetId, clickLatLng);
+        }
+
+        // 按当前选中边对所有连线重新着色（高亮选中边，其余恢复常态）
+        function applySelectedEdgeStyle(link) {
             mapPolylines.forEach(function(polyline) {
                 const sourceNode = currentNodes.find(function(n) { return n.id === polyline.sourceId; });
                 const targetNode = currentNodes.find(function(n) { return n.id === polyline.targetId; });
-                if (polyline.linkData === link) {
-                    polyline.setStyle({ 
+                if (link && polyline.linkData === link) {
+                    polyline.setStyle({
                         color: getMapLinkColor(polyline.linkData, sourceNode, targetNode, true),
-                        weight: 4, 
+                        weight: 4,
                         opacity: 1,
                         dashArray: getMapLinkDashArray(polyline.linkData)
                     });
                     polyline.bringToFront();
                 } else {
-                    polyline.setStyle({ 
+                    polyline.setStyle({
                         color: polyline.segmentColor || getMapLinkColor(polyline.linkData, sourceNode, targetNode, false),
                         weight: polyline.segmentColor ? 3 : 2.5,
                         opacity: getMapLinkOpacity(polyline.linkData, false),
@@ -6052,8 +6061,6 @@
                     });
                 }
             });
-            
-            showEdgeDetailPanel(link, sourceId, targetId, clickLatLng);
         }
 
         function getEdgePopupLatLng(sourceId, targetId, clickLatLng) {
