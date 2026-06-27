@@ -78,7 +78,7 @@ REQUIRED_LINK_NO_OFFLINE_DATA_NODE = {
 UNDERNEATH_SITE_RULES = [
   {
     "expected_alarms": {
-      "required_alarms": OFFLINE_ALARMS | LINK_ALARMS | POWER_ALARMS
+      "required_alarms": OFFLINE_ALARMS
     }
   }
 ]
