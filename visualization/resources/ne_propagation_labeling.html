@@ -4442,13 +4442,12 @@
                         : '<span>-</span>';
                     const virtualBadge = renderVirtualAlarmBadge(alarm);
                     return '<div style="margin-top: 6px; padding-top: 6px; border-top: 1px solid #d8dee4;">' +
-                        '<div style="font-size: 10px; color: #8c959f;">' + alarmTime + '</div>' +
                         '<div style="font-size: 12px; color: #cf222e; font-weight: 600; line-height: 1.4; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
                             '<span>' + alarmTitle + '</span>' + virtualBadge +
                         '</div>' +
                         '<div style="font-size: 10px; color: #57606a; margin-top: 2px;">工单号: ' + ticketId + '</div>' +
                         '<div style="font-size: 10px; color: #57606a; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
-                        '<div style="font-size: 10px; color: #57606a;">告警清除时间: ' + alarmClearTime + '</div>' +
+                        '<div style="font-size: 10px; color: #57606a;">告警持续时间: ' + alarmTime + '～' + alarmClearTime + '</div>' +
                         buildAlarmRootCauseLabel(node, alarm, alarmIndex) +
                         '</div>';
                 }).join('');
@@ -5652,11 +5651,10 @@
                         '</span>' +
                         '<span style="font-size: 10px; padding: 2px 6px; border-radius: 4px; background: ' + severityColor + '; color: white;">' + severityText + '</span>' +
                     '</div>' +
-                    '<div style="color: #8c959f; font-size: 10px;">' + time + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; margin-top: 4px;">工单号: ' + ticketId + '</div>' +
                     '<div style="color: #57606a; font-size: 11px; display:flex; align-items:center; gap:4px;">故障组ID: ' + faultGroupHtml + '</div>' +
                     virtualMeta +
-                    '<div style="color: #57606a; font-size: 11px;">告警清除时间: ' + alarmClearTime + '</div>' +
+                    '<div style="color: #57606a; font-size: 11px;">告警持续时间: ' + time + '～' + alarmClearTime + '</div>' +
                     buildAlarmRootCauseLabel(node, alarm, index) +
                     '</div>';
             });
