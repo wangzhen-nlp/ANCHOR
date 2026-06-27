@@ -5022,9 +5022,15 @@
                     const ll = this.getLatLng();
                     this.setPopupContent(buildNodeMarkerPopup(node, ll.lat, ll.lng));
                 });
-                // 通过 popup 自带关闭按钮(×)关闭时，同步页签跟踪，避免下次点击误判为"再次点击关闭"
+                // 页签关闭时（含 popup 自带 × 按钮）同步页签跟踪；若关闭的是当前选中 NE，则一并清除选中红框/详情
                 marker.on('popupclose', function() {
                     pinnedNodePopups.delete(node.id);
+                    if (selectedNode === node.id) {
+                        clearNodeSelection();
+                    }
+                    if (currentAlarmNodeId === node.id) {
+                        closeAlarmPopup();
+                    }
                 });
 
                 // 站点邻居扩展模式下尽量保持轻交互，不弹 popup。
@@ -5051,6 +5057,11 @@
                 // ==========================================
                 // 修改地图标记点击事件中的多选处理逻辑
                 // ==========================================
+
+                // 关闭 Leaflet 绑定 popup 时自带的"点击 marker 自动开关 popup"行为：
+                // 它会在我们的 click 处理之前先关掉已打开的 popup（触发 popupclose 改写页签跟踪），
+                // 导致"再次点击已选中 NE"被误判为新选择而重新打开。改由下面的 click 处理统一管理开关。
+                marker.off('click');
 
                 marker.on('click', function(e) {
                     L.DomEvent.stopPropagation(e);
