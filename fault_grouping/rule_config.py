@@ -75,24 +75,20 @@ REQUIRED_LINK_NO_OFFLINE_DATA_NODE = {
   ]
 }
 
-OFFLINE_UNDERNEATH_SITE_RULES = [
+UNDERNEATH_SITE_RULES = [
   {
     "expected_alarms": {
-      "required_alarms": OFFLINE_ALARMS,
-      "optional_alarms": LINK_ALARMS | POWER_ALARMS
+      "required_alarms": OFFLINE_ALARMS | LINK_ALARMS | POWER_ALARMS
     }
   }
 ]
 
-UNDERNEATH_OFFLINE_COMPOUND_NODE = {
+UNDERNEATH_COMPOUND_NODE = {
   "type": "compound",
   "hide_if_no_alarms": True,
   "min_count": 1,
   "patterns": [
-    {
-      "type": "primitive",
-      "site_rules": OFFLINE_UNDERNEATH_SITE_RULES
-    }
+    {"type": "primitive", "site_rules": UNDERNEATH_SITE_RULES},
   ]
 }
 
@@ -293,7 +289,7 @@ data_link_adjacent_no_offline_rule = {
   "nodes": {
     "data_link_adjacent_data_neighbor_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED,
     "data_link_parent_data_node": NO_OFFLINE_DATA_NODE,
-    "data_link_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+    "data_link_underneath_compound_node": UNDERNEATH_COMPOUND_NODE
   },
   "edges": [
     {
@@ -309,7 +305,16 @@ data_link_adjacent_no_offline_rule = {
       "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "max_hops": 1
     }
-  ]
+  ],
+  "result_constraints": {
+    "role_alarm_requirements_any": [
+      {
+        "roles": ["data_link_underneath_compound_node"],
+        "alarms": OFFLINE_ALARMS,
+        "min_roles": 1
+      }
+    ]
+  }
 }
 
 data_link_adjacent_offline_rule = {
@@ -325,7 +330,7 @@ data_link_adjacent_offline_rule = {
   "nodes": {
     "data_link_offline_adjacent_data_node": REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED,
     "data_link_offline_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
-    "data_link_offline_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+    "data_link_offline_underneath_compound_node": UNDERNEATH_COMPOUND_NODE
   },
   "edges": [
     {
@@ -385,9 +390,9 @@ data_no_offline_adjacent_optional_offline_rule = {
   ],
   "nodes": {
     "current_parent_data_node": NO_OFFLINE_DATA_NODE,
-    "current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
+    "current_underneath_compound_node": UNDERNEATH_COMPOUND_NODE,
     "adjacent_router_data_neighbor_node": OPTIONAL_OFFLINE_DATA_NODE,
-    "adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+    "adjacent_router_underneath_compound_node": UNDERNEATH_COMPOUND_NODE
   },
   "edges": [
     {
@@ -412,11 +417,17 @@ data_no_offline_adjacent_optional_offline_rule = {
     }
   ],
   "result_constraints": {
+    "role_alarm_requirements_any": [
+      {
+        "roles": ["current_underneath_compound_node"],
+        "alarms": OFFLINE_ALARMS,
+        "min_roles": 1
+      }
+    ],
     "role_alarm_or_presence_any": [
       {
-        "alarm_roles": ["adjacent_router_data_neighbor_node"],
+        "alarm_roles": ["adjacent_router_data_neighbor_node", "adjacent_router_underneath_compound_node"],
         "alarms": OFFLINE_ALARMS,
-        "presence_roles": ["adjacent_router_underneath_compound_node"],
         "min_matches": 1
       }
     ]
@@ -436,9 +447,9 @@ data_offline_adjacent_offline_rule = {
   ],
   "nodes": {
     "offline_current_parent_data_node": REQUIRED_OFFLINE_DATA_NODE,
-    "offline_current_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE,
+    "offline_current_underneath_compound_node": UNDERNEATH_COMPOUND_NODE,
     "offline_adjacent_router_data_neighbor_node": REQUIRED_OFFLINE_DATA_NODE,
-    "offline_adjacent_router_underneath_compound_node": UNDERNEATH_OFFLINE_COMPOUND_NODE
+    "offline_adjacent_router_underneath_compound_node": UNDERNEATH_COMPOUND_NODE
   },
   "edges": [
     {
