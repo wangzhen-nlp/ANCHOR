@@ -3,7 +3,7 @@
 """
 一次性生成 site_graph.json / ne_graph.json / link_peer_index.json 三个产物。
 
-这是 extract_site_graph.py、extract_ne_graph.py、build_link_peer_index.py 的合并版：
+这是 extract_site_graph.py、extract_ne_graph.py、build_link_peer_index.py 的合并版。
 三个独立工具各自都要读一遍并去重同一份链路文件，且 SYS_NE 被读取两次、ne_graph
 还要把 site_graph.json 从磁盘读回。本工具把这些共享读取合并为：
 
@@ -11,12 +11,17 @@
 - SYS_SITE 读取 1 次（站点信息直接驻留内存，供 site 图与 ne 图共用）
 - 链路读取 + 去重 1 次（单趟遍历同时聚合 site 邻接、ne 邻接与端口对端索引）
 
-输出与三个独立工具逐字节一致，可直接替代它们。
+本文件自包含，不依赖上述三个脚本，输出与它们逐字节等价。
 """
 
 import json
+import os
+import csv
+import io
+import zipfile
 import argparse
 
+from dataclasses import asdict, dataclass
 from collections import defaultdict
 
 if __package__ in (None, ""):
@@ -24,6 +29,7 @@ if __package__ in (None, ""):
 
     ensure_repo_root(1)
 
+from alarm_tools.progress_utils import ProgressBar
 from topology_resources import (
     LINK_PEER_INDEX_JSON,
     NE_GRAPH_JSON,
@@ -33,18 +39,15 @@ from topology_resources import (
     SYS_SITE_DIR,
     resource_display,
 )
-from topology_tools.extract_site_graph import (
-    load_latest_link_records,
-    load_site_info,
-)
-from topology_tools.extract_ne_graph import load_ne_from_csv
-from topology_tools.link_peer_index import (
-    PeerDevice,
-    _get_record_value,
-    _make_key,
-    _normalize_ne_key,
-    save_peer_index,
-)
+
+# 行级进度的刷新间隔（行数）；计数模式下每次 set 都会重绘，需要批量节流
+PROGRESS_ROW_STEP = 5000
+
+LINK_FILE_SUFFIXES = ('.jsonl', '.csv', '.zip')
+CSV_FILE_SUFFIXES = ('.csv', '.zip')
+
+# 链路记录的去重键字段，按优先级取第一个非空值
+LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
 
 # site_graph 中缺省站点信息（NE 引用了某站点但 SYS_SITE 中无该站点时使用）
 _DEFAULT_SITE = {
@@ -57,11 +60,285 @@ _DEFAULT_SITE = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# 去重 / 校验辅助
+# --------------------------------------------------------------------------- #
+def _require_last_modified(record: dict, row_number: int, source: str) -> int:
+    """校验并解析 last_Modified（毫秒级 Unix 时间戳，形如 1758256413325）；缺失或格式不符直接报错退出。"""
+    raw = record.get('last_Modified')
+    if isinstance(raw, str):
+        raw = raw.strip()
+    if raw in ("", None):
+        raise SystemExit(f"{source} 第 {row_number} 行缺少 last_Modified 字段: {record}")
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        raise SystemExit(
+            f"{source} 第 {row_number} 行 last_Modified 格式错误: {raw!r}"
+            f"（要求为毫秒级 Unix 时间戳，形如 1758256413325）"
+        )
+
+
+def _keep_latest(records: dict, key: str, last_modified: int, payload, duplicates: dict = None) -> None:
+    """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。
+
+    传入 duplicates(dict) 时，会累加重复 key 的额外出现次数，供明细报告使用。
+    """
+    existing = records.get(key)
+    if existing is not None and duplicates is not None:
+        duplicates[key] += 1
+    if existing is None or last_modified > existing[0]:
+        records[key] = (last_modified, payload)
+
+
+def _report_duplicate_detail(duplicates: dict, label: str) -> None:
+    """打印重复 key 的明细（按重复次数降序）；duplicates 为空或 None 时不输出。"""
+    if not duplicates:
+        return
+    items = sorted(duplicates.items(), key=lambda kv: kv[1], reverse=True)
+    print(f"  检测到 {len(items)} 个{label}存在重复（已保留 last_Modified 最新记录）:")
+    for key, extra in items:
+        print(f"    {key}: {extra + 1} 条")
+
+
+def _parse_bool(value) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "t", "yes", "y", "是"}
+
+
+# --------------------------------------------------------------------------- #
+# 文件迭代：CSV / zip(内含CSV) / JSONL
+# --------------------------------------------------------------------------- #
+def _iter_zip_csv(zip_path: str):
+    """迭代 zip 包内所有 CSV 的记录。"""
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in sorted(zf.namelist()):
+            if not name.lower().endswith('.csv'):
+                continue
+            with zf.open(name) as member:
+                text = io.TextIOWrapper(
+                    member, encoding='utf-8-sig', errors='replace', newline=''
+                )
+                yield from csv.DictReader(text)
+
+
+def _iter_link_file(file_path: str):
+    """迭代单个链路文件中的记录，支持 .jsonl / .csv / .zip（内含 CSV）。"""
+    lower = file_path.lower()
+    if lower.endswith('.jsonl'):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield json.loads(line)
+    elif lower.endswith('.csv'):
+        with open(file_path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
+            yield from csv.DictReader(f)
+    elif lower.endswith('.zip'):
+        yield from _iter_zip_csv(file_path)
+    else:
+        raise SystemExit(f"不支持的链路文件格式: {file_path}（支持 .jsonl/.csv/.zip）")
+
+
+def iter_csv_dir_records(data_dir: str, name_keyword: str, progress: ProgressBar = None):
+    """迭代目录中文件名含 name_keyword 的 .csv / .zip(内含CSV) 文件的记录。"""
+    file_names = sorted(
+        name for name in os.listdir(data_dir)
+        if name_keyword in name and name.lower().endswith(CSV_FILE_SUFFIXES)
+    )
+    if not file_names:
+        print(f"警告: 目录中未找到文件名含 {name_keyword} 的 .csv/.zip 文件: {data_dir}")
+        return
+    for name in file_names:
+        if progress is not None:
+            progress.set_extra_text(name, force=True)
+        path = os.path.join(data_dir, name)
+        if name.lower().endswith('.csv'):
+            with open(path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
+                yield from csv.DictReader(f)
+        else:
+            yield from _iter_zip_csv(path)
+
+
+def iter_link_records(link_input: str, progress: ProgressBar = None):
+    """迭代链路记录；link_input 可以是单个文件，也可以是包含链路文件的目录。"""
+    if os.path.isdir(link_input):
+        file_names = sorted(
+            name for name in os.listdir(link_input)
+            if name.lower().endswith(LINK_FILE_SUFFIXES)
+        )
+        if not file_names:
+            raise SystemExit(f"目录中未找到链路文件(.jsonl/.csv/.zip): {link_input}")
+        for name in file_names:
+            if progress is not None:
+                progress.set_extra_text(name, force=True)
+            yield from _iter_link_file(os.path.join(link_input, name))
+    else:
+        if progress is not None:
+            progress.set_extra_text(os.path.basename(link_input), force=True)
+        yield from _iter_link_file(link_input)
+
+
+# --------------------------------------------------------------------------- #
+# 基础数据加载（去重取最新）
+# --------------------------------------------------------------------------- #
+def load_ne_from_csv(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False) -> dict:
+    """从 SYS_NE 加载 NE 信息；同 nativeId 按 last_Modified 取最新记录，不做字段合并。
+
+    Returns:
+        {nativeId: {domain, type, network_type, name, manufacturer, region_id, site_id, running_status}}
+    """
+    records = {}
+    duplicates = defaultdict(int) if report_duplicates else None
+
+    progress = ProgressBar(0, "  读取NE记录")
+    row_count = 0
+    for row in iter_csv_dir_records(data_dir, 'SYS_NE', progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        last_modified = _require_last_modified(row, row_count, 'SYS_NE')
+        nativeId = (row.get('nativeId') or '').strip().upper()
+        if not nativeId:
+            continue
+        incoming = {
+            'domain': (row.get('domain') or '').strip(),
+            'type': (row.get('typeId') or '').strip(),
+            'network_type': (row.get('network_type') or '').strip(),
+            'name': (row.get('name') or '').strip(),
+            'manufacturer': (row.get('manufacturer') or '').strip(),
+            'region_id': (row.get('regionId1') or '').strip(),
+            'site_id': (row.get('ne_site_id') or '').strip().upper(),
+            'running_status': (row.get('running_status') or '').strip()
+        }
+        _keep_latest(records, nativeId, last_modified, incoming, duplicates)
+    progress.set(row_count)
+    progress.close()
+
+    ne_info = {key: payload for key, (_, payload) in records.items()}
+    print(f"  读取 {row_count} 行，去重后 {len(ne_info)} 个NE")
+    _report_duplicate_detail(duplicates, 'nativeId')
+    return ne_info
+
+
+def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False) -> dict:
+    """从 SYS_SITE 加载站点信息；同 site_id 按 last_Modified 取最新记录，不做字段合并。
+
+    Returns:
+        {site_id: {site_name, site_type, longitude, latitude, region_id, is_hub}}
+    """
+    records = {}
+    duplicates = defaultdict(int) if report_duplicates else None
+
+    progress = ProgressBar(0, "  读取站点记录")
+    row_count = 0
+    for row in iter_csv_dir_records(data_dir, 'SYS_SITE', progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        last_modified = _require_last_modified(row, row_count, 'SYS_SITE')
+        site_id = (row.get('site_id') or '').strip().upper()
+        if not site_id:
+            continue
+        incoming = {
+            'site_name': (row.get('name') or '').strip(),
+            'site_type': (row.get('site_type') or '').strip(),
+            'longitude': (row.get('longitude') or '').strip(),
+            'latitude': (row.get('latitude') or '').strip(),
+            'region_id': (row.get('region_id') or '').strip(),
+            'is_hub': _parse_bool(row.get('is_hub', '')),
+        }
+        _keep_latest(records, site_id, last_modified, incoming, duplicates)
+    progress.set(row_count)
+    progress.close()
+
+    site_info = {key: payload for key, (_, payload) in records.items()}
+    print(f"  读取 {row_count} 行，去重后 {len(site_info)} 个站点")
+    _report_duplicate_detail(duplicates, 'site_id')
+    return site_info
+
+
+def load_latest_link_records(link_input: str, report_duplicates: bool = False) -> list:
+    """读取链路记录并按 last_Modified 去重：同一链路 ID 只保留最新记录。
+
+    无法确定链路 ID 的记录不参与去重，原样保留。
+    """
+    records = {}
+    no_key_records = []
+    duplicates = defaultdict(int) if report_duplicates else None
+
+    progress = ProgressBar(0, "  读取链路记录")
+    row_count = 0
+    for record in iter_link_records(link_input, progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        last_modified = _require_last_modified(record, row_count, '链路输入')
+        key = ''
+        for field in LINK_KEY_FIELDS:
+            key = (record.get(field) or '').strip()
+            if key:
+                break
+        if not key:
+            no_key_records.append(record)
+            continue
+        _keep_latest(records, key, last_modified, record, duplicates)
+    progress.set(row_count)
+    progress.close()
+
+    latest_records = [payload for _, payload in records.values()] + no_key_records
+    print(f"  读取 {row_count} 行，去重后 {len(latest_records)} 条链路记录")
+    _report_duplicate_detail(duplicates, '链路ID')
+    return latest_records
+
+
+# --------------------------------------------------------------------------- #
+# 端口对端索引
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class PeerDevice:
+    ne_native_id: str
+    port_name: str = ""
+    port_ip: str = ""
+    manager_name: str = ""
+
+
+def _normalize_ne_key(ne_id):
+    return str(ne_id or "").strip().upper()
+
+
+def _normalize_port_key(port_name):
+    return str(port_name or "").strip()
+
+
+def _make_key(ne_id, port_name):
+    return f"{_normalize_ne_key(ne_id)}|{_normalize_port_key(port_name)}"
+
+
+def _get_record_value(record, *field_names):
+    for field_name in field_names:
+        value = str(record.get(field_name, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def save_peer_index(peer_index: dict, output_path: str) -> None:
+    data = {
+        key: asdict(value) if isinstance(value, PeerDevice) else dict(value)
+        for key, value in peer_index.items()
+    }
+    with open(output_path, "w", encoding="utf-8") as fw:
+        json.dump(data, fw, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+# --------------------------------------------------------------------------- #
+# 图构建
+# --------------------------------------------------------------------------- #
 def _add_bidirectional_edge(graph: dict, a: str, b: str, link_type: str) -> None:
     """在 graph 中登记 a->b 的有向边，并维护 b 侧的反向标记。
 
-    与 extract_site_graph.build_site_graph / extract_ne_graph.build_ne_graph 中的
-    逻辑完全一致：首次出现记 '->'/'<-'，两个方向都出现则升级为 '<->'。
+    首次出现记 '->'/'<-'，两个方向都出现则升级为 '<->'。
     """
     fwd = graph[a][b]
     if link_type in fwd:
@@ -134,7 +411,7 @@ def build_graphs(latest_links: list, ne_site_map: dict):
 
 
 def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
-    """合并站点信息与站点邻接关系，等价于 extract_site_graph.main 的输出。"""
+    """合并站点信息与站点邻接关系，等价于 extract_site_graph 的输出。"""
     result = {}
     for site_id in (set(site_info) | set(site_links)):
         site_data = dict(site_info.get(site_id, _DEFAULT_SITE))
@@ -144,7 +421,7 @@ def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
 
 
 def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
-    """合并 NE 信息、站点信息与 NE 邻接关系，等价于 extract_ne_graph.main 的输出。"""
+    """合并 NE 信息、站点信息与 NE 邻接关系，等价于 extract_ne_graph 的输出。"""
     ne_graph = {}
     for ne_id in (set(ne_links) | set(ne_info)):
         ne_data = dict(ne_info.get(ne_id, {}))
