@@ -128,8 +128,11 @@ def compute_connected_components(all_sites, site_neighbors, show_progress=False)
     visited = set()
     components = []
 
+    # 全程不排序：分量划分与成员集合是图不变量，遍历/输出顺序不影响边方向判断
+    # （anchor 选择内部自带 site_id 全序，core_distance 为 BFS 最短路，均与顺序无关）。
+    # 代价：component_id 编号与 full-output 顺序不再跨运行稳定，但二者都不参与决策。
     with ProgressReporter(len(all_sites), "pairwise: 计算连通分量", show_progress) as progress:
-        for start_site in sorted(all_sites):
+        for start_site in all_sites:
             progress.update()
             if start_site in visited:
                 continue
@@ -140,13 +143,13 @@ def compute_connected_components(all_sites, site_neighbors, show_progress=False)
             while queue:
                 current_site = queue.popleft()
                 component.append(current_site)
-                for neighbor_site in sorted(site_neighbors.get(current_site, ())):
+                for neighbor_site in site_neighbors.get(current_site, ()):
                     if neighbor_site in visited:
                         continue
                     visited.add(neighbor_site)
                     queue.append(neighbor_site)
 
-            components.append(sorted(component))
+            components.append(component)
 
     return components
 
@@ -159,8 +162,9 @@ def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
     bridges = set()
     current_time = 0
 
+    # 不排序：桥集是图不变量，DFS 根/邻居顺序不改变返回的桥边集合（is_bridge 因此稳定）
     with ProgressReporter(len(all_sites), "pairwise: 识别桥边", show_progress) as progress:
-        for start_site in sorted(all_sites):
+        for start_site in all_sites:
             if start_site in discovery_time:
                 continue
 
@@ -168,7 +172,8 @@ def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
             current_time += 1
             discovery_time[start_site] = low_link[start_site] = current_time
             progress.update()
-            stack = [(start_site, iter(sorted(site_neighbors.get(start_site, ()))))]
+            # 邻居无需排序：桥集是图不变量，Tarjan 对任意 DFS 邻居顺序返回相同结果
+            stack = [(start_site, iter(site_neighbors.get(start_site, ())))]
 
             while stack:
                 site_id, neighbors_iter = stack[-1]
@@ -192,7 +197,7 @@ def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
                     current_time += 1
                     discovery_time[neighbor_site] = low_link[neighbor_site] = current_time
                     progress.update()
-                    stack.append((neighbor_site, iter(sorted(site_neighbors.get(neighbor_site, ())))))
+                    stack.append((neighbor_site, iter(site_neighbors.get(neighbor_site, ()))))
                 else:
                     low_link[site_id] = min(low_link[site_id], discovery_time[neighbor_site])
 
@@ -837,7 +842,68 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
     }
 
 
-def parse_args():
+def build_pairwise_meta(args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics):
+    """组装 pairwise 输出的 meta（main 与内存调用共用，避免字段漂移）。"""
+    return {
+        "algorithm": "pairwise_evidence",
+        "ne_graph": args.ne_graph,
+        "site_count": len(inputs["all_sites"]),
+        "adjacent_pair_count": len(inputs["pair_edge_count"]),
+        "component_count": len(component_summaries),
+        "strict_ring_before_directed_pair_count": pair_outputs["before_directed_pair_count"],
+        "strict_ring_before_bidirectional_pair_count": pair_outputs["before_bidirectional_pair_count"],
+        "directed_pair_count": pair_outputs["directed_pair_count"],
+        "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
+        "bridge_pair_count": bridge_pair_count,
+        "non_bridge_pair_count": len(pair_graph_metrics) - bridge_pair_count,
+        "smooth_level": args.smooth_level,
+        "smooth_alpha": args.smooth_alpha,
+        "smooth_iters": args.smooth_iters,
+        "smooth_tol": args.smooth_tol,
+        "global_gap_first": args.global_gap_first,
+        "global_gap_threshold": args.global_gap_threshold,
+        "global_gap_nonbridge_bonus": args.global_gap_nonbridge_bonus,
+        "global_gap_shared_neighbor_bonus": args.global_gap_shared_neighbor_bonus,
+        "strict_ring_bidirectional": args.strict_ring_bidirectional,
+        "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
+        "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],
+        "strict_ring_entry_direction_pair_count": pair_outputs["strict_ring_entry_direction_pair_count"],
+        "strict_ring_changed_pair_count": pair_outputs["strict_ring_changed_pair_count"],
+    }
+
+
+def build_pairwise_prediction(ne_graph, args, show_progress=False):
+    """在内存中跑完整 pairwise 流程，返回 compact 输出（meta / edges / downstream_map）。
+
+    与 main 的非 full-output 路径产物一致，可直接作为下游 site_chains 的 prediction 输入，
+    省去落盘再读盘。
+    """
+    inputs = build_site_pair_inputs(ne_graph, show_progress=show_progress)
+    pair_graph_metrics = build_pairwise_graph_metrics(inputs, show_progress=show_progress)
+    bridge_pair_count = sum(
+        1 for graph_metrics in pair_graph_metrics.values() if graph_metrics["is_bridge"]
+    )
+    site_metrics, component_summaries = build_pairwise_site_metrics(
+        inputs, args, show_progress=show_progress
+    )
+    pair_outputs = build_pairwise_orders(
+        inputs, site_metrics, pair_graph_metrics, args, show_progress=show_progress
+    )
+    meta = build_pairwise_meta(
+        args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
+    )
+    compact_edges = [
+        compact_pairwise_prediction(pair_result)
+        for pair_result in pair_outputs["pair_orders"].values()
+    ]
+    return {
+        "meta": meta,
+        "edges": compact_edges,
+        "downstream_map": pair_outputs["downstream_map"],
+    }
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="根据 ne_graph.json 生成相邻站点对的方向先验（pairwise 证据融合版）"
     )
@@ -988,7 +1054,7 @@ def parse_args():
     parser.add_argument("--full-output", action="store_true", help="输出完整调试信息")
     parser.add_argument("--no-progress", action="store_true", help="关闭进度条显示")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.direction_margin < 0:
         parser.error("direction-margin 不能小于 0")
@@ -1091,32 +1157,9 @@ def main():
         print(f"严格环入口定向站点对数: {pair_outputs['strict_ring_entry_direction_pair_count']}")
         print(f"严格环实际改写站点对数: {pair_outputs['strict_ring_changed_pair_count']}")
 
-    meta = {
-        "algorithm": "pairwise_evidence",
-        "ne_graph": args.ne_graph,
-        "site_count": len(inputs["all_sites"]),
-        "adjacent_pair_count": len(inputs["pair_edge_count"]),
-        "component_count": len(component_summaries),
-        "strict_ring_before_directed_pair_count": pair_outputs["before_directed_pair_count"],
-        "strict_ring_before_bidirectional_pair_count": pair_outputs["before_bidirectional_pair_count"],
-        "directed_pair_count": pair_outputs["directed_pair_count"],
-        "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
-        "bridge_pair_count": bridge_pair_count,
-        "non_bridge_pair_count": len(pair_graph_metrics) - bridge_pair_count,
-        "smooth_level": args.smooth_level,
-        "smooth_alpha": args.smooth_alpha,
-        "smooth_iters": args.smooth_iters,
-        "smooth_tol": args.smooth_tol,
-        "global_gap_first": args.global_gap_first,
-        "global_gap_threshold": args.global_gap_threshold,
-        "global_gap_nonbridge_bonus": args.global_gap_nonbridge_bonus,
-        "global_gap_shared_neighbor_bonus": args.global_gap_shared_neighbor_bonus,
-        "strict_ring_bidirectional": args.strict_ring_bidirectional,
-        "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
-        "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],
-        "strict_ring_entry_direction_pair_count": pair_outputs["strict_ring_entry_direction_pair_count"],
-        "strict_ring_changed_pair_count": pair_outputs["strict_ring_changed_pair_count"],
-    }
+    meta = build_pairwise_meta(
+        args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
+    )
 
     compact_edges = [
         compact_pairwise_prediction(pair_result)

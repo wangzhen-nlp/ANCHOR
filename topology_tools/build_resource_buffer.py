@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一次性生成 site_graph.json / ne_graph.json / link_peer_index.json 三个产物。
+一次性生成单个资源缓冲文件，用字段区分不同内容：
+
+- site_graph:         站点邻接图
+- ne_graph:           NE 邻接图
+- link_peer_index:    端口对端索引
+- site_device_counts: 每个站点各 domain 的设备数量（由 ne_graph 派生）
 
 读取过程共享，避免重复 IO：
 
@@ -27,14 +32,30 @@ if __package__ in (None, ""):
 
 from alarm_tools.progress_utils import ProgressBar
 from topology_resources import (
-    LINK_PEER_INDEX_JSON,
     NE_GRAPH_JSON,
-    SITE_GRAPH_JSON,
     SYS_LINK_JSONL,
     SYS_NE_DIR,
     SYS_SITE_DIR,
     resource_display,
 )
+from topology_tools.generate_site_chains import build_site_chains_from_data
+from topology_tools.generate_site_pair_order_pairwise import (
+    build_pairwise_prediction,
+    parse_args as parse_pairwise_args,
+)
+
+# site_chains 字段的生成口径：等价于先跑
+#   generate_site_pair_order_pairwise.py --smooth-level --global-gap-first --strict-ring-bidirectional
+# 再用其产物跑 generate_site_chains.py --restrict-relation（ne_graph 取本缓冲内存版）。
+SITE_PAIR_PAIRWISE_FLAGS = [
+    "--smooth-level",
+    "--global-gap-first",
+    "--strict-ring-bidirectional",
+    "--no-progress",
+]
+
+# 单文件缓冲产物的默认输出路径；与默认资源同目录，避免额外引入路径常量
+DEFAULT_BUFFER_OUTPUT = os.path.join(os.path.dirname(NE_GRAPH_JSON), "resource_buffer.json")
 
 # 行级进度的刷新间隔（行数）；计数模式下每次 set 都会重绘，需要批量节流
 PROGRESS_ROW_STEP = 5000
@@ -319,13 +340,12 @@ def _get_record_value(record, *field_names):
     return ""
 
 
-def save_peer_index(peer_index: dict, output_path: str) -> None:
-    data = {
+def serialize_peer_index(peer_index: dict) -> dict:
+    """把 peer_index 中的 PeerDevice 统一转成可序列化的普通 dict。"""
+    return {
         key: asdict(value) if isinstance(value, PeerDevice) else dict(value)
         for key, value in peer_index.items()
     }
-    with open(output_path, "w", encoding="utf-8") as fw:
-        json.dump(data, fw, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -443,9 +463,47 @@ def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
     return ne_graph
 
 
+def build_site_device_counts(ne_graph: dict) -> dict:
+    """由 ne_graph 派生每个站点各 domain 的设备数量（站点画像）。
+
+    与匹配运行时构建 ne->domain 的口径一致：site_id 与 domain 都非空才计数。
+
+    Returns:
+        {site_id: {domain: count, ...}}
+    """
+    counts = defaultdict(lambda: defaultdict(int))
+    for ne_data in ne_graph.values():
+        site_id = ne_data.get('site_id', '')
+        domain = ne_data.get('domain', '')
+        if site_id and domain:
+            counts[site_id][domain] += 1
+    return {site_id: dict(domains) for site_id, domains in counts.items()}
+
+
+def build_site_chains_field(ne_graph: dict) -> dict:
+    """在内存中复刻 site_chains.json 的生成链路，产出可作为缓冲字段的站点链路。
+
+    等价命令：
+        generate_site_pair_order_pairwise.py --smooth-level --global-gap-first --strict-ring-bidirectional
+        generate_site_chains.py --restrict-relation --ne-graph <ne_graph>
+
+    两步都直接吃内存里的 ne_graph，省去中间落盘再读盘。
+    """
+    pairwise_args = parse_pairwise_args(SITE_PAIR_PAIRWISE_FLAGS)
+    prediction = build_pairwise_prediction(ne_graph, pairwise_args, show_progress=False)
+    return build_site_chains_from_data(
+        prediction,
+        ne_graph=ne_graph,
+        prediction_label="<resource_buffer: pairwise prediction>",
+        ne_graph_label="<resource_buffer: ne_graph>",
+        restrict_relation=True,
+        show_progress=False,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="一次性生成 site_graph.json / ne_graph.json / link_peer_index.json"
+        description="一次性生成单个资源缓冲文件（site_graph / ne_graph / link_peer_index / site_device_counts 各占一个字段）"
     )
     parser.add_argument(
         "--ne-dir",
@@ -466,19 +524,10 @@ def main():
         ),
     )
     parser.add_argument(
-        "--site-graph-output",
-        default=SITE_GRAPH_JSON,
-        help=f"输出 site_graph.json，默认: {resource_display('site_graph.json')}",
-    )
-    parser.add_argument(
-        "--ne-graph-output",
-        default=NE_GRAPH_JSON,
-        help=f"输出 ne_graph.json，默认: {resource_display('ne_graph.json')}",
-    )
-    parser.add_argument(
-        "--peer-index-output",
-        default=LINK_PEER_INDEX_JSON,
-        help=f"输出 link_peer_index.json，默认: {resource_display('link_peer_index.json')}",
+        "--output",
+        "-o",
+        default=DEFAULT_BUFFER_OUTPUT,
+        help=f"输出缓冲文件（单文件，字段区分内容），默认: {resource_display('resource_buffer.json')}",
     )
     parser.add_argument(
         "--report-duplicates",
@@ -510,33 +559,47 @@ def main():
     print(f"  站点图: 处理 {stats['site_link_count']} 条链路，成功映射 {stats['site_mapped_count']} 条")
     print(f"  NE图:   处理 {stats['ne_link_count']} 条链路，成功映射 {stats['ne_mapped_count']} 条")
 
-    # 4) 组装并写出
+    # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出
     site_graph = assemble_site_graph(site_info, site_links)
-    with open(args.site_graph_output, 'w', encoding='utf-8') as f:
-        json.dump(site_graph, f, ensure_ascii=False, indent=2)
-
     ne_graph = assemble_ne_graph(ne_info, site_info, ne_links)
-    with open(args.ne_graph_output, 'w', encoding='utf-8') as f:
-        json.dump(ne_graph, f, ensure_ascii=False, indent=2)
+    site_device_counts = build_site_device_counts(ne_graph)
 
-    save_peer_index(peer_index, args.peer_index_output)
+    # 由 ne_graph 派生站点链路（pairwise 方向先验 + restrict-relation 裁剪）
+    print("\n生成站点链路(site_chains)...")
+    site_chains = build_site_chains_field(ne_graph)
+
+    buffer = {
+        'site_graph': site_graph,
+        'ne_graph': ne_graph,
+        'link_peer_index': serialize_peer_index(peer_index),
+        'site_device_counts': site_device_counts,
+        'site_chains': site_chains,
+    }
+    with open(args.output, 'w', encoding='utf-8') as f:
+        json.dump(buffer, f, ensure_ascii=False, indent=2)
 
     # 汇总
-    print(f"\n生成文件: {args.site_graph_output}")
-    print(f"  站点数: {len(site_graph)}")
+    print(f"\n生成文件: {args.output}")
+
+    print(f"  [site_graph] 站点数: {len(site_graph)}")
     site_neighbor_counts = [len(v['link']) for v in site_graph.values()]
     if site_neighbor_counts:
-        print(f"  平均邻居站点数: {sum(site_neighbor_counts)/len(site_neighbor_counts):.1f}")
-        print(f"  最大邻居站点数: {max(site_neighbor_counts)}")
+        print(f"    平均邻居站点数: {sum(site_neighbor_counts)/len(site_neighbor_counts):.1f}")
+        print(f"    最大邻居站点数: {max(site_neighbor_counts)}")
 
-    print(f"生成文件: {args.ne_graph_output}")
-    print(f"  NE数: {len(ne_graph)}")
+    print(f"  [ne_graph] NE数: {len(ne_graph)}")
     if ne_graph:
         with_site = sum(1 for ne in ne_graph.values() if ne.get('site_id'))
-        print(f"  有站点信息的NE: {with_site} ({with_site/len(ne_graph)*100:.1f}%)")
+        print(f"    有站点信息的NE: {with_site} ({with_site/len(ne_graph)*100:.1f}%)")
 
-    print(f"生成文件: {args.peer_index_output}")
-    print(f"  对端索引记录数: {len(peer_index)}")
+    print(f"  [link_peer_index] 对端索引记录数: {len(peer_index)}")
+
+    print(f"  [site_device_counts] 站点画像数: {len(site_device_counts)}")
+
+    site_chains_meta = site_chains.get('meta', {})
+    print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")
+    print(f"    下游可达关系数: {site_chains_meta.get('total_downstream_relations', 0)}")
+    print(f"    双向直接边数: {site_chains_meta.get('total_bidirectional_edges', 0)}")
 
 
 if __name__ == "__main__":

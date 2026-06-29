@@ -361,18 +361,23 @@ def reachable_downstream_sites(adjacency, first_hop_adjacency, source_site, max_
     }
 
 
-def build_site_chains(
-    prediction_path,
+def build_site_chains_from_data(
+    data,
     *,
-    ne_graph_path=None,
+    ne_graph=None,
+    prediction_label=None,
+    ne_graph_label=None,
     enrich_relation=False,
     restrict_relation=False,
     directed_only=False,
     max_depth=None,
     show_progress=True,
 ):
-    with open(prediction_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    """从已加载的 prediction 数据与可选 ne_graph 生成站点链路；不读盘，供内存复用。
+
+    prediction_label / ne_graph_label 仅用于 meta 中的来源标注。
+    """
+    has_ne_graph = ne_graph is not None
 
     adjacency, first_hop_adjacency, all_sites, adjacency_source, edge_stats, warnings = build_adjacency(
         data,
@@ -385,10 +390,7 @@ def build_site_chains(
     augmentation_stats = None
     restriction_stats = None
 
-    if ne_graph_path and (enrich_relation or restrict_relation):
-        with open(ne_graph_path, "r", encoding="utf-8") as f:
-            ne_graph = json.load(f)
-
+    if has_ne_graph and (enrich_relation or restrict_relation):
         prediction_pairs = collect_prediction_pairs(data)
         relation_data = collect_ne_graph_relation_data(
             ne_graph,
@@ -398,7 +400,7 @@ def build_site_chains(
         )
         if enrich_relation:
             augmentation_stats = apply_ne_graph_augmentation_from_counts(
-                ne_graph_path,
+                ne_graph_label,
                 len(prediction_pairs),
                 relation_data["missing_pair_counts"],
                 relation_data["stats"],
@@ -412,10 +414,10 @@ def build_site_chains(
     elif enrich_relation or restrict_relation:
         warnings.append("--enrich-relation/--restrict-relation 未生效：未提供 --ne-graph")
 
-    if ne_graph_path and not enrich_relation and not restrict_relation:
+    if has_ne_graph and not enrich_relation and not restrict_relation:
         warnings.append("--ne-graph 已提供，但未开启 --enrich-relation/--restrict-relation；不会影响站点关系")
 
-    if restrict_relation and not ne_graph_path:
+    if restrict_relation and not has_ne_graph:
         restriction_stats = {
             "enabled": False,
             "reason": "missing_ne_graph",
@@ -424,7 +426,7 @@ def build_site_chains(
         restriction_stats = {
             "enabled": True,
             "mode": "filter_final_downstream_site_hops",
-            "ne_graph": str(ne_graph_path),
+            "ne_graph": ne_graph_label,
             "ne_graph_pair_count": len(relation_data["ne_graph_pairs"]) if relation_data else 0,
             "downstream_relation_count_before": 0,
             "downstream_relation_count_after": 0,
@@ -487,8 +489,8 @@ def build_site_chains(
     edge_stats = edge_stats or {}
     meta = {
         "input_config": {
-            "prediction_json": str(prediction_path),
-            "ne_graph": str(ne_graph_path) if ne_graph_path else None,
+            "prediction_json": prediction_label,
+            "ne_graph": ne_graph_label,
             "max_depth": max_depth,
             "directed_only": directed_only,
             "enrich_relation": enrich_relation,
@@ -502,11 +504,11 @@ def build_site_chains(
         "warnings": warnings,
         "edge_stats": edge_stats,
         "relation_options": {
-            "ne_graph_provided": bool(ne_graph_path),
+            "ne_graph_provided": has_ne_graph,
             "enrich_relation_requested": enrich_relation,
             "restrict_relation_requested": restrict_relation,
-            "enrich_relation_effective": bool(ne_graph_path and enrich_relation),
-            "restrict_relation_effective": bool(ne_graph_path and restrict_relation),
+            "enrich_relation_effective": bool(has_ne_graph and enrich_relation),
+            "restrict_relation_effective": bool(has_ne_graph and restrict_relation),
         },
     }
     if augmentation_stats:
@@ -537,6 +539,38 @@ def build_site_chains(
         "meta": meta,
         "sites": site_chains,
     }
+
+
+def build_site_chains(
+    prediction_path,
+    *,
+    ne_graph_path=None,
+    enrich_relation=False,
+    restrict_relation=False,
+    directed_only=False,
+    max_depth=None,
+    show_progress=True,
+):
+    """从文件读取 prediction 与可选 ne_graph 后生成站点链路（CLI 入口的薄封装）。"""
+    with open(prediction_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    ne_graph = None
+    if ne_graph_path:
+        with open(ne_graph_path, "r", encoding="utf-8") as f:
+            ne_graph = json.load(f)
+
+    return build_site_chains_from_data(
+        data,
+        ne_graph=ne_graph,
+        prediction_label=str(prediction_path),
+        ne_graph_label=str(ne_graph_path) if ne_graph_path else None,
+        enrich_relation=enrich_relation,
+        restrict_relation=restrict_relation,
+        directed_only=directed_only,
+        max_depth=max_depth,
+        show_progress=show_progress,
+    )
 
 
 def parse_args():

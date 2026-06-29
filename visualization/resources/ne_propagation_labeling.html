@@ -965,27 +965,27 @@
         }
 
         .node-item.has-alarm {
-            border-left-color: #0891b2;
-            border-color: #0891b2;
-            box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
+            border-left-color: #1e40af;
+            border-color: #1e40af;
+            box-shadow: inset 0 0 0 1px rgba(30, 64, 175, 0.15);
         }
 
         .node-item.has-alarm-associated {
-            border-left-color: #16a34a;
-            border-color: #16a34a;
-            box-shadow: inset 0 0 0 1px rgba(22, 163, 74, 0.15);
+            border-left-color: #1e40af;
+            border-color: #1e40af;
+            box-shadow: inset 0 0 0 1px rgba(30, 64, 175, 0.15);
         }
 
         .node-item.has-alarm-missing {
-            border-left-color: #f59e0b;
-            border-color: #f59e0b;
-            box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.18);
+            border-left-color: #1e40af;
+            border-color: #1e40af;
+            box-shadow: inset 0 0 0 1px rgba(30, 64, 175, 0.15);
         }
 
         .node-item.has-alarm-context {
-            border-left-color: #0891b2;
-            border-color: #0891b2;
-            box-shadow: inset 0 0 0 1px rgba(8, 145, 178, 0.15);
+            border-left-color: #1e40af;
+            border-color: #1e40af;
+            box-shadow: inset 0 0 0 1px rgba(30, 64, 175, 0.15);
         }
 
         .node-item.supplemental-context {
@@ -2433,10 +2433,10 @@
 
         const EDGE_DOMAIN_PRIORITY = ['IP', 'Transmission', 'RAN', 'DEFAULT'];
         const NODE_ROLE_BORDER_STYLE = {
-            associated_site: { color: '#16a34a', width: 3.5, label: '关联站点告警设备' },
-            missing_site: { color: '#f59e0b', width: 3.5, label: '缺失站点告警设备' },
-            context_site: { color: '#0891b2', width: 3.5, label: '上下文站点告警设备' },
-            alarm_other: { color: '#0891b2', width: 3.5, label: '其它有告警设备' },
+            associated_site: { color: '#1e40af', width: 3.5, label: '关联站点告警设备' },
+            missing_site: { color: '#1e40af', width: 3.5, label: '缺失站点告警设备' },
+            context_site: { color: '#1e40af', width: 3.5, label: '上下文站点告警设备' },
+            alarm_other: { color: '#1e40af', width: 3.5, label: '其它有告警设备' },
             default: { color: '#ffffff', width: 2, label: '普通设备' }
         };
 
@@ -3094,6 +3094,7 @@
         let rcSourceFiles = {};     // uuid -> data/ 下源文件名（服务模式实时回写用）
         let rcOriginalGroup = null; // 当前组从文件载入时的原始对象（回写时只改标注/备注，保留其余字段）
         let _writeBackTimer = null; // 实时回写防抖计时器
+        let _noteSaveTimer = null;  // 备注输入防抖计时器（停止输入后才落盘/推总览）
         let neGraphData = null;
         let roleSiteSets = {
             associated_site: new Set(),
@@ -6691,6 +6692,8 @@
         // 切换离开当前组前：同步备注、把状态回写总览页、自动落盘
         function commitCurrentGroup(useBeacon) {
             if (!graphData) return;
+            // 这里会做完整保存，取消挂起的备注防抖计时器，避免切组后它晚到、把备注写到新组上
+            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
             const ta = document.getElementById('noteTextarea');
             if (ta) {
                 graphData.note = ta.value.trim();
@@ -8146,6 +8149,7 @@
 
         // 禁用备注面板
         function disableNotePanel() {
+            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
             const noteTextarea = document.getElementById('noteTextarea');
             noteTextarea.disabled = true;
             noteTextarea.value = '';
@@ -8301,12 +8305,30 @@
         }
 
         // 监听备注输入变化
-        document.getElementById('noteTextarea').addEventListener('input', function(e) {
+        // 停止输入后才执行的重活：写 localStorage + 推送总览（昂贵，按键时不能每次都跑）
+        function flushNoteSave() {
+            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
             if (!graphData) return;
-            graphData.note = e.target.value.trim();
-            graphData.note_updated_at = new Date().toISOString();
             autoSaveResults();
             pushStatusToOverview();
+        }
+        document.getElementById('noteTextarea').addEventListener('input', function(e) {
+            if (!graphData) return;
+            // 内存赋值极快、每次按键都做，保证数据不丢；trim 留到落盘时再做避免吞掉中间空格
+            graphData.note = e.target.value;
+            graphData.note_updated_at = new Date().toISOString();
+            // 防抖：连续输入时不断推迟，停手 400ms 后才落盘 / 推总览
+            if (_noteSaveTimer) clearTimeout(_noteSaveTimer);
+            _noteSaveTimer = setTimeout(function() {
+                graphData.note = graphData.note.trim();
+                flushNoteSave();
+            }, 400);
+        });
+        // 失焦兜底：点出输入框时立即落盘，避免不足 400ms 就切走导致丢失
+        document.getElementById('noteTextarea').addEventListener('blur', function() {
+            if (!_noteSaveTimer || !graphData) return;
+            graphData.note = (graphData.note || '').trim();
+            flushNoteSave();
         });
 
         // 文件处理
