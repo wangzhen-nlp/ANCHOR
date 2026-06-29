@@ -313,6 +313,55 @@ def compute_component_core_distance(component_sites, anchors, site_neighbors):
     return distance_map
 
 
+def smooth_level_scores(
+    site_metrics,
+    site_neighbors,
+    anchor_sites,
+    alpha,
+    max_iter,
+    tol,
+    show_progress=False,
+):
+    """对站点 level_score 做标签传播平滑，得到全局一致的层级场。
+
+    - anchor 站点被钉住（保持原始 level_score），充当稳定参照系；
+    - 其余站点按 new = alpha * 自身原始分 + (1-alpha) * 邻居均值 迭代，直到收敛。
+
+    注意自锚项用的是**原始 level_score**（固定值，软 Dirichlet 约束），而非当前迭代值；
+    否则不动点退化为纯调和场，非 anchor 站点会全部塌缩到最近 anchor，抹掉层级落差。
+
+    复杂度 O(max_iter * E)，纯线性迭代，无路径枚举/优化器。
+    """
+    base_level = {site_id: metrics["level_score"] for site_id, metrics in site_metrics.items()}
+    scores = dict(base_level)
+    anchors = set(anchor_sites)
+
+    # 预先算好每个非 anchor 站点的有效邻居列表，避免每轮重复过滤/成员判断
+    pending = {}
+    for site_id in scores:
+        if site_id in anchors:
+            continue
+        neighbors = [n for n in site_neighbors.get(site_id, ()) if n in scores]
+        if neighbors:
+            pending[site_id] = neighbors
+
+    with ProgressReporter(max_iter, "pairwise: 平滑层级分", show_progress) as progress:
+        for _ in range(max_iter):
+            progress.update()
+            new_scores = dict(scores)
+            max_delta = 0.0
+            for site_id, neighbors in pending.items():
+                neighbor_avg = sum(scores[n] for n in neighbors) / len(neighbors)
+                value = alpha * base_level[site_id] + (1.0 - alpha) * neighbor_avg
+                new_scores[site_id] = value
+                max_delta = max(max_delta, abs(value - scores[site_id]))
+            scores = new_scores
+            if max_delta < tol:
+                break
+
+    return scores
+
+
 def build_pairwise_site_metrics(inputs, args, show_progress=False):
     base_scores = {
         site_id: compute_base_core_score(site_id, inputs, args)
@@ -364,6 +413,26 @@ def build_pairwise_site_metrics(inputs, args, show_progress=False):
                     "level_score": round(level_score, 6),
                 }
 
+    # 可选：标签传播平滑，得到全局一致的层级场（默认关闭，不影响原行为）
+    if getattr(args, "smooth_level", False):
+        anchor_sites = set()
+        for summary in component_summaries:
+            anchor_sites.update(summary["anchor_sites"])
+        smoothed = smooth_level_scores(
+            site_metrics,
+            inputs["site_neighbors"],
+            anchor_sites,
+            args.smooth_alpha,
+            args.smooth_iters,
+            args.smooth_tol,
+            show_progress=show_progress,
+        )
+        for site_id, metrics in site_metrics.items():
+            metrics["level_score_smoothed"] = round(smoothed[site_id], 6)
+    else:
+        for metrics in site_metrics.values():
+            metrics["level_score_smoothed"] = metrics["level_score"]
+
     return site_metrics, component_summaries
 
 
@@ -377,6 +446,39 @@ def _add_direction_evidence(score_container, winner, loser, feature, amount, det
             "towards": f"{winner}->{loser}",
         }
     )
+
+
+def build_global_gap_result(
+    left_site, right_site, left_level, right_level, gap, effective_threshold, graph_metrics, args
+):
+    """全局层级差决定方向时的结果，字段对齐常规 evaluate 输出。"""
+    if gap > 0:
+        preferred_source, preferred_target = left_site, right_site
+    else:
+        preferred_source, preferred_target = right_site, left_site
+    return {
+        "site_a": left_site,
+        "site_b": right_site,
+        "relation": "->",
+        "preferred_source": preferred_source,
+        "preferred_target": preferred_target,
+        "score_a_to_b": round(max(gap, 0.0), 6),
+        "score_b_to_a": round(max(-gap, 0.0), 6),
+        "score_gap": round(gap, 6),
+        "decision_margin": round(effective_threshold, 6),
+        "base_global_gap_threshold": args.global_gap_threshold,
+        "base_direction_margin": args.direction_margin,
+        "decision_method": "global_level_gap",
+        "level_smoothed_a": round(left_level, 6),
+        "level_smoothed_b": round(right_level, 6),
+        "is_bridge": graph_metrics["is_bridge"],
+        "has_alternative_path": graph_metrics["has_alternative_path"],
+        "shared_neighbor_count": graph_metrics["shared_neighbor_count"],
+        "shared_neighbors": graph_metrics["shared_neighbors"],
+        "uncertainty_adjustments": [],
+        "score_breakdown_a_to_b": [],
+        "score_breakdown_b_to_a": [],
+    }
 
 
 def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_graph_metrics, args):
@@ -393,6 +495,26 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
             "shared_neighbors": [],
         },
     )
+
+    # 可选：全局层级场清晰时直接按层级差定向，跳过局部 7 特征投票（默认关闭）。
+    # 短路阈值与投票的 effective_margin 一样对非桥边/共享邻居更保守：层级差不够大时
+    # 不短路，交回投票，由其保守 margin 把不确定的环路/多路径边判成双向。
+    if getattr(args, "global_gap_first", False):
+        left_level = left_metrics.get("level_score_smoothed", left_metrics["level_score"])
+        right_level = right_metrics.get("level_score_smoothed", right_metrics["level_score"])
+        gap = left_level - right_level
+        effective_threshold = args.global_gap_threshold
+        if not graph_metrics["is_bridge"]:
+            effective_threshold += args.global_gap_nonbridge_bonus
+        effective_threshold += (
+            min(graph_metrics["shared_neighbor_count"], args.max_shared_neighbor_bonus_count)
+            * args.global_gap_shared_neighbor_bonus
+        )
+        if gap != 0.0 and abs(gap) >= effective_threshold:
+            return build_global_gap_result(
+                left_site, right_site, left_level, right_level, gap,
+                effective_threshold, graph_metrics, args,
+            )
 
     score_container = {
         left_site: {"score": 0.0, "breakdown": []},
@@ -645,7 +767,11 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                 if graph_metrics.get("is_bridge")
             ],
             site_scores={
-                site_id: metrics.get("level_score", 0.0)
+                # 与 gap-first 一致地使用平滑层级；未开启平滑时该字段等于 level_score，
+                # 故对默认路径是 no-op，保持向后兼容。
+                site_id: metrics.get(
+                    "level_score_smoothed", metrics.get("level_score", 0.0)
+                )
                 for site_id, metrics in site_metrics.items()
             },
         )
@@ -795,6 +921,66 @@ def parse_args():
     parser.add_argument("--max-neighbor-delta", type=int, default=4)
     parser.add_argument("--max-pair-domain-delta", type=int, default=4)
     parser.add_argument(
+        "--smooth-level",
+        action="store_true",
+        help=(
+            "对站点 level_score 做标签传播平滑，得到全局一致的层级场（默认关闭）。"
+            "注意：平滑结果只在 --global-gap-first（参与边定向）或 "
+            "--strict-ring-bidirectional（影响环入口排序）时生效；"
+            "单独开启不改变常规投票方向（投票仍用原始 level_score）"
+        ),
+    )
+    parser.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=0.5,
+        help="平滑时非 anchor 站点保留自身分的权重，(1-alpha) 给邻居均值，默认 0.5",
+    )
+    parser.add_argument(
+        "--smooth-iters",
+        type=int,
+        default=100,
+        help="层级平滑最大迭代轮数，默认 100（带 tol 提前收敛）",
+    )
+    parser.add_argument(
+        "--smooth-tol",
+        type=float,
+        default=1e-4,
+        help="层级平滑收敛阈值（最大变化小于此值即停止），默认 1e-4",
+    )
+    parser.add_argument(
+        "--global-gap-first",
+        action="store_true",
+        help=(
+            "全局层级差 >= 阈值时直接按层级定向，跳过局部 7 特征投票；"
+            "未配 --smooth-level 时基于未平滑的 level_score（默认关闭）"
+        ),
+    )
+    parser.add_argument(
+        "--global-gap-threshold",
+        type=float,
+        default=1.0,
+        help="--global-gap-first 的基础判定阈值：|层级差| 大于等于该值才直接定向，默认 1.0",
+    )
+    parser.add_argument(
+        "--global-gap-nonbridge-bonus",
+        type=float,
+        default=2.0,
+        help=(
+            "非桥边（环路/有替代路径）在 --global-gap-first 下额外要求的层级差，"
+            "对应投票的 non-bridge-margin-bonus，默认 2.0"
+        ),
+    )
+    parser.add_argument(
+        "--global-gap-shared-neighbor-bonus",
+        type=float,
+        default=0.5,
+        help=(
+            "--global-gap-first 下每个共享邻居额外要求的层级差（按 "
+            "max-shared-neighbor-bonus-count 封顶），对应投票的 shared-neighbor-margin-bonus，默认 0.5"
+        ),
+    )
+    parser.add_argument(
         "--strict-ring-bidirectional",
         action="store_true",
         help="严格环模式：入口相关站点对强制为入口指向环内站点，其余环内站点对强制输出双向",
@@ -816,6 +1002,18 @@ def parse_args():
         parser.error("shared-neighbor-margin-bonus 不能小于 0")
     if args.max_shared_neighbor_bonus_count < 0:
         parser.error("max-shared-neighbor-bonus-count 不能小于 0")
+    if not 0.0 <= args.smooth_alpha <= 1.0:
+        parser.error("smooth-alpha 必须在 [0, 1] 之间")
+    if args.smooth_iters <= 0:
+        parser.error("smooth-iters 必须大于 0")
+    if args.smooth_tol < 0:
+        parser.error("smooth-tol 不能小于 0")
+    if args.global_gap_threshold < 0:
+        parser.error("global-gap-threshold 不能小于 0")
+    if args.global_gap_nonbridge_bonus < 0:
+        parser.error("global-gap-nonbridge-bonus 不能小于 0")
+    if args.global_gap_shared_neighbor_bonus < 0:
+        parser.error("global-gap-shared-neighbor-bonus 不能小于 0")
     return args
 
 
@@ -905,6 +1103,14 @@ def main():
         "bidirectional_pair_count": pair_outputs["bidirectional_pair_count"],
         "bridge_pair_count": bridge_pair_count,
         "non_bridge_pair_count": len(pair_graph_metrics) - bridge_pair_count,
+        "smooth_level": args.smooth_level,
+        "smooth_alpha": args.smooth_alpha,
+        "smooth_iters": args.smooth_iters,
+        "smooth_tol": args.smooth_tol,
+        "global_gap_first": args.global_gap_first,
+        "global_gap_threshold": args.global_gap_threshold,
+        "global_gap_nonbridge_bonus": args.global_gap_nonbridge_bonus,
+        "global_gap_shared_neighbor_bonus": args.global_gap_shared_neighbor_bonus,
         "strict_ring_bidirectional": args.strict_ring_bidirectional,
         "strict_ring_component_count": len(pair_outputs["strict_ring_components"]),
         "strict_ring_forced_pair_count": pair_outputs["strict_ring_forced_pair_count"],

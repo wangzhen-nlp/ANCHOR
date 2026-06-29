@@ -284,10 +284,11 @@ def _print_sample(title, items, sample, both):
     for item in items[:sample]:
         if both:
             pair_key, left_relation, right_relation = item
+            left_arrow = relation_arrow(pair_key, left_relation)
+            right_arrow = relation_arrow(pair_key, right_relation)
             print(
                 f"  {format_pair(pair_key):<28}"
-                f"L: {relation_arrow(pair_key, left_relation):<16}"
-                f"R: {relation_arrow(pair_key, right_relation)}"
+                f"L: {left_arrow:<24} | R: {right_arrow}"
             )
         else:
             print(f"  {format_pair(item)}")
