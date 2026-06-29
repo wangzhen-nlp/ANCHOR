@@ -21,6 +21,7 @@ import csv
 import io
 import zipfile
 import argparse
+import itertools
 
 from dataclasses import asdict, dataclass
 from collections import defaultdict
@@ -65,6 +66,16 @@ CSV_FILE_SUFFIXES = ('.csv', '.zip')
 
 # 链路记录的去重键字段，按优先级取第一个非空值
 LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
+
+# build_graphs 实际用到的链路字段；去重时只保留这些，避免在内存中驻留整条原始记录
+LINK_NEEDED_FIELDS = (
+    "a_end_ne_nativeId", "a_end_ne_nativeId(')",
+    "z_end_ne_nativeId", "z_end_ne_nativeId(')",
+    "link_layer",
+    "a_end_port_name", "z_end_port_name",
+    "a_end_port_ip", "z_end_port_ip",
+    "a_end_ne_manager_name", "z_end_ne_manager_name",
+)
 
 # site_graph 中缺省站点信息（NE 引用了某站点但 SYS_SITE 中无该站点时使用）
 _DEFAULT_SITE = {
@@ -275,10 +286,13 @@ def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False
     return site_info
 
 
-def load_latest_link_records(link_input: str, report_duplicates: bool = False) -> list:
+def load_latest_link_records(link_input: str, report_duplicates: bool = False):
     """读取链路记录并按 last_Modified 去重：同一链路 ID 只保留最新记录。
 
     无法确定链路 ID 的记录不参与去重，原样保留。
+
+    去重时只保留 build_graphs 用得到的字段（见 LINK_NEEDED_FIELDS），不在内存中
+    驻留整条原始记录；返回惰性可迭代对象，调用方单趟遍历即可，避免再物化成大列表。
     """
     records = {}
     no_key_records = []
@@ -296,17 +310,21 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False) -
             key = (record.get(field) or '').strip()
             if key:
                 break
+        slim = {name: record[name] for name in LINK_NEEDED_FIELDS if name in record}
         if not key:
-            no_key_records.append(record)
+            no_key_records.append(slim)
             continue
-        _keep_latest(records, key, last_modified, record, duplicates)
+        _keep_latest(records, key, last_modified, slim, duplicates)
     progress.set(row_count)
     progress.close()
 
-    latest_records = [payload for _, payload in records.values()] + no_key_records
-    print(f"  读取 {row_count} 行，去重后 {len(latest_records)} 条链路记录")
+    unique_count = len(records) + len(no_key_records)
+    print(f"  读取 {row_count} 行，去重后 {unique_count} 条链路记录")
     _report_duplicate_detail(duplicates, '链路ID')
-    return latest_records
+    return itertools.chain(
+        (payload for _, payload in records.values()),
+        no_key_records,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -437,11 +455,16 @@ def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
 
 
 def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
-    """合并 NE 信息、站点信息与 NE 邻接关系，生成 ne_graph。"""
+    """合并 NE 信息、站点信息与 NE 邻接关系，生成 ne_graph。
+
+    注意：会原地改写 ne_info 中的 NE dict（调用方此后不应再使用 ne_info），
+    以免为每个 NE 额外复制一份，峰值内存可省去整份 NE 信息的副本。
+    """
     ne_graph = {}
     for ne_id in (set(ne_links) | set(ne_info)):
-        ne_data = dict(ne_info.get(ne_id, {}))
-        neighbors = ne_links.get(ne_id, {})
+        ne_data = ne_info.get(ne_id)
+        if ne_data is None:
+            ne_data = {}
         site_id = ne_data.get('site_id', '')
         site_data = site_info.get(site_id, {})
 
@@ -455,11 +478,9 @@ def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
             }
         )
         ne_data['region_id'] = ne_data.get('region_id', '') or site_data.get('region_id', '')
+        ne_data['link'] = dict(ne_links.get(ne_id, {}))
 
         ne_graph[ne_id] = ne_data
-        ne_graph[ne_id]['link'] = {}
-        for neighbor_id, links in neighbors.items():
-            ne_graph[ne_id]['link'][neighbor_id] = links
     return ne_graph
 
 
