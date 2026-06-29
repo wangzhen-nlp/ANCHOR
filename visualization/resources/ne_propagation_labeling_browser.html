@@ -598,6 +598,8 @@
                 <input id="deviceFilterInput" class="site-filter-input" type="text" placeholder="输入设备 ID / 名称，支持包含匹配">
             </div>
             <div class="filter-row">
+                <span class="site-filter-label">持续时间过滤</span>
+                <input id="durationFilterInput" class="site-filter-input" type="number" min="0" step="1" placeholder="至少几分钟（留空或0不过滤）">
                 <span class="site-filter-label">备注过滤</span>
                 <input id="noteFilterInput" class="site-filter-input" type="text" placeholder="输入备注关键词，支持包含匹配">
             </div>
@@ -1075,17 +1077,53 @@
             return `${formatTs(timestamps[0])} ~ ${formatTs(timestamps[timestamps.length - 1])}`;
         }
 
+        function parseClearTimeSeconds(value) {
+            if (value === null || value === undefined || value === '') return null;
+            if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+            const str = String(value).trim();
+            if (!str || str === '-') return null;
+            if (/^\d+(\.\d+)?$/.test(str)) return Number(str); // 纯数字按 epoch 秒
+            // "YYYY-MM-DD HH:MM:SS" 用 '/' 分隔可被各浏览器稳定按本地时区解析
+            const ms = Date.parse(str.replace(/-/g, '/'));
+            return Number.isFinite(ms) ? ms / 1000 : null;
+        }
+
+        // 持续时间 = 最晚的告警清除时间 − 最早的告警发生时间
         function getGroupDurationSeconds(group) {
             const symptoms = group.symptoms || [];
-            const timestamps = symptoms
+            const startTimes = symptoms
                 .map(symptom => symptom && symptom.ts)
-                .filter(ts => ts !== null && ts !== undefined)
-                .sort((a, b) => a - b);
-
-            if (timestamps.length < 2) {
+                .filter(ts => ts !== null && ts !== undefined);
+            if (startTimes.length === 0) {
                 return 0;
             }
-            return timestamps[timestamps.length - 1] - timestamps[0];
+            const earliestStart = Math.min(...startTimes);
+
+            const clearTimes = symptoms
+                .map(symptom => parseClearTimeSeconds(symptom && (symptom['告警清除时间'] || symptom.alarm_clear_time)))
+                .filter(ts => ts !== null && ts !== undefined);
+            // 无任何可解析的清除时间 → 视为持续中，时长为 Infinity（任何过滤阈值都通过）
+            if (clearTimes.length === 0) {
+                return Infinity;
+            }
+            const latestEnd = Math.max(Math.max(...clearTimes), Math.max(...startTimes));
+
+            return Math.max(0, latestEnd - earliestStart);
+        }
+
+        function formatDuration(seconds) {
+            if (!Number.isFinite(seconds)) {
+                return '持续中（无清除时间）';
+            }
+            const total = Math.max(0, Math.round(seconds));
+            const h = Math.floor(total / 3600);
+            const m = Math.floor((total % 3600) / 60);
+            const s = total % 60;
+            const parts = [];
+            if (h > 0) parts.push(`${h}小时`);
+            if (m > 0) parts.push(`${m}分`);
+            parts.push(`${s}秒`);
+            return parts.join('');
         }
 
         function mergeStringLists(...lists) {
@@ -1393,7 +1431,7 @@
                     }
                 }
 
-                if (durationFilterSeconds > 0 && getGroupDurationSeconds(group) <= durationFilterSeconds) {
+                if (durationFilterSeconds > 0 && getGroupDurationSeconds(group) < durationFilterSeconds) {
                     return false;
                 }
 
@@ -1520,7 +1558,7 @@
                         ${badge}
                         <span class="card-stats">站点 ${getSiteCount(group)} · 设备 ${getNodeCount(group)} · 告警 ${getSymptomCount(group)}</span>
                     </div>
-                    <div class="time">时间范围：${escapeHtml(getGroupTimeRange(group))}</div>
+                    <div class="time">时间范围：${escapeHtml(getGroupTimeRange(group))}（持续 ${escapeHtml(formatDuration(getGroupDurationSeconds(group)))}）</div>
                     ${note ? `<div class="card-note">📝 ${escapeHtml(note)}</div>` : ''}
                 </div>
             `;
@@ -1608,6 +1646,12 @@
 
         document.getElementById('deviceFilterInput').addEventListener('input', function(event) {
             deviceFilterQuery = event.target.value.trim();
+            renderGroups();
+        });
+
+        document.getElementById('durationFilterInput').addEventListener('input', function(event) {
+            const minutes = parseFloat(event.target.value);
+            durationFilterSeconds = (isNaN(minutes) || minutes <= 0) ? 0 : minutes * 60;
             renderGroups();
         });
 

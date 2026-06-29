@@ -2305,6 +2305,18 @@
                 <div class="device-filter-status" id="deviceTypeFilterStatus">显示全部设备</div>
             </div>
 
+            <div class="device-filter-panel" id="alarmDurationFilterPanel">
+                <h4>告警持续时间筛选</h4>
+                <div style="display:flex; align-items:center; gap:6px;">
+                    <span style="font-size:12px; color:#24292f;">至少</span>
+                    <input type="number" id="alarmDurationFilterInput" min="0" step="1"
+                        style="width:70px; padding:4px 6px; font-size:12px; border:1px solid #d0d7de; border-radius:6px;"
+                        placeholder="0" oninput="updateAlarmDurationFilter(this.value)">
+                    <span style="font-size:12px; color:#24292f;">分钟</span>
+                </div>
+                <div class="device-filter-status" id="alarmDurationFilterStatus">显示全部告警</div>
+            </div>
+
             <!-- 备注编辑区域 -->
             <div class="note-panel" id="notePanel">
                 <h3>故障组备注</h3>
@@ -4297,8 +4309,8 @@
         function getNodeAlarmGroupIds(node) {
             const groups = [];
             const seen = new Set();
-            (node && Array.isArray(node.alarm) ? node.alarm : []).forEach(function(alarm) {
-                const groupId = getAlarmFaultGroupId(alarm);
+            getVisibleNodeAlarms(node).forEach(function(item) {
+                const groupId = getAlarmFaultGroupId(item.alarm);
                 if (!groupId) return;
                 if (!seen.has(groupId)) {
                     seen.add(groupId);
@@ -4311,7 +4323,7 @@
         function buildAlarmGroupPartition(nodes) {
             const groupMap = new Map();
             (nodes || []).forEach(function(node) {
-                const alarms = Array.isArray(node.alarm) ? node.alarm : [];
+                const alarms = getVisibleNodeAlarms(node).map(function(item) { return item.alarm; });
                 alarms.forEach(function(alarm) {
                     const groupId = getAlarmFaultGroupId(alarm);
                     if (!groupId) return;
@@ -4427,7 +4439,8 @@
                 popupContent += '<div class="popup-row">坐标: ' + Number(lat).toFixed(6) + ', ' + Number(lng).toFixed(6) + '</div>';
             }
 
-            if (node.alarm && node.alarm.length > 0) {
+            const visibleMarkerAlarms = getVisibleNodeAlarms(node);
+            if (visibleMarkerAlarms.length > 0) {
                 const alarmGroups = getNodeAlarmGroupIds(node);
                 if (alarmGroups.length > 0) {
                     popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">涉及故障组</div>' +
@@ -4439,7 +4452,9 @@
                         }).join('') +
                         '</div>';
                 }
-                const alarmRows = node.alarm.map(function(alarm, alarmIndex) {
+                const alarmRows = visibleMarkerAlarms.map(function(item) {
+                    const alarm = item.alarm;
+                    const alarmIndex = item.index;
                     const alarmTime = getAlarmDisplayTime(alarm);
                     const alarmClearTime = alarm['告警清除时间'] || alarm.alarm_clear_time || '-';
                     const alarmTitle = alarm.alarm_type || alarm.title || '未知告警';
@@ -4459,7 +4474,7 @@
                         buildAlarmRootCauseLabel(node, alarm, alarmIndex) +
                         '</div>';
                 }).join('');
-                popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">告警列表 (' + node.alarm.length + ' 个)</div>' + alarmRows;
+                popupContent += '<div class="popup-row" style="margin-top: 8px; color: #24292f; font-weight: 600;">告警列表 (' + visibleMarkerAlarms.length + ' 个)</div>' + alarmRows;
             } else {
                 popupContent += '<div class="popup-row">告警: 0 个</div>';
             }
@@ -4482,8 +4497,15 @@
             if (!node) return false;
             const entry = getNodeRootCauseEntry(node.id, false);
             if (!entry) return false;
-            if (entry.device === true) return true;
+            // 设备级根因仅在"无可见告警"时有效（与 computeDeviceRootCause 口径一致）
+            if (entry.device === true && !deviceHasAlarms(node)) return true;
             if (entry.alarms && typeof entry.alarms === 'object') {
+                // 仅统计"通过持续时间筛选的可见告警"对应的根因；被筛掉的告警不再算根因
+                if (Array.isArray(node.alarm)) {
+                    return getVisibleNodeAlarms(node).some(function(item) {
+                        return !!entry.alarms[getAlarmRootCauseKey(item.alarm, item.index)];
+                    });
+                }
                 return Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
             }
             return false;
@@ -4496,11 +4518,20 @@
             Object.keys(store).forEach(function(neId) {
                 const entry = store[neId];
                 if (!entry) return;
-                const hasAlarmRc = entry.alarms && typeof entry.alarms === 'object' &&
-                    Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+                const node = allNodes.find(function(n) { return n.id === neId; });
+                let hasAlarmRc;
+                if (node && Array.isArray(node.alarm)) {
+                    // 仅统计"通过持续时间筛选的可见告警"对应的根因
+                    hasAlarmRc = !!entry.alarms && getVisibleNodeAlarms(node).some(function(item) {
+                        return !!entry.alarms[getAlarmRootCauseKey(item.alarm, item.index)];
+                    });
+                } else {
+                    hasAlarmRc = entry.alarms && typeof entry.alarms === 'object' &&
+                        Object.keys(entry.alarms).some(function(k) { return !!entry.alarms[k]; });
+                }
                 if (hasAlarmRc) {
                     list.push({ id: neId, type: 'alarm' });
-                } else if (entry.device === true) {
+                } else if (entry.device === true && (!node || !deviceHasAlarms(node))) {
                     list.push({ id: neId, type: 'device' });
                 }
             });
@@ -4761,10 +4792,102 @@
             updateSiteNeighborSelectionUI();
         }
 
+        // ===== 告警持续时间筛选 =====
+        // 阈值（秒）。0 表示不筛选。筛掉持续时间 < 阈值的告警；
+        // 被筛掉的告警在 NE 页签里不再显示，NE 若因此无可见告警则边框置白、根因逻辑随之改变。
+        let alarmDurationFilterSeconds = 0;
+
+        function parseTimeToSeconds(value) {
+            if (value === null || value === undefined || value === '') return null;
+            if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+            const str = String(value).trim();
+            if (!str || str === '-') return null;
+            if (/^\d+(\.\d+)?$/.test(str)) return Number(str); // 纯数字按 epoch 秒
+            // "YYYY-MM-DD HH:MM:SS" 用 '/' 分隔可被各浏览器稳定按本地时区解析
+            const ms = Date.parse(str.replace(/-/g, '/'));
+            return Number.isFinite(ms) ? ms / 1000 : null;
+        }
+
+        function getAlarmStartSeconds(alarm) {
+            if (!alarm || typeof alarm !== 'object') return null;
+            const tsNum = Number(alarm.ts);
+            if (alarm.ts !== null && alarm.ts !== undefined && alarm.ts !== '' && Number.isFinite(tsNum)) {
+                return tsNum;
+            }
+            return parseTimeToSeconds(alarm.alarm_time || alarm.time || alarm.time_str);
+        }
+
+        function getAlarmClearSeconds(alarm) {
+            if (!alarm || typeof alarm !== 'object') return null;
+            return parseTimeToSeconds(alarm['告警清除时间'] || alarm.alarm_clear_time);
+        }
+
+        // 返回告警持续秒数；未清除（无清除时间）视为持续中→Infinity；起始时间缺失→null（无法判断）
+        function getAlarmDurationSeconds(alarm) {
+            const start = getAlarmStartSeconds(alarm);
+            if (start === null) return null;
+            const clear = getAlarmClearSeconds(alarm);
+            if (clear === null) return Infinity;
+            return Math.max(0, clear - start);
+        }
+
+        // 该告警是否通过持续时间筛选（即在 NE 页签中可见）。无法计算时长的不隐藏。
+        function isAlarmWithinDurationFilter(alarm) {
+            if (!(alarmDurationFilterSeconds > 0)) return true;
+            const dur = getAlarmDurationSeconds(alarm);
+            if (dur === null) return true;
+            return dur >= alarmDurationFilterSeconds;
+        }
+
+        // 返回通过筛选的告警，保留其在 node.alarm 中的原始下标（根因 key 依赖下标）
+        function getVisibleNodeAlarms(node) {
+            if (!node || !Array.isArray(node.alarm)) return [];
+            const out = [];
+            node.alarm.forEach(function(alarm, index) {
+                if (isAlarmWithinDurationFilter(alarm)) out.push({ alarm: alarm, index: index });
+            });
+            return out;
+        }
+
+        function updateAlarmDurationFilter(value) {
+            const minutes = parseFloat(value);
+            alarmDurationFilterSeconds = (isNaN(minutes) || minutes <= 0) ? 0 : minutes * 60;
+            const statusEl = document.getElementById('alarmDurationFilterStatus');
+            if (statusEl) {
+                statusEl.textContent = alarmDurationFilterSeconds > 0
+                    ? ('仅显示持续 ≥ ' + minutes + ' 分钟的告警')
+                    : '显示全部告警';
+            }
+            // 重绘地图以更新边框颜色（无可见告警的 NE 置白），并刷新已打开页签内容
+            renderMap({ preserveViewport: true });
+            refreshOpenPopupsContent();
+            renderRootCausePanel();
+        }
+
+        // 刷新所有已打开的设备页签 popup 内容（筛选变化后告警列表/计数随之更新）
+        function refreshOpenPopupsContent() {
+            try {
+                pinnedNodePopups.forEach(function(neId) {
+                    const node = getCurrentNodeById(neId) || allNodes.find(function(n) { return n.id === neId; });
+                    const marker = mapMarkers[neId];
+                    if (!node || !marker) return;
+                    const ll = marker.getLatLng ? marker.getLatLng() : null;
+                    marker.setPopupContent(buildNodeMarkerPopup(node, ll && ll.lat, ll && ll.lng));
+                });
+            } catch (error) {
+                console.warn('刷新页签内容失败:', error);
+            }
+            const alarmPopup = document.getElementById('alarmPopup');
+            if (alarmPopup && alarmPopup.classList.contains('show') && currentAlarmNodeId) {
+                const node = getCurrentNodeById(currentAlarmNodeId) || allNodes.find(function(n) { return n.id === currentAlarmNodeId; });
+                if (node) showAlarmPopup(node);
+            }
+        }
+
         function nodeHasAlarm(node) {
             if (!node || typeof node !== 'object') return false;
             if (Array.isArray(node.alarm)) {
-                return node.alarm.length > 0;
+                return getVisibleNodeAlarms(node).length > 0;
             }
             return Number(node.alarm_count || 0) > 0;
         }
@@ -5439,7 +5562,7 @@
         }
 
         function deviceHasAlarms(node) {
-            return !!(node && Array.isArray(node.alarm) && node.alarm.length > 0);
+            return getVisibleNodeAlarms(node).length > 0;
         }
 
         function isAlarmRootCause(neId, alarm, index) {
@@ -5453,7 +5576,10 @@
             const entry = getNodeRootCauseEntry(node.id, false);
             if (deviceHasAlarms(node)) {
                 if (!entry) return false;
-                return node.alarm.some(function(a, i) { return !!entry.alarms[getAlarmRootCauseKey(a, i)]; });
+                // 仅按"通过筛选的可见告警"派生设备级根因（被筛掉的告警不计入）
+                return getVisibleNodeAlarms(node).some(function(item) {
+                    return !!entry.alarms[getAlarmRootCauseKey(item.alarm, item.index)];
+                });
             }
             return !!(entry && entry.device);
         }
@@ -5714,11 +5840,14 @@
                 alarmHtml += '<div style="padding: 10px; color: #57606a; font-size: 12px; background: #f6f8fa; border-radius: 6px;">该设备无告警</div>';
             }
 
+            const visiblePopupAlarms = getVisibleNodeAlarms(node);
             if (hasAlarms) {
-            alarmHtml += '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + node.alarm.length + ' 个):</div>' +
+            alarmHtml += '<div style="font-weight: bold; margin-bottom: 10px; color: #24292f;">告警列表 (' + visiblePopupAlarms.length + ' 个):</div>' +
                 '<div class="alarm-list">';
 
-            node.alarm.forEach(function(alarm, index) {
+            visiblePopupAlarms.forEach(function(item) {
+                const alarm = item.alarm;
+                const index = item.index;
                 const alarmType = alarm.alarm_type || '未知';
                 const severity = alarm.severity || alarm.alarm_level || 'warning';
                 const description = alarm.description || alarm.alarm_desc || '-';

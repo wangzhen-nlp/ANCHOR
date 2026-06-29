@@ -3,15 +3,11 @@
 """
 一次性生成 site_graph.json / ne_graph.json / link_peer_index.json 三个产物。
 
-这是 extract_site_graph.py、extract_ne_graph.py、build_link_peer_index.py 的合并版。
-三个独立工具各自都要读一遍并去重同一份链路文件，且 SYS_NE 被读取两次、ne_graph
-还要把 site_graph.json 从磁盘读回。本工具把这些共享读取合并为：
+读取过程共享，避免重复 IO：
 
 - SYS_NE 读取 1 次（得到完整 NE 信息，并据此派生 nativeId->site_id 映射）
-- SYS_SITE 读取 1 次（站点信息直接驻留内存，供 site 图与 ne 图共用）
+- SYS_SITE 读取 1 次（站点信息驻留内存，供 site 图与 ne 图共用）
 - 链路读取 + 去重 1 次（单趟遍历同时聚合 site 邻接、ne 邻接与端口对端索引）
-
-本文件自包含，不依赖上述三个脚本，输出与它们逐字节等价。
 """
 
 import json
@@ -411,7 +407,7 @@ def build_graphs(latest_links: list, ne_site_map: dict):
 
 
 def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
-    """合并站点信息与站点邻接关系，等价于 extract_site_graph 的输出。"""
+    """合并站点信息与站点邻接关系，生成 site_graph。"""
     result = {}
     for site_id in (set(site_info) | set(site_links)):
         site_data = dict(site_info.get(site_id, _DEFAULT_SITE))
@@ -421,7 +417,7 @@ def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
 
 
 def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
-    """合并 NE 信息、站点信息与 NE 邻接关系，等价于 extract_ne_graph 的输出。"""
+    """合并 NE 信息、站点信息与 NE 邻接关系，生成 ne_graph。"""
     ne_graph = {}
     for ne_id in (set(ne_links) | set(ne_info)):
         ne_data = dict(ne_info.get(ne_id, {}))
