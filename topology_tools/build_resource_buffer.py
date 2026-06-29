@@ -21,7 +21,6 @@ import csv
 import io
 import zipfile
 import argparse
-import itertools
 import stat
 
 from dataclasses import asdict, dataclass
@@ -68,16 +67,6 @@ CSV_FILE_SUFFIXES = ('.csv', '.zip')
 # 链路记录的去重键字段，按优先级取第一个非空值
 LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
 
-# build_graphs 实际用到的链路字段；去重时只保留这些，避免在内存中驻留整条原始记录
-LINK_NEEDED_FIELDS = (
-    "a_end_ne_nativeId", "a_end_ne_nativeId(')",
-    "z_end_ne_nativeId", "z_end_ne_nativeId(')",
-    "link_layer",
-    "a_end_port_name", "z_end_port_name",
-    "a_end_port_ip", "z_end_port_ip",
-    "a_end_ne_manager_name", "z_end_ne_manager_name",
-)
-
 # site_graph 中缺省站点信息（NE 引用了某站点但 SYS_SITE 中无该站点时使用）
 _DEFAULT_SITE = {
     'site_name': '',
@@ -106,18 +95,6 @@ def _require_last_modified(record: dict, row_number: int, source: str) -> int:
             f"{source} 第 {row_number} 行 last_Modified 格式错误: {raw!r}"
             f"（要求为毫秒级 Unix 时间戳，形如 1758256413325）"
         )
-
-
-def _keep_latest(records: dict, key: str, last_modified: int, payload, duplicates: dict = None) -> None:
-    """同 key 去重：只保留 last_Modified 更晚的记录，不做字段合并；时间相同保留先读到的。
-
-    传入 duplicates(dict) 时，会累加重复 key 的额外出现次数，供明细报告使用。
-    """
-    existing = records.get(key)
-    if existing is not None and duplicates is not None:
-        duplicates[key] += 1
-    if existing is None or last_modified > existing[0]:
-        records[key] = (last_modified, payload)
 
 
 def _report_duplicate_detail(duplicates: dict, label: str) -> None:
@@ -312,13 +289,70 @@ def _link_dedup_key(record) -> str:
     return ''
 
 
+def _get_record_value(record, *field_names):
+    for field_name in field_names:
+        value = str(record.get(field_name, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+@dataclass(frozen=True, slots=True)
+class LatestLink:
+    """去重阶段驻留的紧凑链路记录；字段均已按构图口径完成解析。"""
+
+    last_modified: int
+    a_ne: str
+    z_ne: str
+    link_type: str
+    a_port: str
+    z_port: str
+    a_ip: str
+    z_ip: str
+    a_manager: str
+    z_manager: str
+
+
+def _parse_latest_link(record: dict, last_modified: int) -> LatestLink:
+    """把原始 CSV/JSON 记录压缩成 build_graphs 实际使用的语义字段。"""
+    return LatestLink(
+        last_modified=last_modified,
+        a_ne=_get_record_value(
+            record, "a_end_ne_nativeId", "a_end_ne_nativeId(')"
+        ).upper(),
+        z_ne=_get_record_value(
+            record, "z_end_ne_nativeId", "z_end_ne_nativeId(')"
+        ).upper(),
+        link_type=(record.get('link_layer') or '').strip().upper(),
+        a_port=_get_record_value(record, "a_end_port_name"),
+        z_port=_get_record_value(record, "z_end_port_name"),
+        a_ip=_get_record_value(record, "a_end_port_ip"),
+        z_ip=_get_record_value(record, "z_end_port_ip"),
+        a_manager=_get_record_value(record, "a_end_ne_manager_name"),
+        z_manager=_get_record_value(record, "z_end_ne_manager_name"),
+    )
+
+
+def _consume_latest_links(keyed_records: list, no_key_records: list):
+    """保持既有顺序逐条产出，弹出后即置空槽位，使已构图记录尽早回收。
+
+    入参均为普通 list（去重字典在调用前已转 list 并清空），因此消费阶段不再驻留
+    去重哈希表与链路 ID 字符串，只剩一段随消费逐步缩小的指针数组。
+    """
+    for records in (keyed_records, no_key_records):
+        for index, payload in enumerate(records):
+            records[index] = None
+            yield payload
+        records.clear()
+
+
 def load_latest_link_records(link_input: str, report_duplicates: bool = False):
     """读取链路记录并按 last_Modified 去重：同一链路 ID 只保留最新记录。
 
     无法确定链路 ID 的记录不参与去重，原样保留。
 
-    去重时只保留 build_graphs 用得到的字段（见 LINK_NEEDED_FIELDS），不在内存中
-    驻留整条原始记录；返回惰性可迭代对象，调用方单趟遍历即可，避免再物化成大列表。
+    去重时把原始记录解析为 slots 紧凑对象，不在内存中驻留字段字典；返回惰性可迭代
+    对象，调用方单趟遍历并逐条从去重表弹出，避免完整去重表与完整图长期重叠。
 
     产出顺序与原始实现完全一致（按链路 ID 首次出现的顺序给出其最新记录，再接所有
     无 ID 记录），以保证 build_graphs 中“同 (ne,port) 键后写覆盖”等顺序相关行为不变。
@@ -335,21 +369,27 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
             progress.set(row_count)
         last_modified = _require_last_modified(record, row_count, '链路输入')
         key = _link_dedup_key(record)
-        slim = {name: record[name] for name in LINK_NEEDED_FIELDS if name in record}
         if not key:
-            no_key_records.append(slim)
+            no_key_records.append(_parse_latest_link(record, last_modified))
             continue
-        _keep_latest(records, key, last_modified, slim, duplicates)
+        existing = records.get(key)
+        if existing is not None:
+            if duplicates is not None:
+                duplicates[key] += 1
+            if last_modified <= existing.last_modified:
+                continue
+        records[key] = _parse_latest_link(record, last_modified)
     progress.set(row_count)
     progress.close()
 
     unique_count = len(records) + len(no_key_records)
     print(f"  读取 {row_count} 行，去重后 {unique_count} 条链路记录")
     _report_duplicate_detail(duplicates, '链路ID')
-    return itertools.chain(
-        (payload for _, payload in records.values()),
-        no_key_records,
-    )
+
+    # 转成 value 列表并立即清空字典：在构图开始前就释放去重哈希表与全部链路 ID 字符串
+    keyed_records = list(records.values())
+    records.clear()
+    return _consume_latest_links(keyed_records, no_key_records)
 
 
 # --------------------------------------------------------------------------- #
@@ -373,14 +413,6 @@ def _normalize_port_key(port_name):
 
 def _make_key(ne_id, port_name):
     return f"{_normalize_ne_key(ne_id)}|{_normalize_port_key(port_name)}"
-
-
-def _get_record_value(record, *field_names):
-    for field_name in field_names:
-        value = str(record.get(field_name, "") or "").strip()
-        if value:
-            return value
-    return ""
 
 
 def _json_default(obj):
@@ -412,7 +444,7 @@ def _add_bidirectional_edge(graph: dict, a: str, b: str, link_type: str) -> None
         rev[link_type] = '<-'
 
 
-def build_graphs(latest_links, ne_site_map: dict = None, *, ne_info: dict = None):
+def build_graphs(latest_links, ne_info: dict):
     """单趟遍历去重后的链路，同时构建 site 邻接图、ne 邻接图与端口对端索引。
 
     Returns:
@@ -430,9 +462,19 @@ def build_graphs(latest_links, ne_site_map: dict = None, *, ne_info: dict = None
     }
 
     for record in latest_links:
-        a_ne = _get_record_value(record, "a_end_ne_nativeId", "a_end_ne_nativeId(')").upper()
-        z_ne = _get_record_value(record, "z_end_ne_nativeId", "z_end_ne_nativeId(')").upper()
-        link_type = (record.get('link_layer') or '').strip().upper()
+        if isinstance(record, LatestLink):
+            a_ne = record.a_ne
+            z_ne = record.z_ne
+            link_type = record.link_type
+        else:
+            # 兼容直接调用 build_graphs 的既有 dict 输入。
+            a_ne = _get_record_value(
+                record, "a_end_ne_nativeId", "a_end_ne_nativeId(')"
+            ).upper()
+            z_ne = _get_record_value(
+                record, "z_end_ne_nativeId", "z_end_ne_nativeId(')"
+            ).upper()
+            link_type = (record.get('link_layer') or '').strip().upper()
 
         if a_ne and z_ne:
             # NE 邻接图
@@ -442,90 +484,91 @@ def build_graphs(latest_links, ne_site_map: dict = None, *, ne_info: dict = None
 
             # 站点邻接图：两端 NE 都能映射到站点时才登记
             stats['site_link_count'] += 1
-            if ne_info is None:
-                a_site = ne_site_map.get(a_ne)
-                z_site = ne_site_map.get(z_ne)
-            else:
-                a_site = ne_info.get(a_ne, {}).get('site_id')
-                z_site = ne_info.get(z_ne, {}).get('site_id')
+            a_site = ne_info.get(a_ne, {}).get('site_id')
+            z_site = ne_info.get(z_ne, {}).get('site_id')
             if a_site and z_site:
                 stats['site_mapped_count'] += 1
                 _add_bidirectional_edge(site_links, a_site, z_site, link_type)
 
             # 端口对端索引：还需两端端口名
-            a_port = _get_record_value(record, "a_end_port_name")
-            z_port = _get_record_value(record, "z_end_port_name")
+            if isinstance(record, LatestLink):
+                a_port = record.a_port
+                z_port = record.z_port
+                a_ip = record.a_ip
+                z_ip = record.z_ip
+                a_manager = record.a_manager
+                z_manager = record.z_manager
+            else:
+                a_port = _get_record_value(record, "a_end_port_name")
+                z_port = _get_record_value(record, "z_end_port_name")
+                a_ip = _get_record_value(record, "a_end_port_ip")
+                z_ip = _get_record_value(record, "z_end_port_ip")
+                a_manager = _get_record_value(record, "a_end_ne_manager_name")
+                z_manager = _get_record_value(record, "z_end_ne_manager_name")
             if a_port and z_port:
                 peer_index[_make_key(a_ne, a_port)] = PeerDevice(
                     ne_native_id=_normalize_ne_key(z_ne),
                     port_name=z_port,
-                    port_ip=_get_record_value(record, "z_end_port_ip"),
-                    manager_name=_get_record_value(record, "z_end_ne_manager_name"),
+                    port_ip=z_ip,
+                    manager_name=z_manager,
                 )
                 peer_index[_make_key(z_ne, z_port)] = PeerDevice(
                     ne_native_id=_normalize_ne_key(a_ne),
                     port_name=a_port,
-                    port_ip=_get_record_value(record, "a_end_port_ip"),
-                    manager_name=_get_record_value(record, "a_end_ne_manager_name"),
+                    port_ip=a_ip,
+                    manager_name=a_manager,
                 )
 
     return site_links, ne_links, peer_index, stats
 
 
-def assemble_site_graph(site_info: dict, site_links: dict, *, consume_links: bool = False) -> dict:
-    """合并站点信息与站点邻接关系；consume_links=True 时逐节点消费邻接输入。"""
-    result = {}
-    for site_id in (set(site_info) | set(site_links)):
-        site_data = dict(site_info.get(site_id, _DEFAULT_SITE))
-        links = (
-            site_links.pop(site_id, {})
-            if consume_links
-            else site_links.get(site_id, {})
-        )
-        site_data['link'] = dict(links)
-        result[site_id] = site_data
-    return result
+def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
+    """原地把站点信息补成 site_graph：给每个站点挂 link 字段，返回 site_info 自身。
 
-
-def assemble_ne_graph(
-    ne_info: dict,
-    site_info: dict,
-    ne_links: dict,
-    *,
-    consume_links: bool = False,
-) -> dict:
-    """合并 NE 信息、站点信息与 NE 邻接关系，生成 ne_graph。
-
-    注意：会原地改写 ne_info 中的 NE dict（调用方此后不应再使用 ne_info），
-    以免为每个 NE 额外复制一份，峰值内存可省去整份 NE 信息的副本。
+    直接复用 site_info 外层字典、并把 site_links 的邻接字典逐站点 pop 后直接挂载
+    （不再拷贝外层字典与邻接字典）。输出值与原实现完全一致，仅顶层站点的 key 顺序
+    由原来的集合并集顺序变为 site_info 插入顺序、缺省站点追加在后。
     """
-    ne_graph = {}
-    for ne_id in (set(ne_links) | set(ne_info)):
-        ne_data = ne_info.get(ne_id)
-        if ne_data is None:
-            ne_data = {}
+    for site_id, site_data in site_info.items():
+        site_data['link'] = site_links.pop(site_id, {})
+    # 仅出现在邻接里、SYS_SITE 中没有的站点，用缺省信息补齐
+    for site_id in list(site_links):
+        site_data = dict(_DEFAULT_SITE)
+        site_data['link'] = site_links.pop(site_id)
+        site_info[site_id] = site_data
+    return site_info
+
+
+def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
+    """原地把 NE 信息补成 ne_graph：补站点字段与 link 字段，返回 ne_info 自身。
+
+    直接复用 ne_info 外层字典与各 NE 内层字典，把 ne_links 的邻接字典逐节点 pop 后
+    直接挂载（不再额外创建 ne_graph 外层字典，也不再产生 set 并集临时集合）。
+    调用方此后不应再使用 ne_info。输出值与原实现完全一致，仅顶层 NE 的 key 顺序
+    由集合并集顺序变为 ne_info 插入顺序、缺省 NE 追加在后。
+    """
+    for ne_id, ne_data in ne_info.items():
         site_id = ne_data.get('site_id', '')
         site_data = site_info.get(site_id, {})
-
-        ne_data.update(
-            {
-                'site_id': site_id,
-                'site_name': site_data.get('site_name', ''),
-                'site_type': site_data.get('site_type', ''),
-                'longitude': site_data.get('longitude', ''),
-                'latitude': site_data.get('latitude', ''),
-            }
-        )
+        ne_data['site_id'] = site_id
+        ne_data['site_name'] = site_data.get('site_name', '')
+        ne_data['site_type'] = site_data.get('site_type', '')
+        ne_data['longitude'] = site_data.get('longitude', '')
+        ne_data['latitude'] = site_data.get('latitude', '')
         ne_data['region_id'] = ne_data.get('region_id', '') or site_data.get('region_id', '')
-        links = (
-            ne_links.pop(ne_id, {})
-            if consume_links
-            else ne_links.get(ne_id, {})
-        )
-        ne_data['link'] = dict(links)
-
-        ne_graph[ne_id] = ne_data
-    return ne_graph
+        ne_data['link'] = ne_links.pop(ne_id, {})
+    # 仅出现在邻接里、SYS_NE 中没有的 NE，用缺省字段补齐
+    for ne_id in list(ne_links):
+        ne_info[ne_id] = {
+            'site_id': '',
+            'site_name': '',
+            'site_type': '',
+            'longitude': '',
+            'latitude': '',
+            'region_id': '',
+            'link': ne_links.pop(ne_id),
+        }
+    return ne_info
 
 
 def build_site_device_counts(ne_graph: dict) -> dict:
@@ -645,8 +688,8 @@ def main():
     print(f"  NE图:   处理 {stats['ne_link_count']} 条链路，成功映射 {stats['ne_mapped_count']} 条")
 
     # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出
-    site_graph = assemble_site_graph(site_info, site_links, consume_links=True)
-    ne_graph = assemble_ne_graph(ne_info, site_info, ne_links, consume_links=True)
+    site_graph = assemble_site_graph(site_info, site_links)
+    ne_graph = assemble_ne_graph(ne_info, site_info, ne_links)
     site_device_counts = build_site_device_counts(ne_graph)
 
     # 保存汇总值后释放组装输入；ne_info/ne_graph 共享内层 NE dict，但外层 dict 可回收。
