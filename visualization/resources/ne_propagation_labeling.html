@@ -3094,7 +3094,6 @@
         let rcSourceFiles = {};     // uuid -> data/ 下源文件名（服务模式实时回写用）
         let rcOriginalGroup = null; // 当前组从文件载入时的原始对象（回写时只改标注/备注，保留其余字段）
         let _writeBackTimer = null; // 实时回写防抖计时器
-        let _noteSaveTimer = null;  // 备注输入防抖计时器（停止输入后才落盘/推总览）
         let neGraphData = null;
         let roleSiteSets = {
             associated_site: new Set(),
@@ -6692,8 +6691,7 @@
         // 切换离开当前组前：同步备注、把状态回写总览页、自动落盘
         function commitCurrentGroup(useBeacon) {
             if (!graphData) return;
-            // 这里会做完整保存，取消挂起的备注防抖计时器，避免切组后它晚到、把备注写到新组上
-            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
+            // 这里把当前备注落盘并回写总览；备注只在切组/返回总览/页面退出时保存
             const ta = document.getElementById('noteTextarea');
             if (ta) {
                 graphData.note = ta.value.trim();
@@ -8149,7 +8147,6 @@
 
         // 禁用备注面板
         function disableNotePanel() {
-            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
             const noteTextarea = document.getElementById('noteTextarea');
             noteTextarea.disabled = true;
             noteTextarea.value = '';
@@ -8305,30 +8302,13 @@
         }
 
         // 监听备注输入变化
-        // 停止输入后才执行的重活：写 localStorage + 推送总览（昂贵，按键时不能每次都跑）
-        function flushNoteSave() {
-            if (_noteSaveTimer) { clearTimeout(_noteSaveTimer); _noteSaveTimer = null; }
-            if (!graphData) return;
-            autoSaveResults();
-            pushStatusToOverview();
-        }
+        // 备注不再按键落盘：输入过程中只更新内存，真正的落盘 / 推总览统一交给
+        // commitCurrentGroup —— 仅在「切换故障组 / 返回总览 / 页面退出（关闭刷新）」时触发。
         document.getElementById('noteTextarea').addEventListener('input', function(e) {
             if (!graphData) return;
-            // 内存赋值极快、每次按键都做，保证数据不丢；trim 留到落盘时再做避免吞掉中间空格
+            // 内存赋值极快、每次按键都做，保证切组/退出时 commit 能取到最新值；trim 留到落盘时再做
             graphData.note = e.target.value;
             graphData.note_updated_at = new Date().toISOString();
-            // 防抖：连续输入时不断推迟，停手 400ms 后才落盘 / 推总览
-            if (_noteSaveTimer) clearTimeout(_noteSaveTimer);
-            _noteSaveTimer = setTimeout(function() {
-                graphData.note = graphData.note.trim();
-                flushNoteSave();
-            }, 400);
-        });
-        // 失焦兜底：点出输入框时立即落盘，避免不足 400ms 就切走导致丢失
-        document.getElementById('noteTextarea').addEventListener('blur', function() {
-            if (!_noteSaveTimer || !graphData) return;
-            graphData.note = (graphData.note || '').trim();
-            flushNoteSave();
         });
 
         // 文件处理
