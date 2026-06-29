@@ -440,10 +440,15 @@ def build_site_chains_from_data(
     for downstream_sites in first_hop_adjacency.values():
         all_sites.update(downstream_sites)
 
-    downstream_hops_by_site = {}
-    upstream_hops_by_site = {site_id: {} for site_id in all_sites}
-
     sorted_sites = sorted(all_sites)
+    site_chains = {
+        site_id: {
+            "bidirectional_sites": sorted(bidirectional_neighbors.get(site_id, set())),
+            "downstream_site_hops": {},
+            "upstream_site_hops": {},
+        }
+        for site_id in sorted_sites
+    }
     total_sites = len(sorted_sites)
     with ProgressReporter(total_sites, "site_chains: 生成每站点链路集合", show_progress) as progress:
         for site_id in sorted_sites:
@@ -466,25 +471,15 @@ def build_site_chains_from_data(
                 restriction_stats["downstream_relation_count_before"] += before_count
                 restriction_stats["downstream_relation_count_after"] += after_count
                 restriction_stats["removed_downstream_relation_count"] += before_count - after_count
-            downstream_hops_by_site[site_id] = downstream_site_hops
-            for downstream_site, hop in downstream_site_hops.items():
-                upstream_hops_by_site.setdefault(downstream_site, {})[site_id] = hop
-
-    site_chains = {}
-    for site_id in sorted_sites:
-        downstream_site_hops = downstream_hops_by_site.get(site_id, {})
-        upstream_site_hops = upstream_hops_by_site.get(site_id, {})
-        site_chains[site_id] = {
-            "bidirectional_sites": sorted(bidirectional_neighbors.get(site_id, set())),
-            "downstream_site_hops": {
+            # 直接填充最终结果，避免同时保留 downstream/upstream 中间表及其完整副本。
+            site_chains[site_id]["downstream_site_hops"] = {
                 downstream_site: downstream_site_hops[downstream_site]
                 for downstream_site in sorted(downstream_site_hops)
-            },
-            "upstream_site_hops": {
-                upstream_site: upstream_site_hops[upstream_site]
-                for upstream_site in sorted(upstream_site_hops)
-            },
-        }
+            }
+            # site_id 按 sorted_sites 递增处理，因此每个 upstream dict 的插入顺序
+            # 与原实现最后显式 sorted(upstream_site_hops) 的结果一致。
+            for downstream_site, hop in downstream_site_hops.items():
+                site_chains[downstream_site]["upstream_site_hops"][site_id] = hop
 
     edge_stats = edge_stats or {}
     meta = {

@@ -1164,7 +1164,9 @@ def complete_group_topology(
         excluded_ancestor_site_ids=non_offline_alarm_sites,
         data_site_ids=site_has_data,
     )
-    selected_sites = completion["selected_sites"]
+    # 上游祖先仍只由断站/Offline 告警站点推断，但只要站点上存在任意告警，
+    # 就应把该站点纳入设备展开范围，补齐站内没有告警的设备。
+    selected_sites = set(completion["selected_sites"]) | set(alarm_sites)
     topology_highlight_sites = _build_topology_highlight_sites(completion)
     (
         topology_highlight_sites,

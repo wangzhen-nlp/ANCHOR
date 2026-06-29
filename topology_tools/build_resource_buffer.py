@@ -22,6 +22,7 @@ import io
 import zipfile
 import argparse
 import itertools
+import stat
 
 from dataclasses import asdict, dataclass
 from collections import defaultdict
@@ -229,6 +230,12 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False
         nativeId = (row.get('nativeId') or '').strip().upper()
         if not nativeId:
             continue
+        existing = records.get(nativeId)
+        if existing is not None:
+            if duplicates is not None:
+                duplicates[nativeId] += 1
+            if last_modified <= existing[0]:
+                continue
         incoming = {
             'domain': (row.get('domain') or '').strip(),
             'type': (row.get('typeId') or '').strip(),
@@ -239,14 +246,16 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False
             'site_id': (row.get('ne_site_id') or '').strip().upper(),
             'running_status': (row.get('running_status') or '').strip()
         }
-        _keep_latest(records, nativeId, last_modified, incoming, duplicates)
+        records[nativeId] = (last_modified, incoming)
     progress.set(row_count)
     progress.close()
 
-    ne_info = {key: payload for key, (_, payload) in records.items()}
-    print(f"  读取 {row_count} 行，去重后 {len(ne_info)} 个NE")
+    # 只替换 value 不改变 key 与插入顺序，避免同时驻留第二个等大的外层 dict。
+    for key, (_, payload) in records.items():
+        records[key] = payload
+    print(f"  读取 {row_count} 行，去重后 {len(records)} 个NE")
     _report_duplicate_detail(duplicates, 'nativeId')
-    return ne_info
+    return records
 
 
 def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False) -> dict:
@@ -268,6 +277,12 @@ def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False
         site_id = (row.get('site_id') or '').strip().upper()
         if not site_id:
             continue
+        existing = records.get(site_id)
+        if existing is not None:
+            if duplicates is not None:
+                duplicates[site_id] += 1
+            if last_modified <= existing[0]:
+                continue
         incoming = {
             'site_name': (row.get('name') or '').strip(),
             'site_type': (row.get('site_type') or '').strip(),
@@ -276,14 +291,25 @@ def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False
             'region_id': (row.get('region_id') or '').strip(),
             'is_hub': _parse_bool(row.get('is_hub', '')),
         }
-        _keep_latest(records, site_id, last_modified, incoming, duplicates)
+        records[site_id] = (last_modified, incoming)
     progress.set(row_count)
     progress.close()
 
-    site_info = {key: payload for key, (_, payload) in records.items()}
-    print(f"  读取 {row_count} 行，去重后 {len(site_info)} 个站点")
+    # 只替换 value 不改变 key 与插入顺序，避免同时驻留第二个等大的外层 dict。
+    for key, (_, payload) in records.items():
+        records[key] = payload
+    print(f"  读取 {row_count} 行，去重后 {len(records)} 个站点")
     _report_duplicate_detail(duplicates, 'site_id')
-    return site_info
+    return records
+
+
+def _link_dedup_key(record) -> str:
+    """取链路去重键：按 LINK_KEY_FIELDS 优先级返回第一个非空值，全空返回 ''。"""
+    for field in LINK_KEY_FIELDS:
+        key = (record.get(field) or '').strip()
+        if key:
+            return key
+    return ''
 
 
 def load_latest_link_records(link_input: str, report_duplicates: bool = False):
@@ -293,6 +319,9 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
 
     去重时只保留 build_graphs 用得到的字段（见 LINK_NEEDED_FIELDS），不在内存中
     驻留整条原始记录；返回惰性可迭代对象，调用方单趟遍历即可，避免再物化成大列表。
+
+    产出顺序与原始实现完全一致（按链路 ID 首次出现的顺序给出其最新记录，再接所有
+    无 ID 记录），以保证 build_graphs 中“同 (ne,port) 键后写覆盖”等顺序相关行为不变。
     """
     records = {}
     no_key_records = []
@@ -305,11 +334,7 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
         last_modified = _require_last_modified(record, row_count, '链路输入')
-        key = ''
-        for field in LINK_KEY_FIELDS:
-            key = (record.get(field) or '').strip()
-            if key:
-                break
+        key = _link_dedup_key(record)
         slim = {name: record[name] for name in LINK_NEEDED_FIELDS if name in record}
         if not key:
             no_key_records.append(slim)
@@ -330,7 +355,7 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
 # --------------------------------------------------------------------------- #
 # 端口对端索引
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PeerDevice:
     ne_native_id: str
     port_name: str = ""
@@ -358,12 +383,11 @@ def _get_record_value(record, *field_names):
     return ""
 
 
-def serialize_peer_index(peer_index: dict) -> dict:
-    """把 peer_index 中的 PeerDevice 统一转成可序列化的普通 dict。"""
-    return {
-        key: asdict(value) if isinstance(value, PeerDevice) else dict(value)
-        for key, value in peer_index.items()
-    }
+def _json_default(obj):
+    """json.dump 的回退序列化器：把 PeerDevice 即时转 dict，避免预先整体物化一份。"""
+    if isinstance(obj, PeerDevice):
+        return asdict(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +412,7 @@ def _add_bidirectional_edge(graph: dict, a: str, b: str, link_type: str) -> None
         rev[link_type] = '<-'
 
 
-def build_graphs(latest_links: list, ne_site_map: dict):
+def build_graphs(latest_links, ne_site_map: dict = None, *, ne_info: dict = None):
     """单趟遍历去重后的链路，同时构建 site 邻接图、ne 邻接图与端口对端索引。
 
     Returns:
@@ -418,8 +442,12 @@ def build_graphs(latest_links: list, ne_site_map: dict):
 
             # 站点邻接图：两端 NE 都能映射到站点时才登记
             stats['site_link_count'] += 1
-            a_site = ne_site_map.get(a_ne)
-            z_site = ne_site_map.get(z_ne)
+            if ne_info is None:
+                a_site = ne_site_map.get(a_ne)
+                z_site = ne_site_map.get(z_ne)
+            else:
+                a_site = ne_info.get(a_ne, {}).get('site_id')
+                z_site = ne_info.get(z_ne, {}).get('site_id')
             if a_site and z_site:
                 stats['site_mapped_count'] += 1
                 _add_bidirectional_edge(site_links, a_site, z_site, link_type)
@@ -444,17 +472,28 @@ def build_graphs(latest_links: list, ne_site_map: dict):
     return site_links, ne_links, peer_index, stats
 
 
-def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
-    """合并站点信息与站点邻接关系，生成 site_graph。"""
+def assemble_site_graph(site_info: dict, site_links: dict, *, consume_links: bool = False) -> dict:
+    """合并站点信息与站点邻接关系；consume_links=True 时逐节点消费邻接输入。"""
     result = {}
     for site_id in (set(site_info) | set(site_links)):
         site_data = dict(site_info.get(site_id, _DEFAULT_SITE))
-        site_data['link'] = dict(site_links.get(site_id, {}))
+        links = (
+            site_links.pop(site_id, {})
+            if consume_links
+            else site_links.get(site_id, {})
+        )
+        site_data['link'] = dict(links)
         result[site_id] = site_data
     return result
 
 
-def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
+def assemble_ne_graph(
+    ne_info: dict,
+    site_info: dict,
+    ne_links: dict,
+    *,
+    consume_links: bool = False,
+) -> dict:
     """合并 NE 信息、站点信息与 NE 邻接关系，生成 ne_graph。
 
     注意：会原地改写 ne_info 中的 NE dict（调用方此后不应再使用 ne_info），
@@ -478,7 +517,12 @@ def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
             }
         )
         ne_data['region_id'] = ne_data.get('region_id', '') or site_data.get('region_id', '')
-        ne_data['link'] = dict(ne_links.get(ne_id, {}))
+        links = (
+            ne_links.pop(ne_id, {})
+            if consume_links
+            else ne_links.get(ne_id, {})
+        )
+        ne_data['link'] = dict(links)
 
         ne_graph[ne_id] = ne_data
     return ne_graph
@@ -522,6 +566,32 @@ def build_site_chains_field(ne_graph: dict) -> dict:
     )
 
 
+class _NestedIndentWriter:
+    """为单个顶层字段增加一级缩进，使分字段写出与 json.dump 格式一致。"""
+
+    def __init__(self, raw_file):
+        self.raw_file = raw_file
+
+    def write(self, text):
+        return self.raw_file.write(text.replace('\n', '\n  '))
+
+
+def _write_buffer_field(output_file, name: str, value, *, first: bool) -> None:
+    """按 json.dump(..., indent=2) 的格式写一个顶层字段。"""
+    if not first:
+        output_file.write(',\n')
+    output_file.write('  ')
+    json.dump(name, output_file, ensure_ascii=False)
+    output_file.write(': ')
+    json.dump(
+        value,
+        _NestedIndentWriter(output_file),
+        ensure_ascii=False,
+        indent=2,
+        default=_json_default,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="一次性生成单个资源缓冲文件（site_graph / ne_graph / link_peer_index / site_device_counts 各占一个字段）"
@@ -562,13 +632,6 @@ def main():
     ne_info = load_ne_from_csv(args.ne_dir, args.report_duplicates)
     print(f"  NE数量: {len(ne_info)}")
 
-    # 由 NE 信息派生 nativeId->site_id 映射，无需再读一遍 SYS_NE
-    ne_site_map = {
-        native_id: info['site_id']
-        for native_id, info in ne_info.items()
-        if info.get('site_id')
-    }
-
     # 2) SYS_SITE 读取一次
     print("\n加载站点信息...")
     site_info = load_site_info(args.site_dir, args.report_duplicates)
@@ -576,46 +639,83 @@ def main():
     # 3) 链路读取+去重一次，单趟遍历产出三张图
     print("\n生成传播图与对端索引...")
     latest_links = load_latest_link_records(args.link_input, args.report_duplicates)
-    site_links, ne_links, peer_index, stats = build_graphs(latest_links, ne_site_map)
+    site_links, ne_links, peer_index, stats = build_graphs(latest_links, ne_info=ne_info)
+    del latest_links  # 释放去重表（slim 记录）
     print(f"  站点图: 处理 {stats['site_link_count']} 条链路，成功映射 {stats['site_mapped_count']} 条")
     print(f"  NE图:   处理 {stats['ne_link_count']} 条链路，成功映射 {stats['ne_mapped_count']} 条")
 
     # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出
-    site_graph = assemble_site_graph(site_info, site_links)
-    ne_graph = assemble_ne_graph(ne_info, site_info, ne_links)
+    site_graph = assemble_site_graph(site_info, site_links, consume_links=True)
+    ne_graph = assemble_ne_graph(ne_info, site_info, ne_links, consume_links=True)
     site_device_counts = build_site_device_counts(ne_graph)
 
-    # 由 ne_graph 派生站点链路（pairwise 方向先验 + restrict-relation 裁剪）
-    print("\n生成站点链路(site_chains)...")
-    site_chains = build_site_chains_field(ne_graph)
+    # 保存汇总值后释放组装输入；ne_info/ne_graph 共享内层 NE dict，但外层 dict 可回收。
+    site_graph_count = len(site_graph)
+    site_neighbor_total = sum(len(v['link']) for v in site_graph.values())
+    site_neighbor_max = max((len(v['link']) for v in site_graph.values()), default=0)
+    ne_graph_count = len(ne_graph)
+    ne_with_site_count = sum(1 for ne in ne_graph.values() if ne.get('site_id'))
+    peer_index_count = len(peer_index)
+    site_device_count = len(site_device_counts)
+    del site_links, ne_links, ne_info, site_info
 
-    buffer = {
-        'site_graph': site_graph,
-        'ne_graph': ne_graph,
-        'link_peer_index': serialize_peer_index(peer_index),
-        'site_device_counts': site_device_counts,
-        'site_chains': site_chains,
-    }
-    with open(args.output, 'w', encoding='utf-8') as f:
-        json.dump(buffer, f, ensure_ascii=False, indent=2)
+    # 分字段写临时文件：site_chains 只依赖 ne_graph，先写并释放其余大字段，
+    # 避免 pairwise/site_chains 的临时结构与 site_graph、peer_index 叠加成峰值。
+    output_path = os.path.realpath(args.output)
+    temp_output = f"{output_path}.tmp.{os.getpid()}"
+    existing_mode = (
+        stat.S_IMODE(os.stat(output_path).st_mode)
+        if os.path.exists(output_path)
+        else None
+    )
+    try:
+        with open(temp_output, 'w', encoding='utf-8') as f:
+            f.write('{\n')
+            _write_buffer_field(f, 'site_graph', site_graph, first=True)
+            del site_graph
+
+            _write_buffer_field(f, 'ne_graph', ne_graph, first=False)
+
+            _write_buffer_field(f, 'link_peer_index', peer_index, first=False)
+            del peer_index
+
+            _write_buffer_field(f, 'site_device_counts', site_device_counts, first=False)
+            del site_device_counts
+
+            # 由 ne_graph 派生站点链路（pairwise 方向先验 + restrict-relation 裁剪）
+            print("\n生成站点链路(site_chains)...")
+            site_chains = build_site_chains_field(ne_graph)
+            _write_buffer_field(f, 'site_chains', site_chains, first=False)
+            f.write('\n}')
+
+        if existing_mode is not None:
+            os.chmod(temp_output, existing_mode)
+        os.replace(temp_output, output_path)
+    except BaseException:
+        try:
+            os.remove(temp_output)
+        except FileNotFoundError:
+            pass
+        raise
 
     # 汇总
     print(f"\n生成文件: {args.output}")
 
-    print(f"  [site_graph] 站点数: {len(site_graph)}")
-    site_neighbor_counts = [len(v['link']) for v in site_graph.values()]
-    if site_neighbor_counts:
-        print(f"    平均邻居站点数: {sum(site_neighbor_counts)/len(site_neighbor_counts):.1f}")
-        print(f"    最大邻居站点数: {max(site_neighbor_counts)}")
+    print(f"  [site_graph] 站点数: {site_graph_count}")
+    if site_graph_count:
+        print(f"    平均邻居站点数: {site_neighbor_total/site_graph_count:.1f}")
+        print(f"    最大邻居站点数: {site_neighbor_max}")
 
-    print(f"  [ne_graph] NE数: {len(ne_graph)}")
-    if ne_graph:
-        with_site = sum(1 for ne in ne_graph.values() if ne.get('site_id'))
-        print(f"    有站点信息的NE: {with_site} ({with_site/len(ne_graph)*100:.1f}%)")
+    print(f"  [ne_graph] NE数: {ne_graph_count}")
+    if ne_graph_count:
+        print(
+            f"    有站点信息的NE: {ne_with_site_count} "
+            f"({ne_with_site_count/ne_graph_count*100:.1f}%)"
+        )
 
-    print(f"  [link_peer_index] 对端索引记录数: {len(peer_index)}")
+    print(f"  [link_peer_index] 对端索引记录数: {peer_index_count}")
 
-    print(f"  [site_device_counts] 站点画像数: {len(site_device_counts)}")
+    print(f"  [site_device_counts] 站点画像数: {site_device_count}")
 
     site_chains_meta = site_chains.get('meta', {})
     print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")

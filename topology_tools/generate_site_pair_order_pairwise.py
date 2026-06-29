@@ -751,8 +751,16 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
     }
 
 
-def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_progress=False):
+def build_pairwise_orders(
+    inputs,
+    site_metrics,
+    pair_graph_metrics,
+    args,
+    show_progress=False,
+    compact_output=False,
+):
     pair_orders = {}
+    compact_edges = [] if compact_output else None
     downstream_map = defaultdict(set)
     before_directed_pair_count = 0
     before_bidirectional_pair_count = 0
@@ -812,7 +820,10 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                     strict_ring_entry_direction_pair_count += 1
                 if strict_ring_changed:
                     strict_ring_changed_pair_count += 1
-            pair_orders[f"{left_site}||{right_site}"] = pair_result
+            if compact_output:
+                compact_edges.append(compact_pairwise_prediction(pair_result))
+            else:
+                pair_orders[f"{left_site}||{right_site}"] = pair_result
 
             relation = pair_result["relation"]
             if relation == "<->":
@@ -825,7 +836,7 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
                     pair_result["preferred_target"]
                 )
 
-    return {
+    output = {
         "pair_orders": pair_orders,
         "downstream_map": {
             site_id: sorted(neighbors)
@@ -840,6 +851,9 @@ def build_pairwise_orders(inputs, site_metrics, pair_graph_metrics, args, show_p
         "strict_ring_entry_direction_pair_count": strict_ring_entry_direction_pair_count,
         "strict_ring_changed_pair_count": strict_ring_changed_pair_count,
     }
+    if compact_output:
+        output["compact_edges"] = compact_edges
+    return output
 
 
 def build_pairwise_meta(args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics):
@@ -887,18 +901,19 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
         inputs, args, show_progress=show_progress
     )
     pair_outputs = build_pairwise_orders(
-        inputs, site_metrics, pair_graph_metrics, args, show_progress=show_progress
+        inputs,
+        site_metrics,
+        pair_graph_metrics,
+        args,
+        show_progress=show_progress,
+        compact_output=True,
     )
     meta = build_pairwise_meta(
         args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
     )
-    compact_edges = [
-        compact_pairwise_prediction(pair_result)
-        for pair_result in pair_outputs["pair_orders"].values()
-    ]
     return {
         "meta": meta,
-        "edges": compact_edges,
+        "edges": pair_outputs["compact_edges"],
         "downstream_map": pair_outputs["downstream_map"],
     }
 
