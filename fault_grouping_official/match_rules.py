@@ -49,7 +49,7 @@ class RuntimeExecutionPlan:
 def _build_arg_parser():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
-    parser.add_argument('output', type=str, nargs='?', help='output jsonl file；--no-output 时可省略')
+    parser.add_argument('output', type=str, help='output jsonl file')
     parser.add_argument('--resource-buffer', type=str, default=RESOURCE_BUFFER_JSONL, help=f'build_resource_buffer.py 生成的资源缓冲文件（含 ne_graph / site_chains / link_peer_index），默认: {resource_display("resource_buffer.jsonl")}')
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='offline', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=DEFAULT_HARVEST_INTERVAL_SEC, help=f'模拟时间下的定时收割周期，单位秒，默认 {DEFAULT_HARVEST_INTERVAL_SEC:g}')
@@ -57,8 +57,6 @@ def _build_arg_parser():
     parser.add_argument('--clear-delay-sec', type=float, default=DEFAULT_CLEAR_DELAY_SEC, help=f'清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间，默认 {DEFAULT_CLEAR_DELAY_SEC:g}')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--stream-sorted-alarms', action='store_true', help='从排序告警缓存流式读取，不把全部 valid_alarms 加载到内存；仅当 alarms 本身为 prepare_sorted_alarms.py 生成的排序缓存(JSONL/ZIP)时生效')
-    parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
-    parser.add_argument('--no-output', action='store_true', help='只运行匹配与统计，不创建、不截断、不写入故障组输出 JSONL')
     return parser
 
 
@@ -90,17 +88,14 @@ def _prepare_runtime_execution(parser, args):
         valid_alarm_titles,
         sorted_alarm_cache_metadata,
     )
-    if args.no_output:
-        alarm_metadata_index = {}
-    else:
-        metadata_alarm_iter = alarm_load_result.valid_alarms
-        if args.stream_sorted_alarms:
-            metadata_alarm_iter = _iter_with_progress(
-                alarm_load_result.valid_alarms,
-                alarm_load_result.filtered_count,
-                "构建告警元数据索引",
-            )
-        alarm_metadata_index = build_alarm_metadata_index(metadata_alarm_iter)
+    metadata_alarm_iter = alarm_load_result.valid_alarms
+    if args.stream_sorted_alarms:
+        metadata_alarm_iter = _iter_with_progress(
+            alarm_load_result.valid_alarms,
+            alarm_load_result.filtered_count,
+            "构建告警元数据索引",
+        )
+    alarm_metadata_index = build_alarm_metadata_index(metadata_alarm_iter)
     print_alarm_load_summary(alarm_load_result)
     output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
     return RuntimeExecutionPlan(

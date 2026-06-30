@@ -64,8 +64,6 @@ class AlarmLoadResult:
 
 
 def validate_main_args(parser, args):
-    if not args.no_output and not args.output:
-        parser.error("未指定 output；正常输出模式必须提供 output，或使用 --no-output 跳过故障组输出")
     sorted_alarm_cache_metadata = try_read_sorted_alarm_cache_header(args.alarms)
     if args.stream_sorted_alarms and sorted_alarm_cache_metadata is None:
         parser.error(
@@ -131,8 +129,6 @@ def load_static_context(args):
 def print_run_configuration(args, valid_alarm_titles):
     if args.clear_delay_sec > 0:
         print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
-    if args.no_output:
-        print("故障组输出: 关闭（--no-output，仅统计不写 JSONL）")
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
 
 

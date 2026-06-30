@@ -39,8 +39,6 @@ class MatchOutputSession:
     _fw: object = field(default=None, init=False, repr=False)
 
     def reset_output_file(self):
-        if self.args.no_output:
-            return
         # 先关掉已有句柄，再截断文件并打开新句柄。
         with self.output_lock:
             self._close_fw_locked()
@@ -83,11 +81,6 @@ class MatchOutputSession:
 
     def write_matches(self, matches):
         with self.output_lock:
-            if self.args.no_output:
-                self.match_count += len(matches)
-                self.refresh_progress_extra_text()
-                return
-
             fw = self._fw
             if fw is None:
                 raise RuntimeError("output file is not initialized; call reset_output_file() first")
@@ -99,7 +92,6 @@ class MatchOutputSession:
                     self.alarm_metadata_index,
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
-                    compact_output=self.args.compact_output,
                 )
                 output_lines.append(_dumps_line(enriched_match))
             fw.writelines(output_lines)

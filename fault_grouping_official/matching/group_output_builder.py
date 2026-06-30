@@ -53,7 +53,7 @@ def _get_ne_static_info(ne_graph_data, ne_id):
     return info
 
 
-def format_ne_link_info(ne_graph_entry, compact_output=False):
+def format_ne_link_info(ne_graph_entry):
     raw_links = ne_graph_entry.get("link", {}) if isinstance(ne_graph_entry, dict) else {}
     if not isinstance(raw_links, dict):
         return {}
@@ -69,42 +69,27 @@ def format_ne_link_info(ne_graph_entry, compact_output=False):
 
         connection_type = ",".join(connection_types)
         topology = ",".join(topologies)
-        if compact_output:
-            formatted_link = {}
-            if connection_type:
-                formatted_link["connection_type"] = connection_type
-            if topology:
-                formatted_link["topology"] = topology
-        else:
-            formatted_link = {
-                "connection_type": connection_type,
-                "distance": "",
-                "topology": topology,
-                "time_window": "",
-                "left_alarm": {},
-                "right_alarm": {},
-            }
+        formatted_link = {}
+        if connection_type:
+            formatted_link["connection_type"] = connection_type
+        if topology:
+            formatted_link["topology"] = topology
 
         formatted_links[neighbor_id] = formatted_link
     return formatted_links
 
 
-def get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache, compact_output=False):
-    cache_key = (ne_id, compact_output)
-    if cache_key not in ne_link_info_cache:
-        ne_link_info_cache[cache_key] = format_ne_link_info(
-            ne_graph_data.get(ne_id, {}),
-            compact_output=compact_output,
-        )
-    return ne_link_info_cache[cache_key]
+def get_cached_ne_link_info(ne_id, ne_graph_data, ne_link_info_cache):
+    if ne_id not in ne_link_info_cache:
+        ne_link_info_cache[ne_id] = format_ne_link_info(ne_graph_data.get(ne_id, {}))
+    return ne_link_info_cache[ne_id]
 
 
-def build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache, compact_output=False):
+def build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache):
     formatted_links = get_cached_ne_link_info(
         ne_id,
         ne_graph_data,
         ne_link_info_cache,
-        compact_output=compact_output,
     )
     link_info = {}
 
@@ -148,7 +133,6 @@ def build_group_output(
     ne_graph_data,
     site_to_ne_ids,
     ne_link_info_cache,
-    compact_output=False,
 ):
     group_id = match["uuid"]
     ne_info = {}
@@ -225,7 +209,6 @@ def build_group_output(
                 group_ne_id_set,
                 ne_graph_data,
                 ne_link_info_cache=ne_link_info_cache,
-                compact_output=compact_output,
             ),
             "group": group_id,
             "name": ne_static["name"],
@@ -240,8 +223,6 @@ def build_group_output(
             "longitude": site_context["longitude"],
             "latitude": site_context["latitude"],
         }
-        if not compact_output:
-            node_info["alarm"] = alarms
 
         ne_info[ne_id] = node_info
 
@@ -326,7 +307,6 @@ def build_jsonl_match_output(
     alarm_metadata_index,
     site_to_ne_ids,
     ne_link_info_cache,
-    compact_output=False,
 ):
     enriched_match = dict(match)
     enriched_match["symptoms"] = enrich_match_symptoms(
@@ -339,7 +319,6 @@ def build_jsonl_match_output(
         ne_graph_data,
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
-        compact_output=compact_output,
     )
     timestamps = [symptom["ts"] for symptom in enriched_match["symptoms"]]
     group_anchor_ts = min(timestamps) if timestamps else None
