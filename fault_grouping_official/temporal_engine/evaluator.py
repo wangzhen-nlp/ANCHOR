@@ -151,6 +151,13 @@ class TemporalGraphEngineEvaluatorMixin:
             self.sites_domain_map.get(phys_node, {}),
             role_cfg,
         )
+        # Compound roles do not define ``site_rules`` themselves; their child
+        # patterns do.  In that case resolve_expected_alarms() legitimately
+        # returns None, so there is no role-level link-alarm requirement to
+        # apply here.
+        if not isinstance(expected, dict):
+            return frozenset()
+
         required_alarms = expected.get("required_alarms")
         if required_alarms is None:
             return frozenset()
