@@ -9,7 +9,7 @@
 3. 计算每个站点到 anchor 的 hops 与层级分数；
 4. 只对相邻站点对输出 A->B / B->A / <-> 三态方向关系。
 
-这里不再强行给所有站点排全序；当局部与全局证据都不够时，保留双向边。
+这里不强行给所有站点排全序；当局部与全局证据都不够时，保留双向边。
 """
 
 from collections import Counter, defaultdict, deque
@@ -124,7 +124,7 @@ def compute_connected_components(all_sites, site_neighbors, show_progress=False)
 
     # 全程不排序：分量划分与成员集合是图不变量，遍历/输出顺序不影响边方向判断
     # （anchor 选择内部自带 site_id 全序，core_distance 为 BFS 最短路，均与顺序无关）。
-    # 代价：component_id 编号与 full-output 顺序不再跨运行稳定，但二者都不参与决策。
+    # 代价：component_id 编号与 full-output 顺序可能不跨运行稳定，但二者都不参与决策。
     with ProgressReporter(len(all_sites), "pairwise: 计算连通分量", show_progress) as progress:
         for start_site in all_sites:
             progress.update()

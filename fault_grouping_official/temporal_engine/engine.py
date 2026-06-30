@@ -219,7 +219,7 @@ class TemporalGraphEngine(
             raise ValueError("必须提供非空 site_chain_index")
 
         # site_chains 是快速路径；当其中缺少站点时，回退到 ne_graph 派生的
-        # 站点级正反向拓扑做 BFS，与 fault_grouping 的遍历策略保持一致。
+        # 站点级正反向拓扑做 BFS。
         self.topo_down = topo_downstream_map or {}
         self.topo_up = collections.defaultdict(list)
         for upstream_site, downstream_sites in self.topo_down.items():

@@ -1,18 +1,11 @@
-"""故障模式分析与记录增强（self-contained 移植）。
+"""故障模式分析与记录增强。
 
-从 ticket_recall/evaluation/analyze_case_fault_patterns.py 移植两部分逻辑，使
-fault_grouping_official 不依赖 ticket_recall / 旧 fault_grouping / alarm_tools /
-topology_resources 等外部包，做到自满足：
+主要功能：
 
-  1) 过滤判定：站点连通分量拆分、断站吸收、链/环模式识别（analyze_case_record /
+  1) 过滤判定：站点连通分量拆分、断站吸收、链/环模式识别（analyze_case_record、
      filter_other_patterns / SiteRelationIndex 等）。
   2) 记录增强：故障模式备注（note）、fault_pattern_* 字段、补充相关站点/网元/链路
      （supplemental_fault_pattern_context，供 ne_propagation_visualizer.html 标红展示）。
-
-不含原脚本的 IO、汇总、CLI 以及 build_augmented_case_record 外壳（该外壳的 27 行
-编排在 fault_pattern_filter.py 中按原样实现，但省去 deepcopy——因为传入的是每个故障组
-新构建、未被共享的记录，可安全原地改写）。其余函数与原脚本逐行一致；若原脚本行为有变，
-请对照同步。OFFLINE_ALARMS 取官方版本（与 alarm_tools 版集合相同）。
 """
 
 from collections import defaultdict, deque
@@ -35,16 +28,15 @@ PATTERN_PRIORITY = {
     "unknown": 99,
 }
 
-# —— 性能保护参数（官方新增，非移植自原脚本）——
+# —— 性能保护参数 ——
 # longest_path_in_component 对 ≤N 个站的分量做穷举 DFS 找最长简单链；该穷举随分量稠密度
-# 指数级膨胀（实测稠密 14~15 站即从毫秒跳到秒级乃至卡死）。原脚本对 >18 的分量退化到双
-# BFS 近似，但实测该近似在带环分量上严重偏差（哈密顿覆盖几乎 100% 漏判），会把环型模式误
-# 判成 unknown，不可用于落盘判定。
+# 指数级膨胀（实测稠密 14~15 站即从毫秒跳到秒级乃至卡死）。双 BFS 近似在带环分量上
+# 偏差严重（哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown，不可用于落盘判定。
 #
 # 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
 # unknown -> 该故障组被丢弃，而不是给出错误的近似链。
-# 默认 18：≤18 的分量与原脚本逐字一致；要削掉稠密大分量的耗时，调小该值即可（实测拐点在
-# 13~14 附近，可按数据规模权衡 速度 vs 召回）。
+# 默认 18；要削掉稠密大分量的耗时，调小该值即可（实测拐点在 13~14 附近，可按数据规模
+# 权衡速度与召回）。
 LONGEST_PATH_EXACT_MAX_SITES = 18
 
 
@@ -346,7 +338,7 @@ def longest_path_in_component(component, relation_index):
         for site_id in component
     }
 
-    # ≤N 的分量用 DFS 穷举最长简单链（与原脚本一致）。
+    # ≤N 的分量用 DFS 穷举最长简单链。
     if len(component) <= LONGEST_PATH_EXACT_MAX_SITES:
         best_path = []
 
@@ -370,8 +362,7 @@ def longest_path_in_component(component, relation_index):
             dfs([start], {start})
         return best_path
 
-    # 官方偏离原脚本：>N 的分量不再退化到双 BFS 近似（该近似在带环分量上严重偏差，
-    # 见 LONGEST_PATH_EXACT_MAX_SITES 注释），直接返回空链。classify_component 的
+    # >N 的分量不采用误差较大的双 BFS 近似，直接返回空链。classify_component 的
     # `set(chain) != set(unmanaged_component)` 覆盖校验会因此跳过该分量，最终落为
     # unknown -> 故障组被丢弃，避免给出错误的模式分类。
     return []

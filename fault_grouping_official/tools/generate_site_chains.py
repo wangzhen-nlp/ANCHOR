@@ -398,8 +398,7 @@ def build_site_chains_from_data(
                 downstream_site: downstream_site_hops[downstream_site]
                 for downstream_site in sorted(downstream_site_hops)
             }
-            # site_id 按 sorted_sites 递增处理，因此每个 upstream dict 的插入顺序
-            # 与原实现最后显式 sorted(upstream_site_hops) 的结果一致。
+            # site_id 按 sorted_sites 递增处理，因此每个 upstream dict 的插入顺序稳定。
             for downstream_site, hop in downstream_site_hops.items():
                 site_chains[downstream_site]["upstream_site_hops"][site_id] = hop
 

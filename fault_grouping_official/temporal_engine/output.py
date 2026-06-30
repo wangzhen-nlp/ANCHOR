@@ -277,7 +277,7 @@ class TemporalGraphEngineOutputMixin:
         if distance_candidates:
             return min(distance_candidates)[2]
 
-        # 无 site_chains 或无法用 downstream_hops 判定时，保持原有遍历顺序 first-win。
+        # 无 site_chains 或无法用 downstream_hops 判定时，按遍历顺序 first-win。
         return min(roles, key=lambda role: role_order[role])
 
     def _apply_default_site_role_ownership(self, inst, rule, nodes_cfg):

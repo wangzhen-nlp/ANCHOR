@@ -163,7 +163,7 @@ def collect_output_eligible_rules(rules_config):
 
     match_rules.py 输出故障组前据此过滤——只有 merged_rules 命中其中任意一个
     规则的故障组才会写入输出文件。若没有任何规则被标记，返回 None 表示不过滤
-    （全部落盘），保持旧行为。
+    （全部落盘）。
     """
     eligible = frozenset(
         rule_name
@@ -180,8 +180,7 @@ def collect_output_eligible_rules(rules_config):
 def build_fault_pattern_filter(static_context):
     """构建落盘前故障模式过滤器（filter-others + one-component-only，默认启用）。
 
-    复用 ticket_recall.evaluation.analyze_case_fault_patterns 的分析逻辑，依赖
-    较重（牵出 fault_grouping / alarm_tools 等），故按需在函数内延迟导入。
+    过滤器仅在启用时使用，因此在函数内延迟导入。
     """
     from fault_grouping_official.matching.fault_pattern_filter import FaultPatternFilter
 

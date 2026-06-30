@@ -1,11 +1,10 @@
 # resources
 
-`fault_grouping_official` 的自包含资源目录。所有工具与 matcher 默认依赖的资源文件、
+`fault_grouping_official` 的资源目录。所有工具与 matcher 默认依赖的资源文件、
 数据目录都集中放在这里，由 [`tools/topology_resources.py`](../tools/topology_resources.py)
 统一解析（`RESOURCE_DIR = fault_grouping_official/resources`）。
 
-本包不依赖仓库其它目录：不再回退到仓库根目录或仓库级 `topology_resources/` 的旧位置。
-把真实数据直接放到这里即可。
+资源路径固定在本目录，把真实数据直接放到这里即可。
 
 ## 默认约定的资源
 

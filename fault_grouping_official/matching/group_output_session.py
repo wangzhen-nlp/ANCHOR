@@ -35,7 +35,7 @@ class MatchOutputSession:
     # 只有 merged_rules 命中其中任意一个规则的故障组才会写入输出文件。
     output_eligible_rules: object = None
     # 落盘前故障模式过滤器（FaultPatternFilter）。None 表示不做故障模式过滤。
-    # 等价 analyze_case_fault_patterns.py --filter-others --one-component-only。
+    # 默认剔除 other 模式，并要求故障组只有一个连通分量。
     fault_pattern_filter: object = None
     match_count: int = 0
     process_progress: object = None

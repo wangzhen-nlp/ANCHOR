@@ -7,7 +7,7 @@ from fault_grouping_official.time_config import (
 # 规则字典上的可选布尔字段：标记为 True 的规则才算“可落盘规则”。
 # match_rules.py 输出故障组前会做一次过滤——只有 merged_rules 命中任意一个
 # 带 output_eligible=True 的规则的故障组，才会写入输出文件。
-# 若所有规则都没标记该字段，则不做过滤（全部落盘），保持旧行为。
+# 若所有规则都没标记该字段，则不做过滤（全部落盘）。
 # 引擎只读取 nodes/edges/trigger_role 等已知字段，多出来的该字段会被安全忽略。
 OUTPUT_ELIGIBLE_RULE_FIELD = "output_eligible"
 

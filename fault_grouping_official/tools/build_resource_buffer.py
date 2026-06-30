@@ -71,7 +71,7 @@ _DEFAULT_SITE = {
 
 
 def _resource_buffer_pairwise_args():
-    """固定 build_resource_buffer 的 pairwise 行为，不再暴露/拼装 CLI flags。"""
+    """固定 build_resource_buffer 的 pairwise 行为，不暴露或拼装 CLI flags。"""
     return SimpleNamespace(
         ne_graph="<resource_buffer: ne_graph>",
         output="<resource_buffer: site_pair_order_pairwise>",
@@ -374,8 +374,8 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
     去重时把原始记录解析为 slots 紧凑对象，不在内存中驻留字段字典；返回惰性可迭代
     对象，调用方单趟遍历并逐条从去重表弹出，避免完整去重表与完整图长期重叠。
 
-    产出顺序与原始实现完全一致（按链路 ID 首次出现的顺序给出其最新记录，再接所有
-    无 ID 记录），以保证 build_graphs 中“同 (ne,port) 键后写覆盖”等顺序相关行为不变。
+    按链路 ID 首次出现的顺序给出其最新记录，再接所有无 ID 记录，以保证
+    build_graphs 中“同 (ne,port) 键后写覆盖”等顺序相关行为稳定。
     """
     records = {}
     no_key_records = []
@@ -511,9 +511,8 @@ def build_graphs(latest_links, ne_info: dict):
 def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
     """原地把站点信息补成 site_graph：给每个站点挂 link 字段，返回 site_info 自身。
 
-    直接复用 site_info 外层字典、并把 site_links 的邻接字典逐站点 pop 后直接挂载
-    （不再拷贝外层字典与邻接字典）。输出值与原实现完全一致，仅顶层站点的 key 顺序
-    由原来的集合并集顺序变为 site_info 插入顺序、缺省站点追加在后。
+    直接复用 site_info 外层字典、并把 site_links 的邻接字典逐站点 pop 后直接挂载，
+    避免拷贝外层字典与邻接字典。顶层站点保持 site_info 插入顺序，缺省站点追加在后。
     """
     for site_id, site_data in site_info.items():
         site_data['link'] = site_links.pop(site_id, {})
@@ -529,9 +528,8 @@ def assemble_ne_graph(ne_info: dict, site_info: dict, ne_links: dict) -> dict:
     """原地把 NE 信息补成 ne_graph：补站点字段与 link 字段，返回 ne_info 自身。
 
     直接复用 ne_info 外层字典与各 NE 内层字典，把 ne_links 的邻接字典逐节点 pop 后
-    直接挂载（不再额外创建 ne_graph 外层字典，也不再产生 set 并集临时集合）。
-    调用方此后不应再使用 ne_info。输出值与原实现完全一致，仅顶层 NE 的 key 顺序
-    由集合并集顺序变为 ne_info 插入顺序、缺省 NE 追加在后。
+    直接挂载，避免创建 ne_graph 外层字典和 set 并集临时集合。调用方此后不应再使用
+    ne_info。顶层 NE 保持 ne_info 插入顺序，缺省 NE 追加在后。
     """
     for ne_id, ne_data in ne_info.items():
         site_id = ne_data.get('site_id', '')
@@ -575,7 +573,7 @@ def build_site_device_counts(ne_graph: dict) -> dict:
 
 
 def build_site_chains_field(ne_graph: dict) -> dict:
-    """在内存中复刻 site_chains.json 的生成链路，产出可作为缓冲字段的站点链路。
+    """在内存中生成 site_chains.json 对应的数据，产出可作为缓冲字段的站点链路。
 
     等价命令：
         generate_site_pair_order_pairwise.py

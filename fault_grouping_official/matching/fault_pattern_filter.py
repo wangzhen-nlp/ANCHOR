@@ -1,8 +1,6 @@
-"""落盘前的故障模式过滤 + 记录增强适配器。
+"""落盘前的故障模式过滤与记录增强。
 
-复用（移植自 ticket_recall/evaluation/analyze_case_fault_patterns.py 的）故障模式
-分析，等价于在该脚本上同时启用 --filter-others 与 --one-component-only，并作为默认
-行为，且与该脚本一样在保留的记录上追加模式信息：
+默认同时启用模式过滤与单连通分量约束，并在保留的记录上追加模式信息：
 
   - 过滤：仅当故障组拆分后 component_count == 1，且剔除 ip_ring_others 之后仍保留
     至少一个可识别故障模式时，才允许写入输出文件；否则在落盘前丢弃。
@@ -10,12 +8,10 @@
     站点/网元/链路（supplemental_fault_pattern_context，供 ne_propagation_
     visualizer.html 标红展示）。
 
-分析与增强都作用在 build_jsonl_match_output() 产出的“增强后”记录上（含 match_info /
-ne_info / group_info / symptoms），与该脚本作用于 case JSONL 的结构一致。
+分析与增强都作用在 build_jsonl_match_output() 产出的记录上（含 match_info /
+ne_info / group_info / symptoms）。
 """
 
-# 分析与增强逻辑已移植进官方包（fault_pattern_analysis），不再依赖 ticket_recall /
-# 旧 fault_grouping / alarm_tools 等外部包，保证 fault_grouping_official 自满足。
 from fault_grouping_official.matching.fault_pattern_analysis import (
     SiteRelationIndex,
     absorb_unmanaged_downstream_sites,
@@ -59,12 +55,12 @@ class FaultPatternFilter:
         site_to_ne_ids,
         site_graph_data=None,
     ):
-        """用官方 static_context 已有的数据构建过滤器，无需额外 site_chains 文件。
+        """用 static_context 已有的数据构建过滤器，无需额外 site_chains 文件。
 
-        官方 site_chain_index 与 analyze 脚本里 load_site_chain_index 的结构一致
-        （downstream_site_hops / upstream_site_hops / bidirectional_sites），可直接
-        注入 SiteRelationIndex 并展开为直接上下游/双向邻接关系；缺失时退化为仅凭
-        ne_graph 拓扑（此时没有双向环关系，无法识别 ip_ring_* 模式）。
+        site_chain_index 包含 downstream_site_hops、upstream_site_hops 和
+        bidirectional_sites，可直接注入 SiteRelationIndex 并展开为直接上下游/双向
+        邻接关系；缺失时退化为仅凭 ne_graph 拓扑（此时没有双向环关系，无法识别
+        ip_ring_* 模式）。
         """
         if site_chain_index:
             relation_index = SiteRelationIndex()
@@ -85,17 +81,13 @@ class FaultPatternFilter:
     def process(self, record):
         """对单条增强后记录做过滤与模式增强。
 
-        返回增强后的记录（保留并写盘）；若被过滤掉则返回 None（不落盘）。等价于
-        analyze_case_fault_patterns.py 在 --filter-others --one-component-only 下，
-        对保留 case 调用 build_augmented_case_record 后写出。
+        返回增强后的记录（保留并写盘）；若被过滤掉则返回 None（不落盘）。
 
-        过滤判定（与该脚本一致）：
+        过滤判定：
           - one-component-only：拆分后必须是单连通分量（component_count == 1）。
-          - filter-others + 无条件兜底：剔除 ip_ring_others 后必须仍有可识别模式。
-            （脚本中“had_other 且过滤后为空则丢弃”与“过滤后为空则丢弃”两条分支，
-            合并即：过滤 others 后无模式 -> 丢弃。）
-        增强使用的是“剔除 others 之后”的分析结果，与脚本中先 filter_other_patterns
-        再 build_augmented_case_record 的顺序一致。
+          - filter-others + 无条件兜底：剔除 ip_ring_others 后必须仍有可识别模式，
+            否则丢弃。
+        增强使用“剔除 others 之后”的分析结果。
         """
         # ① one-component-only 提前短路：先用便宜的方式算出投影连通分量数，!= 1 的组
         #    必被丢弃，可跳过 analyze_case_record 里逐分量的 classify_component
@@ -120,10 +112,10 @@ class FaultPatternFilter:
     def _projected_component_count(self, record):
         """与 analyze_case_record 一致地算出投影连通分量数，但不做逐分量分类。
 
-        仅由已移植的原语组合而成（extract_case_sites / extract_offline_sites /
+        由 extract_case_sites / extract_offline_sites /
         absorb_unmanaged_downstream_sites / projected_active_components_by_original_graph），
-        与 analyze_case_record 计算 component_count 的步骤逐行对应，因此判定一致；
-        差别只是省掉了昂贵的 classify_component。
+        按 analyze_case_record 计算 component_count 的同一流程执行，但省掉昂贵的
+        classify_component。
         """
         site_ids = extract_case_sites(record)
         offline_sites = extract_offline_sites(record, self._ne_to_site) & set(site_ids)
@@ -140,10 +132,9 @@ class FaultPatternFilter:
         return len(projected_components)
 
     def _augment(self, record, analysis):
-        """原样实现 build_augmented_case_record 的编排，但省去 deepcopy。
+        """把分析结果写入记录，省去不必要的 deepcopy。
 
-        record 是每个故障组新构建、未被共享的增强记录，可安全原地改写——这是与
-        脚本唯一的差异（脚本对外部传入的 case 先 deepcopy 再改写）。
+        record 是每个故障组新构建、未被共享的记录，可安全原地改写。
         """
         pattern_note = build_pattern_note(analysis)
 
