@@ -1,6 +1,8 @@
 import json
 import zipfile
 
+from datetime import datetime
+
 from fault_grouping_official.alarm_events.identity import ALARM_IDENTITY_SCHEME, require_alarm_identity
 
 
@@ -23,6 +25,14 @@ def _require_cached_alarm_identity(item):
         "eid": eid,
         "occurrence_uuid": item.get("occurrence_uuid") if isinstance(item, dict) else None,
     })
+
+
+def build_sorted_alarm_cache_metadata(**kwargs):
+    metadata = dict(kwargs)
+    metadata["cache_type"] = SORTED_ALARM_CACHE_TYPE
+    metadata["alarm_identity_scheme"] = ALARM_IDENTITY_SCHEME
+    metadata["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return metadata
 
 
 def is_sorted_alarm_cache_header(record):
@@ -126,6 +136,33 @@ class SortedAlarmCacheStream:
                 break
             self._first_ts_loaded = True
         return self._first_ts
+
+
+def _write_sorted_alarm_cache_jsonl(stream, sorted_alarms, header):
+    stream.write(json.dumps(header, ensure_ascii=False) + "\n")
+    for item in sorted_alarms:
+        _require_cached_alarm_identity(item)
+        stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def write_sorted_alarm_cache(path, sorted_alarms, metadata=None):
+    metadata = metadata or {}
+    header = build_sorted_alarm_cache_metadata(**metadata)
+    header["alarm_count"] = len(sorted_alarms)
+
+    if str(path).lower().endswith(".zip"):
+        zip_member = header.get("zip_member") or SORTED_ALARM_CACHE_MEMBER
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            with zf.open(zip_member, "w") as raw:
+                raw.write((json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8"))
+                for item in sorted_alarms:
+                    _require_cached_alarm_identity(item)
+                    raw.write((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+    else:
+        with open(path, "w", encoding="utf-8") as fw:
+            _write_sorted_alarm_cache_jsonl(fw, sorted_alarms, header)
+
+    return header
 
 
 def load_sorted_alarm_cache(path, metadata, show_progress=False):

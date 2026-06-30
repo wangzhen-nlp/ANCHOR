@@ -74,7 +74,11 @@ def load_valid_alarms(
     valid_alarm_titles,
     valid_sites,
     ne_to_site,
+    start_ts=None,
+    end_ts=None,
     clear_delay_sec=0.0,
+    allowed_alarm_sources=None,
+    region_filter_stats=None,
     show_progress=True,
 ):
     processed_count = 0
@@ -90,6 +94,22 @@ def load_valid_alarms(
             continue
 
         alarm_source = str(alarm.get('告警源', '') or '').strip()
+        if allowed_alarm_sources is not None:
+            if region_filter_stats is not None:
+                region_filter_stats["raw_checked_alarm_count"] = (
+                    region_filter_stats.get("raw_checked_alarm_count", 0) + 1
+                )
+            if alarm_source not in allowed_alarm_sources:
+                if region_filter_stats is not None:
+                    region_filter_stats["raw_dropped_alarm_count"] = (
+                        region_filter_stats.get("raw_dropped_alarm_count", 0) + 1
+                    )
+                continue
+            if region_filter_stats is not None:
+                region_filter_stats["raw_kept_alarm_count"] = (
+                    region_filter_stats.get("raw_kept_alarm_count", 0) + 1
+                )
+
         site_id = alarm.get('站点ID', '')
         if not site_id or site_id not in valid_sites:
             site_id = ne_to_site.get(alarm_source, '')
@@ -98,6 +118,13 @@ def load_valid_alarms(
             continue
 
         first_occurrence_str = str(alarm.get("告警首次发生时间", "")).strip()
+        first_occurrence_ts = parse_datetime_text(
+            first_occurrence_str, "告警首次发生时间"
+        ).timestamp()
+        if start_ts is not None and first_occurrence_ts < start_ts:
+            continue
+        if end_ts is not None and first_occurrence_ts > end_ts:
+            continue
 
         occurrence_uuid = alarm_content_uuid(alarm)
         append_alarm_event(

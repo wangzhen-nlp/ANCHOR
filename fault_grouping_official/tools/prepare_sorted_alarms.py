@@ -1,45 +1,40 @@
-import json
 import os
 import time
 from argparse import ArgumentParser
-from pathlib import Path
 
 if __package__ in (None, ""):
-    import sys
+    from _script_env import ensure_package_parent
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    ensure_package_parent()
 
-from alarm_tools.alarm_types import CRITICAL_ALARMS
-from fault_grouping.alarm_events.io import (
+from fault_grouping_official.alarm_types import CRITICAL_ALARMS
+from fault_grouping_official.alarm_events.io import (
     is_clear_alarm,
     load_valid_alarms,
     parse_datetime_text,
     trim_trailing_clear_alarms,
 )
-from fault_grouping.site_topology import (
-    build_site_topology_from_ne_graph,
-)
-from fault_grouping.alarm_events.sorted_cache import write_sorted_alarm_cache
-from topology_resources import (
-    NE_GRAPH_JSON,
-    SITE_GRAPH_BY_NE_JSON,
+from fault_grouping_official.resource_buffer import load_resource_buffer
+from fault_grouping_official.site_topology import build_site_chain_index
+from fault_grouping_official.alarm_events.sorted_cache import write_sorted_alarm_cache
+from fault_grouping_official.tools.topology_resources import (
+    RESOURCE_BUFFER_JSONL,
     resource_display,
 )
-from topology_tools.region_utils import allowed_devices_for_regions, load_ne_graph, parse_regions
+from fault_grouping_official.tools.region_utils import (
+    allowed_devices_for_regions,
+    parse_regions,
+)
 
 
-def _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path):
-    ne_graph_data = load_ne_graph(ne_graph_path)
-    if topo_path:
-        topo_downstream_map = json.load(open(topo_path, "r", encoding="utf-8"))
-        valid_sites = set(topo_downstream_map.keys())
-        for _, connected_sites in topo_downstream_map.items():
-            if isinstance(connected_sites, list):
-                valid_sites.update(connected_sites)
-            elif isinstance(connected_sites, dict):
-                valid_sites.update(connected_sites.keys())
-    else:
-        _topo_downstream_map, valid_sites = build_site_topology_from_ne_graph(ne_graph_data)
+def _load_valid_sites_and_ne_mapping(resource_buffer_path):
+    """从 resource_buffer.jsonl 取 ne_graph / site_chains，与 match_rules.py 口径一致。"""
+    resources = load_resource_buffer(
+        resource_buffer_path,
+        wanted_types=("ne_graph", "site_chains"),
+    )
+    ne_graph_data = resources["ne_graph"]
+    _site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
 
     ne_to_site = {
         ne_id: str(ne_info.get("site_id", "")).strip()
@@ -52,8 +47,7 @@ def _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path):
 def build_sorted_alarms(
     alarm_input,
     *,
-    topo_path=SITE_GRAPH_BY_NE_JSON,
-    ne_graph_path=NE_GRAPH_JSON,
+    resource_buffer_path=RESOURCE_BUFFER_JSONL,
     start_time=None,
     end_time=None,
     clear_delay_sec=0.0,
@@ -66,7 +60,7 @@ def build_sorted_alarms(
         raise ValueError("start_time 不能晚于 end_time")
 
     selected_regions = parse_regions(regions)
-    valid_sites, ne_to_site, ne_graph_data = _load_valid_sites_and_ne_mapping(topo_path, ne_graph_path)
+    valid_sites, ne_to_site, ne_graph_data = _load_valid_sites_and_ne_mapping(resource_buffer_path)
     allowed_alarm_sources = None
     region_filter_stats = {
         "stage": "raw_input",
@@ -103,8 +97,7 @@ def build_sorted_alarms(
     cached_clear_alarm_count = len(valid_alarms) - cached_normal_alarm_count
     metadata = {
         "source_alarms": os.path.abspath(alarm_input),
-        "topo": os.path.abspath(topo_path) if topo_path else "",
-        "ne_graph": os.path.abspath(ne_graph_path),
+        "resource_buffer": os.path.abspath(resource_buffer_path),
         "start_time": start_time or "",
         "end_time": end_time or "",
         "clear_delay_sec": float(clear_delay_sec),
@@ -138,19 +131,13 @@ def main():
     parser.add_argument("alarms", help="原始告警输入，支持 jsonl/csv/zip/目录，与 match_rules.py 一致")
     parser.add_argument("output", help="排序告警缓存输出；后缀为 .zip 时写压缩包，否则写 JSONL")
     parser.add_argument(
-        "--topo",
+        "--resource-buffer",
         type=str,
-        default=SITE_GRAPH_BY_NE_JSON,
+        default=RESOURCE_BUFFER_JSONL,
         help=(
-            f"站点拓扑文件，默认: {resource_display('site_graph_by_ne.json')}；"
-            "若传空值则退回为基于 ne_graph.json 原始连边自动构建"
+            "build_resource_buffer.py 生成的资源缓冲文件（含 ne_graph / site_chains），"
+            f"与 match_rules.py 一致，默认: {resource_display('resource_buffer.jsonl')}"
         ),
-    )
-    parser.add_argument(
-        "--ne-graph",
-        type=str,
-        default=NE_GRAPH_JSON,
-        help=f"ne_graph.json 文件，默认: {resource_display('ne_graph.json')}",
     )
     parser.add_argument("--start_time", type=str, help="仅处理告警首次发生时间 >= 该时间")
     parser.add_argument("--end_time", type=str, help="仅处理告警首次发生时间 <= 该时间")
@@ -173,8 +160,7 @@ def main():
     start_time = time.time()
     valid_alarms, metadata = build_sorted_alarms(
         args.alarms,
-        topo_path=args.topo,
-        ne_graph_path=args.ne_graph,
+        resource_buffer_path=args.resource_buffer,
         start_time=args.start_time,
         end_time=args.end_time,
         clear_delay_sec=args.clear_delay_sec,
