@@ -1,3 +1,5 @@
+import collections
+
 from fault_grouping_official.temporal_engine.utils import _normalize_edge_directions
 
 
@@ -154,8 +156,10 @@ class TemporalGraphEngineTraversalMixin:
             max_hops=max_hops,
         )
         if result is None:
-            raise ValueError(
-                f"site_chains 缺少站点 {start_node!r} 或不支持遍历方向 {direction!r}"
+            result = self._traverse_site_topology_bfs(
+                start_node,
+                direction,
+                max_hops,
             )
 
         with self._topo_cache_lock:
@@ -163,4 +167,36 @@ class TemporalGraphEngineTraversalMixin:
             self.global_topo_cache.move_to_end(cache_key)
             if len(self.global_topo_cache) > self.max_topo_cache_size:
                 self.global_topo_cache.popitem(last=False)
+        return result
+
+    def _get_site_topology_neighbors(self, node, direction):
+        if direction == "downstream":
+            return self.topo_down.get(node, ())
+        if direction == "upstream":
+            return self.topo_up.get(node, ())
+        if direction == "bidirectional":
+            return tuple(
+                set(self.topo_down.get(node, ()))
+                & set(self.topo_up.get(node, ()))
+            )
+        raise ValueError(f"不支持遍历方向 {direction!r}")
+
+    def _traverse_site_topology_bfs(self, start_node, direction, max_hops):
+        start_node = str(start_node or "").strip()
+        visited = {start_node}
+        queue = collections.deque([(start_node, 0)])
+        result = {}
+
+        while queue:
+            current_node, hops = queue.popleft()
+            if hops > 0:
+                result[current_node] = hops
+            if max_hops is not None and hops >= max_hops:
+                continue
+            for neighbor in self._get_site_topology_neighbors(current_node, direction):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append((neighbor, hops + 1))
+
         return result

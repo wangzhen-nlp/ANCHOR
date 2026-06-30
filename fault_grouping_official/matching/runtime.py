@@ -32,6 +32,7 @@ from fault_grouping_official.site_topology import (
     build_site_domain_map,
     build_site_to_ne_ids,
     build_site_chain_index,
+    build_site_topology_from_ne_graph,
 )
 from fault_grouping_official.link_peer_index import build_peer_index
 from fault_grouping_official.resource_buffer import load_resource_buffer
@@ -41,6 +42,7 @@ from fault_grouping_official.resource_buffer import load_resource_buffer
 class LoadedStaticContext:
     ne_graph_data: dict
     valid_sites: set
+    topo_downstream_map: dict
     site_chain_index: object
     site_domain_map: dict
     ne_to_site: dict
@@ -88,8 +90,11 @@ def load_static_context(args):
     )
     ne_graph_data = resources["ne_graph"]
     site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
+    topo_downstream_map, topology_sites = build_site_topology_from_ne_graph(ne_graph_data)
+    valid_sites.update(topology_sites)
     site_domain_map = build_site_domain_map(ne_graph_data)
     print(f"预计算站点链路站点数: {len(site_chain_index)}")
+    print(f"ne_graph 站点拓扑起点数: {len(topo_downstream_map)}")
 
     print("加载有效站点集合...")
     print(f"有效站点数: {len(valid_sites)}")
@@ -116,6 +121,7 @@ def load_static_context(args):
     return LoadedStaticContext(
         ne_graph_data=ne_graph_data,
         valid_sites=valid_sites,
+        topo_downstream_map=topo_downstream_map,
         site_chain_index=site_chain_index,
         site_domain_map=site_domain_map,
         ne_to_site=ne_to_site,
@@ -151,6 +157,7 @@ def initialize_engine(args, static_context, rules_config):
         static_context.site_domain_map,
         alarm_source_domain_map=static_context.alarm_source_domain_map,
         aggregation_wait_sec=args.aggregation_wait_sec,
+        topo_downstream_map=static_context.topo_downstream_map,
         site_chain_index=static_context.site_chain_index,
         ne_graph_data=static_context.ne_graph_data,
         site_to_ne_ids=static_context.site_to_ne_ids,
