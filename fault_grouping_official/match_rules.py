@@ -8,13 +8,9 @@ if __package__ in (None, ""):
 
     ensure_package_parent()
 
-from fault_grouping_official.tools.progress_utils import ProgressBar
 from fault_grouping_official.tools.topology_resources import (
     RESOURCE_BUFFER_JSONL,
     resource_display,
-)
-from fault_grouping_official.matching.group_output_builder import (
-    build_alarm_metadata_index,
 )
 from fault_grouping_official.matching.group_output_session import MatchOutputSession
 from fault_grouping_official.matching.runtime import (
@@ -60,13 +56,12 @@ def _build_arg_parser():
     return parser
 
 
-def _build_output_session(args, engine, static_context, alarm_metadata_index):
+def _build_output_session(args, engine, static_context):
     output_session = MatchOutputSession(
         args=args,
         engine=engine,
         output_path=args.output,
         ne_graph_data=static_context.ne_graph_data,
-        alarm_metadata_index=alarm_metadata_index,
         site_to_ne_ids=static_context.site_to_ne_ids,
         ne_link_info_cache=static_context.ne_link_info_cache,
     )
@@ -88,32 +83,14 @@ def _prepare_runtime_execution(parser, args):
         valid_alarm_titles,
         sorted_alarm_cache_metadata,
     )
-    metadata_alarm_iter = alarm_load_result.valid_alarms
-    if args.stream_sorted_alarms:
-        metadata_alarm_iter = _iter_with_progress(
-            alarm_load_result.valid_alarms,
-            alarm_load_result.filtered_count,
-            "构建告警元数据索引",
-        )
-    alarm_metadata_index = build_alarm_metadata_index(metadata_alarm_iter)
     print_alarm_load_summary(alarm_load_result)
-    output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
+    output_session = _build_output_session(args, engine, static_context)
     return RuntimeExecutionPlan(
         engine=engine,
         alarm_load_result=alarm_load_result,
         output_session=output_session,
         run_started_at=run_started_at,
     )
-
-
-def _iter_with_progress(iterable, total, label):
-    progress = ProgressBar(total, label)
-    try:
-        for item in iterable:
-            yield item
-            progress.update()
-    finally:
-        progress.close()
 
 
 def main():

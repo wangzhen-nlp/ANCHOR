@@ -28,7 +28,6 @@ class MatchOutputSession:
     engine: TemporalGraphEngine
     output_path: str
     ne_graph_data: dict
-    alarm_metadata_index: dict
     site_to_ne_ids: dict
     ne_link_info_cache: dict
     match_count: int = 0
@@ -89,7 +88,6 @@ class MatchOutputSession:
                 enriched_match = build_jsonl_match_output(
                     match,
                     self.ne_graph_data,
-                    self.alarm_metadata_index,
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
                 )

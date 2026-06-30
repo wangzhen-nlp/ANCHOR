@@ -3,7 +3,7 @@ from collections import defaultdict
 from functools import lru_cache
 from operator import itemgetter
 
-from fault_grouping_official.alarm_events.identity import require_alarm_identity, require_occurrence_uuid
+from fault_grouping_official.alarm_events.identity import require_occurrence_uuid
 
 
 _SORT_ALARM_KEY = itemgetter("alarm_time", "alarm_id")
@@ -245,58 +245,17 @@ def build_group_output(
     }
 
 
-def build_alarm_metadata_index(valid_alarms):
-    alarm_metadata_index = {}
-
-    def merge_metadata(key, metadata):
-        existing = alarm_metadata_index.setdefault(key, {})
-        for field_name, value in metadata.items():
-            if value and not existing.get(field_name):
-                existing[field_name] = value
-
-    for item in valid_alarms:
-        alarm = item.get("alarm", {})
-        event_id = alarm.get("告警编码ID", "")
-        if not event_id:
-            continue
-
-        identity = require_alarm_identity({
-            "eid": event_id,
-            "occurrence_uuid": item.get("occurrence_uuid"),
-        })
-
-        metadata = {}
-        for field_name in ("工单号", "故障组ID", "告警清除时间"):
-            value = str(alarm.get(field_name, "")).strip()
-            if value:
-                metadata[field_name] = value
-
-        if not metadata:
-            continue
-
-        merge_metadata(identity, metadata)
-
-    return alarm_metadata_index
-
-
-def enrich_match_symptoms(match, alarm_metadata_index):
+def enrich_match_symptoms(match):
     enriched_symptoms = []
-
-    def lookup_metadata(symptom, event_id):
-        return alarm_metadata_index.get(require_alarm_identity({
-            "eid": event_id,
-            "occurrence_uuid": symptom.get("occurrence_uuid"),
-        }), {})
 
     for symptom in match["symptoms"]:
         enriched_symptom = dict(symptom)
-        enriched_symptom.pop("alarm_payload", None)
-        event_id = enriched_symptom.get("eid", "")
-        if event_id:
-            metadata = lookup_metadata(enriched_symptom, event_id)
+        alarm_payload = enriched_symptom.pop("alarm_payload", None)
+        if isinstance(alarm_payload, dict):
             for field_name in ("工单号", "故障组ID", "告警清除时间"):
-                if metadata.get(field_name) and not enriched_symptom.get(field_name):
-                    enriched_symptom[field_name] = metadata[field_name]
+                value = str(alarm_payload.get(field_name, "")).strip()
+                if value and not enriched_symptom.get(field_name):
+                    enriched_symptom[field_name] = value
         enriched_symptoms.append(enriched_symptom)
     return enriched_symptoms
 
@@ -304,15 +263,11 @@ def enrich_match_symptoms(match, alarm_metadata_index):
 def build_jsonl_match_output(
     match,
     ne_graph_data,
-    alarm_metadata_index,
     site_to_ne_ids,
     ne_link_info_cache,
 ):
     enriched_match = dict(match)
-    enriched_match["symptoms"] = enrich_match_symptoms(
-        match,
-        alarm_metadata_index,
-    )
+    enriched_match["symptoms"] = enrich_match_symptoms(match)
 
     group_output = build_group_output(
         enriched_match,
