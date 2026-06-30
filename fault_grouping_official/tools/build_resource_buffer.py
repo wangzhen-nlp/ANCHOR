@@ -29,23 +29,21 @@ from collections import defaultdict
 from types import SimpleNamespace
 
 if __package__ in (None, ""):
-    from _script_env import ensure_repo_root
+    from _script_env import ensure_package_parent
 
-    ensure_repo_root(1)
+    ensure_package_parent()
 
-from alarm_tools.progress_utils import ProgressBar
-from topology_resources import (
+from fault_grouping_official.peer_index_keys import make_key
+from fault_grouping_official.tools.progress_utils import ProgressBar
+from fault_grouping_official.tools.topology_resources import (
     NE_GRAPH_JSON,
-    SYS_LINK_JSONL,
+    SYS_LINK_DIR,
     SYS_NE_DIR,
     SYS_SITE_DIR,
     resource_display,
 )
-from topology_tools.generate_site_chains import build_site_chains_from_data
-from topology_tools.generate_site_pair_order_pairwise import build_pairwise_prediction
-# site_chains 字段的生成口径：等价于固定启用 pairwise 的
-# smooth-level / global-gap-first / strict-ring-bidirectional，
-# 再按 restrict-relation 口径生成 site_chains（ne_graph 取本缓冲内存版）。
+from fault_grouping_official.tools.generate_site_chains import build_site_chains_from_data
+from fault_grouping_official.tools.generate_site_pair_order_pairwise import build_pairwise_prediction
 
 # 单文件缓冲产物的默认输出路径（JSONL：每行一个资源）；与默认资源同目录
 DEFAULT_BUFFER_OUTPUT = os.path.join(os.path.dirname(NE_GRAPH_JSON), "resource_buffer.jsonl")
@@ -53,14 +51,12 @@ DEFAULT_BUFFER_OUTPUT = os.path.join(os.path.dirname(NE_GRAPH_JSON), "resource_b
 # 行级进度的刷新间隔（行数）；计数模式下每次 set 都会重绘，需要批量节流
 PROGRESS_ROW_STEP = 5000
 
-LINK_FILE_SUFFIXES = ('.jsonl', '.csv', '.zip')
 CSV_FILE_SUFFIXES = ('.csv', '.zip')
 
 # 链路记录的去重键字段，按优先级取第一个非空值
 LINK_KEY_FIELDS = ('nativeId', "nativeId(')", 'resId', 'source_uuid')
 
 # site_chains 计算阶段实际会从 ne_graph 节点读取的字段（site_id/domain/link）。
-# ne_graph 写盘后，按此集合原地裁剪每个 NE，释放 name/经纬度等重字段以压低峰值。
 _SITE_CHAINS_NE_FIELDS = ('site_id', 'domain', 'link')
 
 # site_graph 中缺省站点信息（NE 引用了某站点但 SYS_SITE 中无该站点时使用）
@@ -108,15 +104,12 @@ def _resource_buffer_pairwise_args():
         max_base_score_delta=6.0,
         max_neighbor_delta=4,
         max_pair_domain_delta=4,
-        smooth_level=True,
         smooth_alpha=0.5,
         smooth_iters=100,
         smooth_tol=0.0001,
-        global_gap_first=True,
         global_gap_threshold=1.0,
         global_gap_nonbridge_bonus=2.0,
         global_gap_shared_neighbor_bonus=0.5,
-        strict_ring_bidirectional=True,
         full_output=False,
         no_progress=True,
     )
@@ -157,7 +150,7 @@ def _parse_bool(value) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# 文件迭代：CSV / zip(内含CSV) / JSONL
+# 文件迭代：CSV / zip(内含CSV)
 # --------------------------------------------------------------------------- #
 def _iter_zip_csv(zip_path: str):
     """迭代 zip 包内所有 CSV 的记录。"""
@@ -172,61 +165,47 @@ def _iter_zip_csv(zip_path: str):
                 yield from csv.DictReader(text)
 
 
-def _iter_link_file(file_path: str):
-    """迭代单个链路文件中的记录，支持 .jsonl / .csv / .zip（内含 CSV）。"""
+def _iter_csv_or_zip_file(file_path: str):
+    """迭代单个 .csv / .zip(内含 CSV) 文件的记录。"""
     lower = file_path.lower()
-    if lower.endswith('.jsonl'):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
-    elif lower.endswith('.csv'):
+    if lower.endswith('.csv'):
         with open(file_path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
             yield from csv.DictReader(f)
     elif lower.endswith('.zip'):
         yield from _iter_zip_csv(file_path)
     else:
-        raise SystemExit(f"不支持的链路文件格式: {file_path}（支持 .jsonl/.csv/.zip）")
+        raise SystemExit(f"不支持的文件格式: {file_path}（支持 .csv/.zip）")
 
 
-def iter_csv_dir_records(data_dir: str, name_keyword: str, progress: ProgressBar = None):
-    """迭代目录中文件名含 name_keyword 的 .csv / .zip(内含CSV) 文件的记录。"""
-    file_names = sorted(
-        name for name in os.listdir(data_dir)
-        if name_keyword in name and name.lower().endswith(CSV_FILE_SUFFIXES)
-    )
-    if not file_names:
-        print(f"警告: 目录中未找到文件名含 {name_keyword} 的 .csv/.zip 文件: {data_dir}")
-        return
-    for name in file_names:
-        if progress is not None:
-            progress.set_extra_text(name, force=True)
-        path = os.path.join(data_dir, name)
-        if name.lower().endswith('.csv'):
-            with open(path, 'r', encoding='utf-8-sig', errors='replace', newline='') as f:
-                yield from csv.DictReader(f)
-        else:
-            yield from _iter_zip_csv(path)
+def iter_csv_records(input_path: str, progress: ProgressBar = None, *,
+                     name_keyword: str = None, require: bool = False):
+    """迭代 .csv / .zip(内含 CSV) 记录。
 
-
-def iter_link_records(link_input: str, progress: ProgressBar = None):
-    """迭代链路记录；link_input 可以是单个文件，也可以是包含链路文件的目录。"""
-    if os.path.isdir(link_input):
+    input_path 可以是单个文件，也可以是包含这些文件的目录；目录模式下 name_keyword
+    非空时只取文件名含该关键字的文件。目录内无匹配文件时：require=True 报错退出，
+    否则仅打印警告并跳过。
+    """
+    if os.path.isdir(input_path):
         file_names = sorted(
-            name for name in os.listdir(link_input)
-            if name.lower().endswith(LINK_FILE_SUFFIXES)
+            name for name in os.listdir(input_path)
+            if name.lower().endswith(CSV_FILE_SUFFIXES)
+            and (name_keyword is None or name_keyword in name)
         )
         if not file_names:
-            raise SystemExit(f"目录中未找到链路文件(.jsonl/.csv/.zip): {link_input}")
+            scope = f"文件名含 {name_keyword} 的 " if name_keyword else ""
+            message = f"目录中未找到{scope}.csv/.zip 文件: {input_path}"
+            if require:
+                raise SystemExit(message)
+            print(f"警告: {message}")
+            return
         for name in file_names:
             if progress is not None:
                 progress.set_extra_text(name, force=True)
-            yield from _iter_link_file(os.path.join(link_input, name))
+            yield from _iter_csv_or_zip_file(os.path.join(input_path, name))
     else:
         if progress is not None:
-            progress.set_extra_text(os.path.basename(link_input), force=True)
-        yield from _iter_link_file(link_input)
+            progress.set_extra_text(os.path.basename(input_path), force=True)
+        yield from _iter_csv_or_zip_file(input_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +222,7 @@ def load_ne_from_csv(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False
 
     progress = ProgressBar(0, "  读取NE记录")
     row_count = 0
-    for row in iter_csv_dir_records(data_dir, 'SYS_NE', progress):
+    for row in iter_csv_records(data_dir, progress, name_keyword='SYS_NE'):
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
@@ -292,7 +271,7 @@ def load_site_info(data_dir: str = SYS_SITE_DIR, report_duplicates: bool = False
 
     progress = ProgressBar(0, "  读取站点记录")
     row_count = 0
-    for row in iter_csv_dir_records(data_dir, 'SYS_SITE', progress):
+    for row in iter_csv_records(data_dir, progress, name_keyword='SYS_SITE'):
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
@@ -354,17 +333,12 @@ class LatestLink:
     link_type: str
     a_port: str
     z_port: str
-    a_ip: str
-    z_ip: str
-    a_manager: str
-    z_manager: str
 
 
 def _parse_latest_link(record: dict, last_modified: int) -> LatestLink:
     """把原始 CSV/JSON 记录压缩成 build_graphs 实际使用的语义字段。"""
-    # NE 端点(基数=设备数，跨链路高度重复)、link_type、manager 低基数字段做 intern，
-    # 与 NE/站点加载共用同一 intern 表，端点对象可与 ne_graph 的 key 共享。端口名/IP
-    # 基数高，不 intern。
+    # NE 端点(基数=设备数，跨链路高度重复)、link_type 做 intern，与 NE/站点加载共用
+    # 同一 intern 表，端点对象可与 ne_graph 的 key 共享。端口名基数高，不 intern。
     return LatestLink(
         last_modified=last_modified,
         a_ne=sys.intern(_get_record_value(
@@ -376,10 +350,6 @@ def _parse_latest_link(record: dict, last_modified: int) -> LatestLink:
         link_type=sys.intern((record.get('link_layer') or '').strip().upper()),
         a_port=_get_record_value(record, "a_end_port_name"),
         z_port=_get_record_value(record, "z_end_port_name"),
-        a_ip=_get_record_value(record, "a_end_port_ip"),
-        z_ip=_get_record_value(record, "z_end_port_ip"),
-        a_manager=sys.intern(_get_record_value(record, "a_end_ne_manager_name")),
-        z_manager=sys.intern(_get_record_value(record, "z_end_ne_manager_name")),
     )
 
 
@@ -413,7 +383,7 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
 
     progress = ProgressBar(0, "  读取链路记录")
     row_count = 0
-    for record in iter_link_records(link_input, progress):
+    for record in iter_csv_records(link_input, progress, require=True):
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
@@ -454,20 +424,6 @@ def load_latest_link_records(link_input: str, report_duplicates: bool = False):
 class PeerDevice:
     ne_native_id: str
     port_name: str = ""
-    port_ip: str = ""
-    manager_name: str = ""
-
-
-def _normalize_ne_key(ne_id):
-    return str(ne_id or "").strip().upper()
-
-
-def _normalize_port_key(port_name):
-    return str(port_name or "").strip()
-
-
-def _make_key(ne_id, port_name):
-    return f"{_normalize_ne_key(ne_id)}|{_normalize_port_key(port_name)}"
 
 
 def _json_default(obj):
@@ -517,19 +473,9 @@ def build_graphs(latest_links, ne_info: dict):
     }
 
     for record in latest_links:
-        if isinstance(record, LatestLink):
-            a_ne = record.a_ne
-            z_ne = record.z_ne
-            link_type = record.link_type
-        else:
-            # 兼容直接调用 build_graphs 的既有 dict 输入。
-            a_ne = _get_record_value(
-                record, "a_end_ne_nativeId", "a_end_ne_nativeId(')"
-            ).upper()
-            z_ne = _get_record_value(
-                record, "z_end_ne_nativeId", "z_end_ne_nativeId(')"
-            ).upper()
-            link_type = (record.get('link_layer') or '').strip().upper()
+        a_ne = record.a_ne
+        z_ne = record.z_ne
+        link_type = record.link_type
 
         if a_ne and z_ne:
             # NE 邻接图
@@ -546,33 +492,17 @@ def build_graphs(latest_links, ne_info: dict):
                 _add_bidirectional_edge(site_links, a_site, z_site, link_type)
 
             # 端口对端索引：还需两端端口名
-            if isinstance(record, LatestLink):
-                a_port = record.a_port
-                z_port = record.z_port
-                a_ip = record.a_ip
-                z_ip = record.z_ip
-                a_manager = record.a_manager
-                z_manager = record.z_manager
-            else:
-                a_port = _get_record_value(record, "a_end_port_name")
-                z_port = _get_record_value(record, "z_end_port_name")
-                a_ip = _get_record_value(record, "a_end_port_ip")
-                z_ip = _get_record_value(record, "z_end_port_ip")
-                a_manager = _get_record_value(record, "a_end_ne_manager_name")
-                z_manager = _get_record_value(record, "z_end_ne_manager_name")
+            a_port = record.a_port
+            z_port = record.z_port
             if a_port and z_port:
-                peer_index[_make_key(a_ne, a_port)] = PeerDevice(
+                peer_index[make_key(a_ne, a_port)] = PeerDevice(
                     # a_ne/z_ne 已按构图口径归一化；直接复用，避免每条索引再复制 NE ID。
                     ne_native_id=z_ne,
                     port_name=z_port,
-                    port_ip=z_ip,
-                    manager_name=z_manager,
                 )
-                peer_index[_make_key(z_ne, z_port)] = PeerDevice(
+                peer_index[make_key(z_ne, z_port)] = PeerDevice(
                     ne_native_id=a_ne,
                     port_name=a_port,
-                    port_ip=a_ip,
-                    manager_name=a_manager,
                 )
 
     return site_links, ne_links, peer_index, stats
@@ -648,7 +578,7 @@ def build_site_chains_field(ne_graph: dict) -> dict:
     """在内存中复刻 site_chains.json 的生成链路，产出可作为缓冲字段的站点链路。
 
     等价命令：
-        generate_site_pair_order_pairwise.py --smooth-level --global-gap-first --strict-ring-bidirectional
+        generate_site_pair_order_pairwise.py
         generate_site_chains.py --restrict-relation --ne-graph <ne_graph>
 
     两步都直接吃内存里的 ne_graph，省去中间落盘再读盘。
@@ -707,10 +637,10 @@ def main():
     )
     parser.add_argument(
         "--link-input",
-        default=SYS_LINK_JSONL,
+        default=SYS_LINK_DIR,
         help=(
-            "链路输入，支持 .jsonl/.csv/.zip(内含CSV) 文件或包含这些文件的目录，"
-            f"默认: {resource_display('sys_link_1231.jsonl')}"
+            "链路输入，支持 .csv/.zip(内含CSV) 文件或包含这些文件的目录，"
+            f"默认: {resource_display('SYS_LINK_0306')}"
         ),
     )
     parser.add_argument(

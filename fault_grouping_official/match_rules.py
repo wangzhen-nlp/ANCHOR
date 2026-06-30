@@ -1,0 +1,156 @@
+import time
+
+from argparse import ArgumentParser
+from dataclasses import dataclass
+
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
+
+from fault_grouping_official.tools.progress_utils import ProgressBar
+from fault_grouping_official.tools.topology_resources import (
+    NE_GRAPH_JSON,
+    SITE_CHAINS_JSON,
+    LINK_PEER_INDEX_JSON,
+    resource_display,
+)
+from fault_grouping_official.matching.group_output_builder import (
+    build_alarm_metadata_index,
+)
+from fault_grouping_official.matching.group_output_session import MatchOutputSession
+from fault_grouping_official.matching.runtime import (
+    AlarmLoadResult,
+    build_rules_config,
+    default_valid_alarm_titles,
+    initialize_engine,
+    load_alarm_data,
+    load_static_context,
+    print_alarm_load_summary,
+    print_final_summary,
+    print_run_configuration,
+    run_matching_pipeline,
+    validate_main_args,
+)
+from fault_grouping_official.temporal_engine.engine import TemporalGraphEngine
+from fault_grouping_official.time_config import (
+    DEFAULT_AGGREGATION_WAIT_SEC,
+    DEFAULT_CLEAR_DELAY_SEC,
+    DEFAULT_HARVEST_INTERVAL_SEC,
+)
+
+
+@dataclass
+class RuntimeExecutionPlan:
+    engine: TemporalGraphEngine
+    alarm_load_result: AlarmLoadResult
+    output_session: MatchOutputSession
+    run_started_at: float
+
+
+def _build_arg_parser():
+    parser = ArgumentParser()
+    parser.add_argument('alarms', type=str, help='alarm stream')
+    parser.add_argument('output', type=str, nargs='?', help='output jsonl file；--no-output 时可省略')
+    parser.add_argument('--site-chains', type=str, default=SITE_CHAINS_JSON, help=f'generate_site_chains.py 输出的预计算站点链路，默认: {resource_display("site_chains.json")}')
+    parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
+    parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='offline', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
+    parser.add_argument('--harvest-interval-sec', type=float, default=DEFAULT_HARVEST_INTERVAL_SEC, help=f'模拟时间下的定时收割周期，单位秒，默认 {DEFAULT_HARVEST_INTERVAL_SEC:g}')
+    parser.add_argument('--aggregation-wait-sec', type=float, default=DEFAULT_AGGREGATION_WAIT_SEC, help=f'trigger 成熟前的聚合等待时间，单位秒，默认 {DEFAULT_AGGREGATION_WAIT_SEC:g}')
+    parser.add_argument('--clear-delay-sec', type=float, default=DEFAULT_CLEAR_DELAY_SEC, help=f'清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间，默认 {DEFAULT_CLEAR_DELAY_SEC:g}')
+    parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
+    parser.add_argument('--stream-sorted-alarms', action='store_true', help='从排序告警缓存流式读取，不把全部 valid_alarms 加载到内存；仅当 alarms 本身为 prepare_sorted_alarms.py 生成的排序缓存(JSONL/ZIP)时生效')
+    parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
+    parser.add_argument('--no-output', action='store_true', help='只运行匹配与统计，不创建、不截断、不写入故障组输出 JSONL')
+    parser.add_argument('--link-peer-index', type=str, default=LINK_PEER_INDEX_JSON, help=f'设备端口对端索引 JSON，默认: {resource_display("link_peer_index.json")}；link 告警必须指向模式关联站点')
+    return parser
+
+
+def _build_output_session(args, engine, static_context, alarm_metadata_index):
+    output_session = MatchOutputSession(
+        args=args,
+        engine=engine,
+        output_path=args.output,
+        ne_graph_data=static_context.ne_graph_data,
+        alarm_metadata_index=alarm_metadata_index,
+        site_to_ne_ids=static_context.site_to_ne_ids,
+        ne_link_info_cache=static_context.ne_link_info_cache,
+    )
+    output_session.reset_output_file()
+    return output_session
+
+
+def _prepare_runtime_execution(parser, args):
+    sorted_alarm_cache_metadata = validate_main_args(parser, args)
+    static_context = load_static_context(args)
+    valid_alarm_titles = default_valid_alarm_titles()
+    print_run_configuration(args, valid_alarm_titles)
+    rules_config = build_rules_config()
+    engine = initialize_engine(args, static_context, rules_config)
+    run_started_at = time.time()
+    alarm_load_result = load_alarm_data(
+        args,
+        static_context,
+        valid_alarm_titles,
+        sorted_alarm_cache_metadata,
+    )
+    if args.no_output:
+        alarm_metadata_index = {}
+    else:
+        metadata_alarm_iter = alarm_load_result.valid_alarms
+        if args.stream_sorted_alarms:
+            metadata_alarm_iter = _iter_with_progress(
+                alarm_load_result.valid_alarms,
+                alarm_load_result.filtered_count,
+                "构建告警元数据索引",
+            )
+        alarm_metadata_index = build_alarm_metadata_index(metadata_alarm_iter)
+    print_alarm_load_summary(alarm_load_result)
+    output_session = _build_output_session(args, engine, static_context, alarm_metadata_index)
+    return RuntimeExecutionPlan(
+        engine=engine,
+        alarm_load_result=alarm_load_result,
+        output_session=output_session,
+        run_started_at=run_started_at,
+    )
+
+
+def _iter_with_progress(iterable, total, label):
+    progress = ProgressBar(total, label)
+    try:
+        for item in iterable:
+            yield item
+            progress.update()
+    finally:
+        progress.close()
+
+
+def main():
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    runtime_plan = _prepare_runtime_execution(parser, args)
+
+    try:
+        run_matching_pipeline(
+            args,
+            runtime_plan.engine,
+            runtime_plan.alarm_load_result.valid_alarms,
+            runtime_plan.output_session,
+        )
+    finally:
+        # 关闭持久输出文件句柄，确保 flush 落盘。
+        runtime_plan.output_session.close()
+
+    elapsed = time.time() - runtime_plan.run_started_at
+    print_final_summary(
+        runtime_plan.engine,
+        runtime_plan.alarm_load_result.processed_count,
+        runtime_plan.alarm_load_result.filtered_count,
+        runtime_plan.output_session.match_count,
+        elapsed,
+    )
+
+
+if __name__ == "__main__":
+    main()

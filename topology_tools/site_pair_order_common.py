@@ -125,7 +125,15 @@ def is_wireless_only_site(site_id, site_role_counts):
     return total > 0 and role_counts.get("wireless", 0) == total
 
 
-def should_include_cross_site_link(source_site, source_domain, target_site, target_domain, site_role_counts):
+def should_include_cross_site_link(
+    source_site,
+    source_domain,
+    target_site,
+    target_domain,
+    site_role_counts=None,
+    *,
+    wireless_only_sites=None,
+):
     """
     判断跨站 NE 边是否可用于站点拓扑推断。
 
@@ -142,15 +150,26 @@ def should_include_cross_site_link(source_site, source_domain, target_site, targ
     target_role = classify_device_role(target_domain)
     allowed_peer_roles = {"wireless", "router"}
 
+    source_wireless_only = (
+        source_site in wireless_only_sites
+        if wireless_only_sites is not None
+        else is_wireless_only_site(source_site, site_role_counts)
+    )
+    target_wireless_only = (
+        target_site in wireless_only_sites
+        if wireless_only_sites is not None
+        else is_wireless_only_site(target_site, site_role_counts)
+    )
+
     if (
-        is_wireless_only_site(source_site, site_role_counts)
+        source_wireless_only
         and source_role == "wireless"
         and target_role in allowed_peer_roles
     ):
         return True
 
     if (
-        is_wireless_only_site(target_site, site_role_counts)
+        target_wireless_only
         and target_role == "wireless"
         and source_role in allowed_peer_roles
     ):
@@ -159,10 +178,23 @@ def should_include_cross_site_link(source_site, source_domain, target_site, targ
     return False
 
 
-def iter_unique_cross_site_links(ne_graph):
-    """按 NE 对 + link_type 去重，遍历跨站点链路。"""
-    seen = set()
-    site_role_counts = build_site_role_counts(ne_graph)
+def iter_unique_cross_site_links(
+    ne_graph,
+    *,
+    assume_symmetric=False,
+    wireless_only_sites=None,
+):
+    """按 NE 对 + link_type 去重，遍历跨站点链路。
+
+    assume_symmetric=True 仅用于已知双向存储的 ne_graph：按 NE ID 规范侧遍历，
+    避免维护与物理边数同规模的 seen 集合。
+    """
+    seen = None if assume_symmetric else set()
+    site_role_counts = (
+        None
+        if wireless_only_sites is not None
+        else build_site_role_counts(ne_graph)
+    )
 
     for source_ne, source_info in ne_graph.items():
         source_site = _get_site_id(source_info)
@@ -200,10 +232,14 @@ def iter_unique_cross_site_links(ne_graph):
             )
 
             for link_type in link_types:
-                key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
-                if key in seen:
-                    continue
-                seen.add(key)
+                if assume_symmetric:
+                    if source_ne > target_ne:
+                        continue
+                else:
+                    key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                 yield {
                     "source_ne": source_ne,
                     "target_ne": target_ne,
@@ -752,6 +788,7 @@ def build_site_topology_enhanced(ne_graph, show_progress=False):
                     target_site,
                     target_domain,
                     site_role_counts,
+                    wireless_only_sites=wireless_only_sites,
                 ):
                     continue
 
