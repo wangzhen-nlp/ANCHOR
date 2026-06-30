@@ -35,6 +35,18 @@ PATTERN_PRIORITY = {
     "unknown": 99,
 }
 
+# —— 性能保护参数（官方新增，非移植自原脚本）——
+# longest_path_in_component 对 ≤N 个站的分量做穷举 DFS 找最长简单链；该穷举随分量稠密度
+# 指数级膨胀（实测稠密 14~15 站即从毫秒跳到秒级乃至卡死）。原脚本对 >18 的分量退化到双
+# BFS 近似，但实测该近似在带环分量上严重偏差（哈密顿覆盖几乎 100% 漏判），会把环型模式误
+# 判成 unknown，不可用于落盘判定。
+#
+# 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
+# unknown -> 该故障组被丢弃，而不是给出错误的近似链。
+# 默认 18：≤18 的分量与原脚本逐字一致；要削掉稠密大分量的耗时，调小该值即可（实测拐点在
+# 13~14 附近，可按数据规模权衡 速度 vs 召回）。
+LONGEST_PATH_EXACT_MAX_SITES = 18
+
 
 def normalize_text(value):
     text = str(value or "").strip()
@@ -334,8 +346,8 @@ def longest_path_in_component(component, relation_index):
         for site_id in component
     }
 
-    # case 通常不大；小图用 DFS 找最长简单链，大图退化为双 BFS 直径近似。
-    if len(component) <= 18:
+    # ≤N 的分量用 DFS 穷举最长简单链（与原脚本一致）。
+    if len(component) <= LONGEST_PATH_EXACT_MAX_SITES:
         best_path = []
 
         def dfs(path, visited):
@@ -358,23 +370,11 @@ def longest_path_in_component(component, relation_index):
             dfs([start], {start})
         return best_path
 
-    def farthest(start):
-        queue = deque([(start, [start])])
-        visited = {start}
-        best = [start]
-        while queue:
-            site_id, path = queue.popleft()
-            if len(path) > len(best):
-                best = path
-            for neighbor in adjacency.get(site_id, []):
-                if neighbor in visited:
-                    continue
-                visited.add(neighbor)
-                queue.append((neighbor, path + [neighbor]))
-        return best
-
-    first_path = farthest(min(component))
-    return farthest(first_path[-1])
+    # 官方偏离原脚本：>N 的分量不再退化到双 BFS 近似（该近似在带环分量上严重偏差，
+    # 见 LONGEST_PATH_EXACT_MAX_SITES 注释），直接返回空链。classify_component 的
+    # `set(chain) != set(unmanaged_component)` 覆盖校验会因此跳过该分量，最终落为
+    # unknown -> 故障组被丢弃，避免给出错误的模式分类。
+    return []
 
 
 def classify_chain_uplink(chain, component_sites, relation_index):
