@@ -6,8 +6,8 @@ or wall-clock runtime stay in the code paths that compute them.
 
 # CLI defaults used by fault_grouping_official/match_rules.py.
 DEFAULT_HARVEST_INTERVAL_SEC = 300
-DEFAULT_AGGREGATION_WAIT_SEC = 420
-DEFAULT_CLEAR_DELAY_SEC = 420
+DEFAULT_AGGREGATION_WAIT_SEC = 300
+DEFAULT_CLEAR_DELAY_SEC = 0
 
 # Temporal engine defaults.
 DEFAULT_EVENT_TTL_SEC = 3600
