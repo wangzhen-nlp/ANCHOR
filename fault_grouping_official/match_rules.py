@@ -55,6 +55,34 @@ def _build_arg_parser():
     parser.add_argument('--clear-delay-sec', type=float, default=DEFAULT_CLEAR_DELAY_SEC, help=f'清除告警最小延迟时间，清除生效时间=max(clear_delay_sec, 清除时间-发生时间)+发生时间，默认 {DEFAULT_CLEAR_DELAY_SEC:g}')
     parser.add_argument('--speedup', type=float, default=1.0, help='按 ts 模拟实时流时的加速倍数，1 表示真实时间，60 表示 1 分钟压到 1 秒')
     parser.add_argument('--stream-sorted-alarms', action='store_true', help='从排序告警缓存流式读取，不把全部 valid_alarms 加载到内存；仅当 alarms 本身为 prepare_sorted_alarms.py 生成的排序缓存(JSONL/ZIP)时生效')
+    rule_check_group = parser.add_mutually_exclusive_group()
+    rule_check_group.add_argument(
+        '--rule-check',
+        dest='rule_check',
+        action='store_true',
+        default=True,
+        help='启用落盘规则检查，只输出命中可落盘规则的故障组（默认）',
+    )
+    rule_check_group.add_argument(
+        '--no-rule-check',
+        dest='rule_check',
+        action='store_false',
+        help='关闭落盘规则检查，允许所有引擎匹配结果进入后续处理',
+    )
+    pattern_check_group = parser.add_mutually_exclusive_group()
+    pattern_check_group.add_argument(
+        '--pattern-check',
+        dest='pattern_check',
+        action='store_true',
+        default=True,
+        help='启用落盘故障模式检查与模式字段增强（默认）',
+    )
+    pattern_check_group.add_argument(
+        '--no-pattern-check',
+        dest='pattern_check',
+        action='store_false',
+        help='关闭落盘故障模式检查，同时跳过模式字段增强',
+    )
     return parser
 
 
@@ -82,8 +110,16 @@ def _prepare_runtime_execution(parser, args):
     valid_alarm_titles = default_valid_alarm_titles()
     print_run_configuration(args, valid_alarm_titles)
     rules_config = build_rules_config()
-    output_eligible_rules = collect_output_eligible_rules(rules_config)
-    fault_pattern_filter = build_fault_pattern_filter(static_context)
+    output_eligible_rules = (
+        collect_output_eligible_rules(rules_config)
+        if args.rule_check
+        else None
+    )
+    fault_pattern_filter = (
+        build_fault_pattern_filter(static_context)
+        if args.pattern_check
+        else None
+    )
     engine = initialize_engine(args, static_context, rules_config)
     run_started_at = time.time()
     alarm_load_result = load_alarm_data(

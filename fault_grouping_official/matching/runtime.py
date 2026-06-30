@@ -145,6 +145,8 @@ def print_run_configuration(args, valid_alarm_titles):
     if args.clear_delay_sec > 0:
         print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
+    print(f"落盘规则检查: {'启用' if args.rule_check else '关闭'}")
+    print(f"故障模式检查与增强: {'启用' if args.pattern_check else '关闭'}")
 
 
 def build_rules_config():
