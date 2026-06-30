@@ -14,7 +14,6 @@ _REQUIRED_CACHE_METADATA_FIELDS = (
     "cached_normal_alarm_count",
     "cached_clear_alarm_count",
     "clear_delay_sec",
-    "ne_graph",
 )
 
 

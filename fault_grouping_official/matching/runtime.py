@@ -1,5 +1,6 @@
 import os
 import time
+import zipfile
 
 from dataclasses import dataclass
 
@@ -25,6 +26,7 @@ from fault_grouping_official.rule_config import (
 )
 from fault_grouping_official.alarm_events.sorted_cache import (
     SortedAlarmCacheStream,
+    read_sorted_alarm_cache_header,
     try_read_sorted_alarm_cache_header,
 )
 from fault_grouping_official.temporal_engine.engine import TemporalGraphEngine
@@ -66,13 +68,16 @@ class AlarmLoadResult:
 
 
 def validate_main_args(parser, args):
-    sorted_alarm_cache_metadata = try_read_sorted_alarm_cache_header(args.alarms)
-    if args.stream_sorted_alarms and sorted_alarm_cache_metadata is None:
-        parser.error(
-            "--stream-sorted-alarms 只能用于排序告警缓存；"
-            "请先使用与当前缓存格式一致的预处理流程生成缓存，"
-            "并将缓存文件作为 alarms 位置参数传入"
-        )
+    if args.stream_sorted_alarms:
+        try:
+            sorted_alarm_cache_metadata = read_sorted_alarm_cache_header(args.alarms)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            parser.error(
+                "--stream-sorted-alarms 只能用于排序告警缓存；"
+                f"缓存识别失败: {exc}"
+            )
+    else:
+        sorted_alarm_cache_metadata = try_read_sorted_alarm_cache_header(args.alarms)
     if not os.path.exists(args.resource_buffer):
         parser.error(
             f"资源缓冲文件不存在: {args.resource_buffer}；"

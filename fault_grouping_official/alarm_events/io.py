@@ -1,3 +1,5 @@
+import os
+
 from datetime import datetime
 
 from fault_grouping_official.alarm_inputs import stream_alarm_inputs
@@ -192,6 +194,16 @@ def warn_sorted_alarm_cache_option_mismatch(metadata, args):
     if abs(float(args.clear_delay_sec) - expected_clear_delay) > 1e-9:
         mismatches.append(
             f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(args.clear_delay_sec):g}"
+        )
+
+    cached_resource_buffer = str(metadata.get("resource_buffer", "") or "").strip()
+    current_resource_buffer = os.path.abspath(args.resource_buffer)
+    if cached_resource_buffer and os.path.normcase(os.path.normpath(cached_resource_buffer)) != os.path.normcase(
+        os.path.normpath(current_resource_buffer)
+    ):
+        mismatches.append(
+            "resource_buffer: "
+            f"缓存={cached_resource_buffer}, 当前={current_resource_buffer}"
         )
 
     if mismatches:

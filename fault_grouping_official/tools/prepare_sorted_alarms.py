@@ -15,7 +15,10 @@ from fault_grouping_official.alarm_events.io import (
     trim_trailing_clear_alarms,
 )
 from fault_grouping_official.resource_buffer import load_resource_buffer
-from fault_grouping_official.site_topology import build_site_chain_index
+from fault_grouping_official.site_topology import (
+    build_site_chain_index,
+    build_site_topology_from_ne_graph,
+)
 from fault_grouping_official.alarm_events.sorted_cache import write_sorted_alarm_cache
 from fault_grouping_official.tools.topology_resources import (
     RESOURCE_BUFFER_JSONL,
@@ -35,6 +38,8 @@ def _load_valid_sites_and_ne_mapping(resource_buffer_path):
     )
     ne_graph_data = resources["ne_graph"]
     _site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
+    _topo_downstream_map, topology_sites = build_site_topology_from_ne_graph(ne_graph_data)
+    valid_sites.update(topology_sites)
 
     ne_to_site = {
         ne_id: str(ne_info.get("site_id", "")).strip()
