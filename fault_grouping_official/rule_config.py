@@ -4,6 +4,13 @@ from fault_grouping_official.time_config import (
   RULE_DEFAULT_MAX_STAY_TIME_SEC,
 )
 
+# 规则字典上的可选布尔字段：标记为 True 的规则才算“可落盘规则”。
+# match_rules.py 输出故障组前会做一次过滤——只有 merged_rules 命中任意一个
+# 带 output_eligible=True 的规则的故障组，才会写入输出文件。
+# 若所有规则都没标记该字段，则不做过滤（全部落盘），保持旧行为。
+# 引擎只读取 nodes/edges/trigger_role 等已知字段，多出来的该字段会被安全忽略。
+OUTPUT_ELIGIBLE_RULE_FIELD = "output_eligible"
+
 NO_OFFLINE_DATA_NODE = {
   "type": "primitive",
   "site_rules": [
@@ -86,6 +93,8 @@ REQUIRED_LINK_NO_OFFLINE_DATA_NODE_NE_ANCHORED = {
 data_link_adjacent_no_offline_rule = {
   "pattern_name": "data_link_adjacent_no_offline_context",
   "description": "本路由Data link且无Data offline，邻接路由无Data offline -> 下挂断站",
+  # 终极/可落盘规则：包含此规则的故障组才会被 match_rules.py 写入输出文件。
+  "output_eligible": True,
   "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "data_link_underneath_compound_node",
   "exclusive_site_roles": [
@@ -160,6 +169,8 @@ data_link_adjacent_offline_rule = {
 data_no_offline_adjacent_optional_offline_rule = {
   "pattern_name": "data_no_offline_adjacent_optional_offline_context",
   "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",
+  # 终极/可落盘规则：包含此规则的故障组才会被 match_rules.py 写入输出文件。
+  "output_eligible": True,
   "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "current_underneath_compound_node",
   "exclusive_site_roles": [

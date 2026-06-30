@@ -19,6 +19,7 @@ from fault_grouping_official.alarm_events.stream import (
     stream_alarms_by_ts,
 )
 from fault_grouping_official.rule_config import (
+    OUTPUT_ELIGIBLE_RULE_FIELD,
     data_link_adjacent_no_offline_rule,
     data_link_adjacent_offline_rule,
     data_no_offline_adjacent_optional_offline_rule,
@@ -152,6 +153,42 @@ def build_rules_config():
     }
     print("启用规则: " + ", ".join(rules_config.keys()))
     return rules_config
+
+
+def collect_output_eligible_rules(rules_config):
+    """返回“可落盘规则”名集合：rule_config 中标记 output_eligible=True 的规则。
+
+    match_rules.py 输出故障组前据此过滤——只有 merged_rules 命中其中任意一个
+    规则的故障组才会写入输出文件。若没有任何规则被标记，返回 None 表示不过滤
+    （全部落盘），保持旧行为。
+    """
+    eligible = frozenset(
+        rule_name
+        for rule_name, rule in rules_config.items()
+        if rule.get(OUTPUT_ELIGIBLE_RULE_FIELD)
+    )
+    if not eligible:
+        print("未标记可落盘规则(output_eligible)，输出不做规则过滤")
+        return None
+    print("仅落盘包含以下规则的故障组: " + ", ".join(sorted(eligible)))
+    return eligible
+
+
+def build_fault_pattern_filter(static_context):
+    """构建落盘前故障模式过滤器（filter-others + one-component-only，默认启用）。
+
+    复用 ticket_recall.evaluation.analyze_case_fault_patterns 的分析逻辑，依赖
+    较重（牵出 fault_grouping / alarm_tools 等），故按需在函数内延迟导入。
+    """
+    from fault_grouping_official.matching.fault_pattern_filter import FaultPatternFilter
+
+    fault_pattern_filter = FaultPatternFilter.from_static_context(
+        static_context.ne_graph_data,
+        static_context.site_chain_index,
+        static_context.ne_to_site,
+    )
+    print("已启用落盘前故障模式过滤: filter-others + one-component-only")
+    return fault_pattern_filter
 
 
 def initialize_engine(args, static_context, rules_config):

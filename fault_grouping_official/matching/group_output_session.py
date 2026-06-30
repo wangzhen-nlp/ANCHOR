@@ -30,6 +30,12 @@ class MatchOutputSession:
     ne_graph_data: dict
     site_to_ne_ids: dict
     ne_link_info_cache: dict
+    # 可落盘规则名集合（frozenset）。None 表示不做规则过滤，全部落盘。
+    # 只有 merged_rules 命中其中任意一个规则的故障组才会写入输出文件。
+    output_eligible_rules: object = None
+    # 落盘前故障模式过滤器（FaultPatternFilter）。None 表示不做故障模式过滤。
+    # 等价 analyze_case_fault_patterns.py --filter-others --one-component-only。
+    fault_pattern_filter: object = None
     match_count: int = 0
     process_progress: object = None
     output_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -78,21 +84,52 @@ class MatchOutputSession:
             return
         self.process_progress.set_extra_text(self.build_progress_extra_text(), force=force)
 
+    def _match_is_output_eligible(self, match):
+        """故障组是否满足落盘规则要求。
+
+        output_eligible_rules 为 None 时全部放行；否则要求 merged_rules（单个规则名
+        列表，权威来源）与可落盘规则集合有交集。merged_rules 缺失时退回到 rule 字段，
+        但合并组的 rule 形如 "a + b"，无法直接命中，故以 merged_rules 为准。
+        """
+        eligible = self.output_eligible_rules
+        if eligible is None:
+            return True
+        merged_rules = match.get("merged_rules")
+        if isinstance(merged_rules, list):
+            for rule_name in merged_rules:
+                if str(rule_name).strip() in eligible:
+                    return True
+            return False
+        rule = match.get("rule")
+        return isinstance(rule, str) and rule.strip() in eligible
+
     def write_matches(self, matches):
         with self.output_lock:
             fw = self._fw
             if fw is None:
                 raise RuntimeError("output file is not initialized; call reset_output_file() first")
             output_lines = []
+            written_count = 0
             for match in matches:
+                # 落盘前过滤：不含可落盘规则的故障组直接跳过，不再构建输出对象。
+                if not self._match_is_output_eligible(match):
+                    continue
                 enriched_match = build_jsonl_match_output(
                     match,
                     self.ne_graph_data,
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
                 )
+                # 故障模式过滤需要增强后的 ne_info/group_info，故在构建之后判断。
+                if (
+                    self.fault_pattern_filter is not None
+                    and not self.fault_pattern_filter.should_keep(enriched_match)
+                ):
+                    continue
                 output_lines.append(_dumps_line(enriched_match))
-            fw.writelines(output_lines)
-            fw.flush()
-            self.match_count += len(matches)
+                written_count += 1
+            if output_lines:
+                fw.writelines(output_lines)
+                fw.flush()
+            self.match_count += written_count
             self.refresh_progress_extra_text()

@@ -15,7 +15,9 @@ from fault_grouping_official.tools.topology_resources import (
 from fault_grouping_official.matching.group_output_session import MatchOutputSession
 from fault_grouping_official.matching.runtime import (
     AlarmLoadResult,
+    build_fault_pattern_filter,
     build_rules_config,
+    collect_output_eligible_rules,
     default_valid_alarm_titles,
     initialize_engine,
     load_alarm_data,
@@ -56,7 +58,9 @@ def _build_arg_parser():
     return parser
 
 
-def _build_output_session(args, engine, static_context):
+def _build_output_session(
+    args, engine, static_context, output_eligible_rules, fault_pattern_filter
+):
     output_session = MatchOutputSession(
         args=args,
         engine=engine,
@@ -64,6 +68,8 @@ def _build_output_session(args, engine, static_context):
         ne_graph_data=static_context.ne_graph_data,
         site_to_ne_ids=static_context.site_to_ne_ids,
         ne_link_info_cache=static_context.ne_link_info_cache,
+        output_eligible_rules=output_eligible_rules,
+        fault_pattern_filter=fault_pattern_filter,
     )
     output_session.reset_output_file()
     return output_session
@@ -75,6 +81,8 @@ def _prepare_runtime_execution(parser, args):
     valid_alarm_titles = default_valid_alarm_titles()
     print_run_configuration(args, valid_alarm_titles)
     rules_config = build_rules_config()
+    output_eligible_rules = collect_output_eligible_rules(rules_config)
+    fault_pattern_filter = build_fault_pattern_filter(static_context)
     engine = initialize_engine(args, static_context, rules_config)
     run_started_at = time.time()
     alarm_load_result = load_alarm_data(
@@ -84,7 +92,9 @@ def _prepare_runtime_execution(parser, args):
         sorted_alarm_cache_metadata,
     )
     print_alarm_load_summary(alarm_load_result)
-    output_session = _build_output_session(args, engine, static_context)
+    output_session = _build_output_session(
+        args, engine, static_context, output_eligible_rules, fault_pattern_filter
+    )
     return RuntimeExecutionPlan(
         engine=engine,
         alarm_load_result=alarm_load_result,
