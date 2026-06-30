@@ -1,36 +1,51 @@
-"""落盘前的故障模式过滤适配器。
+"""落盘前的故障模式过滤 + 记录增强适配器。
 
 复用（移植自 ticket_recall/evaluation/analyze_case_fault_patterns.py 的）故障模式
 分析，等价于在该脚本上同时启用 --filter-others 与 --one-component-only，并作为默认
-行为：
+行为，且与该脚本一样在保留的记录上追加模式信息：
 
-  仅当故障组拆分后 component_count == 1，且剔除 ip_ring_others 之后仍保留至少一个
-  可识别故障模式时，才允许写入输出文件；否则在落盘前丢弃。
+  - 过滤：仅当故障组拆分后 component_count == 1，且剔除 ip_ring_others 之后仍保留
+    至少一个可识别故障模式时，才允许写入输出文件；否则在落盘前丢弃。
+  - 增强：对保留下来的记录追加 note 模式备注、fault_pattern_* 字段，以及补充相关
+    站点/网元/链路（supplemental_fault_pattern_context，供 ne_propagation_
+    visualizer.html 标红展示）。
 
-分析在 build_jsonl_match_output() 产出的“增强后”记录上进行（含 match_info /
+分析与增强都作用在 build_jsonl_match_output() 产出的“增强后”记录上（含 match_info /
 ne_info / group_info / symptoms），与该脚本作用于 case JSONL 的结构一致。
 """
 
-# 分析逻辑已移植进官方包（fault_pattern_analysis），不再依赖 ticket_recall /
+# 分析与增强逻辑已移植进官方包（fault_pattern_analysis），不再依赖 ticket_recall /
 # 旧 fault_grouping / alarm_tools 等外部包，保证 fault_grouping_official 自满足。
 from fault_grouping_official.matching.fault_pattern_analysis import (
     SiteRelationIndex,
     analyze_case_record,
+    append_note,
+    augment_case_with_supplemental_fault_pattern_sites,
+    build_pattern_note,
     build_site_has_router_device_map,
     filter_other_patterns,
 )
 
 
 class FaultPatternFilter:
-    """对增强后的故障组记录做 filter-others + one-component-only 过滤。"""
+    """对增强后的故障组记录做 filter-others + one-component-only 过滤与模式增强。"""
 
-    def __init__(self, relation_index, ne_to_site, site_has_router_device):
+    def __init__(
+        self,
+        relation_index,
+        ne_to_site,
+        site_has_router_device,
+        ne_graph_data,
+        site_to_ne_ids,
+    ):
         self._relation_index = relation_index
         self._ne_to_site = ne_to_site
         self._site_has_router_device = site_has_router_device
+        self._ne_graph_data = ne_graph_data
+        self._site_to_ne_ids = site_to_ne_ids
 
     @classmethod
-    def from_static_context(cls, ne_graph_data, site_chain_index, ne_to_site):
+    def from_static_context(cls, ne_graph_data, site_chain_index, ne_to_site, site_to_ne_ids):
         """用官方 static_context 已有的数据构建过滤器，无需额外 site_chains 文件。
 
         官方 site_chain_index 与 analyze 脚本里 load_site_chain_index 的结构一致
@@ -45,23 +60,67 @@ class FaultPatternFilter:
         else:
             relation_index = SiteRelationIndex(ne_graph_data=ne_graph_data)
         site_has_router_device = build_site_has_router_device_map(ne_graph_data)
-        return cls(relation_index, ne_to_site, site_has_router_device)
+        return cls(
+            relation_index,
+            ne_to_site,
+            site_has_router_device,
+            ne_graph_data,
+            site_to_ne_ids,
+        )
 
-    def should_keep(self, record):
-        """等价 analyze_case_fault_patterns.py --filter-others --one-component-only。
+    def process(self, record):
+        """对单条增强后记录做过滤与模式增强。
 
-        - one-component-only：拆分后必须是单连通分量（component_count == 1）。
-        - filter-others + 无条件兜底：剔除 ip_ring_others 后必须仍有可识别模式。
-          （脚本中“had_other 且过滤后为空则丢弃”与“过滤后为空则丢弃”两条分支，
-          合并即：过滤 others 后无模式 -> 丢弃。）
+        返回增强后的记录（保留并写盘）；若被过滤掉则返回 None（不落盘）。等价于
+        analyze_case_fault_patterns.py 在 --filter-others --one-component-only 下，
+        对保留 case 调用 build_augmented_case_record 后写出。
+
+        过滤判定（与该脚本一致）：
+          - one-component-only：拆分后必须是单连通分量（component_count == 1）。
+          - filter-others + 无条件兜底：剔除 ip_ring_others 后必须仍有可识别模式。
+            （脚本中“had_other 且过滤后为空则丢弃”与“过滤后为空则丢弃”两条分支，
+            合并即：过滤 others 后无模式 -> 丢弃。）
+        增强使用的是“剔除 others 之后”的分析结果，与脚本中先 filter_other_patterns
+        再 build_augmented_case_record 的顺序一致。
         """
-        result = analyze_case_record(
+        analysis = analyze_case_record(
             record,
             self._relation_index,
             self._ne_to_site,
             self._site_has_router_device,
         )
-        if result.get("component_count") != 1:
-            return False
-        result = filter_other_patterns(result)
-        return bool(result.get("patterns"))
+        if analysis.get("component_count") != 1:
+            return None
+        analysis = filter_other_patterns(analysis)
+        if not analysis.get("patterns"):
+            return None
+        return self._augment(record, analysis)
+
+    def _augment(self, record, analysis):
+        """原样实现 build_augmented_case_record 的编排，但省去 deepcopy。
+
+        record 是每个故障组新构建、未被共享的增强记录，可安全原地改写——这是与
+        脚本唯一的差异（脚本对外部传入的 case 先 deepcopy 再改写）。
+        """
+        pattern_note = build_pattern_note(analysis)
+
+        record["note"] = append_note(record.get("note", ""), pattern_note)
+        match_info = record.setdefault("match_info", {})
+        if isinstance(match_info, dict):
+            match_info["note"] = append_note(match_info.get("note", ""), pattern_note)
+
+        record["fault_pattern_analysis"] = analysis
+        record["fault_patterns"] = analysis.get("patterns", [])
+        record["fault_pattern_count"] = analysis.get("pattern_count", 0)
+        record["fault_pattern_managed_sites"] = analysis.get("managed_sites", [])
+        record["fault_pattern_active_unmanaged_sites"] = analysis.get(
+            "active_unmanaged_sites", []
+        )
+        augment_case_with_supplemental_fault_pattern_sites(
+            record,
+            analysis,
+            self._ne_graph_data,
+            self._site_to_ne_ids,
+            site_has_router_device=self._site_has_router_device,
+        )
+        return record

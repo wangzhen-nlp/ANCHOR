@@ -186,8 +186,9 @@ def build_fault_pattern_filter(static_context):
         static_context.ne_graph_data,
         static_context.site_chain_index,
         static_context.ne_to_site,
+        static_context.site_to_ne_ids,
     )
-    print("已启用落盘前故障模式过滤: filter-others + one-component-only")
+    print("已启用落盘前故障模式过滤+增强: filter-others + one-component-only")
     return fault_pattern_filter
 
 

@@ -120,12 +120,12 @@ class MatchOutputSession:
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
                 )
-                # 故障模式过滤需要增强后的 ne_info/group_info，故在构建之后判断。
-                if (
-                    self.fault_pattern_filter is not None
-                    and not self.fault_pattern_filter.should_keep(enriched_match)
-                ):
-                    continue
+                # 故障模式过滤+增强需要增强后的 ne_info/group_info，故在构建之后处理。
+                # process() 返回追加了模式备注/相关站点的记录；被过滤掉时返回 None。
+                if self.fault_pattern_filter is not None:
+                    enriched_match = self.fault_pattern_filter.process(enriched_match)
+                    if enriched_match is None:
+                        continue
                 output_lines.append(_dumps_line(enriched_match))
                 written_count += 1
             if output_lines:

@@ -1,12 +1,18 @@
-"""故障模式分析（self-contained 移植）。
+"""故障模式分析与记录增强（self-contained 移植）。
 
-从 ticket_recall/evaluation/analyze_case_fault_patterns.py 移植 should_keep 所需的
-分析逻辑，使 fault_grouping_official 不依赖 ticket_recall / 旧 fault_grouping /
-alarm_tools / topology_resources 等外部包，做到自满足。
+从 ticket_recall/evaluation/analyze_case_fault_patterns.py 移植两部分逻辑，使
+fault_grouping_official 不依赖 ticket_recall / 旧 fault_grouping / alarm_tools /
+topology_resources 等外部包，做到自满足：
 
-仅包含“过滤判定”相关函数（站点连通分量拆分、断站吸收、链/环模式识别），不含原脚本
-的 case 增强、IO、汇总与 CLI 部分。逻辑与原脚本逐行一致；如需同步行为改动，请对照
-原脚本一并更新。OFFLINE_ALARMS 取官方版本（与 alarm_tools 版集合相同）。
+  1) 过滤判定：站点连通分量拆分、断站吸收、链/环模式识别（analyze_case_record /
+     filter_other_patterns / SiteRelationIndex 等）。
+  2) 记录增强：故障模式备注（note）、fault_pattern_* 字段、补充相关站点/网元/链路
+     （supplemental_fault_pattern_context，供 ne_propagation_visualizer.html 标红展示）。
+
+不含原脚本的 IO、汇总、CLI 以及 build_augmented_case_record 外壳（该外壳的 27 行
+编排在 fault_pattern_filter.py 中按原样实现，但省去 deepcopy——因为传入的是每个故障组
+新构建、未被共享的记录，可安全原地改写）。其余函数与原脚本逐行一致；若原脚本行为有变，
+请对照同步。OFFLINE_ALARMS 取官方版本（与 alarm_tools 版集合相同）。
 """
 
 from collections import defaultdict, deque
@@ -682,3 +688,265 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
         "absorb_steps": absorb_steps,
     }
     return update_analysis_patterns(analysis, component_records)
+
+
+def format_pattern_summary_line(pattern_info, index):
+    pattern = pattern_info.get("pattern", "unknown")
+    managed_sites = pattern_info.get("managed_sites", []) or []
+
+    if pattern.startswith("ip_ring"):
+        chains = pattern_info.get("chains", []) or []
+        chain = chains[0].get("chain", []) if chains and isinstance(chains[0], dict) else []
+        matched_text = "->".join(chain) if chain else "->".join(managed_sites)
+    else:
+        matched_text = "->".join(managed_sites)
+
+    return f"模式{index}：{pattern}（{matched_text or '无'}）"
+
+
+def build_pattern_note(analysis):
+    patterns = analysis.get("patterns", []) or []
+    if not patterns:
+        return ""
+
+    lines = ["故障模式挖掘："]
+    lines.extend(
+        format_pattern_summary_line(pattern_info, index)
+        for index, pattern_info in enumerate(patterns, 1)
+    )
+    return "\n".join(lines)
+
+
+def format_link_context(raw_link):
+    if isinstance(raw_link, dict):
+        return dict(raw_link)
+    if raw_link in (None, ""):
+        return {}
+    return {"connection_type": str(raw_link)}
+
+
+def build_context_ne_info(ne_id, ne_graph_entry, group_id):
+    return {
+        "link": {},
+        "group": group_id,
+        "name": ne_graph_entry.get("name", ne_id),
+        "site_id": normalize_text(ne_graph_entry.get("site_id")),
+        "site_name": normalize_text(ne_graph_entry.get("site_name")) or normalize_text(ne_graph_entry.get("site_id")),
+        "type": normalize_text(ne_graph_entry.get("type")).upper(),
+        "network_type": normalize_text(ne_graph_entry.get("network_type")).upper(),
+        "manufacturer": normalize_text(ne_graph_entry.get("manufacturer")).upper(),
+        "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
+        "domain": normalize_text(ne_graph_entry.get("domain")).upper(),
+        "region_id": normalize_text(ne_graph_entry.get("region_id")),
+        "longitude": ne_graph_entry.get("longitude", ne_graph_entry.get("lon", ne_graph_entry.get("lng", ""))),
+        "latitude": ne_graph_entry.get("latitude", ne_graph_entry.get("lat", "")),
+        "alarm": [],
+        "supplemental_fault_pattern_context": True,
+    }
+
+
+def add_bidirectional_link(ne_info, source_ne, target_ne, link_context):
+    if source_ne not in ne_info or target_ne not in ne_info:
+        return
+    if not link_context:
+        link_context = {"connection_type": "supplemental_fault_pattern_context"}
+    source_links = ne_info[source_ne].setdefault("link", {})
+    target_links = ne_info[target_ne].setdefault("link", {})
+    source_links.setdefault(target_ne, dict(link_context))
+    target_links.setdefault(source_ne, dict(link_context))
+
+
+def find_ne_link_context(source_ne, target_ne, ne_graph_data):
+    source_links = as_dict(as_dict(ne_graph_data.get(source_ne)).get("link"))
+    if target_ne in source_links:
+        return format_link_context(source_links.get(target_ne))
+    target_links = as_dict(as_dict(ne_graph_data.get(target_ne)).get("link"))
+    if source_ne in target_links:
+        return format_link_context(target_links.get(source_ne))
+    return {}
+
+
+def collect_supplemental_fault_pattern_sites(analysis, existing_sites, site_has_router_device=None):
+    existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
+    site_has_router_device = site_has_router_device or {}
+    supplemental_sites = []
+    seen = set()
+    for pattern_info in analysis.get("patterns", []) or []:
+        pattern = pattern_info.get("pattern")
+        if pattern not in {
+            "ip_chain_single_link",
+            "ip_chain_multi_link",
+            "ip_ring_single_upstream",
+            "ip_ring_multi_upstream",
+        }:
+            continue
+        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
+            normalized_site_id = normalize_text(as_dict(edge_info).get("supplemental_site"))
+            if (
+                normalized_site_id
+                and normalized_site_id not in existing_sites
+                and normalized_site_id not in seen
+                and site_has_router_device.get(normalized_site_id, False)
+            ):
+                seen.add(normalized_site_id)
+                supplemental_sites.append(normalized_site_id)
+        for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
+            normalized_site_id = normalize_text(site_id)
+            if (
+                normalized_site_id
+                and normalized_site_id not in existing_sites
+                and normalized_site_id not in seen
+                and site_has_router_device.get(normalized_site_id, False)
+            ):
+                seen.add(normalized_site_id)
+                supplemental_sites.append(normalized_site_id)
+    return supplemental_sites
+
+
+def collect_supplemental_fault_pattern_edges(analysis, existing_sites, supplemental_sites=None):
+    existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
+    supplemental_site_set = {
+        normalize_text(site_id)
+        for site_id in (supplemental_sites or [])
+        if normalize_text(site_id)
+    }
+    supplemental_edges = []
+    seen = set()
+    for pattern_info in analysis.get("patterns", []) or []:
+        pattern = pattern_info.get("pattern")
+        if pattern not in {
+            "ip_chain_single_link",
+            "ip_chain_multi_link",
+            "ip_ring_single_upstream",
+            "ip_ring_multi_upstream",
+        }:
+            continue
+        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
+            edge_info = as_dict(edge_info)
+            supplemental_site = normalize_text(edge_info.get("supplemental_site"))
+            anchor_site = normalize_text(edge_info.get("anchor_site"))
+            if (
+                not supplemental_site
+                or not anchor_site
+                or supplemental_site in existing_sites
+                or supplemental_site not in supplemental_site_set
+            ):
+                continue
+            edge_key = (supplemental_site, anchor_site)
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            supplemental_edges.append({
+                "supplemental_site": supplemental_site,
+                "anchor_site": anchor_site,
+                "pattern": pattern,
+                "relation": normalize_text(edge_info.get("relation")),
+            })
+        unmanaged_sites = [
+            normalize_text(site_id)
+            for site_id in pattern_info.get("unmanaged_sites", []) or []
+            if normalize_text(site_id)
+        ]
+        if len(unmanaged_sites) != 1:
+            continue
+        anchor_site = unmanaged_sites[0]
+        for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
+            supplemental_site = normalize_text(site_id)
+            if (
+                not supplemental_site
+                or supplemental_site in existing_sites
+                or supplemental_site not in supplemental_site_set
+            ):
+                continue
+            edge_key = (supplemental_site, anchor_site)
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+            supplemental_edges.append({
+                "supplemental_site": supplemental_site,
+                "anchor_site": anchor_site,
+                "pattern": pattern,
+            })
+    return supplemental_edges
+
+
+def augment_case_with_supplemental_fault_pattern_sites(
+    record,
+    analysis,
+    ne_graph_data,
+    site_to_ne_ids,
+    site_has_router_device=None,
+):
+    if not ne_graph_data:
+        return
+
+    ne_info = record.setdefault("ne_info", {})
+    if not isinstance(ne_info, dict):
+        return
+
+    group_id = extract_record_uuid(record) or normalize_text(record.get("uuid")) or "fault_pattern_context"
+    existing_sites = extract_case_sites(record)
+    supplemental_sites = collect_supplemental_fault_pattern_sites(
+        analysis,
+        existing_sites,
+        site_has_router_device=site_has_router_device,
+    )
+    if not supplemental_sites:
+        return
+
+    existing_ne_ids = set(ne_info.keys())
+    supplemental_ne_ids = []
+    site_to_added_ne_ids = defaultdict(list)
+    for site_id in supplemental_sites:
+        for ne_id in site_to_ne_ids.get(site_id, ()):
+            ne_graph_entry = as_dict(ne_graph_data.get(ne_id))
+            if ne_id not in ne_info:
+                ne_info[ne_id] = build_context_ne_info(ne_id, ne_graph_entry, group_id)
+            ne_info[ne_id]["supplemental_fault_pattern_context"] = True
+            supplemental_ne_ids.append(ne_id)
+            site_to_added_ne_ids[site_id].append(ne_id)
+
+    supplemental_edges = collect_supplemental_fault_pattern_edges(
+        analysis,
+        existing_sites,
+        supplemental_sites=supplemental_sites,
+    )
+    for edge in supplemental_edges:
+        supplemental_site = edge["supplemental_site"]
+        anchor_site = edge["anchor_site"]
+        source_ne_ids = site_to_added_ne_ids.get(supplemental_site, [])
+        target_ne_ids = [
+            ne_id
+            for ne_id in site_to_ne_ids.get(anchor_site, ())
+            if ne_id in ne_info
+        ]
+        for source_ne in source_ne_ids:
+            for target_ne in target_ne_ids:
+                link_context = find_ne_link_context(source_ne, target_ne, ne_graph_data)
+                if link_context:
+                    link_context["supplemental_fault_pattern_context"] = True
+                    add_bidirectional_link(ne_info, source_ne, target_ne, link_context)
+
+    group_info = record.setdefault("group_info", {})
+    if isinstance(group_info, dict):
+        group_entry = group_info.setdefault(group_id, {})
+        if isinstance(group_entry, dict):
+            group_entry["site_list"] = sorted(set(group_entry.get("site_list", [])) | set(supplemental_sites))
+            group_entry["ne_list"] = sorted(set(group_entry.get("ne_list", [])) | set(existing_ne_ids) | set(supplemental_ne_ids))
+            group_entry["supplemental_fault_pattern_sites"] = supplemental_sites
+
+    record["fault_pattern_supplemental_sites"] = supplemental_sites
+    record["fault_pattern_supplemental_ne_ids"] = sorted(set(supplemental_ne_ids))
+    record["fault_pattern_supplemental_edges"] = supplemental_edges
+
+
+def append_note(original_note, pattern_note):
+    original_note = normalize_text(original_note)
+    pattern_note = normalize_text(pattern_note)
+    if not pattern_note:
+        return original_note
+    if not original_note:
+        return pattern_note
+    if pattern_note in original_note:
+        return original_note
+    return f"{original_note.rstrip()}\n\n{pattern_note}"
