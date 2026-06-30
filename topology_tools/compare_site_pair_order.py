@@ -2,10 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 比较任意两个 site_pair_order_*.json（pairwise / global_no_path /
-global_path_voting / global_path_optimized，含其 _ring 变体）的方向预测差异统计。
+global_path_voting / global_path_optimized，含其 _ring 变体）的方向预测差异统计；
+也支持 build_resource_buffer.py 生成的 resource_buffer.jsonl。
 
 四个生成脚本输出同一外层结构：
     {"meta": {...}, "edges": [{site_a, site_b, prediction, upstream_site, downstream_site}, ...], "downstream_map": {...}}
+
+resource_buffer.jsonl 中没有保存中间 prediction，而是保存其派生结果 site_chains。
+本脚本从 site_chains 中用 downstream_site_hops 的 hop=1 还原直接有向边，并用
+bidirectional_sites 还原直接双向边，再按相同口径比较。
 
 注意：edges 里的 `prediction` 字符串方向约定在 pairwise 与 global 系列之间并不一致
 （pairwise 写 upstream->downstream，global 写 downstream->upstream），因此本脚本
@@ -41,6 +46,7 @@ from topology_tools.site_pair_order_common import build_downstream_map
 
 
 RELATION_LABELS = ("s0_up", "s1_up", "bidir")
+RESOURCE_TYPE_PREFIX = '{"resource_type":'
 
 
 def resolve_input_path(value):
@@ -54,15 +60,131 @@ def resolve_input_path(value):
     return path
 
 
+def _load_site_chains_from_buffer(path):
+    """从 build_resource_buffer 的 JSONL 中只解析 site_chains 资源。"""
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.startswith(RESOURCE_TYPE_PREFIX):
+                continue
+            try:
+                resource_type, _ = json.JSONDecoder().raw_decode(
+                    line[len(RESOURCE_TYPE_PREFIX):]
+                )
+            except json.JSONDecodeError:
+                continue
+            if resource_type == "site_chains":
+                record = json.loads(line)
+                site_chains = record.get("data")
+                if isinstance(site_chains, dict):
+                    return site_chains
+                break
+    raise SystemExit(
+        f"资源缓冲文件缺少有效的 site_chains 资源: {path}；"
+        "请重新运行 build_resource_buffer.py"
+    )
+
+
+def _is_first_hop(value):
+    """兼容 JSON 中的数值 1，以及少量手工数据中的字符串 \"1\"。"""
+    return value == 1 or (isinstance(value, str) and value.strip() == "1")
+
+
+def prediction_from_site_chains(site_chains, path="<site_chains>"):
+    """把 site_chains 还原为 compare 所需的直接边 prediction 结构。"""
+    sites = site_chains.get("sites") if isinstance(site_chains, dict) else None
+    if not isinstance(sites, dict):
+        raise SystemExit(f"site_chains 结构不含 sites，无法比较: {path}")
+
+    bidirectional_pairs = set()
+    directed_pairs = set()
+    for raw_site_id, info in sites.items():
+        site_id = str(raw_site_id or "").strip()
+        if not site_id or not isinstance(info, dict):
+            continue
+
+        for raw_other in info.get("bidirectional_sites", []) or ():
+            other = str(raw_other or "").strip()
+            if other and other != site_id:
+                bidirectional_pairs.add(tuple(sorted((site_id, other))))
+
+        downstream_hops = info.get("downstream_site_hops", {}) or {}
+        if not isinstance(downstream_hops, dict):
+            continue
+        for raw_downstream, hop in downstream_hops.items():
+            downstream = str(raw_downstream or "").strip()
+            if downstream and downstream != site_id and _is_first_hop(hop):
+                directed_pairs.add((site_id, downstream))
+
+    # site_chains 正常不会同时含一对站点的双向标记和有向第一跳；若输入异常，
+    # 双向标记优先。两个相反的有向第一跳也按双向关系归一化。
+    directed_by_pair = {}
+    for upstream, downstream in directed_pairs:
+        pair_key = tuple(sorted((upstream, downstream)))
+        directed_by_pair.setdefault(pair_key, set()).add((upstream, downstream))
+
+    edges = []
+    for pair_key in sorted(bidirectional_pairs | set(directed_by_pair)):
+        site_a, site_b = pair_key
+        directions = directed_by_pair.get(pair_key, set())
+        if pair_key in bidirectional_pairs or len(directions) != 1:
+            edges.append({
+                "site_a": site_a,
+                "site_b": site_b,
+                "prediction": "bidirectional",
+                "upstream_site": None,
+                "downstream_site": None,
+            })
+            continue
+        upstream, downstream = next(iter(directions))
+        edges.append({
+            "site_a": site_a,
+            "site_b": site_b,
+            "prediction": f"{upstream}->{downstream}",
+            "upstream_site": upstream,
+            "downstream_site": downstream,
+        })
+
+    prediction = {
+        "meta": {
+            "source": "site_chains",
+            "source_meta": site_chains.get("meta", {}),
+        },
+        "edges": edges,
+    }
+    prediction["downstream_map"] = build_downstream_map(prediction)
+    return prediction
+
+
+def extract_prediction(data, path):
+    """兼容 prediction JSON、site_chains JSON 和旧式嵌套 buffer 对象。"""
+    if not isinstance(data, dict):
+        raise SystemExit(f"文件结构不是对象，无法比较: {path}")
+    if isinstance(data.get("edges"), list):
+        return data
+    if isinstance(data.get("sites"), dict):
+        return prediction_from_site_chains(data, path)
+    nested = data.get("site_chains")
+    if isinstance(nested, dict):
+        return prediction_from_site_chains(nested, path)
+    if data.get("resource_type") == "site_chains" and isinstance(data.get("data"), dict):
+        return prediction_from_site_chains(data["data"], path)
+    raise SystemExit(
+        f"文件结构既不含 edges，也不含 site_chains.sites，无法比较: {path}"
+    )
+
+
 def load_prediction(value):
     path = resolve_input_path(value)
     if not path.exists():
         raise SystemExit(f"未找到预测文件: {value}")
     with open(path, "r", encoding="utf-8") as f:
+        prefix = f.read(len(RESOURCE_TYPE_PREFIX))
+    if prefix == RESOURCE_TYPE_PREFIX:
+        data = _load_site_chains_from_buffer(path)
+        return prediction_from_site_chains(data, path), path
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    if not isinstance(data, dict) or "edges" not in data:
-        raise SystemExit(f"文件结构不含 edges，无法比较: {path}")
-    return data, path
+    return extract_prediction(data, path), path
 
 
 def edge_relation(edge):
@@ -341,10 +463,16 @@ def build_json_report(left_name, right_name, left_stats, right_stats, result):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="比较两个 site_pair_order_*.json 的方向预测差异统计"
+        description=(
+            "比较两个 site_pair_order JSON 或 resource_buffer.jsonl 的方向预测差异统计"
+        )
     )
-    parser.add_argument("left", help="左侧预测 JSON（路径或 topology_resources/ 下文件名）")
-    parser.add_argument("right", help="右侧预测 JSON（路径或 topology_resources/ 下文件名）")
+    parser.add_argument(
+        "left", help="左侧预测 JSON/resource_buffer.jsonl（路径或资源文件名）"
+    )
+    parser.add_argument(
+        "right", help="右侧预测 JSON/resource_buffer.jsonl（路径或资源文件名）"
+    )
     parser.add_argument(
         "-o",
         "--output",

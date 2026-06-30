@@ -10,6 +10,8 @@
 """
 
 import unittest
+import json
+import tempfile
 
 from pathlib import Path
 import sys
@@ -22,6 +24,8 @@ from topology_tools.compare_site_pair_order import (
     build_relation_map,
     compare,
     directed_relation_pairs,
+    load_prediction,
+    prediction_from_site_chains,
     relation_counts,
 )
 
@@ -54,6 +58,27 @@ RIGHT = {
          "upstream_site": None, "downstream_site": None},
     ],
     "downstream_map": {"A": ["B"], "C": ["B"], "D": ["C"]},
+}
+
+SITE_CHAINS = {
+    "meta": {"source": "test"},
+    "sites": {
+        "A": {
+            "bidirectional_sites": [],
+            "downstream_site_hops": {"B": 1, "C": 2},
+            "upstream_site_hops": {},
+        },
+        "B": {
+            "bidirectional_sites": ["C"],
+            "downstream_site_hops": {},
+            "upstream_site_hops": {"A": 1},
+        },
+        "C": {
+            "bidirectional_sites": ["B"],
+            "downstream_site_hops": {},
+            "upstream_site_hops": {"A": 2},
+        },
+    },
 }
 
 
@@ -116,6 +141,38 @@ class CompareSitePairOrderTest(unittest.TestCase):
         pairs = directed_relation_pairs(no_map)
         self.assertIn(("A", "B"), pairs)
         self.assertIn(("D", "C"), pairs)
+
+    def test_prediction_from_site_chains_uses_only_first_hop(self):
+        prediction = prediction_from_site_chains(SITE_CHAINS)
+        relation_map, duplicate_count, invalid_count = build_relation_map(prediction)
+        self.assertEqual(duplicate_count, 0)
+        self.assertEqual(invalid_count, 0)
+        self.assertEqual(relation_map, {
+            ("A", "B"): "s0_up",
+            ("B", "C"): "bidir",
+        })
+        self.assertNotIn(("A", "C"), relation_map)
+        self.assertEqual(
+            directed_relation_pairs(prediction),
+            {("A", "B"), ("B", "C"), ("C", "B")},
+        )
+
+    def test_load_prediction_from_resource_buffer_jsonl(self):
+        records = [
+            {"resource_type": "site_graph", "data": {"ignored": True}},
+            {"resource_type": "site_chains", "data": SITE_CHAINS},
+        ]
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".jsonl") as f:
+            for record in records:
+                json.dump(record, f, ensure_ascii=False, separators=(",", ":"))
+                f.write("\n")
+            f.flush()
+            prediction, path = load_prediction(f.name)
+
+        relation_map, _, _ = build_relation_map(prediction)
+        self.assertEqual(str(path), f.name)
+        self.assertEqual(relation_map[("A", "B")], "s0_up")
+        self.assertEqual(relation_map[("B", "C")], "bidir")
 
 
 if __name__ == "__main__":
