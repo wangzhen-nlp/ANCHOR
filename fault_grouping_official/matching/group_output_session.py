@@ -28,6 +28,7 @@ class MatchOutputSession:
     engine: TemporalGraphEngine
     output_path: str
     ne_graph_data: dict
+    site_graph_data: dict
     site_to_ne_ids: dict
     ne_link_info_cache: dict
     # 可落盘规则名集合（frozenset）。None 表示不做规则过滤，全部落盘。
@@ -117,6 +118,7 @@ class MatchOutputSession:
                 enriched_match = build_jsonl_match_output(
                     match,
                     self.ne_graph_data,
+                    site_graph_data=self.site_graph_data,
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
                 )

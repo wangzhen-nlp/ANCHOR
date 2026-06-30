@@ -725,21 +725,35 @@ def format_link_context(raw_link):
     return {"connection_type": str(raw_link)}
 
 
-def build_context_ne_info(ne_id, ne_graph_entry, group_id):
+def build_context_ne_info(ne_id, ne_graph_entry, group_id, site_graph_entry=None):
+    site_graph_entry = as_dict(site_graph_entry)
     return {
         "link": {},
         "group": group_id,
         "name": ne_graph_entry.get("name", ne_id),
         "site_id": normalize_text(ne_graph_entry.get("site_id")),
-        "site_name": normalize_text(ne_graph_entry.get("site_name")) or normalize_text(ne_graph_entry.get("site_id")),
+        "site_name": (
+            normalize_text(ne_graph_entry.get("site_name"))
+            or normalize_text(site_graph_entry.get("site_name"))
+            or normalize_text(ne_graph_entry.get("site_id"))
+        ),
         "type": normalize_text(ne_graph_entry.get("type")).upper(),
         "network_type": normalize_text(ne_graph_entry.get("network_type")).upper(),
         "manufacturer": normalize_text(ne_graph_entry.get("manufacturer")).upper(),
         "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
         "domain": normalize_text(ne_graph_entry.get("domain")).upper(),
-        "region_id": normalize_text(ne_graph_entry.get("region_id")),
-        "longitude": ne_graph_entry.get("longitude", ne_graph_entry.get("lon", ne_graph_entry.get("lng", ""))),
-        "latitude": ne_graph_entry.get("latitude", ne_graph_entry.get("lat", "")),
+        "region_id": normalize_text(ne_graph_entry.get("region_id")) or normalize_text(site_graph_entry.get("region_id")),
+        "longitude": (
+            ne_graph_entry.get("longitude")
+            or ne_graph_entry.get("lon")
+            or ne_graph_entry.get("lng")
+            or site_graph_entry.get("longitude", "")
+        ),
+        "latitude": (
+            ne_graph_entry.get("latitude")
+            or ne_graph_entry.get("lat")
+            or site_graph_entry.get("latitude", "")
+        ),
         "alarm": [],
         "supplemental_fault_pattern_context": True,
     }
@@ -876,9 +890,11 @@ def augment_case_with_supplemental_fault_pattern_sites(
     ne_graph_data,
     site_to_ne_ids,
     site_has_router_device=None,
+    site_graph_data=None,
 ):
     if not ne_graph_data:
         return
+    site_graph_data = site_graph_data or {}
 
     ne_info = record.setdefault("ne_info", {})
     if not isinstance(ne_info, dict):
@@ -901,7 +917,12 @@ def augment_case_with_supplemental_fault_pattern_sites(
         for ne_id in site_to_ne_ids.get(site_id, ()):
             ne_graph_entry = as_dict(ne_graph_data.get(ne_id))
             if ne_id not in ne_info:
-                ne_info[ne_id] = build_context_ne_info(ne_id, ne_graph_entry, group_id)
+                ne_info[ne_id] = build_context_ne_info(
+                    ne_id,
+                    ne_graph_entry,
+                    group_id,
+                    site_graph_entry=site_graph_data.get(site_id),
+                )
             ne_info[ne_id]["supplemental_fault_pattern_context"] = True
             supplemental_ne_ids.append(ne_id)
             site_to_added_ne_ids[site_id].append(ne_id)

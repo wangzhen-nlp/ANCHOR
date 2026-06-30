@@ -66,6 +66,7 @@ def _build_output_session(
         engine=engine,
         output_path=args.output,
         ne_graph_data=static_context.ne_graph_data,
+        site_graph_data=static_context.site_graph_data,
         site_to_ne_ids=static_context.site_to_ne_ids,
         ne_link_info_cache=static_context.ne_link_info_cache,
         output_eligible_rules=output_eligible_rules,

@@ -108,8 +108,9 @@ def build_group_link_info(ne_id, group_ne_ids, ne_graph_data, ne_link_info_cache
     return link_info
 
 
-def resolve_ne_site_context(ne_id, alarms, ne_graph_data):
-    """仅使用 ne_graph；NE 未标站点时从当前告警的唯一站点回填。"""
+def resolve_ne_site_context(ne_id, alarms, ne_graph_data, site_graph_data=None):
+    """解析 NE 的站点上下文，并按 site_id 用 site_graph 补齐站点字段。"""
+    site_graph_data = site_graph_data or {}
     ne_graph_entry = ne_graph_data.get(ne_id, {})
     resolved_site_id = ne_graph_entry.get("site_id", "")
     if not resolved_site_id:
@@ -119,12 +120,13 @@ def resolve_ne_site_context(ne_id, alarms, ne_graph_data):
             if alarm.get("site_id")
         })
         resolved_site_id = alarm_site_ids[0] if len(alarm_site_ids) == 1 else ""
+    site_graph_entry = site_graph_data.get(resolved_site_id, {}) if resolved_site_id else {}
     return {
         "site_id": resolved_site_id,
-        "site_name": ne_graph_entry.get("site_name", ""),
-        "region_id": ne_graph_entry.get("region_id", ""),
-        "longitude": ne_graph_entry.get("longitude", ""),
-        "latitude": ne_graph_entry.get("latitude", ""),
+        "site_name": ne_graph_entry.get("site_name", "") or site_graph_entry.get("site_name", ""),
+        "region_id": ne_graph_entry.get("region_id", "") or site_graph_entry.get("region_id", ""),
+        "longitude": ne_graph_entry.get("longitude", "") or site_graph_entry.get("longitude", ""),
+        "latitude": ne_graph_entry.get("latitude", "") or site_graph_entry.get("latitude", ""),
     }
 
 
@@ -133,7 +135,9 @@ def build_group_output(
     ne_graph_data,
     site_to_ne_ids,
     ne_link_info_cache,
+    site_graph_data=None,
 ):
+    site_graph_data = site_graph_data or {}
     group_id = match["uuid"]
     ne_info = {}
     ne_alarms = defaultdict(list)
@@ -162,6 +166,7 @@ def build_group_output(
         if site_id:
             group_site_ids.add(site_id)
 
+        site_graph_entry = site_graph_data.get(site_id, {}) if site_id else {}
         alarm_output = {
             "alarm_id": representative_eid,
             "alarm_type": symptom.get("alarm", ""),
@@ -169,7 +174,7 @@ def build_group_output(
             "alarm_clear_time": symptom.get("告警清除时间", ""),
             "domain": ne_static["domain_raw"],
             "site_id": site_id,
-            "site_name": ne_static["site_name_from_ne"],
+            "site_name": ne_static["site_name_from_ne"] or site_graph_entry.get("site_name", ""),
             "matched_role": symptom.get("matched_role", ""),
             "matched_rule": symptom.get("matched_rule", ""),
             "matched_role_key": symptom.get("matched_role_key", ""),
@@ -198,7 +203,12 @@ def build_group_output(
             ne_static = _get_ne_static_info(ne_graph_data, ne_id)
             local_ne_static[ne_id] = ne_static
         alarms = sorted(ne_alarms.get(ne_id, []), key=_SORT_ALARM_KEY)
-        site_context = resolve_ne_site_context(ne_id, alarms, ne_graph_data)
+        site_context = resolve_ne_site_context(
+            ne_id,
+            alarms,
+            ne_graph_data,
+            site_graph_data=site_graph_data,
+        )
         site_id = site_context["site_id"]
         if site_id:
             group_site_ids.add(site_id)
@@ -265,6 +275,7 @@ def build_jsonl_match_output(
     ne_graph_data,
     site_to_ne_ids,
     ne_link_info_cache,
+    site_graph_data=None,
 ):
     enriched_match = dict(match)
     enriched_match["symptoms"] = enrich_match_symptoms(match)
@@ -272,6 +283,7 @@ def build_jsonl_match_output(
     group_output = build_group_output(
         enriched_match,
         ne_graph_data,
+        site_graph_data=site_graph_data,
         site_to_ne_ids=site_to_ne_ids,
         ne_link_info_cache=ne_link_info_cache,
     )

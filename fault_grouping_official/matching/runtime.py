@@ -44,6 +44,7 @@ from fault_grouping_official.resource_buffer import load_resource_buffer
 @dataclass
 class LoadedStaticContext:
     ne_graph_data: dict
+    site_graph_data: dict
     valid_sites: set
     topo_downstream_map: dict
     site_chain_index: object
@@ -92,9 +93,10 @@ def load_static_context(args):
     print(f"加载资源缓冲文件: {args.resource_buffer}")
     resources = load_resource_buffer(
         args.resource_buffer,
-        wanted_types=("ne_graph", "site_chains", "link_peer_index"),
+        wanted_types=("ne_graph", "site_graph", "site_chains", "link_peer_index"),
     )
     ne_graph_data = resources["ne_graph"]
+    site_graph_data = resources["site_graph"]
     site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
     topo_downstream_map, topology_sites = build_site_topology_from_ne_graph(ne_graph_data)
     valid_sites.update(topology_sites)
@@ -126,6 +128,7 @@ def load_static_context(args):
 
     return LoadedStaticContext(
         ne_graph_data=ne_graph_data,
+        site_graph_data=site_graph_data,
         valid_sites=valid_sites,
         topo_downstream_map=topo_downstream_map,
         site_chain_index=site_chain_index,
@@ -187,6 +190,7 @@ def build_fault_pattern_filter(static_context):
         static_context.site_chain_index,
         static_context.ne_to_site,
         static_context.site_to_ne_ids,
+        site_graph_data=static_context.site_graph_data,
     )
     print("已启用落盘前故障模式过滤+增强: filter-others + one-component-only")
     return fault_pattern_filter
