@@ -24,6 +24,11 @@ def load_site_chain_index(site_chains_path):
     """加载 generate_site_chains.py 产出的预计算上下游 hop 索引。"""
     with open(site_chains_path, "r", encoding="utf-8") as file_obj:
         data = json.load(file_obj)
+    return build_site_chain_index(data)
+
+
+def build_site_chain_index(data):
+    """从已加载的 site_chains 数据构建上下游 hop 索引与有效站点集合。"""
     raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
     site_chain_index = {}
     valid_sites = set()

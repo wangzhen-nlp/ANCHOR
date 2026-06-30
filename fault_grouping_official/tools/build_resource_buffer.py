@@ -36,7 +36,7 @@ if __package__ in (None, ""):
 from fault_grouping_official.peer_index_keys import make_key
 from fault_grouping_official.tools.progress_utils import ProgressBar
 from fault_grouping_official.tools.topology_resources import (
-    NE_GRAPH_JSON,
+    RESOURCE_BUFFER_JSONL,
     SYS_LINK_DIR,
     SYS_NE_DIR,
     SYS_SITE_DIR,
@@ -45,8 +45,8 @@ from fault_grouping_official.tools.topology_resources import (
 from fault_grouping_official.tools.generate_site_chains import build_site_chains_from_data
 from fault_grouping_official.tools.generate_site_pair_order_pairwise import build_pairwise_prediction
 
-# 单文件缓冲产物的默认输出路径（JSONL：每行一个资源）；与默认资源同目录
-DEFAULT_BUFFER_OUTPUT = os.path.join(os.path.dirname(NE_GRAPH_JSON), "resource_buffer.jsonl")
+# 单文件缓冲产物的默认输出路径（JSONL：每行一个资源）
+DEFAULT_BUFFER_OUTPUT = RESOURCE_BUFFER_JSONL
 
 # 行级进度的刷新间隔（行数）；计数模式下每次 set 都会重绘，需要批量节流
 PROGRESS_ROW_STEP = 5000
@@ -628,19 +628,19 @@ def main():
     parser.add_argument(
         "--ne-dir",
         default=SYS_NE_DIR,
-        help=f"SYS_NE 数据目录，默认: {resource_display('SYS_NE_0306')}",
+        help=f"SYS_NE 数据目录，默认: {resource_display('SYS_NE_20260525')}",
     )
     parser.add_argument(
         "--site-dir",
         default=SYS_SITE_DIR,
-        help=f"SYS_SITE 数据目录，默认: {resource_display('SYS_SITE_0306')}",
+        help=f"SYS_SITE 数据目录，默认: {resource_display('SYS_SITE_20260525')}",
     )
     parser.add_argument(
         "--link-input",
         default=SYS_LINK_DIR,
         help=(
             "链路输入，支持 .csv/.zip(内含CSV) 文件或包含这些文件的目录，"
-            f"默认: {resource_display('SYS_LINK_0306')}"
+            f"默认: {resource_display('SYS_LINK_20260525')}"
         ),
     )
     parser.add_argument(

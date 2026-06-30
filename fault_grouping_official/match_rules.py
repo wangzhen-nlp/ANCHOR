@@ -10,9 +10,7 @@ if __package__ in (None, ""):
 
 from fault_grouping_official.tools.progress_utils import ProgressBar
 from fault_grouping_official.tools.topology_resources import (
-    NE_GRAPH_JSON,
-    SITE_CHAINS_JSON,
-    LINK_PEER_INDEX_JSON,
+    RESOURCE_BUFFER_JSONL,
     resource_display,
 )
 from fault_grouping_official.matching.group_output_builder import (
@@ -52,8 +50,7 @@ def _build_arg_parser():
     parser = ArgumentParser()
     parser.add_argument('alarms', type=str, help='alarm stream')
     parser.add_argument('output', type=str, nargs='?', help='output jsonl file；--no-output 时可省略')
-    parser.add_argument('--site-chains', type=str, default=SITE_CHAINS_JSON, help=f'generate_site_chains.py 输出的预计算站点链路，默认: {resource_display("site_chains.json")}')
-    parser.add_argument('--ne-graph', type=str, default=NE_GRAPH_JSON, help=f'ne_graph.json 文件，默认: {resource_display("ne_graph.json")}')
+    parser.add_argument('--resource-buffer', type=str, default=RESOURCE_BUFFER_JSONL, help=f'build_resource_buffer.py 生成的资源缓冲文件（含 ne_graph / site_chains / link_peer_index），默认: {resource_display("resource_buffer.jsonl")}')
     parser.add_argument('--mode', type=str, choices=('live', 'offline'), default='offline', help='live: 按 ts 模拟实时流并启动后台定时收割; offline: 每条告警到来时直接触发检查')
     parser.add_argument('--harvest-interval-sec', type=float, default=DEFAULT_HARVEST_INTERVAL_SEC, help=f'模拟时间下的定时收割周期，单位秒，默认 {DEFAULT_HARVEST_INTERVAL_SEC:g}')
     parser.add_argument('--aggregation-wait-sec', type=float, default=DEFAULT_AGGREGATION_WAIT_SEC, help=f'trigger 成熟前的聚合等待时间，单位秒，默认 {DEFAULT_AGGREGATION_WAIT_SEC:g}')
@@ -62,7 +59,6 @@ def _build_arg_parser():
     parser.add_argument('--stream-sorted-alarms', action='store_true', help='从排序告警缓存流式读取，不把全部 valid_alarms 加载到内存；仅当 alarms 本身为 prepare_sorted_alarms.py 生成的排序缓存(JSONL/ZIP)时生效')
     parser.add_argument('--compact-output', action='store_true', help='输出轻量化 JSONL：省略 ne_info 内重复告警列表，并压缩空 link 字段；可视化页会从 symptoms 补回节点告警')
     parser.add_argument('--no-output', action='store_true', help='只运行匹配与统计，不创建、不截断、不写入故障组输出 JSONL')
-    parser.add_argument('--link-peer-index', type=str, default=LINK_PEER_INDEX_JSON, help=f'设备端口对端索引 JSON，默认: {resource_display("link_peer_index.json")}；link 告警必须指向模式关联站点')
     return parser
 
 

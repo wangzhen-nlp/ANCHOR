@@ -24,6 +24,10 @@ class PeerDevice:
 def load_peer_index(path):
     with open(path, "r", encoding="utf-8") as file_obj:
         data = json.load(file_obj)
+    return build_peer_index(data)
+
+
+def build_peer_index(data):
     return {
         key: PeerDevice(**value) if isinstance(value, dict) else value
         for key, value in data.items()

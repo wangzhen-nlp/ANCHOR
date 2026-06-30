@@ -1,4 +1,3 @@
-import json
 import os
 import time
 
@@ -32,9 +31,10 @@ from fault_grouping_official.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping_official.site_topology import (
     build_site_domain_map,
     build_site_to_ne_ids,
-    load_site_chain_index,
+    build_site_chain_index,
 )
-from fault_grouping_official.link_peer_index import load_peer_index
+from fault_grouping_official.link_peer_index import build_peer_index
+from fault_grouping_official.resource_buffer import load_resource_buffer
 
 
 @dataclass
@@ -73,23 +73,23 @@ def validate_main_args(parser, args):
             "请先使用与当前缓存格式一致的预处理流程生成缓存，"
             "并将缓存文件作为 alarms 位置参数传入"
         )
-    if not os.path.exists(args.site_chains):
-        parser.error(f"site_chains 文件不存在: {args.site_chains}")
-    if not os.path.exists(args.ne_graph):
-        parser.error(f"ne_graph 文件不存在: {args.ne_graph}")
-    if not os.path.exists(args.link_peer_index):
+    if not os.path.exists(args.resource_buffer):
         parser.error(
-            f"link_peer_index 文件不存在: {args.link_peer_index}；"
-            "请将索引放入 resources/link_peer_index.json，"
-            "或通过 --link-peer-index 指定已有索引"
+            f"资源缓冲文件不存在: {args.resource_buffer}；"
+            "请先运行 build_resource_buffer.py 生成 resources/resource_buffer.jsonl，"
+            "或通过 --resource-buffer 指定已有缓冲文件"
         )
     return sorted_alarm_cache_metadata
 
 
 def load_static_context(args):
-    ne_graph_data = json.load(open(args.ne_graph, 'r', encoding='utf-8'))
-    print(f"加载预计算站点链路: {args.site_chains}")
-    site_chain_index, valid_sites = load_site_chain_index(args.site_chains)
+    print(f"加载资源缓冲文件: {args.resource_buffer}")
+    resources = load_resource_buffer(
+        args.resource_buffer,
+        wanted_types=("ne_graph", "site_chains", "link_peer_index"),
+    )
+    ne_graph_data = resources["ne_graph"]
+    site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
     site_domain_map = build_site_domain_map(ne_graph_data)
     print(f"预计算站点链路站点数: {len(site_chain_index)}")
 
@@ -112,8 +112,7 @@ def load_static_context(args):
     site_to_ne_ids = build_site_to_ne_ids(ne_graph_data)
     ne_link_info_cache = {}
     print(f"site -> NE 索引站点数: {len(site_to_ne_ids)}")
-    print(f"加载 link peer_index: {args.link_peer_index}")
-    link_peer_index = load_peer_index(args.link_peer_index)
+    link_peer_index = build_peer_index(resources["link_peer_index"])
     print(f"link peer_index 记录数: {len(link_peer_index)}")
 
     return LoadedStaticContext(

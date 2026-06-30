@@ -1,5 +1,3 @@
-import os
-
 from datetime import datetime
 
 from fault_grouping_official.alarm_inputs import stream_alarm_inputs
@@ -164,10 +162,6 @@ def load_sorted_alarm_cache_with_stats(cache_path, metadata):
 def warn_sorted_alarm_cache_option_mismatch(metadata, args):
     mismatches = []
     expected_clear_delay = float(metadata["clear_delay_sec"])
-    expected_ne_graph = str(metadata["ne_graph"])
-    current_ne_graph = os.path.abspath(args.ne_graph)
-    if expected_ne_graph and expected_ne_graph != current_ne_graph:
-        mismatches.append(f"ne_graph: 缓存={expected_ne_graph}, 当前={current_ne_graph}")
     if abs(float(args.clear_delay_sec) - expected_clear_delay) > 1e-9:
         mismatches.append(
             f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(args.clear_delay_sec):g}"
