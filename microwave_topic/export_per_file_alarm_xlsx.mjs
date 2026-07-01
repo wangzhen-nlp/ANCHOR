@@ -2,6 +2,7 @@
 /** 把 complete_group_topology.py --per-file 的 JSONL 逐个导出为层级告警 Excel。 */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { createRequire } from "node:module";
@@ -74,16 +75,22 @@ export async function loadArtifactTool() {
   try {
     return await import("@oai/artifact-tool");
   } catch (originalError) {
-    const nodeModules = process.env.ARTIFACT_TOOL_NODE_MODULES;
-    if (!nodeModules) {
+    const nodeModules =
+      process.env.ARTIFACT_TOOL_NODE_MODULES ||
+      path.join(
+        os.homedir(),
+        ".cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules",
+      );
+    const require = createRequire(import.meta.url);
+    try {
+      const resolved = require.resolve("@oai/artifact-tool", { paths: [nodeModules] });
+      return import(pathToFileURL(resolved).href);
+    } catch (fallbackError) {
       throw new Error(
-        "找不到 @oai/artifact-tool。请安装该依赖，或通过 ARTIFACT_TOOL_NODE_MODULES 指向包含它的 node_modules 目录。",
-        { cause: originalError },
+        `找不到 @oai/artifact-tool；已检查项目依赖和 Codex 自带运行时: ${nodeModules}`,
+        { cause: fallbackError || originalError },
       );
     }
-    const require = createRequire(import.meta.url);
-    const resolved = require.resolve("@oai/artifact-tool", { paths: [nodeModules] });
-    return import(pathToFileURL(resolved).href);
   }
 }
 
