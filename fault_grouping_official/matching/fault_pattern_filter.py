@@ -8,22 +8,22 @@
     站点/网元/链路（supplemental_fault_pattern_context，供 ne_propagation_
     visualizer.html 标红展示）。
 
-分析与增强都作用在 build_jsonl_match_output() 产出的记录上（含 match_info /
-ne_info / group_info / symptoms）。
+过滤分析可直接作用于引擎原始 match，避免为被丢弃记录构建完整输出；增强仍作用于
+build_jsonl_match_output() 产出的记录（含 match_info / ne_info / group_info / symptoms）。
 """
 
 from fault_grouping_official.matching.fault_pattern_analysis import (
+    MAX_ANALYSIS_SITES,
     SiteRelationIndex,
-    absorb_unmanaged_downstream_sites,
-    analyze_case_record,
+    analyze_prepared_case,
     append_note,
     augment_case_with_supplemental_fault_pattern_sites,
     build_pattern_note,
     build_site_has_router_device_map,
     extract_case_sites,
-    extract_offline_sites,
     filter_other_patterns,
-    projected_active_components_by_original_graph,
+    normalize_text,
+    prepare_case_record,
 )
 
 
@@ -54,6 +54,7 @@ class FaultPatternFilter:
         ne_to_site,
         site_to_ne_ids,
         site_graph_data=None,
+        precomputed_upstream_hops_complete=False,
     ):
         """用 static_context 已有的数据构建过滤器，无需额外 site_chains 文件。
 
@@ -65,6 +66,9 @@ class FaultPatternFilter:
         if site_chain_index:
             relation_index = SiteRelationIndex()
             relation_index.site_chains = site_chain_index
+            relation_index.precomputed_upstream_hops_complete = bool(
+                precomputed_upstream_hops_complete
+            )
             relation_index._load_direct_relations_from_site_chains()
         else:
             relation_index = SiteRelationIndex(ne_graph_data=ne_graph_data)
@@ -89,49 +93,62 @@ class FaultPatternFilter:
             否则丢弃。
         增强使用“剔除 others 之后”的分析结果。
         """
-        # ① one-component-only 提前短路：先用便宜的方式算出投影连通分量数，!= 1 的组
-        #    必被丢弃，可跳过 analyze_case_record 里逐分量的 classify_component
-        #    （其中 longest_path 的穷举 DFS 是热路径上的指数级开销来源）。被丢弃的组
-        #    本就不落盘，最终 keep/drop 与增强结果与"先 analyze 再判断"完全一致。
-        if self._projected_component_count(record) != 1:
+        analysis = self.analyze(record)
+        if analysis is None:
             return None
-        analysis = analyze_case_record(
+        return self.augment(record, analysis)
+
+    def _extract_match_sites(self, match):
+        """从引擎原始 match 提取与完整输出记录等价的站点集合。
+
+        build_group_output 还会把 symptom.alarm_source 对应的静态 site_id 加入
+        group_info；这里轻量复刻该补齐，避免为了模式过滤提前构建全部 NE/链路。
+        """
+        site_ids = set(extract_case_sites(match))
+        for symptom in match.get("symptoms", []) or []:
+            if not isinstance(symptom, dict):
+                continue
+            alarm_source = symptom.get("alarm_source")
+            static_site_id = normalize_text(self._ne_to_site.get(alarm_source, ""))
+            if static_site_id:
+                site_ids.add(static_site_id)
+        return sorted(site_ids)
+
+    def analyze_match(self, match):
+        """在构建完整 JSONL 输出前，对引擎原始 match 做等价模式判定。"""
+        return self.analyze(match, site_ids=self._extract_match_sites(match))
+
+    def analyze(self, record, site_ids=None):
+        """返回可保留记录的模式分析；不满足输出条件时返回 None。"""
+        if site_ids is None:
+            site_ids = extract_case_sites(record)
+        if len(site_ids) > MAX_ANALYSIS_SITES:
+            return None
+
+        prepared_case = prepare_case_record(
             record,
             self._relation_index,
             self._ne_to_site,
             self._site_has_router_device,
+            site_ids=site_ids,
+            # 只接受单分量；发现第二个投影分量即可停止遍历。
+            component_limit=2,
         )
-        if analysis.get("component_count") != 1:
-            # 与上面短路一致（同一确定性计算），仅作健壮性兜底。
+        if len(prepared_case.projected_components) != 1:
             return None
+
+        analysis = analyze_prepared_case(
+            record,
+            prepared_case,
+            self._relation_index,
+            recognized_patterns_only=True,
+        )
         analysis = filter_other_patterns(analysis)
         if not analysis.get("patterns"):
             return None
-        return self._augment(record, analysis)
+        return analysis
 
-    def _projected_component_count(self, record):
-        """与 analyze_case_record 一致地算出投影连通分量数，但不做逐分量分类。
-
-        由 extract_case_sites / extract_offline_sites /
-        absorb_unmanaged_downstream_sites / projected_active_components_by_original_graph），
-        按 analyze_case_record 计算 component_count 的同一流程执行，但省掉昂贵的
-        classify_component。
-        """
-        site_ids = extract_case_sites(record)
-        offline_sites = extract_offline_sites(record, self._ne_to_site) & set(site_ids)
-        active_sites, _unmanaged, _absorbed_by, _steps = absorb_unmanaged_downstream_sites(
-            site_ids,
-            offline_sites,
-            self._relation_index,
-        )
-        projected_components = projected_active_components_by_original_graph(
-            site_ids,
-            active_sites,
-            self._relation_index,
-        )
-        return len(projected_components)
-
-    def _augment(self, record, analysis):
+    def augment(self, record, analysis):
         """把分析结果写入记录，省去不必要的 deepcopy。
 
         record 是每个故障组新构建、未被共享的记录，可安全原地改写。

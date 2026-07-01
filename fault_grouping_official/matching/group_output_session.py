@@ -115,6 +115,13 @@ class MatchOutputSession:
                 # 落盘前过滤：不含可落盘规则的故障组直接跳过，不再构建输出对象。
                 if not self._match_is_output_eligible(match):
                     continue
+                pattern_analysis = None
+                if self.fault_pattern_filter is not None:
+                    # 模式判定只依赖轻量的站点/告警/拓扑数据。先在原始 match 上判定，
+                    # 被过滤的记录无需再展开全部 NE、链路和展示字段。
+                    pattern_analysis = self.fault_pattern_filter.analyze_match(match)
+                    if pattern_analysis is None:
+                        continue
                 enriched_match = build_jsonl_match_output(
                     match,
                     self.ne_graph_data,
@@ -122,12 +129,13 @@ class MatchOutputSession:
                     site_to_ne_ids=self.site_to_ne_ids,
                     ne_link_info_cache=self.ne_link_info_cache,
                 )
-                # 故障模式过滤+增强需要增强后的 ne_info/group_info，故在构建之后处理。
-                # process() 返回追加了模式备注/相关站点的记录；被过滤掉时返回 None。
+                # 补充模式上下文需要增强后的 ne_info/group_info，因此仅对已通过判定的
+                # 记录执行；分析结果直接复用，不再重复提取和拓扑计算。
                 if self.fault_pattern_filter is not None:
-                    enriched_match = self.fault_pattern_filter.process(enriched_match)
-                    if enriched_match is None:
-                        continue
+                    enriched_match = self.fault_pattern_filter.augment(
+                        enriched_match,
+                        pattern_analysis,
+                    )
                 output_lines.append(_dumps_line(enriched_match))
                 written_count += 1
             if output_lines:

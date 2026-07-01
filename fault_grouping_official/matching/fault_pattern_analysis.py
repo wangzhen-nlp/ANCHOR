@@ -8,7 +8,11 @@
      （supplemental_fault_pattern_context，供 ne_propagation_visualizer.html 标红展示）。
 """
 
+import heapq
+
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from functools import lru_cache
 
 from fault_grouping_official.alarm_types import OFFLINE_ALARMS
 from fault_grouping_official.site_topology import (
@@ -29,15 +33,23 @@ PATTERN_PRIORITY = {
 }
 
 # —— 性能保护参数 ——
-# longest_path_in_component 对 ≤N 个站的分量做穷举 DFS 找最长简单链；该穷举随分量稠密度
-# 指数级膨胀（实测稠密 14~15 站即从毫秒跳到秒级乃至卡死）。双 BFS 近似在带环分量上
-# 偏差严重（哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown，不可用于落盘判定。
+# longest_path_in_component 对链/环走线性快路径，其余 ≤N 个站的分量用 bitmask 记忆化
+# 求精确最长简单链。该问题本身仍是指数级；双 BFS 近似在带环分量上偏差严重
+# （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown，不可用于落盘判定。
 #
 # 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
 # unknown -> 该故障组被丢弃，而不是给出错误的近似链。
-# 默认 18；要削掉稠密大分量的耗时，调小该值即可（实测拐点在 13~14 附近，可按数据规模
-# 权衡速度与召回）。
+# 默认 18；复杂分量仍需按数据规模权衡精确搜索成本与召回。
 LONGEST_PATH_EXACT_MAX_SITES = 18
+
+# 整组站点数上限：故障组站点总数超过该值，直接判定不可保留（在分析前丢弃）。
+# 虽然连通分量已按邻接边遍历、断站吸收已改为增量候选堆，但候选规模仍可能达到
+# O(n²)，且与 LONGEST_PATH_EXACT_MAX_SITES 无关。emitted_group_store 合并出的巨型组
+# （成百上千站）仍会带来明显的内存和 CPU 开销。
+# 而这类巨型组几乎不可能满足"单连通分量 + ≤N 路由链/环"的保留条件，故直接丢弃，
+# 用一次 O(站点数) 的计数把二次候选规模挡在门外。
+# 默认 200；按数据规模和允许的最大单组候选规模调整。
+MAX_ANALYSIS_SITES = 200
 
 
 def normalize_text(value):
@@ -134,10 +146,12 @@ def build_site_has_router_device_map(ne_graph_data):
     return dict(site_has_router_device)
 
 
-def extract_case_router_device_sites(record, site_has_router_device):
+def extract_case_router_device_sites(record, site_has_router_device, site_ids=None):
+    if site_ids is None:
+        site_ids = extract_case_sites(record)
     router_sites = {
         site_id
-        for site_id in extract_case_sites(record)
+        for site_id in site_ids
         if site_has_router_device.get(site_id, False)
     }
 
@@ -181,6 +195,9 @@ class SiteRelationIndex:
         self.upstream_direct = defaultdict(set)
         self.bidirectional_direct = defaultdict(set)
         self._upstream_distance_cache = {}
+        # 只缓存 site_chains 预计算索引中缺失、由 BFS 补出的距离；不复制原 hop dict。
+        self._supplemental_upstream_distances_cache = {}
+        self.precomputed_upstream_hops_complete = False
 
         if site_chains_path:
             self.site_chains, _valid_sites = load_site_chain_index(site_chains_path)
@@ -235,6 +252,40 @@ class SiteRelationIndex:
         self._upstream_distance_cache[cache_key] = None
         return None
 
+    def iter_upstream_distances(self, downstream_site):
+        """迭代某站点的全部可达上游及距离，不复制预计算 hop 字典。
+
+        site_chains 中的预计算值直接从原 dict 迭代；BFS 只计算并缓存其中缺失的
+        可达上游。显式存在的 None/0 等值仍会阻止 BFS 覆盖，保持 upstream_distance()
+        的原语义。
+        """
+        chain_info = self.site_chains.get(downstream_site, {})
+        precomputed_hops = chain_info.get("upstream_site_hops", {})
+        for upstream_site, hop in precomputed_hops.items():
+            if upstream_site != downstream_site and hop is not None and hop > 0:
+                yield upstream_site, hop
+
+        if self.precomputed_upstream_hops_complete:
+            return
+
+        cache = self._supplemental_upstream_distances_cache
+        if downstream_site not in cache:
+            supplemental_distances = {}
+            queue = deque([(downstream_site, 0)])
+            visited = {downstream_site}
+            while queue:
+                site_id, hop = queue.popleft()
+                for parent_site in self.upstream_direct.get(site_id, set()):
+                    if parent_site in visited:
+                        continue
+                    visited.add(parent_site)
+                    if parent_site not in precomputed_hops:
+                        supplemental_distances.setdefault(parent_site, hop + 1)
+                    queue.append((parent_site, hop + 1))
+            cache[downstream_site] = supplemental_distances
+
+        yield from cache[downstream_site].items()
+
     def directly_connected(self, site_a, site_b):
         if site_a == site_b:
             return False
@@ -262,33 +313,74 @@ class SiteRelationIndex:
         return sorted(self.upstream_direct.get(site_id, set()))
 
     def undirected_neighbors_in(self, site_id, site_set):
-        return {
-            other_site
-            for other_site in site_set
-            if self.directly_connected(site_id, other_site)
-        }
+        # direct_neighbors() 只遍历该站点的实际邻接边；旧实现反过来扫描整个
+        # site_set 并逐一调用 directly_connected()，使连通分量计算退化为 O(V²)。
+        return self.direct_neighbors(site_id) & set(site_set)
 
 
 def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relation_index):
+    """按最近上游逐步吸收断站，并保持原有 tuple 最小值选择语义。
+
+    旧实现每吸收一个站点都会重新枚举全部 ``unmanaged × remaining`` 候选，最坏
+    接近 O(n³)。这里让每个首次成为 unmanaged 的站点只生成一次局部候选堆，
+    全局堆仅保留各站点当前最优项，并继续按
+    ``(distance, unmanaged_site, upstream_site)`` 选择；站点被移除后按需推进局部堆。
+    """
     remaining = set(site_ids)
     unmanaged_sites = set(initial_unmanaged_sites) & remaining
     absorbed_by = {}
     absorb_steps = []
 
-    while True:
-        candidates = []
-        for unmanaged_site in sorted(unmanaged_sites & remaining):
-            for upstream_site in sorted(remaining - {unmanaged_site}):
-                distance = relation_index.upstream_distance(unmanaged_site, upstream_site)
-                if distance is not None and distance > 0:
-                    candidates.append((distance, unmanaged_site, upstream_site))
-        if not candidates:
-            break
+    # 每个 unmanaged 站点维护一个局部上游候选堆；全局堆只放每个站点当前
+    # 最优候选，将全局 heap 操作从 O(候选总数) 降为接近 O(站点数)。
+    candidates = []
+    upstream_candidates_by_site = {}
+    seeded_unmanaged_sites = set()
 
-        distance, unmanaged_site, parent_site = min(candidates)
+    def push_next_candidate(unmanaged_site):
+        site_candidates = upstream_candidates_by_site[unmanaged_site]
+        while site_candidates:
+            distance, parent_site = heapq.heappop(site_candidates)
+            if parent_site not in remaining:
+                continue
+            heapq.heappush(
+                candidates,
+                (distance, unmanaged_site, parent_site),
+            )
+            return
+
+    def seed_candidates(unmanaged_site):
+        if unmanaged_site in seeded_unmanaged_sites or unmanaged_site not in remaining:
+            return
+        seeded_unmanaged_sites.add(unmanaged_site)
+        site_candidates = [
+            (distance, upstream_site)
+            for upstream_site, distance in relation_index.iter_upstream_distances(
+                unmanaged_site
+            )
+            if upstream_site in remaining
+        ]
+        heapq.heapify(site_candidates)
+        upstream_candidates_by_site[unmanaged_site] = site_candidates
+        push_next_candidate(unmanaged_site)
+
+    for unmanaged_site in unmanaged_sites:
+        seed_candidates(unmanaged_site)
+
+    while candidates:
+        distance, unmanaged_site, parent_site = heapq.heappop(candidates)
+        if unmanaged_site not in remaining:
+            continue
+        if parent_site not in remaining:
+            push_next_candidate(unmanaged_site)
+            continue
+
         remaining.remove(unmanaged_site)
         absorbed_by[unmanaged_site] = parent_site
+        parent_was_unmanaged = parent_site in unmanaged_sites
         unmanaged_sites.add(parent_site)
+        if not parent_was_unmanaged:
+            seed_candidates(parent_site)
         absorb_steps.append({
             "site": unmanaged_site,
             "absorbed_by": parent_site,
@@ -299,9 +391,8 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
     return remaining, unmanaged_sites & remaining, absorbed_by, absorb_steps
 
 
-def connected_components(nodes, relation_index):
+def iter_connected_components(nodes, relation_index):
     node_set = set(nodes)
-    components = []
     while node_set:
         start = min(node_set)
         queue = deque([start])
@@ -313,19 +404,92 @@ def connected_components(nodes, relation_index):
                 node_set.remove(neighbor)
                 component.add(neighbor)
                 queue.append(neighbor)
-        components.append(component)
-    return components
+        yield component
 
 
-def projected_active_components_by_original_graph(original_sites, active_sites, relation_index):
+def connected_components(nodes, relation_index):
+    return list(iter_connected_components(nodes, relation_index))
+
+
+def projected_active_components_by_original_graph(
+    original_sites,
+    active_sites,
+    relation_index,
+    max_components=None,
+):
     """按原始站点图划分连通分量，再投影出吸收后仍保留的站点。"""
     active_site_set = set(active_sites)
     projected_components = []
-    for original_component in connected_components(original_sites, relation_index):
+    for original_component in iter_connected_components(original_sites, relation_index):
         component_active_sites = set(original_component) & active_site_set
         if component_active_sites:
             projected_components.append(component_active_sites)
+            if max_components is not None and len(projected_components) >= max_components:
+                break
     return projected_components
+
+
+@dataclass
+class PreparedPatternCase:
+    """单条记录的模式分析中间结果，供过滤与分类共享。"""
+
+    site_ids: list
+    offline_sites: set
+    router_device_sites: set
+    active_sites: set
+    active_unmanaged_sites: set
+    absorbed_by: dict
+    absorb_steps: list
+    projected_components: list
+
+
+def prepare_case_record(
+    record,
+    relation_index,
+    ne_to_site,
+    site_has_router_device,
+    site_ids=None,
+    component_limit=None,
+):
+    """提取并计算一次模式分析公共数据。
+
+    ``site_ids`` 允许调用方传入从原始 match 轻量提取的等价站点集合；
+    ``component_limit=2`` 用于 one-component-only 过滤，发现第二个分量即可停止。
+    """
+    if site_ids is None:
+        site_ids = extract_case_sites(record)
+    else:
+        site_ids = sorted(set(site_ids))
+    site_id_set = set(site_ids)
+    offline_sites = extract_offline_sites(record, ne_to_site) & site_id_set
+    router_device_sites = extract_case_router_device_sites(
+        record,
+        site_has_router_device,
+        site_ids=site_ids,
+    )
+    active_sites, active_unmanaged_sites, absorbed_by, absorb_steps = (
+        absorb_unmanaged_downstream_sites(
+            site_ids,
+            offline_sites,
+            relation_index,
+        )
+    )
+    projected_components = projected_active_components_by_original_graph(
+        site_ids,
+        active_sites,
+        relation_index,
+        max_components=component_limit,
+    )
+    return PreparedPatternCase(
+        site_ids=site_ids,
+        offline_sites=offline_sites,
+        router_device_sites=router_device_sites,
+        active_sites=active_sites,
+        active_unmanaged_sites=active_unmanaged_sites,
+        absorbed_by=absorbed_by,
+        absorb_steps=absorb_steps,
+        projected_components=projected_components,
+    )
 
 
 def longest_path_in_component(component, relation_index):
@@ -338,29 +502,102 @@ def longest_path_in_component(component, relation_index):
         for site_id in component
     }
 
-    # ≤N 的分量用 DFS 穷举最长简单链。
+    def traverse_degree_two_component(start, first_neighbor):
+        path = [start]
+        previous = None
+        current = start
+        next_site = first_neighbor
+        while next_site is not None and next_site not in path:
+            path.append(next_site)
+            previous, current = current, next_site
+            unvisited_neighbors = [
+                neighbor
+                for neighbor in adjacency[current]
+                if neighbor != previous and neighbor not in path
+            ]
+            next_site = unvisited_neighbors[0] if unvisited_neighbors else None
+        return path
+
+    # 链和环是模式识别的常见输入。度数 ≤2 且连通时可线性构造精确最长链，
+    # 无需进入通用的指数级搜索；同时保持旧实现“最长后取字典序最小”的结果。
+    if all(len(neighbors) <= 2 for neighbors in adjacency.values()):
+        endpoints = sorted(
+            site_id for site_id, neighbors in adjacency.items() if len(neighbors) == 1
+        )
+        if len(endpoints) == 2:
+            path = traverse_degree_two_component(
+                endpoints[0],
+                adjacency[endpoints[0]][0],
+            )
+            if len(path) == len(component):
+                reversed_path = list(reversed(path))
+                return min(path, reversed_path)
+        elif not endpoints and all(len(neighbors) == 2 for neighbors in adjacency.values()):
+            start = min(component)
+            candidates = [
+                traverse_degree_two_component(start, neighbor)
+                for neighbor in adjacency[start]
+            ]
+            covering_paths = [
+                path for path in candidates if len(path) == len(component)
+            ]
+            if covering_paths:
+                return min(covering_paths)
+
+    # 其余 ≤N 分量使用 bitmask 记忆化求精确最长简单链。相同的
+    # (末端节点, 已访问集合) 只计算一次，避免旧 DFS 对同一子问题反复穷举。
     if len(component) <= LONGEST_PATH_EXACT_MAX_SITES:
-        best_path = []
+        nodes = sorted(component)
+        node_to_index = {site_id: index for index, site_id in enumerate(nodes)}
+        adjacency_indexes = [
+            tuple(node_to_index[neighbor] for neighbor in adjacency[site_id])
+            for site_id in nodes
+        ]
 
-        def dfs(path, visited):
-            nonlocal best_path
-            if (
-                len(path) > len(best_path)
-                or (len(path) == len(best_path) and tuple(path) < tuple(best_path))
-            ):
-                best_path = list(path)
-            for neighbor in adjacency.get(path[-1], []):
-                if neighbor in visited:
+        @lru_cache(maxsize=None)
+        def best_length(last_index, visited_mask):
+            best = 1
+            for neighbor_index in adjacency_indexes[last_index]:
+                neighbor_bit = 1 << neighbor_index
+                if visited_mask & neighbor_bit:
                     continue
-                visited.add(neighbor)
-                path.append(neighbor)
-                dfs(path, visited)
-                path.pop()
-                visited.remove(neighbor)
+                candidate = 1 + best_length(
+                    neighbor_index,
+                    visited_mask | neighbor_bit,
+                )
+                if candidate > best:
+                    best = candidate
+            return best
 
-        for start in sorted(component):
-            dfs([start], {start})
-        return best_path
+        start_lengths = [
+            best_length(index, 1 << index)
+            for index in range(len(nodes))
+        ]
+        remaining_length = max(start_lengths)
+        current_index = next(
+            index
+            for index, length in enumerate(start_lengths)
+            if length == remaining_length
+        )
+        visited_mask = 1 << current_index
+        path = [nodes[current_index]]
+
+        while remaining_length > 1:
+            for neighbor_index in adjacency_indexes[current_index]:
+                neighbor_bit = 1 << neighbor_index
+                if visited_mask & neighbor_bit:
+                    continue
+                next_mask = visited_mask | neighbor_bit
+                if best_length(neighbor_index, next_mask) != remaining_length - 1:
+                    continue
+                current_index = neighbor_index
+                visited_mask = next_mask
+                path.append(nodes[current_index])
+                remaining_length -= 1
+                break
+            else:  # pragma: no cover - 防御性兜底，理论上不会发生
+                break
+        return path
 
     # >N 的分量不采用误差较大的双 BFS 近似，直接返回空链。classify_component 的
     # `set(chain) != set(unmanaged_component)` 覆盖校验会因此跳过该分量，最终落为
@@ -491,7 +728,14 @@ def has_absorbed_site_for_final(final_site, absorbed_by):
     return False
 
 
-def classify_component(component_sites, unmanaged_sites, relation_index, router_device_sites=None, absorbed_by=None):
+def classify_component(
+    component_sites,
+    unmanaged_sites,
+    relation_index,
+    router_device_sites=None,
+    absorbed_by=None,
+    recognized_patterns_only=False,
+):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
     router_device_sites = set(router_device_sites or [])
@@ -545,7 +789,37 @@ def classify_component(component_sites, unmanaged_sites, relation_index, router_
             "chains": [],
         }
 
+    if recognized_patterns_only:
+        # 多断站分量最终只会保留两类 ring 模式：single 要求所有链节点满足
+        # “双向或上游邻居数 == 2”，multi 最多允许两个不满足条件的端点。
+        # 超过两个不合格站点时，无论最长链如何都只会落到 others/unknown，
+        # 可以在指数级最长路径搜索前安全丢弃。
+        ring_degree_mismatch_count = sum(
+            not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
+            for site_id in component_unmanaged_sites
+        )
+        if ring_degree_mismatch_count > 2:
+            return {
+                "pattern": "unknown",
+                "sites": sorted(component_sites),
+                "unmanaged_sites": sorted(component_unmanaged_sites),
+                "managed_sites": sorted(component_unmanaged_sites),
+                "final_site": "",
+                "final_managed_site": "",
+                "chains": [],
+            }
+
     unmanaged_components = connected_components(component_unmanaged_sites, relation_index)
+    if recognized_patterns_only and len(unmanaged_components) != 1:
+        return {
+            "pattern": "unknown",
+            "sites": sorted(component_sites),
+            "unmanaged_sites": sorted(component_unmanaged_sites),
+            "managed_sites": sorted(component_unmanaged_sites),
+            "final_site": "",
+            "final_managed_site": "",
+            "chains": [],
+        }
     unmanaged_chains = []
     chain_covered_sites = set()
     for unmanaged_component in unmanaged_components:
@@ -641,17 +915,21 @@ def filter_other_patterns(analysis):
     return update_analysis_patterns(dict(analysis), filtered_patterns)
 
 
-def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
-    site_ids = extract_case_sites(record)
-    offline_sites = extract_offline_sites(record, ne_to_site) & set(site_ids)
-    router_device_sites = extract_case_router_device_sites(record, site_has_router_device)
-    active_sites, active_unmanaged_sites, absorbed_by, absorb_steps = absorb_unmanaged_downstream_sites(
-        site_ids,
-        offline_sites,
-        relation_index,
-    )
-
-    projected_components = projected_active_components_by_original_graph(site_ids, active_sites, relation_index)
+def analyze_prepared_case(
+    record,
+    prepared_case,
+    relation_index,
+    recognized_patterns_only=False,
+):
+    """使用已计算的公共中间结果完成逐分量分类和分析对象构建。"""
+    site_ids = prepared_case.site_ids
+    offline_sites = prepared_case.offline_sites
+    router_device_sites = prepared_case.router_device_sites
+    active_sites = prepared_case.active_sites
+    active_unmanaged_sites = prepared_case.active_unmanaged_sites
+    absorbed_by = prepared_case.absorbed_by
+    absorb_steps = prepared_case.absorb_steps
+    projected_components = prepared_case.projected_components
     component_records = []
     for component_sites in projected_components:
         component_record = classify_component(
@@ -660,6 +938,7 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
             relation_index,
             router_device_sites=router_device_sites,
             absorbed_by=absorbed_by,
+            recognized_patterns_only=recognized_patterns_only,
         )
         if component_record.get("pattern") != "unknown":
             component_records.append(component_record)
@@ -679,6 +958,16 @@ def analyze_case_record(record, relation_index, ne_to_site, site_has_router_devi
         "absorb_steps": absorb_steps,
     }
     return update_analysis_patterns(analysis, component_records)
+
+
+def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
+    prepared_case = prepare_case_record(
+        record,
+        relation_index,
+        ne_to_site,
+        site_has_router_device,
+    )
+    return analyze_prepared_case(record, prepared_case, relation_index)
 
 
 def format_pattern_summary_line(pattern_info, index):

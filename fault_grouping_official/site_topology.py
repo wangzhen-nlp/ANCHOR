@@ -120,6 +120,30 @@ def build_site_chain_index(data):
     return site_chain_index, valid_sites
 
 
+def site_chain_upstream_hops_are_complete(data):
+    """资源元数据是否保证 upstream_site_hops 未被深度或关系过滤截断。
+
+    旧资源或元数据字段缺失时保守返回 False，由运行时 BFS 补齐。
+    """
+    if not isinstance(data, dict):
+        return False
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    input_config = meta.get("input_config")
+    relation_options = meta.get("relation_options")
+    if not isinstance(input_config, dict) or not isinstance(relation_options, dict):
+        return False
+    if "max_depth" not in input_config:
+        return False
+    if "restrict_relation_effective" not in relation_options:
+        return False
+    return (
+        input_config.get("max_depth") is None
+        and relation_options.get("restrict_relation_effective") is False
+    )
+
+
 def build_site_domain_map(ne_graph_data):
     """直接从 ne_graph 构建规则所需的站点域画像。"""
     site_domains = defaultdict(lambda: defaultdict(int))

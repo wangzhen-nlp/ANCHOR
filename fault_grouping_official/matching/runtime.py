@@ -36,6 +36,7 @@ from fault_grouping_official.site_topology import (
     build_site_to_ne_ids,
     build_site_chain_index,
     build_site_topology_from_ne_graph,
+    site_chain_upstream_hops_are_complete,
 )
 from fault_grouping_official.link_peer_index import build_peer_index
 from fault_grouping_official.resource_buffer import load_resource_buffer
@@ -48,6 +49,7 @@ class LoadedStaticContext:
     valid_sites: set
     topo_downstream_map: dict
     site_chain_index: object
+    site_chain_upstream_hops_complete: bool
     site_domain_map: dict
     ne_to_site: dict
     alarm_source_domain_map: dict
@@ -97,11 +99,24 @@ def load_static_context(args):
     )
     ne_graph_data = resources["ne_graph"]
     site_graph_data = resources["site_graph"]
-    site_chain_index, valid_sites = build_site_chain_index(resources["site_chains"])
+    site_chain_resource = resources["site_chains"]
+    site_chain_index, valid_sites = build_site_chain_index(site_chain_resource)
+    site_chain_upstream_hops_complete = site_chain_upstream_hops_are_complete(
+        site_chain_resource
+    )
     topo_downstream_map, topology_sites = build_site_topology_from_ne_graph(ne_graph_data)
     valid_sites.update(topology_sites)
     site_domain_map = build_site_domain_map(ne_graph_data)
     print(f"预计算站点链路站点数: {len(site_chain_index)}")
+    hop_completeness_label = (
+        "完整，可跳过 BFS 补齐"
+        if site_chain_upstream_hops_complete
+        else "未知/截断，保留 BFS 补齐"
+    )
+    print(
+        "预计算上游 hop 完整性: "
+        + hop_completeness_label
+    )
     print(f"ne_graph 站点拓扑起点数: {len(topo_downstream_map)}")
 
     print("加载有效站点集合...")
@@ -132,6 +147,7 @@ def load_static_context(args):
         valid_sites=valid_sites,
         topo_downstream_map=topo_downstream_map,
         site_chain_index=site_chain_index,
+        site_chain_upstream_hops_complete=site_chain_upstream_hops_complete,
         site_domain_map=site_domain_map,
         ne_to_site=ne_to_site,
         alarm_source_domain_map=alarm_source_domain_map,
@@ -192,6 +208,9 @@ def build_fault_pattern_filter(static_context):
         static_context.ne_to_site,
         static_context.site_to_ne_ids,
         site_graph_data=static_context.site_graph_data,
+        precomputed_upstream_hops_complete=(
+            static_context.site_chain_upstream_hops_complete
+        ),
     )
     print("已启用落盘前故障模式过滤+增强: filter-others + one-component-only")
     return fault_pattern_filter
