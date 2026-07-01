@@ -12,6 +12,8 @@
 build_jsonl_match_output() 产出的记录（含 match_info / ne_info / group_info / symptoms）。
 """
 
+from dataclasses import dataclass
+
 from fault_grouping_official.matching.fault_pattern_analysis import (
     MAX_ANALYSIS_SITES,
     SiteRelationIndex,
@@ -25,6 +27,17 @@ from fault_grouping_official.matching.fault_pattern_analysis import (
     normalize_text,
     prepare_case_record,
 )
+
+
+@dataclass
+class FaultPatternFilterStats:
+    """落盘前过滤丢弃统计（按阈值归因）。"""
+
+    # 整组总站点数 > MAX_ANALYSIS_SITES(200) 直接拒绝的故障组数。
+    dropped_by_max_analysis_sites: int = 0
+    # 因某个断站簇 > LONGEST_PATH_EXACT_MAX_SITES(18) 放弃精确搜索、
+    # 最终导致整组无可识别模式而被丢弃的故障组数。
+    dropped_by_longest_path_cap: int = 0
 
 
 class FaultPatternFilter:
@@ -45,6 +58,7 @@ class FaultPatternFilter:
         self._ne_graph_data = ne_graph_data
         self._site_to_ne_ids = site_to_ne_ids
         self._site_graph_data = site_graph_data or {}
+        self.stats = FaultPatternFilterStats()
 
     @classmethod
     def from_static_context(
@@ -123,6 +137,7 @@ class FaultPatternFilter:
         if site_ids is None:
             site_ids = extract_case_sites(record)
         if len(site_ids) > MAX_ANALYSIS_SITES:
+            self.stats.dropped_by_max_analysis_sites += 1
             return None
 
         prepared_case = prepare_case_record(
@@ -137,14 +152,20 @@ class FaultPatternFilter:
         if len(prepared_case.projected_components) != 1:
             return None
 
+        cap_hits = [0]
         analysis = analyze_prepared_case(
             record,
             prepared_case,
             self._relation_index,
             recognized_patterns_only=True,
+            cap_hits=cap_hits,
         )
         analysis = filter_other_patterns(analysis)
         if not analysis.get("patterns"):
+            # 归因：仅当本组分析确实触发了 >LONGEST_PATH_EXACT_MAX_SITES 的精确搜索
+            # 放弃（cap_hits>0），才计入被 18 上限丢弃；其它无模式丢弃不计入。
+            if cap_hits[0] > 0:
+                self.stats.dropped_by_longest_path_cap += 1
             return None
         return analysis
 

@@ -20,10 +20,19 @@ class TemporalGraphEngineTraversalMixin:
             role_candidates = self.role_site_index.role_candidates(rule_name, target_role)
         if not role_candidates:
             return {}
-        return {
-            site_id: hop
-            for site_id, hop in candidate_hops.items()
+        filtered_sites = [
+            site_id
+            for site_id in candidate_hops
             if site_id in role_candidates
+        ]
+        # 候选集合完全由静态拓扑和角色结构决定。首次构建时直接按 evaluator
+        # 的消费顺序写入 dict，缓存命中后即可复用插入顺序，不再重复排序。
+        filtered_sites.sort(
+            key=lambda site_id: (candidate_hops[site_id], str(site_id))
+        )
+        return {
+            site_id: candidate_hops[site_id]
+            for site_id in filtered_sites
         }
 
     def _traverse_graph_role_filtered(

@@ -142,6 +142,24 @@ def main():
         runtime_plan.output_session.match_count,
         elapsed,
     )
+    _print_fault_pattern_filter_summary(runtime_plan.output_session.fault_pattern_filter)
+
+
+def _print_fault_pattern_filter_summary(fault_pattern_filter):
+    """打印落盘前故障模式过滤中，按阈值归因的丢弃数量。"""
+    if fault_pattern_filter is None:
+        return
+    from fault_grouping_official.matching.fault_pattern_analysis import (
+        LONGEST_PATH_EXACT_MAX_SITES,
+        MAX_ANALYSIS_SITES,
+    )
+
+    stats = fault_pattern_filter.stats
+    print(
+        f"落盘前故障模式过滤丢弃: "
+        f"总站点数>{MAX_ANALYSIS_SITES} {stats.dropped_by_max_analysis_sites} 组 | "
+        f"断站簇>{LONGEST_PATH_EXACT_MAX_SITES}(放弃精确搜索) {stats.dropped_by_longest_path_cap} 组"
+    )
 
 
 if __name__ == "__main__":

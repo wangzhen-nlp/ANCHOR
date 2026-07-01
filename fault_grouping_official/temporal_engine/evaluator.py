@@ -82,7 +82,9 @@ class TemporalGraphEngineEvaluatorMixin:
             edge,
             curr_phys,
         )
-        return sorted(candidate_hops, key=lambda node: (candidate_hops[node], str(node)))
+        # _traverse_graph_role_filtered() 的缓存已按 (hop, site_id) 排序；对称边
+        # 过滤通过 dict comprehension 保持该顺序，因此这里只需按原接口返回 list。
+        return list(candidate_hops)
 
     def _validate_candidate_nodes_for_edge(
         self,
@@ -510,11 +512,53 @@ class TemporalGraphEngineEvaluatorMixin:
     ):
         next_instances = []
         curr_events_by_target = curr_events_by_target or {}
+
+        # 旧实现对每个 target 都完整扫描一次 surviving_curr_phys，并再次扫描
+        # curr_support_targets 来构造依赖，复杂度接近 O(targets * current_nodes)。
+        # 这里先反转一次支撑关系，后续只访问真正支撑该 target 的 current nodes。
+        # 外层按 surviving_curr_phys 的原顺序构建 list，保持实例内容及迭代顺序不变。
+        single_curr_item = None
+        supporting_curr_nodes_by_target = None
+        if len(surviving_curr_phys) == 1:
+            # 这是从 trigger 首次向外分叉时最常见的形态。直接做集合成员判断，
+            # 避免为了单个 current node 构建 target -> nodes 反向字典。
+            single_curr_item = next(iter(surviving_curr_phys.items()))
+            single_curr_node, _single_curr_events = single_curr_item
+            single_curr_supported_targets = curr_support_targets.get(
+                single_curr_node,
+                (),
+            )
+        else:
+            supporting_curr_nodes_by_target = {
+                target_node: []
+                for target_node in valid_targets
+            }
+            for curr_node in surviving_curr_phys:
+                for target_node in curr_support_targets.get(curr_node, ()):
+                    supporting_curr_nodes = supporting_curr_nodes_by_target.get(
+                        target_node
+                    )
+                    if supporting_curr_nodes is not None:
+                        supporting_curr_nodes.append(curr_node)
+
         for target_node, target_events in valid_targets.items():
+            if single_curr_item is not None:
+                supporting_curr_nodes = (
+                    (single_curr_item[0],)
+                    if target_node in single_curr_supported_targets
+                    else ()
+                )
+            else:
+                supporting_curr_nodes = supporting_curr_nodes_by_target.get(
+                    target_node,
+                    (),
+                )
             target_surviving_curr_phys = {
-                curr_node: curr_events_by_target.get((curr_node, target_node), curr_events)
-                for curr_node, curr_events in surviving_curr_phys.items()
-                if target_node in curr_support_targets.get(curr_node, set())
+                curr_node: curr_events_by_target.get(
+                    (curr_node, target_node),
+                    surviving_curr_phys[curr_node],
+                )
+                for curr_node in supporting_curr_nodes
             }
             new_inst = clone_instance_with_updates(
                 inst,
@@ -528,8 +572,8 @@ class TemporalGraphEngineEvaluatorMixin:
                 curr_role,
                 tgt_role,
                 {
-                    curr_node: ({target_node} if target_node in target_nodes else set())
-                    for curr_node, target_nodes in curr_support_targets.items()
+                    curr_node: {target_node}
+                    for curr_node in supporting_curr_nodes
                 },
             )
             stabilized_inst = self._stabilize_instance_dependencies(new_inst, nodes_cfg)

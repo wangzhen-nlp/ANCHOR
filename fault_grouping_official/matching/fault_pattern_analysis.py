@@ -830,6 +830,7 @@ def classify_component(
     router_device_sites=None,
     absorbed_by=None,
     recognized_patterns_only=False,
+    cap_hits=None,
 ):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
@@ -919,6 +920,11 @@ def classify_component(
     chain_covered_sites = set()
     for unmanaged_component in unmanaged_components:
         chain = longest_path_in_component(unmanaged_component, relation_index)
+        if not chain and len(unmanaged_component) > LONGEST_PATH_EXACT_MAX_SITES:
+            # longest_path 只在 >LONGEST_PATH_EXACT_MAX_SITES 的非链/环分量上放弃精确
+            # 搜索、返回空链（纯链/环走线性快路径不会返回空）。据此统计"因 18 上限被丢弃"。
+            if cap_hits is not None:
+                cap_hits[0] += 1
         if len(chain) < 2:
             continue
         if set(chain) != set(unmanaged_component):
@@ -1015,8 +1021,13 @@ def analyze_prepared_case(
     prepared_case,
     relation_index,
     recognized_patterns_only=False,
+    cap_hits=None,
 ):
-    """使用已计算的公共中间结果完成逐分量分类和分析对象构建。"""
+    """使用已计算的公共中间结果完成逐分量分类和分析对象构建。
+
+    cap_hits 传入 [int] 单元素列表时，会累计"因断站簇 > LONGEST_PATH_EXACT_MAX_SITES
+    放弃精确搜索"的次数，供调用方统计被 18 上限丢弃的故障组。
+    """
     site_ids = prepared_case.site_ids
     offline_sites = prepared_case.offline_sites
     router_device_sites = prepared_case.router_device_sites
@@ -1034,6 +1045,7 @@ def analyze_prepared_case(
             router_device_sites=router_device_sites,
             absorbed_by=absorbed_by,
             recognized_patterns_only=recognized_patterns_only,
+            cap_hits=cap_hits,
         )
         if component_record.get("pattern") != "unknown":
             component_records.append(component_record)
