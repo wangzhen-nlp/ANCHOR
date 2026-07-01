@@ -1,8 +1,5 @@
 import collections
 import heapq
-import logging
-import time
-import threading
 
 from fault_grouping_official.emitted_group_store import EmittedGroupStore
 from fault_grouping_official.alarm_events.identity import require_alarm_identity
@@ -10,7 +7,6 @@ from fault_grouping_official.node_rule_helper import NodeRuleHelper
 from fault_grouping_official.time_config import (
     DEFAULT_AGGREGATION_WAIT_SEC,
     DEFAULT_EVENT_TTL_SEC,
-    DEFAULT_PERIODIC_HARVEST_INTERVAL_SEC,
     DEFAULT_POWER_ALARM_TTL_SEC,
 )
 from fault_grouping_official.alarm_types import LINK_ALARMS, POWER_ALARMS
@@ -30,9 +26,6 @@ from fault_grouping_official.temporal_engine.utils import (
     matches_expected_alarm,
     merge_match_batch,
 )
-
-logger = logging.getLogger(__name__)
-
 
 class TemporalGraphEngine(
     TemporalGraphEngineCommonMixin,
@@ -250,16 +243,13 @@ class TemporalGraphEngine(
         # 故障传播等待时间
         self.aggregation_wait_sec = aggregation_wait_sec
 
-        # 流式时间水印
-        self.current_watermark = 0.0
-        # 已到达事件时间上界：TTL 清理只跟真实已进入引擎的事件时间走，不跟 live 模式下的模拟水印走
+        # 已到达事件的时间上界。
         self.latest_arrived_event_ts = 0.0
 
         # 延迟触发队列：记录“当前仍在等待聚合”的 trigger 起点锚点，结构为 (ts, seq)
         self.pending_triggers = {}
         # node -> {(node, rule_name)} 反向索引，供 _expand_matches_with_pending_context
         # 按本批 non-trigger 节点直接定位相关 pending，避免扫全量。
-        # 与 pending_triggers 在同一把 self._lock 下同步维护。
         self._pending_triggers_by_node = collections.defaultdict(set)
         # 延迟触发最小堆：按 ready_ts 排序，快速摘取已成熟的 pending trigger
         self.pending_trigger_heap = []
@@ -315,23 +305,6 @@ class TemporalGraphEngine(
         self.trigger_specs_by_node = {}
         self._build_trigger_indexes()
         
-        # 后台收割线程对象：live 模式下按固定周期推进 watermark
-        self._harvest_thread = None
-        # 后台收割线程停止信号
-        self._harvest_stop_event = None
-        # 后台收割线程的真实运行周期，单位秒
-        self._harvest_interval_sec = None
-        # 后台收割产出结果时的回调函数
-        self._harvest_callback = None
-        # 后台收割线程使用的当前时间函数；默认为真实时间，可由调用方注入模拟时钟
-        self._harvest_now_ts_getter = None
-        # 引擎主锁：保护 event_cache、pending、watermark 和历史组状态的一致性
-        self._lock = threading.RLock()
-        # 拓扑缓存专用锁，避免全局主锁被纯缓存读写长期占用
-        self._topo_cache_lock = threading.Lock()
-        # 事件快照缓存锁，保证锁外评估阶段的按需快照填充安全
-        self._event_snapshot_lock = threading.Lock()
-
         # 分批清理过期节点状态时的游标
         self._prune_cursor = 0
         # 每轮清理最多处理的节点数，避免单次 prune 开销过大
@@ -348,86 +321,73 @@ class TemporalGraphEngine(
         occurrence_uuid,
         alarm_source="",
         is_clear=False,
-        collect_matches=False,
         alarm_payload=None,
     ):
-        """接收单条事件并更新内部状态。默认只更新内部状态；当 collect_matches=True 时，会在事件时间点立即收割已成熟的故障组。
-        """
-        with self._lock:
-            event_id, occurrence_uuid = require_alarm_identity({
+        """接收单条事件，更新内部状态并收割已成熟的故障组。"""
+        event_id, occurrence_uuid = require_alarm_identity({
+            "eid": event_id,
+            "occurrence_uuid": occurrence_uuid,
+        })
+        # 1. 按已到达事件推进时间上界。
+        self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
+
+        # 2. 先清理过期缓存，再按上报/清除事件更新状态。
+        self._prune_expired_raw_events_in_place(node, ts)
+        self._prune_expired_trigger_index(node, ts)
+
+        if is_clear:
+            self._remove_cleared_raw_event(
+                node,
+                event_id,
+                occurrence_uuid,
+                alarm_type=alarm_type,
+                alarm_source=alarm_source,
+            )
+            affected_rule_names = self._remove_cleared_trigger_events(
+                node,
+                event_id,
+                occurrence_uuid,
+                alarm_type=alarm_type,
+                alarm_source=alarm_source,
+            )
+            if affected_rule_names:
+                self._refresh_pending_triggers_for_node(
+                    node,
+                    affected_rule_names=affected_rule_names
+                )
+        else:
+            self.event_cache[node].append({
+                "ts": ts,
                 "eid": event_id,
+                "alarm": alarm_type,
+                "alarm_source": alarm_source,
+                "alarm_payload": alarm_payload if isinstance(alarm_payload, dict) else {},
+                "consumed_trigger_rules": frozenset(),
                 "occurrence_uuid": occurrence_uuid,
             })
-            # 1. 当前仍保留事件时间水印，便于离线按事件时间回放。
-            self.current_watermark = max(self.current_watermark, ts)
-            self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
-            # 2. 先清理过期缓存，再按上报/清除事件更新状态。
-            self._prune_expired_raw_events_in_place(node, ts)
-            self._prune_expired_trigger_index(node, ts)
-
-            if is_clear:
-                self._remove_cleared_raw_event(
-                    node,
-                    event_id,
-                    occurrence_uuid,
-                    alarm_type=alarm_type,
-                    alarm_source=alarm_source,
-                )
-                affected_rule_names = self._remove_cleared_trigger_events(
-                    node,
-                    event_id,
-                    occurrence_uuid,
-                    alarm_type=alarm_type,
-                    alarm_source=alarm_source,
-                )
-                if affected_rule_names:
-                    self._refresh_pending_triggers_for_node(
-                        node,
-                        affected_rule_names=affected_rule_names
+        # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
+        if not is_clear:
+            alarm_source_domain = self.alarm_source_domain_map.get(alarm_source, "")
+            for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
+                if any(
+                    matches_expected_alarm(alarm_type, expected, alarm_source_domain)
+                    for expected in expected_list
+                ):
+                    trigger_key = (node, rule_name)
+                    self._trigger_seq += 1
+                    trigger_seq = self._trigger_seq
+                    self.trigger_event_index[trigger_key].append(
+                        (ts, event_id, trigger_seq, alarm_type, str(alarm_source or ""), occurrence_uuid)
                     )
-            else:
-                self.event_cache[node].append({
-                    "ts": ts,
-                    "eid": event_id,
-                    "alarm": alarm_type,
-                    "alarm_source": alarm_source,
-                    "alarm_payload": alarm_payload if isinstance(alarm_payload, dict) else {},
-                    "consumed_trigger_rules": frozenset(),
-                    "occurrence_uuid": occurrence_uuid,
-                })
+                    # 如果这段时间内已经触发过，就不更新时间，以“第一声警报”为准
+                    if trigger_key not in self.pending_triggers:
+                        self._set_pending_trigger(trigger_key, ts, trigger_seq)
 
-            # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
-            if not is_clear:
-                alarm_source_domain = self.alarm_source_domain_map.get(alarm_source, "")
-                for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
-                    if any(
-                        matches_expected_alarm(alarm_type, expected, alarm_source_domain)
-                        for expected in expected_list
-                    ):
-                        trigger_key = (node, rule_name)
-                        self._trigger_seq += 1
-                        trigger_seq = self._trigger_seq
-                        self.trigger_event_index[trigger_key].append(
-                            (ts, event_id, trigger_seq, alarm_type, str(alarm_source or ""), occurrence_uuid)
-                        )
-                        # 如果这段时间内已经触发过，就不更新时间，以“第一声警报”为准
-                        if trigger_key not in self.pending_triggers:
-                            self._set_pending_trigger(trigger_key, ts, trigger_seq)
-
-        # 离线模式通过事件触发收割
-        if collect_matches:
-            # 快路径：没有 mature pending trigger 时跳过 _collect_pending_matches，
-            # 省掉一次 lock acquire + helper 准备的开销。
-            # race 安全（仅在 live 模式的后台 harvest 线程下才有 race）：
-            #   - 假阴性（实际有 mature）→ 下一个事件会重试，最多延迟一个 ingest 周期
-            #   - 假阳性（heap 顶是 stale anchor 但满足 ts 条件）→ 落回慢路径，
-            #     _collect_mature_pending_locked 会正确丢弃 stale 项
-            heap = self.pending_trigger_heap
-            if heap:
-                effective_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
-                if heap[0][0] <= effective_ts:
-                    return self._collect_pending_matches(force=False)
+        # 快路径：没有 mature pending trigger 时跳过快照和评估。
+        heap = self.pending_trigger_heap
+        if heap and heap[0][0] <= self.latest_arrived_event_ts:
+            return self._collect_pending_matches(force=False)
 
         return []
 
@@ -441,7 +401,7 @@ class TemporalGraphEngine(
         self._pending_triggers_by_node[trigger_key[0]].add(trigger_key)
         ready_ts = first_trigger_ts + self.aggregation_wait_sec
         heapq.heappush(self.pending_trigger_heap, (ready_ts, first_trigger_ts, trigger_seq, trigger_key))
-        self._maybe_rebuild_pending_heap_locked()
+        self._maybe_rebuild_pending_heap()
 
     def _remove_pending_trigger(self, trigger_key):
         """从 pending_triggers 和反向索引同时移除。返回原 anchor 或 None。"""
@@ -456,7 +416,7 @@ class TemporalGraphEngine(
                 del self._pending_triggers_by_node[node]
         return anchor
 
-    def _maybe_rebuild_pending_heap_locked(self):
+    def _maybe_rebuild_pending_heap(self):
         if len(self.pending_trigger_heap) <= max(64, len(self.pending_triggers) * self._pending_heap_rebuild_factor):
             return
 
@@ -504,7 +464,7 @@ class TemporalGraphEngine(
 
         self.trigger_specs_by_node = trigger_specs_by_node
 
-    def _snapshot_event_cache_subset_locked(self, seed_nodes):
+    def _snapshot_event_cache_subset(self, seed_nodes):
         event_cache_snapshot = {}
         for node in seed_nodes:
             events = self.event_cache.get(node)
@@ -516,23 +476,19 @@ class TemporalGraphEngine(
         def get_events(node, cache=event_cache_snapshot):
             if node in cache:
                 return cache[node]
-            with self._event_snapshot_lock:
-                if node in cache:
-                    return cache[node]
-                with self._lock:
-                    events = tuple(self.event_cache.get(node, ()))
-                cache[node] = events
-                return events
+            events = tuple(self.event_cache.get(node, ()))
+            cache[node] = events
+            return events
 
         return NodeRuleHelper(
             get_events,
             self.alarm_source_domain_map,
         )
 
-    def _collect_mature_pending_locked(self, force=False):
-        """在锁内摘取当前已成熟的 pending trigger。"""
+    def _collect_mature_pending(self, force=False):
+        """摘取当前已成熟的 pending trigger。"""
         mature_items = []
-        effective_harvest_ts = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else self.current_watermark
+        latest_event_ts = self.latest_arrived_event_ts
 
         if force:
             for trigger_key, trigger_anchor in list(self.pending_triggers.items()):
@@ -542,7 +498,7 @@ class TemporalGraphEngine(
 
         while self.pending_trigger_heap:
             ready_ts, first_trigger_ts, trigger_seq, trigger_key = self.pending_trigger_heap[0]
-            if ready_ts > effective_harvest_ts:
+            if ready_ts > latest_event_ts:
                 break
 
             heapq.heappop(self.pending_trigger_heap)
@@ -555,79 +511,6 @@ class TemporalGraphEngine(
             mature_items.append((trigger_key, (first_trigger_ts, trigger_seq)))
 
         return mature_items
-
-    def advance_watermark(self, now_ts=None):
-        """通过定时任务推进水印，并收割已成熟的故障组。"""
-        with self._lock:
-            if now_ts is None:
-                now_ts = time.time()
-
-            self.current_watermark = max(self.current_watermark, now_ts)
-        return self._collect_pending_matches(force=False)
-
-    def start_periodic_harvest(
-        self,
-        interval_sec=DEFAULT_PERIODIC_HARVEST_INTERVAL_SEC,
-        on_matches=None,
-        now_ts_getter=None,
-    ):
-        """启动后台定时收割线程。
-
-        on_matches 是一个可选 callback，后台线程每次收割出故障组后会把整批结果交给它。
-        这里先不做线程安全承诺，后续如果线上启用双线程，需要再配合加锁方案一起看。
-        """
-        with self._lock:
-            if interval_sec <= 0:
-                raise ValueError("interval_sec must be > 0")
-            if self._harvest_thread and self._harvest_thread.is_alive():
-                raise RuntimeError("periodic harvest thread is already running")
-
-            self._harvest_interval_sec = interval_sec
-            self._harvest_callback = on_matches
-            self._harvest_now_ts_getter = now_ts_getter
-            self._harvest_stop_event = threading.Event()
-            self._harvest_thread = threading.Thread(
-                target=self._periodic_harvest_loop,
-                name="TemporalGraphEngineHarvest",
-                daemon=True
-            )
-            self._harvest_thread.start()
-
-    def stop_periodic_harvest(self, timeout=None):
-        """停止后台定时收割线程。"""
-        with self._lock:
-            thread = self._harvest_thread
-            stop_event = self._harvest_stop_event
-
-        if not thread:
-            return
-
-        if stop_event:
-            stop_event.set()
-        thread.join(timeout=timeout)
-
-        if thread.is_alive():
-            raise TimeoutError("periodic harvest thread did not stop within the timeout")
-
-        with self._lock:
-            if self._harvest_thread is thread and not self._harvest_thread.is_alive():
-                self._harvest_thread = None
-                self._harvest_stop_event = None
-                self._harvest_interval_sec = None
-                self._harvest_callback = None
-                self._harvest_now_ts_getter = None
-
-    def _periodic_harvest_loop(self):
-        while self._harvest_stop_event and not self._harvest_stop_event.is_set():
-            try:
-                # 定时线程按调用方给定的时间轴推进 watermark；默认退化到真实时间。
-                now_ts_getter = self._harvest_now_ts_getter or time.time
-                matches = self.advance_watermark(now_ts_getter())
-                if matches and self._harvest_callback:
-                    self._harvest_callback(matches)
-            except Exception:
-                logger.exception("Periodic harvest loop failed")
-            self._harvest_stop_event.wait(self._harvest_interval_sec)
 
     def _prune_consumed_alarm_history(self, matches):
         """在本轮定时收割结束时，只回收命中 trigger_role 的节点告警历史。"""
@@ -699,7 +582,7 @@ class TemporalGraphEngine(
             if not trigger_events:
                 self.trigger_event_index.pop(trigger_key, None)
                 self._remove_pending_trigger(trigger_key)
-        self._maybe_rebuild_pending_heap_locked()
+        self._maybe_rebuild_pending_heap()
 
     def _prune_trigger_index_before(self, trigger_key, cutoff_seq):
         """删除某个 trigger_key 下序号不大于 cutoff_seq 的已消费 trigger 事件。"""
@@ -787,7 +670,7 @@ class TemporalGraphEngine(
             else:
                 next_trigger_ts, next_trigger_seq = next_trigger_anchor
                 self._set_pending_trigger(trigger_key, next_trigger_ts, next_trigger_seq)
-        self._maybe_rebuild_pending_heap_locked()
+        self._maybe_rebuild_pending_heap()
 
     def _find_next_trigger_anchor(self, node, rule_name, lower_bound_anchor):
         """找到严格晚于 lower_bound_anchor 的下一条可用 trigger。"""
@@ -808,7 +691,7 @@ class TemporalGraphEngine(
         """流处理结束时，强制执行所有还在等待的触发器"""
         return self._collect_pending_matches(force=True)
 
-    def _prune_expired_state_locked(self, current_ts):
+    def _prune_expired_state(self, current_ts):
         """分批清理长期未再触达节点的过期缓存，避免状态无限滞留。"""
         nodes = list(self.event_cache.keys())
         if not nodes:
@@ -828,10 +711,7 @@ class TemporalGraphEngine(
     def _finalize_matches_with_history(self, matches):
         """把当前批次结果与历史组做最终合并并落库。"""
         finalized = []
-        current_time = self.latest_arrived_event_ts if self.latest_arrived_event_ts > 0 else (
-            self.current_watermark
-        )
-        self.emitted_group_store.prune_expired(current_time)
+        self.emitted_group_store.prune_expired(self.latest_arrived_event_ts)
 
         for match_result in matches:
             match_result, merged_group_indexes, related_group_uuids, should_emit = (
@@ -889,13 +769,12 @@ class TemporalGraphEngine(
         if not non_trigger_nodes:
             return matches, build_empty_merge_stats()
 
-        with self._lock:
-            # 通过反向索引按 non_trigger_nodes 直接取 pending，避免扫全量 pending_triggers。
-            pending_candidates = [
-                (trigger_key, self.pending_triggers[trigger_key])
-                for node in non_trigger_nodes
-                for trigger_key in self._pending_triggers_by_node.get(node, ())
-            ]
+        # 通过反向索引按 non_trigger_nodes 直接取 pending，避免扫全量 pending_triggers。
+        pending_candidates = [
+            (trigger_key, self.pending_triggers[trigger_key])
+            for node in non_trigger_nodes
+            for trigger_key in self._pending_triggers_by_node.get(node, ())
+        ]
 
         if not pending_candidates:
             return matches, build_empty_merge_stats()
@@ -925,7 +804,7 @@ class TemporalGraphEngine(
             return_stats=True,
         )
 
-    def _record_batch_merge_stats_locked(self, merge_stats):
+    def _record_batch_merge_stats(self, merge_stats):
         self.last_batch_merge_stats = build_empty_merge_stats()
         self.last_batch_merge_stats.update(merge_stats or {})
         self.total_batch_merge_stats = add_merge_stats(
@@ -934,8 +813,7 @@ class TemporalGraphEngine(
         )
 
     def get_batch_merge_stats_snapshot(self):
-        with self._lock:
-            return {
-                "last_batch": dict(self.last_batch_merge_stats),
-                "total": dict(self.total_batch_merge_stats),
-            }
+        return {
+            "last_batch": dict(self.last_batch_merge_stats),
+            "total": dict(self.total_batch_merge_stats),
+        }

@@ -32,7 +32,6 @@ from fault_grouping_official.temporal_engine.engine import TemporalGraphEngine
 from fault_grouping_official.time_config import (
     DEFAULT_AGGREGATION_WAIT_SEC,
     DEFAULT_CLEAR_DELAY_SEC,
-    DEFAULT_HARVEST_INTERVAL_SEC,
 )
 
 
@@ -67,25 +66,6 @@ def _build_arg_parser():
         ),
     )
     parser.add_argument(
-        '--mode',
-        type=str,
-        choices=('live', 'offline'),
-        default='offline',
-        help=(
-            'live: 按 ts 模拟实时流并启动后台定时收割; '
-            'offline: 每条告警到来时直接触发检查'
-        ),
-    )
-    parser.add_argument(
-        '--harvest-interval-sec',
-        type=float,
-        default=DEFAULT_HARVEST_INTERVAL_SEC,
-        help=(
-            f'模拟时间下的定时收割周期，单位秒，默认 '
-            f'{DEFAULT_HARVEST_INTERVAL_SEC:g}'
-        ),
-    )
-    parser.add_argument(
         '--aggregation-wait-sec',
         type=float,
         default=DEFAULT_AGGREGATION_WAIT_SEC,
@@ -102,15 +82,6 @@ def _build_arg_parser():
             '清除告警最小延迟时间，清除生效时间='
             'max(clear_delay_sec, 清除时间-发生时间)+发生时间，默认 '
             f'{DEFAULT_CLEAR_DELAY_SEC:g}'
-        ),
-    )
-    parser.add_argument(
-        '--speedup',
-        type=float,
-        default=1.0,
-        help=(
-            '按 ts 模拟实时流时的加速倍数，1 表示真实时间，'
-            '60 表示 1 分钟压到 1 秒'
         ),
     )
     parser.add_argument(
@@ -201,7 +172,6 @@ def main():
 
     try:
         run_matching_pipeline(
-            args,
             runtime_plan.engine,
             runtime_plan.alarm_load_result.valid_alarms,
             runtime_plan.output_session,

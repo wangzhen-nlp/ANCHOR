@@ -1,5 +1,4 @@
 import json
-import threading
 
 from dataclasses import dataclass, field
 
@@ -39,24 +38,21 @@ class MatchOutputSession:
     fault_pattern_filter: object = None
     match_count: int = 0
     process_progress: object = None
-    output_lock: threading.Lock = field(default_factory=threading.Lock)
     # 持久 append-mode 文件句柄，避免每批 open+close 的 syscall 开销。
-    # reset_output_file() 截断 + 打开；close() 显式收尾。多线程下由 output_lock 保护。
+    # reset_output_file() 截断 + 打开；close() 显式收尾。
     _fw: object = field(default=None, init=False, repr=False)
 
     def reset_output_file(self):
         # 先关掉已有句柄，再截断文件并打开新句柄。
-        with self.output_lock:
-            self._close_fw_locked()
-            with open(self.output_path, 'wb'):
-                pass
-            self._fw = open(self.output_path, 'ab')
+        self._close_fw()
+        with open(self.output_path, 'wb'):
+            pass
+        self._fw = open(self.output_path, 'ab')
 
     def close(self):
-        with self.output_lock:
-            self._close_fw_locked()
+        self._close_fw()
 
-    def _close_fw_locked(self):
+    def _close_fw(self):
         fw = self._fw
         if fw is None:
             return
@@ -105,41 +101,40 @@ class MatchOutputSession:
         return isinstance(rule, str) and rule.strip() in eligible
 
     def write_matches(self, matches):
-        with self.output_lock:
-            fw = self._fw
-            if fw is None:
-                raise RuntimeError("output file is not initialized; call reset_output_file() first")
-            output_lines = []
-            written_count = 0
-            for match in matches:
-                # 落盘前过滤：不含可落盘规则的故障组直接跳过，不再构建输出对象。
-                if not self._match_is_output_eligible(match):
+        fw = self._fw
+        if fw is None:
+            raise RuntimeError("output file is not initialized; call reset_output_file() first")
+        output_lines = []
+        written_count = 0
+        for match in matches:
+            # 落盘前过滤：不含可落盘规则的故障组直接跳过，不再构建输出对象。
+            if not self._match_is_output_eligible(match):
+                continue
+            pattern_analysis = None
+            if self.fault_pattern_filter is not None:
+                # 模式判定只依赖轻量的站点/告警/拓扑数据。先在原始 match 上判定，
+                # 被过滤的记录无需再展开全部 NE、链路和展示字段。
+                pattern_analysis = self.fault_pattern_filter.analyze_match(match)
+                if pattern_analysis is None:
                     continue
-                pattern_analysis = None
-                if self.fault_pattern_filter is not None:
-                    # 模式判定只依赖轻量的站点/告警/拓扑数据。先在原始 match 上判定，
-                    # 被过滤的记录无需再展开全部 NE、链路和展示字段。
-                    pattern_analysis = self.fault_pattern_filter.analyze_match(match)
-                    if pattern_analysis is None:
-                        continue
-                enriched_match = build_jsonl_match_output(
-                    match,
-                    self.ne_graph_data,
-                    site_graph_data=self.site_graph_data,
-                    site_to_ne_ids=self.site_to_ne_ids,
-                    ne_link_info_cache=self.ne_link_info_cache,
+            enriched_match = build_jsonl_match_output(
+                match,
+                self.ne_graph_data,
+                site_graph_data=self.site_graph_data,
+                site_to_ne_ids=self.site_to_ne_ids,
+                ne_link_info_cache=self.ne_link_info_cache,
+            )
+            # 补充模式上下文需要增强后的 ne_info/group_info，因此仅对已通过判定的
+            # 记录执行；分析结果直接复用，不再重复提取和拓扑计算。
+            if self.fault_pattern_filter is not None:
+                enriched_match = self.fault_pattern_filter.augment(
+                    enriched_match,
+                    pattern_analysis,
                 )
-                # 补充模式上下文需要增强后的 ne_info/group_info，因此仅对已通过判定的
-                # 记录执行；分析结果直接复用，不再重复提取和拓扑计算。
-                if self.fault_pattern_filter is not None:
-                    enriched_match = self.fault_pattern_filter.augment(
-                        enriched_match,
-                        pattern_analysis,
-                    )
-                output_lines.append(_dumps_line(enriched_match))
-                written_count += 1
-            if output_lines:
-                fw.writelines(output_lines)
-                fw.flush()
-            self.match_count += written_count
-            self.refresh_progress_extra_text()
+            output_lines.append(_dumps_line(enriched_match))
+            written_count += 1
+        if output_lines:
+            fw.writelines(output_lines)
+            fw.flush()
+        self.match_count += written_count
+        self.refresh_progress_extra_text()

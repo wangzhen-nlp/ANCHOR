@@ -23,6 +23,7 @@ from fault_grouping_official.site_topology import (
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 ROUTER_DEVICE_DOMAINS = {"DATA"}
 OTHER_FAULT_PATTERNS = {"ip_ring_others"}
+_EMPTY_NEIGHBORS = frozenset()
 PATTERN_PRIORITY = {
     "ip_chain_single_link": 0,
     "ip_chain_multi_link": 1,
@@ -194,6 +195,8 @@ class SiteRelationIndex:
         self.downstream_direct = defaultdict(set)
         self.upstream_direct = defaultdict(set)
         self.bidirectional_direct = defaultdict(set)
+        self._undirected_neighbors_cache = {}
+        self._ring_neighbors_cache = {}
         self._upstream_distance_cache = {}
         # 只缓存 site_chains 预计算索引中缺失、由 BFS 补出的距离；不复制原 hop dict。
         self._supplemental_upstream_distances_cache = {}
@@ -210,6 +213,7 @@ class SiteRelationIndex:
                     self.upstream_direct[downstream_site].add(upstream_site)
 
     def _load_direct_relations_from_site_chains(self):
+        self._invalidate_neighbor_caches()
         for site_id, chain_info in self.site_chains.items():
             for downstream_site, hop in chain_info.get("downstream_site_hops", {}).items():
                 if hop == 1:
@@ -222,6 +226,10 @@ class SiteRelationIndex:
             for neighbor_site in chain_info.get("bidirectional_sites", set()):
                 self.bidirectional_direct[site_id].add(neighbor_site)
                 self.bidirectional_direct[neighbor_site].add(site_id)
+
+    def _invalidate_neighbor_caches(self):
+        self._undirected_neighbors_cache.clear()
+        self._ring_neighbors_cache.clear()
 
     def upstream_distance(self, downstream_site, upstream_site):
         if downstream_site == upstream_site:
@@ -252,21 +260,9 @@ class SiteRelationIndex:
         self._upstream_distance_cache[cache_key] = None
         return None
 
-    def iter_upstream_distances(self, downstream_site):
-        """迭代某站点的全部可达上游及距离，不复制预计算 hop 字典。
-
-        site_chains 中的预计算值直接从原 dict 迭代；BFS 只计算并缓存其中缺失的
-        可达上游。显式存在的 None/0 等值仍会阻止 BFS 覆盖，保持 upstream_distance()
-        的原语义。
-        """
-        chain_info = self.site_chains.get(downstream_site, {})
-        precomputed_hops = chain_info.get("upstream_site_hops", {})
-        for upstream_site, hop in precomputed_hops.items():
-            if upstream_site != downstream_site and hop is not None and hop > 0:
-                yield upstream_site, hop
-
+    def _supplemental_upstream_distances(self, downstream_site, precomputed_hops):
         if self.precomputed_upstream_hops_complete:
-            return
+            return {}
 
         cache = self._supplemental_upstream_distances_cache
         if downstream_site not in cache:
@@ -283,39 +279,137 @@ class SiteRelationIndex:
                         supplemental_distances.setdefault(parent_site, hop + 1)
                     queue.append((parent_site, hop + 1))
             cache[downstream_site] = supplemental_distances
+        return cache[downstream_site]
 
-        yield from cache[downstream_site].items()
+    @staticmethod
+    def _valid_upstream_hop(downstream_site, upstream_site, hop):
+        return (
+            upstream_site != downstream_site
+            and hop is not None
+            and hop > 0
+        )
+
+    def iter_upstream_distances(self, downstream_site):
+        """迭代某站点的全部可达上游及距离，不复制预计算 hop 字典。"""
+        chain_info = self.site_chains.get(downstream_site, {})
+        precomputed_hops = chain_info.get("upstream_site_hops", {})
+        for upstream_site, hop in precomputed_hops.items():
+            if self._valid_upstream_hop(downstream_site, upstream_site, hop):
+                yield upstream_site, hop
+
+        supplemental_distances = self._supplemental_upstream_distances(
+            downstream_site,
+            precomputed_hops,
+        )
+        yield from supplemental_distances.items()
+
+    def iter_upstream_distances_in(self, downstream_site, allowed_sites):
+        """只迭代 allowed_sites 内的可达上游，优先遍历较小集合。
+
+        小故障组无需扫描站点在全局拓扑中的全部上游；预计算表较小时仍顺序遍历
+        该表，避免对大故障组做过多随机查表。
+        """
+        chain_info = self.site_chains.get(downstream_site, {})
+        precomputed_hops = chain_info.get("upstream_site_hops", {})
+        supplemental_distances = self._supplemental_upstream_distances(
+            downstream_site,
+            precomputed_hops,
+        )
+        if isinstance(allowed_sites, (set, frozenset)):
+            allowed_site_set = allowed_sites
+        else:
+            allowed_site_set = set(allowed_sites)
+        upstream_count = len(precomputed_hops) + len(supplemental_distances)
+
+        if len(allowed_site_set) <= upstream_count:
+            for upstream_site in allowed_site_set:
+                if upstream_site in precomputed_hops:
+                    hop = precomputed_hops[upstream_site]
+                else:
+                    hop = supplemental_distances.get(upstream_site)
+                if self._valid_upstream_hop(
+                    downstream_site,
+                    upstream_site,
+                    hop,
+                ):
+                    yield upstream_site, hop
+            return
+
+        for upstream_site, hop in precomputed_hops.items():
+            if (
+                upstream_site in allowed_site_set
+                and self._valid_upstream_hop(
+                    downstream_site,
+                    upstream_site,
+                    hop,
+                )
+            ):
+                yield upstream_site, hop
+        for upstream_site, hop in supplemental_distances.items():
+            if upstream_site in allowed_site_set:
+                yield upstream_site, hop
 
     def directly_connected(self, site_a, site_b):
         if site_a == site_b:
             return False
         return (
-            site_b in self.downstream_direct.get(site_a, set())
-            or site_a in self.downstream_direct.get(site_b, set())
-            or site_b in self.bidirectional_direct.get(site_a, set())
-            or site_a in self.bidirectional_direct.get(site_b, set())
+            site_b in self.downstream_direct.get(site_a, _EMPTY_NEIGHBORS)
+            or site_a in self.downstream_direct.get(site_b, _EMPTY_NEIGHBORS)
+            or site_b in self.bidirectional_direct.get(site_a, _EMPTY_NEIGHBORS)
+            or site_a in self.bidirectional_direct.get(site_b, _EMPTY_NEIGHBORS)
         )
+
+    def undirected_neighbors(self, site_id):
+        cached = self._undirected_neighbors_cache.get(site_id)
+        if cached is None:
+            cached = frozenset().union(
+                self.downstream_direct.get(site_id, _EMPTY_NEIGHBORS),
+                self.upstream_direct.get(site_id, _EMPTY_NEIGHBORS),
+                self.bidirectional_direct.get(site_id, _EMPTY_NEIGHBORS),
+            )
+            self._undirected_neighbors_cache[site_id] = cached
+        return cached
+
+    def ring_neighbors(self, site_id):
+        """环模式使用的双向及直接上游邻居（静态缓存）。"""
+        cached = self._ring_neighbors_cache.get(site_id)
+        if cached is None:
+            cached = frozenset().union(
+                self.bidirectional_direct.get(site_id, _EMPTY_NEIGHBORS),
+                self.upstream_direct.get(site_id, _EMPTY_NEIGHBORS),
+            )
+            self._ring_neighbors_cache[site_id] = cached
+        return cached
+
+    def bidirectional_neighbor_set(self, site_id):
+        return self.bidirectional_direct.get(site_id, _EMPTY_NEIGHBORS)
+
+    def direct_upstream_neighbor_set(self, site_id):
+        return self.upstream_direct.get(site_id, _EMPTY_NEIGHBORS)
 
     def direct_neighbors(self, site_id):
-        return (
-            set(self.downstream_direct.get(site_id, set()))
-            | set(self.upstream_direct.get(site_id, set()))
-            | set(self.bidirectional_direct.get(site_id, set()))
-        )
+        # 保留原有“返回可变 set”的公开行为；内部热路径直接使用缓存的 frozenset。
+        return set(self.undirected_neighbors(site_id))
 
     def non_downstream_neighbors(self, site_id):
-        return sorted(self.direct_neighbors(site_id) - set(self.downstream_direct.get(site_id, set())))
+        return sorted(
+            self.undirected_neighbors(site_id).difference(
+                self.downstream_direct.get(site_id, _EMPTY_NEIGHBORS)
+            )
+        )
 
     def bidirectional_neighbors(self, site_id):
-        return sorted(self.bidirectional_direct.get(site_id, set()))
+        return sorted(self.bidirectional_neighbor_set(site_id))
 
     def direct_upstream_neighbors(self, site_id):
-        return sorted(self.upstream_direct.get(site_id, set()))
+        return sorted(self.direct_upstream_neighbor_set(site_id))
 
     def undirected_neighbors_in(self, site_id, site_set):
-        # direct_neighbors() 只遍历该站点的实际邻接边；旧实现反过来扫描整个
-        # site_set 并逐一调用 directly_connected()，使连通分量计算退化为 O(V²)。
-        return self.direct_neighbors(site_id) & set(site_set)
+        return {
+            neighbor
+            for neighbor in self.undirected_neighbors(site_id)
+            if neighbor in site_set
+        }
 
 
 def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relation_index):
@@ -355,10 +449,10 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
         seeded_unmanaged_sites.add(unmanaged_site)
         site_candidates = [
             (distance, upstream_site)
-            for upstream_site, distance in relation_index.iter_upstream_distances(
-                unmanaged_site
+            for upstream_site, distance in relation_index.iter_upstream_distances_in(
+                unmanaged_site,
+                remaining,
             )
-            if upstream_site in remaining
         ]
         heapq.heapify(site_candidates)
         upstream_candidates_by_site[unmanaged_site] = site_candidates
@@ -376,6 +470,8 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
             continue
 
         remaining.remove(unmanaged_site)
+        # 该站点不会重新进入 remaining，立即释放尚未消费的局部候选。
+        upstream_candidates_by_site.pop(unmanaged_site, None)
         absorbed_by[unmanaged_site] = parent_site
         parent_was_unmanaged = parent_site in unmanaged_sites
         unmanaged_sites.add(parent_site)
@@ -612,8 +708,7 @@ def classify_chain_uplink(chain, component_sites, relation_index):
     external_connected_chain_sites = {
         chain_site
         for chain_site in chain
-        for other_site in other_sites
-        if relation_index.directly_connected(chain_site, other_site)
+        if not relation_index.undirected_neighbors(chain_site).isdisjoint(other_sites)
     }
     endpoints = {chain[0], chain[-1]} if chain else set()
     subtype = "single_uplink" if external_connected_chain_sites <= endpoints else "multi_uplink"
@@ -640,7 +735,7 @@ def build_context_edges_for_anchors(anchors, related_sites_by_anchor, relation_t
 
 
 def bidirectional_or_upstream_neighbors(site_id, relation_index):
-    return set(relation_index.bidirectional_neighbors(site_id)) | set(relation_index.direct_upstream_neighbors(site_id))
+    return relation_index.ring_neighbors(site_id)
 
 
 def has_two_bidirectional_or_upstream_neighbors(site_id, relation_index):
@@ -656,7 +751,7 @@ def classify_ip_ring_chain(chain, relation_index):
     endpoints = [chain[0], chain[-1]]
     endpoint_set = set(endpoints)
     endpoint_bidir = {
-        endpoint: set(relation_index.bidirectional_neighbors(endpoint))
+        endpoint: relation_index.bidirectional_neighbor_set(endpoint)
         for endpoint in endpoints
     }
 
@@ -681,7 +776,7 @@ def classify_ip_ring_chain(chain, relation_index):
         for endpoint in endpoints
     )
     endpoint_upstream = {
-        endpoint: set(relation_index.direct_upstream_neighbors(endpoint))
+        endpoint: relation_index.direct_upstream_neighbor_set(endpoint)
         for endpoint in endpoints
     }
     common_bidir_sites = sorted((endpoint_bidir[endpoints[0]] & endpoint_bidir[endpoints[1]]) - chain_set)

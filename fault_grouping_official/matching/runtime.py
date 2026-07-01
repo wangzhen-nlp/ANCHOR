@@ -13,10 +13,8 @@ from fault_grouping_official.alarm_events.io import (
     warn_sorted_alarm_cache_option_mismatch,
 )
 from fault_grouping_official.alarm_events.stream import (
-    build_simulated_now_ts_getter,
     process_alarm,
     refresh_process_progress,
-    stream_alarms_by_ts,
 )
 from fault_grouping_official.rule_config import (
     OUTPUT_ELIGIBLE_RULE_FIELD,
@@ -317,43 +315,12 @@ def default_valid_alarm_titles():
     return CRITICAL_ALARMS
 
 
-def run_live_mode(
-    engine,
-    valid_alarms,
-    speedup,
-    real_harvest_interval_sec,
-    on_matches,
-    process_progress,
-    refresh_extra_text,
-):
-    """按 ts 差值模拟实时告警流，并由后台定时线程异步收割成熟故障组。"""
-    print(
-        f"⏱️ 运行模式: live, speedup={speedup:g}x, "
-        f"模拟收割周期={real_harvest_interval_sec * speedup:g}s, "
-        f"真实收割周期={real_harvest_interval_sec:.3f}s"
-    )
-    now_ts_getter = build_simulated_now_ts_getter(valid_alarms, speedup)
-    engine.start_periodic_harvest(
-        interval_sec=real_harvest_interval_sec,
-        on_matches=on_matches,
-        now_ts_getter=now_ts_getter
-    )
-
-    try:
-        for item in stream_alarms_by_ts(valid_alarms, speedup=speedup):
-            process_alarm(engine, item, collect_matches=False)
-            refresh_process_progress(process_progress, refresh_extra_text)
-    finally:
-        process_progress.close()
-        engine.stop_periodic_harvest()
-
-
-def run_offline_mode(engine, valid_alarms, on_matches, process_progress, refresh_extra_text):
+def run_alarm_matching(engine, valid_alarms, on_matches, process_progress, refresh_extra_text):
     """按时间排序顺序处理告警，并在每条告警后立即同步收割一次成熟故障组。"""
-    print("⏱️ 运行模式: offline, 每条告警到来时直接触发检查")
+    print("⏱️ 每条告警到来时直接触发检查")
     try:
         for item in valid_alarms:
-            matches = process_alarm(engine, item, collect_matches=True)
+            matches = process_alarm(engine, item)
             if matches:
                 on_matches(matches)
             refresh_process_progress(process_progress, refresh_extra_text)
@@ -362,35 +329,21 @@ def run_offline_mode(engine, valid_alarms, on_matches, process_progress, refresh
 
 
 def run_matching_pipeline(
-    args,
     engine,
     valid_alarms,
     output_session,
 ):
-    speedup = max(float(args.speedup), 1e-9)
-    real_harvest_interval_sec = max(args.harvest_interval_sec / speedup, 0.001)
     process_progress = ProgressBar(len(valid_alarms), "处理有效告警")
     output_session.process_progress = process_progress
     output_session.refresh_progress_extra_text(force=True)
 
-    if args.mode == 'live':
-        run_live_mode(
-            engine,
-            valid_alarms,
-            speedup,
-            real_harvest_interval_sec,
-            output_session.write_matches,
-            process_progress,
-            output_session.refresh_progress_extra_text,
-        )
-    else:
-        run_offline_mode(
-            engine,
-            valid_alarms,
-            output_session.write_matches,
-            process_progress,
-            output_session.refresh_progress_extra_text,
-        )
+    run_alarm_matching(
+        engine,
+        valid_alarms,
+        output_session.write_matches,
+        process_progress,
+        output_session.refresh_progress_extra_text,
+    )
 
     output_session.process_progress = None
 

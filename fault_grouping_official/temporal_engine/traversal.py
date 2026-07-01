@@ -43,11 +43,10 @@ class TemporalGraphEngineTraversalMixin:
             else ("role", rule_name, target_role)
         )
         cache_key = (structure_key, start_node, directions, max_hops)
-        with self._topo_cache_lock:
-            cached = self.global_role_filtered_neighbor_cache.get(cache_key)
-            if cached is not None:
-                self.global_role_filtered_neighbor_cache.move_to_end(cache_key)
-                return cached
+        cached = self.global_role_filtered_neighbor_cache.get(cache_key)
+        if cached is not None:
+            self.global_role_filtered_neighbor_cache.move_to_end(cache_key)
+            return cached
 
         candidate_hops = self._traverse_graph(
             start_node=start_node,
@@ -61,11 +60,10 @@ class TemporalGraphEngineTraversalMixin:
             candidate_hops,
             target_node_config=target_node_config,
         )
-        with self._topo_cache_lock:
-            self.global_role_filtered_neighbor_cache[cache_key] = filtered
-            self.global_role_filtered_neighbor_cache.move_to_end(cache_key)
-            if len(self.global_role_filtered_neighbor_cache) > self.max_role_filtered_neighbor_cache_size:
-                self.global_role_filtered_neighbor_cache.popitem(last=False)
+        self.global_role_filtered_neighbor_cache[cache_key] = filtered
+        self.global_role_filtered_neighbor_cache.move_to_end(cache_key)
+        if len(self.global_role_filtered_neighbor_cache) > self.max_role_filtered_neighbor_cache_size:
+            self.global_role_filtered_neighbor_cache.popitem(last=False)
         return filtered
 
     def _get_precomputed_site_chain_candidates(self, start_node, direction, max_hops=None):
@@ -144,11 +142,10 @@ class TemporalGraphEngineTraversalMixin:
 
     def _traverse_graph_single_direction(self, start_node, direction, max_hops):
         cache_key = (start_node, direction, max_hops)
-        with self._topo_cache_lock:
-            cached = self.global_topo_cache.get(cache_key)
-            if cached is not None:
-                self.global_topo_cache.move_to_end(cache_key)
-                return cached
+        cached = self.global_topo_cache.get(cache_key)
+        if cached is not None:
+            self.global_topo_cache.move_to_end(cache_key)
+            return cached
 
         result = self._get_precomputed_site_chain_candidates(
             start_node,
@@ -162,11 +159,10 @@ class TemporalGraphEngineTraversalMixin:
                 max_hops,
             )
 
-        with self._topo_cache_lock:
-            self.global_topo_cache[cache_key] = result
-            self.global_topo_cache.move_to_end(cache_key)
-            if len(self.global_topo_cache) > self.max_topo_cache_size:
-                self.global_topo_cache.popitem(last=False)
+        self.global_topo_cache[cache_key] = result
+        self.global_topo_cache.move_to_end(cache_key)
+        if len(self.global_topo_cache) > self.max_topo_cache_size:
+            self.global_topo_cache.popitem(last=False)
         return result
 
     def _get_site_topology_neighbors(self, node, direction):

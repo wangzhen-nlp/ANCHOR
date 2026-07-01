@@ -3,12 +3,11 @@ from fault_grouping_official.temporal_engine.utils import add_merge_stats, merge
 
 class TemporalGraphEngineRuntimeMixin:
     def _prepare_mature_pending_batch(self, force=False):
-        with self._lock:
-            mature_items = self._collect_mature_pending_locked(force=force)
-            if not mature_items:
-                return [], None
-            seed_nodes = {trigger_key[0] for trigger_key, _ in mature_items}
-            event_cache_snapshot = self._snapshot_event_cache_subset_locked(seed_nodes)
+        mature_items = self._collect_mature_pending(force=force)
+        if not mature_items:
+            return [], None
+        seed_nodes = {trigger_key[0] for trigger_key, _ in mature_items}
+        event_cache_snapshot = self._snapshot_event_cache_subset(seed_nodes)
         return mature_items, self._build_snapshot_helper(event_cache_snapshot)
 
     def _evaluate_mature_pending_items(self, mature_items, helper, batch_eval_caches):
@@ -42,10 +41,9 @@ class TemporalGraphEngineRuntimeMixin:
         return expanded_matches, add_merge_stats(batch_merge_stats, expanded_merge_stats)
 
     def _finalize_expanded_matches_for_output(self, expanded_matches, collection_merge_stats):
-        with self._lock:
-            self._record_batch_merge_stats_locked(collection_merge_stats)
-            self._prune_expired_state_locked(self.latest_arrived_event_ts)
-            finalized_matches = self._finalize_matches_with_history(expanded_matches)
+        self._record_batch_merge_stats(collection_merge_stats)
+        self._prune_expired_state(self.latest_arrived_event_ts)
+        finalized_matches = self._finalize_matches_with_history(expanded_matches)
 
         return self._apply_output_visibility_filters_to_matches(finalized_matches)
 

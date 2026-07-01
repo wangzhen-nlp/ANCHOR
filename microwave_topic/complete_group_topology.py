@@ -10,6 +10,7 @@ import re
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -27,6 +28,57 @@ from topology_resources import (
 
 BLOCKED_ANCESTOR_SITE_IDS = {"13PWK0024"}
 OFFLINE_ALARM_KEYS = {str(alarm or "").strip().upper() for alarm in OFFLINE_ALARMS} | {"OFFLINE"}
+
+# --filter 使用：每条规则为 (offline 持续时间阈值秒数, 需要满足的站点数)。
+# 只要任一规则满足（用该阈值卡后仍剩至少这么多个有 offline 告警的站点），故障组即保留。
+OFFLINE_DURATION_FILTER_RULES = (
+    (30 * 60, 4),
+    (15 * 60, 10),
+    (7 * 60, 30),
+)
+# 计算每个站最长 offline 告警持续时间时读取的时间字段（起始取最早发生时间，结束取清除时间）。
+OFFLINE_START_TIME_FIELDS = (
+    "ts",
+    "告警首次发生时间",
+    "告警发生时间",
+    "发生时间",
+    "首次发生时间",
+    "alarm_time",
+    "time",
+)
+OFFLINE_CLEAR_TIME_FIELDS = ("告警清除时间", "alarm_clear_time", "clear_time", "清除时间")
+
+
+def _parse_timestamp(value):
+    """把告警时间字段解析为 epoch 秒；支持数值（已是 epoch）与常见日期字符串。"""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = _normalize_text(value)
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(text.replace("T", " ")).timestamp()
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _first_record_timestamp(record, fields):
+    for field_name in fields:
+        ts = _parse_timestamp(record.get(field_name))
+        if ts is not None:
+            return ts
+    return None
 
 
 def _normalize_text(value):
@@ -402,30 +454,44 @@ def _append_unique_site(site_ids, site_id):
         site_ids.append(site_id)
 
 
-def _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne):
-    site_ids = []
+def _iter_offline_alarm_site_records(group, ne_graph_data, group_site_by_ne):
+    """遍历故障组内所有 Offline/断站 告警记录，产出 (站点ID, 告警记录)。"""
+
+    def _site_for(site_id, ne_id):
+        return _normalize_text(site_id) or _site_of_ne(
+            _normalize_text(ne_id), ne_graph_data, group_site_by_ne
+        )
 
     for symptom in group.get("symptoms") or []:
         if not isinstance(symptom, dict) or not _record_has_offline_alarm(symptom):
             continue
-        site_id = _normalize_text(symptom.get("node") or symptom.get("site_id") or "")
-        ne_id = _normalize_text(symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "")
-        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+        site_id = _site_for(
+            symptom.get("node") or symptom.get("site_id") or "",
+            symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "",
+        )
+        if site_id:
+            yield site_id, symptom
 
     match_info = group.get("match_info") if isinstance(group.get("match_info"), dict) else {}
     for symptom in match_info.get("symptoms") or []:
         if not isinstance(symptom, dict) or not _record_has_offline_alarm(symptom):
             continue
-        site_id = _normalize_text(symptom.get("node") or symptom.get("site_id") or "")
-        ne_id = _normalize_text(symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "")
-        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+        site_id = _site_for(
+            symptom.get("node") or symptom.get("site_id") or "",
+            symptom.get("alarm_source") or symptom.get("ne_id") or symptom.get("source") or "",
+        )
+        if site_id:
+            yield site_id, symptom
 
     for alarm in group.get("alarms") or []:
         if not isinstance(alarm, dict) or not _record_has_offline_alarm(alarm):
             continue
-        site_id = _normalize_text(alarm.get("站点ID") or alarm.get("site_id") or alarm.get("node") or "")
-        ne_id = _normalize_text(alarm.get("告警源") or alarm.get("alarm_source") or alarm.get("ne_id") or alarm.get("source") or "")
-        _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+        site_id = _site_for(
+            alarm.get("站点ID") or alarm.get("site_id") or alarm.get("node") or "",
+            alarm.get("告警源") or alarm.get("alarm_source") or alarm.get("ne_id") or alarm.get("source") or "",
+        )
+        if site_id:
+            yield site_id, alarm
 
     ne_info = group.get("ne_info", {})
     if isinstance(ne_info, dict):
@@ -435,10 +501,69 @@ def _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne):
             for alarm in info.get("alarm") or []:
                 if not isinstance(alarm, dict) or not _record_has_offline_alarm(alarm):
                     continue
-                site_id = _normalize_text(alarm.get("site_id") or alarm.get("node") or info.get("site_id") or "")
-                _append_unique_site(site_ids, site_id or _site_of_ne(ne_id, ne_graph_data, group_site_by_ne))
+                site_id = _site_for(
+                    alarm.get("site_id") or alarm.get("node") or info.get("site_id") or "",
+                    ne_id,
+                )
+                if site_id:
+                    yield site_id, alarm
 
+
+def _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne):
+    site_ids = []
+    for site_id, _record in _iter_offline_alarm_site_records(group, ne_graph_data, group_site_by_ne):
+        _append_unique_site(site_ids, site_id)
     return sorted(site_ids)
+
+
+def _record_offline_duration_seconds(record):
+    """单条 offline 告警的持续时间（秒）：清除时间 - 起始时间；未清除记为 inf（持续中）。"""
+    start_ts = _first_record_timestamp(record, OFFLINE_START_TIME_FIELDS)
+    if start_ts is None:
+        return None
+    clear_ts = _first_record_timestamp(record, OFFLINE_CLEAR_TIME_FIELDS)
+    if clear_ts is None:
+        return float("inf")
+    return max(0.0, clear_ts - start_ts)
+
+
+def _offline_site_max_durations(group, ne_graph_data, group_site_by_ne):
+    """统计每个站点最长的一条 offline 告警持续时间（秒），inf 表示仍在持续/未清除。"""
+    durations = {}
+    for site_id, record in _iter_offline_alarm_site_records(group, ne_graph_data, group_site_by_ne):
+        duration = _record_offline_duration_seconds(record)
+        if duration is None:
+            continue
+        if site_id not in durations or duration > durations[site_id]:
+            durations[site_id] = duration
+    return durations
+
+
+def _serialize_offline_durations(durations):
+    """把每站最长 offline 时长转成 JSON 安全的映射：inf（未清除）序列化为 null。"""
+    return {
+        site_id: (None if duration == float("inf") else int(round(duration)))
+        for site_id, duration in sorted(durations.items())
+    }
+
+
+def _offline_duration_filter_summary(durations):
+    """按 OFFLINE_DURATION_FILTER_RULES 逐条统计满足阈值的站点数，并给出总体是否保留。"""
+    rules = []
+    passes = False
+    for min_seconds, min_site_count in OFFLINE_DURATION_FILTER_RULES:
+        qualifying_site_count = sum(
+            1 for duration in durations.values() if duration >= min_seconds
+        )
+        rule_passes = qualifying_site_count >= min_site_count
+        passes = passes or rule_passes
+        rules.append({
+            "min_minutes": min_seconds // 60,
+            "min_site_count": min_site_count,
+            "qualifying_site_count": qualifying_site_count,
+            "passes": rule_passes,
+        })
+    return {"rules": rules, "passes": passes}
 
 
 def _build_weighted_upstream_adjacency(site_chain_index):
@@ -1153,6 +1278,7 @@ def complete_group_topology(
         if _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
     })
     offline_alarm_sites = _extract_offline_alarm_site_ids(group, ne_graph_data, group_site_by_ne)
+    offline_site_max_durations = _offline_site_max_durations(group, ne_graph_data, group_site_by_ne)
     non_offline_alarm_sites = sorted(set(alarm_sites) - set(offline_alarm_sites))
     if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
         site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
@@ -1322,6 +1448,8 @@ def complete_group_topology(
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(offline_alarm_sites) <= 1,
+        "offline_site_max_duration_seconds": _serialize_offline_durations(offline_site_max_durations),
+        "offline_duration_filter": _offline_duration_filter_summary(offline_site_max_durations),
     }
     return group
 
@@ -1353,6 +1481,7 @@ def complete_groups(
     show_progress=True,
     ancestor_output="all",
     per_file=False,
+    offline_duration_filter=False,
 ):
     ne_graph_data = _load_json_object(ne_graph_path, "ne_graph", warn_if_missing=True)
     site_graph_data = _load_json_object(site_graph_path, "site_graph", warn_if_missing=True)
@@ -1372,6 +1501,7 @@ def complete_groups(
         "one_ancestor_group_count": 0,
         "multiple_ancestor_group_count": 0,
         "skipped_by_ancestor_output_group_count": 0,
+        "skipped_by_offline_duration_filter_group_count": 0,
         "skipped_by_blocked_ancestor_site_group_count": 0,
         "skipped_by_missing_alarm_topology_group_count": 0,
         "missing_alarm_source_group_count": 0,
@@ -1422,6 +1552,10 @@ def complete_groups(
                     stats["multiple_ancestor_group_count"] += 1
                 if not _should_output_by_ancestor_count(completion, ancestor_output):
                     stats["skipped_by_ancestor_output_group_count"] += 1
+                    progress.update(stats)
+                    continue
+                if offline_duration_filter and not completion.get("offline_duration_filter", {}).get("passes", False):
+                    stats["skipped_by_offline_duration_filter_group_count"] += 1
                     progress.update(stats)
                     continue
                 if _blocked_ancestor_site_ids(completion):
@@ -1481,6 +1615,7 @@ def complete_groups(
     stats["site_chains"] = site_chains_path
     stats["restrict_relation"] = restrict_relation
     stats["ancestor_output"] = ancestor_output
+    stats["offline_duration_filter"] = offline_duration_filter
     return stats
 
 
@@ -1523,6 +1658,17 @@ def build_arg_parser():
             "multiple 只输出多个祖先站点的故障组。默认 all"
         ),
     )
+    parser.add_argument(
+        "--filter",
+        dest="offline_duration_filter",
+        action="store_true",
+        help=(
+            "按每站最长 offline 告警持续时间筛选故障组，满足任一情况即保留："
+            "用 ≥30 分钟卡后仍剩至少 4 个有 offline 的站点；"
+            "或用 ≥15 分钟卡后仍剩至少 10 个；"
+            "或用 ≥7 分钟卡后仍剩至少 30 个。未清除的 offline 视为持续中（满足任一阈值）"
+        ),
+    )
     parser.add_argument("--no-progress", action="store_true", help="关闭处理进度输出")
     return parser
 
@@ -1539,6 +1685,7 @@ def main():
         show_progress=not args.no_progress,
         ancestor_output=args.ancestor_output,
         per_file=args.per_file,
+        offline_duration_filter=args.offline_duration_filter,
     )
     print(json.dumps(stats, ensure_ascii=False, indent=2))
 
