@@ -7,14 +7,11 @@ from dataclasses import dataclass
 from fault_grouping_official.alarm_types import CRITICAL_ALARMS
 from fault_grouping_official.tools.progress_utils import ProgressBar
 from fault_grouping_official.alarm_events.io import (
+    is_clear_alarm,
     load_sorted_alarm_cache_with_stats,
     load_valid_alarms,
     trim_trailing_clear_alarms,
     warn_sorted_alarm_cache_option_mismatch,
-)
-from fault_grouping_official.alarm_events.stream import (
-    process_alarm,
-    refresh_process_progress,
 )
 from fault_grouping_official.rule_config import (
     OUTPUT_ELIGIBLE_RULE_FIELD,
@@ -38,6 +35,10 @@ from fault_grouping_official.site_topology import (
 )
 from fault_grouping_official.link_peer_index import build_peer_index
 from fault_grouping_official.resource_buffer import load_resource_buffer
+from fault_grouping_official.time_config import (
+    DEFAULT_AGGREGATION_WAIT_SEC,
+    DEFAULT_CLEAR_DELAY_SEC,
+)
 
 
 @dataclass
@@ -156,11 +157,11 @@ def load_static_context(args):
 
 
 def print_run_configuration(args, valid_alarm_titles):
-    if args.clear_delay_sec > 0:
-        print(f"清除告警最小延迟: {args.clear_delay_sec:g} 秒")
+    if DEFAULT_CLEAR_DELAY_SEC > 0:
+        print(f"清除告警最小延迟: {DEFAULT_CLEAR_DELAY_SEC:g} 秒")
     print(f"有效告警类型数: {len(valid_alarm_titles)}")
-    print(f"落盘规则检查: {'启用' if args.rule_check else '关闭'}")
-    print(f"故障模式检查与增强: {'启用' if args.pattern_check else '关闭'}")
+    print("落盘规则检查: 启用")
+    print("故障模式检查与增强: 启用")
 
 
 def build_rules_config():
@@ -216,12 +217,12 @@ def build_fault_pattern_filter(static_context):
 
 def initialize_engine(args, static_context, rules_config):
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
-    print(f"聚合等待时间: {args.aggregation_wait_sec:g} 秒")
+    print(f"聚合等待时间: {DEFAULT_AGGREGATION_WAIT_SEC:g} 秒")
     engine = TemporalGraphEngine(
         rules_config,
         static_context.site_domain_map,
         alarm_source_domain_map=static_context.alarm_source_domain_map,
-        aggregation_wait_sec=args.aggregation_wait_sec,
+        aggregation_wait_sec=DEFAULT_AGGREGATION_WAIT_SEC,
         topo_downstream_map=static_context.topo_downstream_map,
         site_chain_index=static_context.site_chain_index,
         ne_graph_data=static_context.ne_graph_data,
@@ -282,7 +283,7 @@ def load_alarm_data(args, static_context, valid_alarm_titles, sorted_alarm_cache
         valid_alarm_titles,
         static_context.valid_sites,
         static_context.ne_to_site,
-        clear_delay_sec=args.clear_delay_sec,
+        clear_delay_sec=DEFAULT_CLEAR_DELAY_SEC,
     )
 
     print("⏳ 正在按时间排序有效告警...")
@@ -315,37 +316,37 @@ def default_valid_alarm_titles():
     return CRITICAL_ALARMS
 
 
-def run_alarm_matching(engine, valid_alarms, on_matches, process_progress, refresh_extra_text):
-    """按时间排序顺序处理告警，并在每条告警后立即同步收割一次成熟故障组。"""
-    print("⏱️ 每条告警到来时直接触发检查")
-    try:
-        for item in valid_alarms:
-            matches = process_alarm(engine, item)
-            if matches:
-                on_matches(matches)
-            refresh_process_progress(process_progress, refresh_extra_text)
-    finally:
-        process_progress.close()
-
-
 def run_matching_pipeline(
     engine,
     valid_alarms,
     output_session,
 ):
     process_progress = ProgressBar(len(valid_alarms), "处理有效告警")
-    output_session.process_progress = process_progress
-    output_session.refresh_progress_extra_text(force=True)
-
-    run_alarm_matching(
-        engine,
-        valid_alarms,
-        output_session.write_matches,
-        process_progress,
-        output_session.refresh_progress_extra_text,
+    process_progress.set_extra_text(
+        output_session.build_progress_extra_text(),
+        force=True,
     )
 
-    output_session.process_progress = None
+    print("⏱️ 每条告警到来时直接触发检查")
+    try:
+        for item in valid_alarms:
+            alarm = item["alarm"]
+            matches = engine.process_event(
+                node=item["site_id"],
+                alarm_source=item.get("alarm_source", ""),
+                alarm_type=item["alarm_title"],
+                ts=item["ts"],
+                event_id=alarm["告警编码ID"],
+                occurrence_uuid=item["occurrence_uuid"],
+                alarm_payload=alarm,
+                is_clear=is_clear_alarm(alarm),
+            )
+            if matches:
+                output_session.write_matches(matches)
+            process_progress.set_extra_text(output_session.build_progress_extra_text())
+            process_progress.update()
+    finally:
+        process_progress.close()
 
     print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
     final_matches = engine.flush_pending()

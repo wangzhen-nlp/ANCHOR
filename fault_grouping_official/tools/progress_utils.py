@@ -1,5 +1,4 @@
 import sys
-import threading
 import time
 
 
@@ -22,29 +21,24 @@ class ProgressBar:
         self.extra_text = ""
         self.start_time = time.time()
         self.last_render_time = 0.0
-        self._lock = threading.Lock()
         self._render(force=True)
 
     def update(self, step=1):
-        with self._lock:
-            self.current += step
-            self._render()
+        self.current += step
+        self._render()
 
     def set(self, current):
-        with self._lock:
-            self.current = max(0, int(current))
-            self._render()
+        self.current = max(0, int(current))
+        self._render()
 
     def set_extra_text(self, text, force=False):
-        with self._lock:
-            self.extra_text = str(text).strip()
-            self._render(force=force)
+        self.extra_text = str(text).strip()
+        self._render(force=force)
 
     def close(self):
-        with self._lock:
-            self._render(force=True)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        self._render(force=True)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def _render(self, force=False):
         now = time.time()

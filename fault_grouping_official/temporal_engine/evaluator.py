@@ -655,14 +655,13 @@ class TemporalGraphEngineEvaluatorMixin:
         rule,
         trigger_node,
         trigger_ts,
-        node_rule_helper=None,
         eval_caches=None,
     ):
         """
         全向动态图调度器 (State-Forking Matcher)：
         支持平行宇宙分叉、严格结构匹配、局部性能缓存。
         """
-        helper = node_rule_helper or self.node_rule_helper
+        helper = self.node_rule_helper
         nodes_cfg = rule["nodes"]
 
         plan = self.rule_execution_plans[rule_name]

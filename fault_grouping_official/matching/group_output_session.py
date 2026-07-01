@@ -23,7 +23,6 @@ except ImportError:
 
 @dataclass
 class MatchOutputSession:
-    args: object
     engine: TemporalGraphEngine
     output_path: str
     ne_graph_data: dict
@@ -37,7 +36,6 @@ class MatchOutputSession:
     # 默认剔除 other 模式，并要求故障组只有一个连通分量。
     fault_pattern_filter: object = None
     match_count: int = 0
-    process_progress: object = None
     # 持久 append-mode 文件句柄，避免每批 open+close 的 syscall 开销。
     # reset_output_file() 截断 + 打开；close() 显式收尾。
     _fw: object = field(default=None, init=False, repr=False)
@@ -75,11 +73,6 @@ class MatchOutputSession:
             f"已汇聚故障组数: {self.match_count} | "
             f"{primary_merge_label}: {primary_merge_count}"
         )
-
-    def refresh_progress_extra_text(self, force=False):
-        if self.process_progress is None:
-            return
-        self.process_progress.set_extra_text(self.build_progress_extra_text(), force=force)
 
     def _match_is_output_eligible(self, match):
         """故障组是否满足落盘规则要求。
@@ -137,4 +130,3 @@ class MatchOutputSession:
             fw.writelines(output_lines)
             fw.flush()
         self.match_count += written_count
-        self.refresh_progress_extra_text()

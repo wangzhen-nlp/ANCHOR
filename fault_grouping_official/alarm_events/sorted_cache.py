@@ -118,23 +118,12 @@ class SortedAlarmCacheStream:
         self.path = path
         self.metadata = metadata or read_sorted_alarm_cache_header(path)
         self.alarm_count = int(self.metadata["alarm_count"])
-        self._first_ts = None
-        self._first_ts_loaded = False
 
     def __len__(self):
         return self.alarm_count
 
     def __iter__(self):
         return iter_sorted_alarm_cache_items(self.path, metadata=self.metadata)
-
-    def first_ts(self):
-        if not self._first_ts_loaded:
-            self._first_ts = None
-            for item in self:
-                self._first_ts = item.get("ts")
-                break
-            self._first_ts_loaded = True
-        return self._first_ts
 
 
 def _write_sorted_alarm_cache_jsonl(stream, sorted_alarms, header):

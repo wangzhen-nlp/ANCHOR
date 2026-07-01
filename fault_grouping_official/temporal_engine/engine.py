@@ -384,7 +384,7 @@ class TemporalGraphEngine(
                     if trigger_key not in self.pending_triggers:
                         self._set_pending_trigger(trigger_key, ts, trigger_seq)
 
-        # 快路径：没有 mature pending trigger 时跳过快照和评估。
+        # 快路径：没有 mature pending trigger 时跳过评估。
         heap = self.pending_trigger_heap
         if heap and heap[0][0] <= self.latest_arrived_event_ts:
             return self._collect_pending_matches(force=False)
@@ -464,27 +464,6 @@ class TemporalGraphEngine(
 
         self.trigger_specs_by_node = trigger_specs_by_node
 
-    def _snapshot_event_cache_subset(self, seed_nodes):
-        event_cache_snapshot = {}
-        for node in seed_nodes:
-            events = self.event_cache.get(node)
-            if events:
-                event_cache_snapshot[node] = tuple(events)
-        return event_cache_snapshot
-
-    def _build_snapshot_helper(self, event_cache_snapshot):
-        def get_events(node, cache=event_cache_snapshot):
-            if node in cache:
-                return cache[node]
-            events = tuple(self.event_cache.get(node, ()))
-            cache[node] = events
-            return events
-
-        return NodeRuleHelper(
-            get_events,
-            self.alarm_source_domain_map,
-        )
-
     def _collect_mature_pending(self, force=False):
         """摘取当前已成熟的 pending trigger。"""
         mature_items = []
@@ -513,7 +492,7 @@ class TemporalGraphEngine(
         return mature_items
 
     def _prune_consumed_alarm_history(self, matches):
-        """在本轮定时收割结束时，只回收命中 trigger_role 的节点告警历史。"""
+        """在本轮故障组收割结束时，只回收命中 trigger_role 的节点告警历史。"""
         prune_points = {}
         for match in matches:
             merged_rules = match["merged_rules"]
@@ -757,7 +736,7 @@ class TemporalGraphEngine(
 
         return non_trigger_nodes
 
-    def _expand_matches_with_pending_context(self, matches, node_rule_helper, eval_caches=None):
+    def _expand_matches_with_pending_context(self, matches, eval_caches=None):
         """只读扩充当前批次：汇总整批非 trigger 节点上的 pending，再和当前批统一做一次批内合并。"""
         if not matches:
             return matches, build_empty_merge_stats()
@@ -790,7 +769,6 @@ class TemporalGraphEngine(
                 rule,
                 node,
                 trigger_ts,
-                node_rule_helper=node_rule_helper,
                 eval_caches=eval_caches,
             )
             if results:

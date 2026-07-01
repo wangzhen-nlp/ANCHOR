@@ -5,6 +5,7 @@ from datetime import datetime
 from fault_grouping_official.alarm_inputs import stream_alarm_inputs
 from fault_grouping_official.alarm_events.identity import alarm_content_uuid, require_alarm_identity
 from fault_grouping_official.alarm_events.sorted_cache import load_sorted_alarm_cache
+from fault_grouping_official.time_config import DEFAULT_CLEAR_DELAY_SEC
 
 
 def parse_datetime_text(text, field_name="时间"):
@@ -191,9 +192,9 @@ def load_sorted_alarm_cache_with_stats(cache_path, metadata):
 def warn_sorted_alarm_cache_option_mismatch(metadata, args):
     mismatches = []
     expected_clear_delay = float(metadata["clear_delay_sec"])
-    if abs(float(args.clear_delay_sec) - expected_clear_delay) > 1e-9:
+    if abs(float(DEFAULT_CLEAR_DELAY_SEC) - expected_clear_delay) > 1e-9:
         mismatches.append(
-            f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(args.clear_delay_sec):g}"
+            f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(DEFAULT_CLEAR_DELAY_SEC):g}"
         )
 
     cached_resource_buffer = str(metadata.get("resource_buffer", "") or "").strip()

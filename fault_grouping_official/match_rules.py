@@ -29,10 +29,6 @@ from fault_grouping_official.matching.runtime import (
     validate_main_args,
 )
 from fault_grouping_official.temporal_engine.engine import TemporalGraphEngine
-from fault_grouping_official.time_config import (
-    DEFAULT_AGGREGATION_WAIT_SEC,
-    DEFAULT_CLEAR_DELAY_SEC,
-)
 
 
 @dataclass
@@ -66,25 +62,6 @@ def _build_arg_parser():
         ),
     )
     parser.add_argument(
-        '--aggregation-wait-sec',
-        type=float,
-        default=DEFAULT_AGGREGATION_WAIT_SEC,
-        help=(
-            f'trigger 成熟前的聚合等待时间，单位秒，默认 '
-            f'{DEFAULT_AGGREGATION_WAIT_SEC:g}'
-        ),
-    )
-    parser.add_argument(
-        '--clear-delay-sec',
-        type=float,
-        default=DEFAULT_CLEAR_DELAY_SEC,
-        help=(
-            '清除告警最小延迟时间，清除生效时间='
-            'max(clear_delay_sec, 清除时间-发生时间)+发生时间，默认 '
-            f'{DEFAULT_CLEAR_DELAY_SEC:g}'
-        ),
-    )
-    parser.add_argument(
         '--stream-sorted-alarms',
         action='store_true',
         help=(
@@ -93,20 +70,6 @@ def _build_arg_parser():
             '(JSONL/ZIP)时生效'
         ),
     )
-    parser.add_argument(
-        '--no-rule-check',
-        dest='rule_check',
-        action='store_false',
-        default=True,
-        help='关闭落盘规则检查，允许所有引擎匹配结果进入后续处理',
-    )
-    parser.add_argument(
-        '--no-pattern-check',
-        dest='pattern_check',
-        action='store_false',
-        default=True,
-        help='关闭落盘故障模式检查，同时跳过模式字段增强',
-    )
     return parser
 
 
@@ -114,7 +77,6 @@ def _build_output_session(
     args, engine, static_context, output_eligible_rules, fault_pattern_filter
 ):
     output_session = MatchOutputSession(
-        args=args,
         engine=engine,
         output_path=args.output,
         ne_graph_data=static_context.ne_graph_data,
@@ -134,16 +96,8 @@ def _prepare_runtime_execution(parser, args):
     valid_alarm_titles = default_valid_alarm_titles()
     print_run_configuration(args, valid_alarm_titles)
     rules_config = build_rules_config()
-    output_eligible_rules = (
-        collect_output_eligible_rules(rules_config)
-        if args.rule_check
-        else None
-    )
-    fault_pattern_filter = (
-        build_fault_pattern_filter(static_context)
-        if args.pattern_check
-        else None
-    )
+    output_eligible_rules = collect_output_eligible_rules(rules_config)
+    fault_pattern_filter = build_fault_pattern_filter(static_context)
     engine = initialize_engine(args, static_context, rules_config)
     run_started_at = time.time()
     alarm_load_result = load_alarm_data(

@@ -1,1 +1,1 @@
-"""Alarm event IO, streaming, and sorted-cache helpers."""
+"""Alarm event IO, identity, and sorted-cache helpers."""
