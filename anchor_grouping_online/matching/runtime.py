@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from anchor_grouping_online.alarm_types import CRITICAL_ALARMS
 from anchor_grouping_online.tools.progress_utils import ProgressBar
 from anchor_grouping_online.alarm_events.io import (
+    is_clear_alarm,
+    iter_topology_valid_alarm_events,
     load_sorted_alarm_cache_with_stats,
     load_valid_alarms,
     trim_trailing_clear_alarms,
@@ -67,10 +69,44 @@ class AlarmLoadResult:
     normal_alarm_count: int
     clear_alarm_count: int
     sort_elapsed: float
+    stream_filter: object = None
 
     @property
     def filtered_count(self):
         return len(self.alarm_generator)
+
+
+class TopologyFilteredAlarmStream:
+    """按当前 match_rules 拓扑过滤排序缓存，并保持流式消费。"""
+
+    def __init__(self, alarm_data, valid_sites, ne_to_site):
+        self._alarm_data = alarm_data
+        self._valid_sites = valid_sites
+        self._ne_to_site = ne_to_site
+        self.raw_alarm_count = len(alarm_data)
+        self.normal_alarm_count = 0
+        self.clear_alarm_count = 0
+        self.completed = False
+
+    def __len__(self):
+        if not self.completed:
+            return 0
+        return self.normal_alarm_count + self.clear_alarm_count
+
+    def __iter__(self):
+        if self.completed:
+            raise RuntimeError("排序告警流不能重复消费")
+        for item in iter_topology_valid_alarm_events(
+            self._alarm_data,
+            self._valid_sites,
+            self._ne_to_site,
+        ):
+            if is_clear_alarm(item.get("alarm", {})):
+                self.clear_alarm_count += 1
+            else:
+                self.normal_alarm_count += 1
+            yield item
+        self.completed = True
 
 
 def validate_main_args(parser, args):
@@ -243,13 +279,22 @@ def load_alarm_data(args, static_context, valid_alarm_titles, sorted_alarm_cache
             print(f"⚡ 流式读取排序告警缓存: {sorted_alarm_cache_input}")
             load_start_time = time.time()
             warn_sorted_alarm_cache_option_mismatch(sorted_alarm_cache_metadata, args)
-            valid_alarms = SortedAlarmCacheStream(
+            cached_alarms = SortedAlarmCacheStream(
                 sorted_alarm_cache_input,
                 metadata=sorted_alarm_cache_metadata,
             )
+            valid_alarms = TopologyFilteredAlarmStream(
+                cached_alarms,
+                static_context.valid_sites,
+                static_context.ne_to_site,
+            )
             sort_elapsed = time.time() - load_start_time
-            normal_alarm_count = int(sorted_alarm_cache_metadata["cached_normal_alarm_count"])
-            clear_alarm_count = int(sorted_alarm_cache_metadata["cached_clear_alarm_count"])
+            normal_alarm_count = int(
+                sorted_alarm_cache_metadata["cached_normal_alarm_count"]
+            )
+            clear_alarm_count = int(
+                sorted_alarm_cache_metadata["cached_clear_alarm_count"]
+            )
             processed_count = int(sorted_alarm_cache_metadata["processed_count"])
             return AlarmLoadResult(
                 processed_count=processed_count,
@@ -257,6 +302,7 @@ def load_alarm_data(args, static_context, valid_alarm_titles, sorted_alarm_cache
                 normal_alarm_count=normal_alarm_count,
                 clear_alarm_count=clear_alarm_count,
                 sort_elapsed=sort_elapsed,
+                stream_filter=valid_alarms,
             )
 
         print(f"⚡ 直接加载排序告警缓存: {sorted_alarm_cache_input}")
@@ -271,6 +317,15 @@ def load_alarm_data(args, static_context, valid_alarm_titles, sorted_alarm_cache
             sorted_alarm_cache_input,
             sorted_alarm_cache_metadata,
         )
+        valid_alarms = list(iter_topology_valid_alarm_events(
+            valid_alarms,
+            static_context.valid_sites,
+            static_context.ne_to_site,
+        ))
+        normal_alarm_count = sum(
+            1 for item in valid_alarms if not is_clear_alarm(item.get("alarm", {}))
+        )
+        clear_alarm_count = len(valid_alarms) - normal_alarm_count
         warn_sorted_alarm_cache_option_mismatch(sorted_alarm_cache_metadata, args)
         sort_elapsed = time.time() - load_start_time
         return AlarmLoadResult(
@@ -305,6 +360,17 @@ def load_alarm_data(args, static_context, valid_alarm_titles, sorted_alarm_cache
 
 
 def print_alarm_load_summary(alarm_load_result):
+    if alarm_load_result.stream_filter is not None:
+        print(
+            f"缓存告警数: {alarm_load_result.stream_filter.raw_alarm_count}，"
+            "站点过滤将在流式处理时单遍执行，"
+            f"加载耗时: {alarm_load_result.sort_elapsed:.4f} 秒"
+        )
+        print(
+            f"缓存正常告警数: {alarm_load_result.normal_alarm_count}，"
+            f"缓存清除告警数: {alarm_load_result.clear_alarm_count}"
+        )
+        return
     print(
         f"有效告警数: {alarm_load_result.filtered_count}，排序/加载耗时: "
         f"{alarm_load_result.sort_elapsed:.4f} 秒"

@@ -75,8 +75,8 @@ def apply_clear_delay(first_occurrence_str, clear_time_str, clear_delay_sec):
 def load_valid_alarms(
     alarm_file_path,
     valid_alarm_titles,
-    valid_sites,
-    ne_to_site,
+    valid_sites=None,
+    ne_to_site=None,
     start_ts=None,
     end_ts=None,
     clear_delay_sec=0.0,
@@ -113,12 +113,13 @@ def load_valid_alarms(
                     region_filter_stats.get("raw_kept_alarm_count", 0) + 1
                 )
 
-        site_id = alarm.get('站点ID', '')
-        if not site_id or site_id not in valid_sites:
-            site_id = ne_to_site.get(alarm_source, '')
+        site_id = str(alarm.get('站点ID', '') or '').strip()
+        if valid_sites is not None:
+            if not site_id or site_id not in valid_sites:
+                site_id = str((ne_to_site or {}).get(alarm_source, '') or '').strip()
 
-        if not site_id or site_id not in valid_sites:
-            continue
+            if not site_id or site_id not in valid_sites:
+                continue
 
         first_occurrence_str = str(alarm.get("告警首次发生时间", "")).strip()
         first_occurrence_ts = parse_datetime_text(
@@ -160,6 +161,36 @@ def load_valid_alarms(
             clear_alarm_count += 1
 
     return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
+
+
+def resolve_alarm_event_site(item, valid_sites, ne_to_site):
+    """按当前拓扑校验缓存事件的站点，必要时通过告警源补全站点。"""
+    site_id = str(item.get("site_id", "") or "").strip()
+    if not site_id or site_id not in valid_sites:
+        alarm_source = str(item.get("alarm_source", "") or "").strip()
+        site_id = str(ne_to_site.get(alarm_source, "") or "").strip()
+    if not site_id or site_id not in valid_sites:
+        return None
+    if site_id == item.get("site_id"):
+        return item
+    resolved = dict(item)
+    resolved["site_id"] = site_id
+    return resolved
+
+
+def iter_topology_valid_alarm_events(alarm_events, valid_sites, ne_to_site):
+    """过滤并补全缓存事件，同时删除过滤后位于末尾的清除事件。"""
+    trailing_clear_events = []
+    for item in alarm_events:
+        resolved = resolve_alarm_event_site(item, valid_sites, ne_to_site)
+        if resolved is None:
+            continue
+        if is_clear_alarm(resolved.get("alarm", {})):
+            trailing_clear_events.append(resolved)
+            continue
+        yield from trailing_clear_events
+        trailing_clear_events.clear()
+        yield resolved
 
 
 def trim_trailing_clear_alarms(valid_alarms):
