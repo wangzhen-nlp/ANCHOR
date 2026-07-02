@@ -43,6 +43,65 @@ class CompleteGroupTopologyTest(unittest.TestCase):
         self.assertEqual(completed["topology_completion"]["selected_site_ids"], ["SITE-1"])
         self.assertEqual(completed["topology_completion"]["added_ne_ids"], ["NE-PEER"])
 
+    def test_copies_site_distance_to_device_link_metadata(self):
+        ne_graph = {
+            "NE-A": {
+                "site_id": "SITE-A",
+                "domain": "MICROWAVE",
+                "link": {"NE-B": {"MW": "->"}},
+            },
+            "NE-B": {
+                "site_id": "SITE-B",
+                "domain": "MICROWAVE",
+                "link": {"NE-A": {"MW": "<-"}},
+            },
+        }
+        site_graph = {
+            "SITE-A": {
+                "site_name": "Site A",
+                "link_distance_km": {"SITE-B": 12.345},
+            },
+            "SITE-B": {"site_name": "Site B"},
+        }
+        group = {
+            "故障组ID": "GROUP-DISTANCE",
+            "alarms": [
+                {"告警源": "NE-A", "告警标题": "普通设备告警"},
+                {"告警源": "NE-B", "告警标题": "普通设备告警"},
+            ],
+        }
+
+        completed = complete_group_topology(
+            group,
+            ne_graph,
+            site_graph,
+            build_site_to_ne_ids(ne_graph),
+            site_chain_index={},
+        )
+
+        self.assertEqual(completed["ne_info"]["NE-A"]["link"]["NE-B"]["distance"], 12.35)
+        self.assertEqual(completed["ne_info"]["NE-B"]["link"]["NE-A"]["distance"], 12.35)
+
+    def test_same_site_device_link_distance_is_zero(self):
+        ne_graph = {
+            "NE-A": {"site_id": "SITE-A", "link": {"NE-B": {"IP": "->"}}},
+            "NE-B": {"site_id": "SITE-A", "link": {"NE-A": {"IP": "<-"}}},
+        }
+        group = {
+            "故障组ID": "GROUP-SAME-SITE",
+            "alarms": [{"告警源": "NE-A", "告警标题": "普通设备告警"}],
+        }
+
+        completed = complete_group_topology(
+            group,
+            ne_graph,
+            {"SITE-A": {"site_name": "Site A"}},
+            build_site_to_ne_ids(ne_graph),
+            site_chain_index={},
+        )
+
+        self.assertEqual(completed["ne_info"]["NE-A"]["link"]["NE-B"]["distance"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

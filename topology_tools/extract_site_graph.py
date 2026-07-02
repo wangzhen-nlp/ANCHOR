@@ -16,6 +16,7 @@ import csv
 import io
 import zipfile
 import argparse
+import math
 from collections import defaultdict
 
 if __package__ in (None, ""):
@@ -34,6 +35,9 @@ from topology_resources import (
 
 # 行级进度的刷新间隔（行数）；计数模式下每次 set 都会重绘，需要批量节流
 PROGRESS_ROW_STEP = 5000
+
+# IUGG 推荐的地球平均半径，单位为公里
+EARTH_MEAN_RADIUS_KM = 6371.0088
 
 
 def _require_last_modified(record: dict, row_number: int, source: str) -> int:
@@ -77,6 +81,39 @@ def _report_duplicate_detail(duplicates: dict, label: str) -> None:
 def _parse_bool(value) -> bool:
     text = str(value or "").strip().lower()
     return text in {"1", "true", "t", "yes", "y", "是"}
+
+
+def calculate_distance_km(site_a: dict, site_b: dict):
+    """根据两个站点的经纬度计算球面距离（公里）；坐标缺失或非法时返回 None。"""
+    try:
+        longitude_a = float(site_a.get('longitude', ''))
+        latitude_a = float(site_a.get('latitude', ''))
+        longitude_b = float(site_b.get('longitude', ''))
+        latitude_b = float(site_b.get('latitude', ''))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    coordinates = (longitude_a, latitude_a, longitude_b, latitude_b)
+    if not all(math.isfinite(value) for value in coordinates):
+        return None
+    if not (-180 <= longitude_a <= 180 and -180 <= longitude_b <= 180):
+        return None
+    if not (-90 <= latitude_a <= 90 and -90 <= latitude_b <= 90):
+        return None
+
+    latitude_a_rad = math.radians(latitude_a)
+    latitude_b_rad = math.radians(latitude_b)
+    latitude_delta = latitude_b_rad - latitude_a_rad
+    longitude_delta = math.radians(longitude_b - longitude_a)
+    haversine = (
+        math.sin(latitude_delta / 2) ** 2
+        + math.cos(latitude_a_rad)
+        * math.cos(latitude_b_rad)
+        * math.sin(longitude_delta / 2) ** 2
+    )
+    # 浮点误差可能令 haversine 略微超出 [0, 1]
+    central_angle = 2 * math.asin(math.sqrt(min(1.0, max(0.0, haversine))))
+    return round(EARTH_MEAN_RADIUS_KM * central_angle, 2)
 
 
 def load_ne_site_mapping(data_dir: str = SYS_NE_DIR, report_duplicates: bool = False) -> dict:
@@ -347,6 +384,14 @@ def main():
         action="store_true",
         help="打印 NE/站点/链路 中重复 ID 的明细（默认仅汇总，不打印明细）",
     )
+    parser.add_argument(
+        "--record-distance",
+        action="store_true",
+        help=(
+            "记录相邻站点间的物理距离（公里，保留两位小数）；"
+            "结果写入各站点的 link_distance_km 字段"
+        ),
+    )
     args = parser.parse_args()
 
     # 加载NE到站点的映射
@@ -363,6 +408,8 @@ def main():
 
     # 合并站点信息和链路信息
     result = {}
+    missing_distance_count = 0
+    distance_cache = {}
     for site_id in (set(site_info) | set(site_links)):
         neighbors = site_links.get(site_id, {})
         site_data = site_info.get(site_id, {
@@ -374,8 +421,22 @@ def main():
             'is_hub': False,
         })
         site_data['link'] = {}
+        if args.record_distance:
+            site_data['link_distance_km'] = {}
         for neighbor_id, links in neighbors.items():
             site_data['link'][neighbor_id] = links
+            if args.record_distance:
+                site_pair = tuple(sorted((site_id, neighbor_id)))
+                if site_pair not in distance_cache:
+                    distance_cache[site_pair] = calculate_distance_km(
+                        site_data,
+                        site_info.get(neighbor_id, {}),
+                    )
+                distance = distance_cache[site_pair]
+                if distance is None:
+                    missing_distance_count += 1
+                else:
+                    site_data['link_distance_km'][neighbor_id] = distance
         result[site_id] = site_data
 
     # 输出结果
@@ -385,6 +446,13 @@ def main():
 
     print(f"\n生成文件: {output_file}")
     print(f"站点数: {len(result)}")
+    if args.record_distance:
+        recorded_distance_count = sum(
+            len(site.get('link_distance_km', {})) for site in result.values()
+        )
+        print(f"已记录相邻站点距离数: {recorded_distance_count}")
+        if missing_distance_count:
+            print(f"因经纬度缺失或非法未记录距离数: {missing_distance_count}")
 
     neighbor_counts = [len(v['link']) for v in result.values()]
     if neighbor_counts:

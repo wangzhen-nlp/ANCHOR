@@ -6,6 +6,7 @@ import argparse
 import copy
 import heapq
 import json
+import math
 import re
 import sys
 import time
@@ -122,7 +123,7 @@ def _count_jsonl_records(path):
     return count
 
 
-def _format_link_meta(link_meta):
+def _format_link_meta(link_meta, distance=""):
     if isinstance(link_meta, dict):
         connection_types = sorted(str(key) for key in link_meta.keys())
         topologies = sorted({str(value) for value in link_meta.values() if value})
@@ -131,12 +132,43 @@ def _format_link_meta(link_meta):
         topologies = []
     return {
         "connection_type": ",".join(connection_types),
-        "distance": "",
+        "distance": distance,
         "topology": ",".join(topologies),
         "time_window": "",
         "left_alarm": {},
         "right_alarm": {},
     }
+
+
+def _site_link_distance_km(source_site, target_site, site_graph_data):
+    """读取两个站点间已记录的物理距离（公里）；同站设备距离为 0。"""
+    source_site = _normalize_text(source_site)
+    target_site = _normalize_text(target_site)
+    if not source_site or not target_site:
+        return ""
+    if source_site == target_site:
+        return 0.0
+    if not isinstance(site_graph_data, dict):
+        return ""
+
+    # site_graph 的邻接关系是双向的；兼容仅一侧记录了距离的文件。
+    for current_site, neighbor_site in (
+        (source_site, target_site),
+        (target_site, source_site),
+    ):
+        site_info = site_graph_data.get(current_site, {})
+        if not isinstance(site_info, dict):
+            continue
+        distances = site_info.get("link_distance_km", {})
+        if not isinstance(distances, dict) or neighbor_site not in distances:
+            continue
+        try:
+            distance = float(distances[neighbor_site])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(distance) and distance >= 0:
+            return round(distance, 2)
+    return ""
 
 
 def _detect_restrict_relation(meta):
@@ -1114,17 +1146,27 @@ def _blocked_ancestor_site_ids(completion):
     return sorted(ancestor_site_ids & blocked_site_ids)
 
 
-def _build_filtered_link_info(ne_id, included_ne_ids, ne_graph_data):
+def _build_filtered_link_info(
+    ne_id,
+    included_ne_ids,
+    ne_graph_data,
+    site_graph_data,
+    group_site_by_ne,
+):
     info = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
     links = info.get("link", {}) if isinstance(info, dict) else {}
     if not isinstance(links, dict):
         return {}
     included_ne_ids = set(included_ne_ids)
-    return {
-        target_ne: _format_link_meta(link_meta)
-        for target_ne, link_meta in sorted(links.items())
-        if target_ne in included_ne_ids and target_ne != ne_id
-    }
+    source_site = _site_of_ne(ne_id, ne_graph_data, group_site_by_ne)
+    result = {}
+    for target_ne, link_meta in sorted(links.items()):
+        if target_ne not in included_ne_ids or target_ne == ne_id:
+            continue
+        target_site = _site_of_ne(target_ne, ne_graph_data, group_site_by_ne)
+        distance = _site_link_distance_km(source_site, target_site, site_graph_data)
+        result[target_ne] = _format_link_meta(link_meta, distance)
+    return result
 
 
 def _build_ne_info_entry(
@@ -1146,7 +1188,13 @@ def _build_ne_info_entry(
     site_ctx = _site_context(site_id, site_graph_data, raw_info)
     is_alarm_ne = ne_id in set(alarm_ne_ids)
     entry = {
-        "link": _build_filtered_link_info(ne_id, included_ne_ids, ne_graph_data),
+        "link": _build_filtered_link_info(
+            ne_id,
+            included_ne_ids,
+            ne_graph_data,
+            site_graph_data,
+            group_site_by_ne,
+        ),
         "group": group.get("uuid") or group.get("故障组ID") or group.get("match_info", {}).get("uuid", ""),
         "name": raw_info.get("name", existing.get("name", ne_id)),
         "site_id": site_id or existing.get("site_id", ""),

@@ -6242,7 +6242,10 @@
             const isMissingTopology = isMissingTopologyLink(link);
             const isBrunchPropagation = isMissingTopology && isBrunchPropagationLink(link);
             const connectionType = link.connection_type || '未知';
-            const distance = link.distance || 0;
+            const rawDistance = link && link.distance;
+            const distance = Number(rawDistance);
+            const hasDistance = rawDistance !== undefined && rawDistance !== null &&
+                String(rawDistance).trim() !== '' && Number.isFinite(distance) && distance >= 0;
             const topology = link.topology || '-';
             const topologyArrow = getEdgeTopologyArrow(link, topology);
             let html = '<div class="edge-detail-panel">';
@@ -6287,8 +6290,8 @@
                     html += '<div class="link-row"><span class="link-label">来源模型:</span><span class="link-value">' + escapeHtml(link.edge_source) + '</span></div>';
                 }
             }
-            if (distance > 0) {
-                html += '<div class="link-row"><span class="link-label">距离:</span><span class="link-value">' + distance + ' km</span></div>';
+            if (hasDistance) {
+                html += '<div class="link-row"><span class="link-label">距离:</span><span class="link-value">' + distance.toFixed(2) + ' km</span></div>';
             }
             html += '</div>';
             
@@ -7219,7 +7222,7 @@
                 connection_type: '',
                 topology: '',
                 time_window: '',
-                distance: 0,
+                distance: null,
                 left_alarm: null,
                 right_alarm: null,
                 supplemental_fault_pattern_context: false
@@ -7241,7 +7244,8 @@
             const reservedKeys = new Set([
                 'connection_type', 'connectionType', 'type', 'link_type', 'linkType', 'topology',
                 'direction', 'relation', 'time_window', 'timeWindow', 'distance', 'left_alarm',
-                'leftAlarm', 'right_alarm', 'rightAlarm', 'supplemental_fault_pattern_context'
+                'distance_km', 'distanceKm', 'leftAlarm', 'right_alarm', 'rightAlarm',
+                'supplemental_fault_pattern_context'
             ]);
             const layerEntries = typeMap
                 ? Object.entries(typeMap)
@@ -7256,6 +7260,13 @@
             const directionValues = Array.from(new Set(layerEntries.map(function(entry) {
                 return normalizeLinkDirectionValue(entry[1]);
             }).filter(Boolean)));
+
+            const rawDistance = firstNonEmptyValue(
+                linkInfo.distance,
+                linkInfo.distance_km,
+                linkInfo.distanceKm
+            );
+            const numericDistance = Number(rawDistance);
 
             return Object.assign({}, empty, {
                 connection_type: firstNonEmptyValue(
@@ -7273,7 +7284,9 @@
                     directionValues.join(',')
                 ),
                 time_window: firstNonEmptyValue(linkInfo.time_window, linkInfo.timeWindow),
-                distance: linkInfo.distance || 0,
+                distance: rawDistance === ''
+                    ? null
+                    : (Number.isFinite(numericDistance) ? numericDistance : rawDistance),
                 left_alarm: linkInfo.left_alarm || linkInfo.leftAlarm || null,
                 right_alarm: linkInfo.right_alarm || linkInfo.rightAlarm || null,
                 supplemental_fault_pattern_context: !!linkInfo.supplemental_fault_pattern_context
