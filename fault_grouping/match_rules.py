@@ -1,3 +1,4 @@
+import inspect
 import time
 
 from argparse import ArgumentParser
@@ -99,6 +100,11 @@ def _build_arg_parser():
     parser.add_argument('--enable-support-pruning', action='store_true', help='可选：启用候选邻接 role 支撑剪枝；默认关闭以避免额外邻居扫描开销')
     parser.add_argument('--enable-support-count-sort', action='store_true', help='可选：按候选支撑数量排序；默认关闭，因为会提前计算所有候选支撑，可能变慢')
     parser.add_argument('--profile', action='store_true', help='打开后在结束时打印主要阶段耗时（init/ingest/harvest/evaluate/merge/finalize/output/flush），便于定位瓶颈')
+    parser.add_argument(
+        '--diagnose-matching',
+        action='store_true',
+        help='打印拓扑回退、规则边候选和实例数量统计；只计数，不记录耗时',
+    )
     return parser
 
 
@@ -210,6 +216,227 @@ def _maybe_compute_ticket_recall(args):
         print(f"⚠️ 工单站点召回率计算跳过: {exc}")
 
 
+def _new_edge_diagnostic():
+    return {
+        "candidate_calls": 0,
+        "topology_candidates": 0,
+        "selected_candidates": 0,
+        "max_topology_candidates": 0,
+        "max_selected_candidates": 0,
+        "source_node_evaluations": 0,
+        "valid_targets": 0,
+        "max_valid_targets": 0,
+        "advance_calls": 0,
+        "instances_in": 0,
+        "instances_out": 0,
+        "max_instances_in": 0,
+        "max_instances_out": 0,
+    }
+
+
+def _enable_matching_diagnostics(args, runtime_plan):
+    if not args.diagnose_matching:
+        return None
+
+    engine = runtime_plan.engine
+    static_context = runtime_plan.static_context
+    chain_sites = set((static_context.site_chain_index or {}).keys())
+    topo_sites = set(static_context.topo_downstream_map.keys())
+    for neighbors in static_context.topo_downstream_map.values():
+        if isinstance(neighbors, dict):
+            topo_sites.update(neighbors.keys())
+        else:
+            topo_sites.update(neighbors or ())
+
+    diagnostics = {
+        "configuration": {
+            "rules": list(runtime_plan.rules_config.keys()),
+            "mode": args.mode,
+            "aggregation_wait_sec": args.aggregation_wait_sec,
+            "clear_delay_sec": args.clear_delay_sec,
+            "use_alarm_period_cache": bool(args.use_alarm_period_cache),
+            "enable_support_pruning": bool(args.enable_support_pruning),
+            "enable_support_count_sort": bool(args.enable_support_count_sort),
+            "processed_alarm_count": runtime_plan.alarm_load_result.processed_count,
+            "filtered_alarm_count": runtime_plan.alarm_load_result.filtered_count,
+        },
+        "static_context": {
+            "site_domain_count": len(static_context.site_domain_map),
+            "valid_site_count": len(static_context.valid_sites),
+            "site_chain_site_count": len(chain_sites),
+            "topology_site_count": len(topo_sites),
+            "topology_only_site_count": len(topo_sites - chain_sites),
+            "topology_only_site_sample": sorted(topo_sites - chain_sites)[:50],
+            "link_peer_index_count": len(static_context.link_peer_index),
+        },
+        "precomputed_site_chains": {},
+        "rule_edges": {},
+    }
+
+    def edge_stats(rule_name, curr_role, tgt_role):
+        key = f"{rule_name}::{curr_role}->{tgt_role}"
+        return diagnostics["rule_edges"].setdefault(key, _new_edge_diagnostic())
+
+    original_precomputed = engine._get_precomputed_site_chain_candidates
+
+    def diagnosed_precomputed(start_node, direction, max_hops=None):
+        result = original_precomputed(start_node, direction, max_hops=max_hops)
+        key = f"direction={direction}|max_hops={max_hops}"
+        stats = diagnostics["precomputed_site_chains"].setdefault(key, {
+            "calls": 0,
+            "hits": 0,
+            "misses": 0,
+            "candidate_total": 0,
+            "candidate_max": 0,
+            "hit_start_nodes": set(),
+            "miss_start_nodes": set(),
+        })
+        stats["calls"] += 1
+        if result is None:
+            stats["misses"] += 1
+            stats["miss_start_nodes"].add(str(start_node))
+        else:
+            candidate_count = len(result)
+            stats["hits"] += 1
+            stats["candidate_total"] += candidate_count
+            stats["candidate_max"] = max(stats["candidate_max"], candidate_count)
+            stats["hit_start_nodes"].add(str(start_node))
+        return result
+
+    engine._get_precomputed_site_chain_candidates = diagnosed_precomputed
+
+    original_collect_candidates = engine._collect_edge_candidates
+    collect_signature = inspect.signature(original_collect_candidates)
+
+    def diagnosed_collect_candidates(*call_args, **call_kwargs):
+        bound = collect_signature.bind(*call_args, **call_kwargs)
+        result = original_collect_candidates(*call_args, **call_kwargs)
+        rule_name = bound.arguments.get("rule_name") or "<unknown>"
+        curr_role = bound.arguments["curr_role"]
+        tgt_role = bound.arguments["tgt_role"]
+        stats = edge_stats(rule_name, curr_role, tgt_role)
+        topology_count = len(result.get("candidate_hops", {}))
+        selected_count = len(result.get("candidates", ()))
+        stats["candidate_calls"] += 1
+        stats["topology_candidates"] += topology_count
+        stats["selected_candidates"] += selected_count
+        stats["max_topology_candidates"] = max(
+            stats["max_topology_candidates"], topology_count
+        )
+        stats["max_selected_candidates"] = max(
+            stats["max_selected_candidates"], selected_count
+        )
+        return result
+
+    engine._collect_edge_candidates = diagnosed_collect_candidates
+
+    original_evaluate_source = engine._evaluate_edge_source_node
+    evaluate_source_signature = inspect.signature(original_evaluate_source)
+
+    def diagnosed_evaluate_source(*call_args, **call_kwargs):
+        bound = evaluate_source_signature.bind(*call_args, **call_kwargs)
+        result = original_evaluate_source(*call_args, **call_kwargs)
+        stats = edge_stats(
+            bound.arguments["rule_name"],
+            bound.arguments["curr_role"],
+            bound.arguments["tgt_role"],
+        )
+        valid_count = len(result[0])
+        stats["source_node_evaluations"] += 1
+        stats["valid_targets"] += valid_count
+        stats["max_valid_targets"] = max(stats["max_valid_targets"], valid_count)
+        return result
+
+    engine._evaluate_edge_source_node = diagnosed_evaluate_source
+
+    original_advance = engine._advance_instances_across_edge
+    advance_signature = inspect.signature(original_advance)
+
+    def diagnosed_advance(*call_args, **call_kwargs):
+        bound = advance_signature.bind(*call_args, **call_kwargs)
+        instances = bound.arguments["instances"]
+        result = original_advance(*call_args, **call_kwargs)
+        next_instances = result[0] if isinstance(result, tuple) else result
+        stats = edge_stats(
+            bound.arguments["rule_name"],
+            bound.arguments["curr_role"],
+            bound.arguments["tgt_role"],
+        )
+        instances_in = len(instances)
+        instances_out = len(next_instances)
+        stats["advance_calls"] += 1
+        stats["instances_in"] += instances_in
+        stats["instances_out"] += instances_out
+        stats["max_instances_in"] = max(stats["max_instances_in"], instances_in)
+        stats["max_instances_out"] = max(stats["max_instances_out"], instances_out)
+        return result
+
+    engine._advance_instances_across_edge = diagnosed_advance
+    return diagnostics
+
+
+def _print_matching_diagnostics(diagnostics):
+    if diagnostics is None:
+        return
+
+    print("\n========== 匹配诊断统计 ==========")
+    configuration = diagnostics["configuration"]
+    print(
+        "配置: "
+        f"rules={configuration['rules']} | mode={configuration['mode']} | "
+        f"aggregation_wait={configuration['aggregation_wait_sec']} | "
+        f"clear_delay={configuration['clear_delay_sec']} | "
+        f"processed={configuration['processed_alarm_count']} | "
+        f"filtered={configuration['filtered_alarm_count']}"
+    )
+
+    context = diagnostics["static_context"]
+    print(
+        "静态上下文: "
+        f"site_domain={context['site_domain_count']} | "
+        f"valid_sites={context['valid_site_count']} | "
+        f"site_chain_sites={context['site_chain_site_count']} | "
+        f"topology_sites={context['topology_site_count']} | "
+        f"topology_only={context['topology_only_site_count']} | "
+        f"link_peer_index={context['link_peer_index_count']}"
+    )
+    if context["topology_only_site_sample"]:
+        print(f"topology_only 示例: {context['topology_only_site_sample']}")
+
+    print("site_chains 命中/回退:")
+    for key, stats in sorted(diagnostics["precomputed_site_chains"].items()):
+        miss_start_nodes = stats["miss_start_nodes"]
+        print(
+            f"  {key} | calls={stats['calls']} | hits={stats['hits']} | "
+            f"misses={stats['misses']} | candidates={stats['candidate_total']} | "
+            f"candidate_max={stats['candidate_max']} | "
+            f"hit_starts={len(stats['hit_start_nodes'])} | "
+            f"miss_starts={len(miss_start_nodes)}"
+        )
+        if miss_start_nodes:
+            print(f"    miss_start 示例: {sorted(miss_start_nodes)[:20]}")
+
+    print("规则边候选/实例:")
+    for key, stats in sorted(
+        diagnostics["rule_edges"].items(),
+        key=lambda item: item[1]["instances_out"],
+        reverse=True,
+    ):
+        print(
+            f"  {key} | candidate_calls={stats['candidate_calls']} | "
+            f"candidates={stats['topology_candidates']}->{stats['selected_candidates']} | "
+            f"candidate_max={stats['max_topology_candidates']}->"
+            f"{stats['max_selected_candidates']} | "
+            f"source_evals={stats['source_node_evaluations']} | "
+            f"valid_targets={stats['valid_targets']} | "
+            f"valid_max={stats['max_valid_targets']} | "
+            f"advance_calls={stats['advance_calls']} | "
+            f"instances={stats['instances_in']}->{stats['instances_out']} | "
+            f"instance_max={stats['max_instances_in']}->"
+            f"{stats['max_instances_out']}"
+        )
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
@@ -225,6 +452,8 @@ def main():
         enable_engine_profiling(timer, runtime_plan.engine, runtime_plan.output_session)
         enable_output_profiling(timer, runtime_plan.output_session)
 
+    matching_diagnostics = _enable_matching_diagnostics(args, runtime_plan)
+
     try:
         with (timer.time("pipeline.run_matching_pipeline") if timer else _NullCtx()):
             run_matching_pipeline(
@@ -238,6 +467,8 @@ def main():
     finally:
         # 关闭持久输出文件句柄，确保 flush 落盘；后续 ticket_recall 等读路径才能拿到完整内容。
         runtime_plan.output_session.close()
+
+    _print_matching_diagnostics(matching_diagnostics)
 
     elapsed = time.time() - runtime_plan.start_time
     print_final_summary(
