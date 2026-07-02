@@ -211,8 +211,8 @@ class TemporalGraphEngine(
         if not self.site_chain_index:
             raise ValueError("必须提供非空 site_chain_index")
 
-        # site_chains 是快速路径；当其中缺少站点时，回退到 ne_graph 派生的
-        # 站点级正反向拓扑做 BFS。
+        # 规则匹配只使用 site_chains；缺少站点时直接无候选，不做站点拓扑 BFS。
+        # 这里保留派生拓扑字段仅为构造参数兼容，不参与规则候选遍历。
         self.topo_down = topo_downstream_map or {}
         self.topo_up = collections.defaultdict(list)
         for upstream_site, downstream_sites in self.topo_down.items():

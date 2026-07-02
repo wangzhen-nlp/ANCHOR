@@ -108,9 +108,9 @@ def load_static_context(args):
     site_domain_map = build_site_domain_map(ne_graph_data)
     print(f"预计算站点链路站点数: {len(site_chain_index)}")
     hop_completeness_label = (
-        "完整，可跳过 BFS 补齐"
+        "完整，故障模式分析可跳过 BFS 补齐"
         if site_chain_upstream_hops_complete
-        else "未知/截断，保留 BFS 补齐"
+        else "未知/截断，仅故障模式分析保留 BFS 补齐"
     )
     print(
         "预计算上游 hop 完整性: "
