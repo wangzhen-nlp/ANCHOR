@@ -277,10 +277,14 @@ class BatchFaultGroupMatcher:
                 trigger_candidates.append((event_ts, event_seq, trigger_key))
         # ts 从早到晚；同一时刻按到达序号从先到后，保证顺序确定。
         trigger_candidates.sort()
+        alive_trigger_seqs = {
+            event_seq
+            for _event_ts, event_seq, _trigger_key in trigger_candidates
+        }
 
         raw_matches = []
         for event_ts, event_seq, trigger_key in trigger_candidates:
-            if not _trigger_event_alive(engine, trigger_key, event_seq):
+            if event_seq not in alive_trigger_seqs:
                 continue
             trigger_node, rule_name = trigger_key
             rule = engine.rules.get(rule_name)
@@ -297,7 +301,8 @@ class BatchFaultGroupMatcher:
             if not results:
                 continue
             raw_matches.extend(results)
-            engine._prune_consumed_alarm_history(results)
+            removed_trigger_seqs = engine._prune_consumed_alarm_history(results)
+            alive_trigger_seqs.difference_update(removed_trigger_seqs)
         return raw_matches
 
     @staticmethod
@@ -370,14 +375,3 @@ def _collect_symptom_alarm_ids(match):
             seen.add(alarm_id)
             alarm_ids.append(alarm_id)
     return alarm_ids
-
-
-def _trigger_event_alive(engine, trigger_key, event_seq):
-    """trigger 告警是否仍在索引中（未被此前汇聚消费删除、未被清除/过期）。"""
-    trigger_events = engine.trigger_event_index.get(trigger_key)
-    if not trigger_events:
-        return False
-    for trigger_event in trigger_events:
-        if trigger_event[2] == event_seq:
-            return True
-    return False
