@@ -110,7 +110,7 @@ def iter_sorted_alarm_cache_items(path, metadata=None, show_progress=False):
         _require_cached_alarm_identity(item)
         yield item
         if show_progress and idx % 100000 == 0:
-            print(f"  已流式读取排序告警 {idx} 条...")
+            print(f"  已流式读取排序告警 {idx} 条...", flush=True)
 
 
 class SortedAlarmCacheStream:

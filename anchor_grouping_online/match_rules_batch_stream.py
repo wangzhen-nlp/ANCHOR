@@ -19,6 +19,7 @@
 
 import json
 import math
+import time
 
 from argparse import ArgumentParser
 from collections import deque
@@ -81,7 +82,9 @@ def _iter_window_alarms(alarms_path):
     metadata = read_sorted_alarm_cache_header(alarms_path)
 
     def _generate():
-        for item in iter_sorted_alarm_cache_items(alarms_path, metadata=metadata):
+        for item in iter_sorted_alarm_cache_items(
+            alarms_path, metadata=metadata, show_progress=True
+        ):
             generated_alarm = generate_alarm(item)
             if generated_alarm.get("是否清除"):
                 stats["clear_skipped"] += 1
@@ -111,6 +114,12 @@ def run_sliding_window_aggregation(
     step_sec = float(step_minutes) * 60.0
     matcher = BatchFaultGroupMatcher(resource_buffer=resource_buffer)
 
+    print(
+        f"开始滑动窗口汇聚：窗口 {window_minutes:g} 分钟，"
+        f"步长 {step_minutes:g} 分钟，输出 {output_path}",
+        flush=True,
+    )
+
     alarm_stream, skip_stats = _iter_window_alarms(alarms_path)
     # 缓冲内永远只有 ts ∈ [window_start, window_start + window_sec) 的告警。
     buffer = deque()
@@ -132,12 +141,14 @@ def run_sliding_window_aggregation(
             alarm_groups = {}
             for _ts, group_id, generated_alarm in buffer:
                 alarm_groups.setdefault(group_id, []).append(generated_alarm)
+            aggregation_started_at = time.perf_counter()
             agg_alarm_groups = matcher.aggregate_alarm_groups(
                 alarm_groups,
                 associate_time=associate_time,
                 max_group_time=max_group_time,
                 max_group_member=max_group_member,
             )
+            aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
             record = {
                 "window_start": start,
                 "window_end": start + window_sec,
@@ -146,10 +157,27 @@ def run_sliding_window_aggregation(
                 "input_group_count": len(alarm_groups),
                 "input_alarm_count": len(buffer),
                 "agg_group_count": len(agg_alarm_groups),
+                "aggregation_elapsed_seconds": round(
+                    aggregation_elapsed_seconds, 6
+                ),
                 "agg_alarm_groups": agg_alarm_groups,
             }
             output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # 每个窗口结果立即落盘，方便运行期间通过 tail -f
+            # 查看完整中间结果，不必等到文件关闭。
+            output_file.flush()
             emitted_window_count += 1
+            print(
+                f"  [窗口 {window_count}] "
+                f"{record['window_start_time']} ~ {record['window_end_time']}："
+                f"{record['input_alarm_count']} 条告警 / "
+                f"{record['input_group_count']} 个原始组 -> "
+                f"{record['agg_group_count']} 个汇聚组，"
+                f"汇聚耗时 {aggregation_elapsed_seconds:.3f} 秒"
+                f"（已写入第 "
+                f"{emitted_window_count} 行）",
+                flush=True,
+            )
 
         last_ts = None
         for ts, group_id, generated_alarm in alarm_stream:
@@ -209,7 +237,8 @@ def main():
         f"完成：结算窗口 {stats['window_count']} 个，"
         f"输出非空窗口 {stats['emitted_window_count']} 行，"
         f"跳过清除告警 {stats['clear_skipped']} 条、"
-        f"未归组告警 {stats['ungrouped_skipped']} 条"
+        f"未归组告警 {stats['ungrouped_skipped']} 条",
+        flush=True,
     )
 
 
