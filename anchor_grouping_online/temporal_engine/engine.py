@@ -485,7 +485,7 @@ class TemporalGraphEngine(
         return mature_items
 
     def _prune_consumed_alarm_history(self, matches):
-        """在本轮故障组收割结束时，只回收命中 trigger_role 的节点告警历史。"""
+        """回收命中 trigger_role 的告警历史，返回被删除的 trigger 序号集合。"""
         prune_points = {}
         for match in matches:
             merged_rules = match["merged_rules"]
@@ -532,13 +532,17 @@ class TemporalGraphEngine(
                 for rule_name in matched_rule_names:
                     entry[rule_name] = max(entry.get(rule_name, float("-inf")), ts)
 
+        removed_trigger_seqs = set()
         for (node, alarm_type, alarm_source), cutoff_by_rule in prune_points.items():
-            self._prune_node_alarm_history_before(
-                node,
-                alarm_type,
-                alarm_source,
-                cutoff_by_rule,
+            removed_trigger_seqs.update(
+                self._prune_node_alarm_history_before(
+                    node,
+                    alarm_type,
+                    alarm_source,
+                    cutoff_by_rule,
+                )
             )
+        return removed_trigger_seqs
 
     def _prune_expired_trigger_index(self, node, current_ts):
         """清理某个节点 trigger 索引中超出 TTL 的旧事件。"""

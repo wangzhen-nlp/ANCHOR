@@ -44,9 +44,10 @@ class TemporalGraphEngineEventCacheMixin:
 
     def _remove_trigger_events_by_rule_event_keys(self, node, removed_event_keys_by_rule):
         if not removed_event_keys_by_rule:
-            return
+            return set()
 
         affected_rule_names = set()
+        removed_trigger_seqs = set()
         for rule_name, removed_event_keys in removed_event_keys_by_rule.items():
             trigger_key = (node, rule_name)
             trigger_events = self.trigger_event_index.get(trigger_key)
@@ -68,10 +69,12 @@ class TemporalGraphEngineEventCacheMixin:
                     alarm_type,
                     alarm_source,
                 )
-                if event_key not in removed_event_keys:
-                    kept.append(trigger_event)
-                    if pending_anchor == (event_ts, event_seq):
-                        pending_anchor_kept = True
+                if event_key in removed_event_keys:
+                    removed_trigger_seqs.add(event_seq)
+                    continue
+                kept.append(trigger_event)
+                if pending_anchor == (event_ts, event_seq):
+                    pending_anchor_kept = True
             if kept:
                 self.trigger_event_index[trigger_key] = kept
             else:
@@ -87,6 +90,7 @@ class TemporalGraphEngineEventCacheMixin:
                 node,
                 affected_rule_names=affected_rule_names,
             )
+        return removed_trigger_seqs
 
     def _prune_node_alarm_history_before(
         self,
@@ -97,7 +101,7 @@ class TemporalGraphEngineEventCacheMixin:
     ):
         events = self.event_cache.get(node)
         if not events:
-            return
+            return set()
 
         target_alarm_source = str(alarm_source or "")
         removed_event_keys_by_rule = collections.defaultdict(set)
@@ -132,4 +136,7 @@ class TemporalGraphEngineEventCacheMixin:
                 removed_event_keys_by_rule[rule_name].add(event_key)
 
         self.event_cache[node] = updated_events
-        self._remove_trigger_events_by_rule_event_keys(node, removed_event_keys_by_rule)
+        return self._remove_trigger_events_by_rule_event_keys(
+            node,
+            removed_event_keys_by_rule,
+        )
