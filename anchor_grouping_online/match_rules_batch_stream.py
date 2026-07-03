@@ -149,6 +149,11 @@ def run_sliding_window_aggregation(
                 max_group_member=max_group_member,
             )
             aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
+            merged_input_group_count = sum(
+                len(member_group_ids)
+                for member_group_ids in agg_alarm_groups.values()
+                if len(member_group_ids) > 1
+            )
             record = {
                 "window_start": start,
                 "window_end": start + window_sec,
@@ -157,6 +162,7 @@ def run_sliding_window_aggregation(
                 "input_group_count": len(alarm_groups),
                 "input_alarm_count": len(buffer),
                 "agg_group_count": len(agg_alarm_groups),
+                "merged_input_group_count": merged_input_group_count,
                 "aggregation_elapsed_seconds": round(
                     aggregation_elapsed_seconds, 6
                 ),
@@ -173,6 +179,7 @@ def run_sliding_window_aggregation(
                 f"{record['input_alarm_count']} 条告警 / "
                 f"{record['input_group_count']} 个原始组 -> "
                 f"{record['agg_group_count']} 个汇聚组，"
+                f"其中合并原始组 {merged_input_group_count} 个，"
                 f"汇聚耗时 {aggregation_elapsed_seconds:.3f} 秒"
                 f"（已写入第 "
                 f"{emitted_window_count} 行）",
