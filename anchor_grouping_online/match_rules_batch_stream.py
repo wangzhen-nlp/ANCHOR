@@ -12,7 +12,7 @@
 3. 每个非空窗口的结果作为一行 JSON 追加写入输出文件。
 
 用法：
-    python match_rules_batch_stream_test.py <sorted_alarms> <output.jsonl> \
+    python match_rules_batch_stream.py <sorted_alarms> <output.jsonl> \
         [--resource-buffer ...] [--window-minutes 7] [--step-minutes 1] \
         [--associate-time 7] [--max-group-time 10] [--max-group-member 1000]
 """
@@ -65,7 +65,11 @@ def _build_arg_parser():
     )
     parser.add_argument(
         "--max-group-member", type=int, default=1000,
-        help="aggregate_alarm_groups 的汇聚组最大告警数",
+        help="汇聚组允许包含的最大原始故障组个数",
+    )
+    parser.add_argument(
+        "--batch-isolated", action="store_true",
+        help="批隔离：不使用跨窗口信息，只做本窗口内的告警汇聚",
     )
     return parser
 
@@ -108,20 +112,32 @@ def run_sliding_window_aggregation(
     associate_time=7.0,
     max_group_time=10.0,
     max_group_member=1000,
+    batch_isolated=False,
 ):
-    """按滑动窗口切段并逐窗口二次汇聚，返回运行统计。"""
+    """按滑动窗口切段并逐窗口二次汇聚，返回运行统计。
+
+    默认 matcher 跨窗口持久（有状态）：本窗口的故障组可以与之前窗口喂入
+    的告警/故障组建立汇聚关系（match_rules.py 的在线语义）。
+    batch_isolated=True 时只做本窗口内的告警汇聚，不使用跨窗口信息，
+    汇聚组 ID（UUID）每窗口独立生成，跨窗口比较无意义。
+    """
     window_sec = float(window_minutes) * 60.0
     step_sec = float(step_minutes) * 60.0
-    matcher = BatchFaultGroupMatcher(resource_buffer=resource_buffer)
+    matcher = BatchFaultGroupMatcher(
+        resource_buffer=resource_buffer, batch_isolated=batch_isolated
+    )
 
     print(
         f"开始滑动窗口汇聚：窗口 {window_minutes:g} 分钟，"
-        f"步长 {step_minutes:g} 分钟，输出 {output_path}",
+        f"步长 {step_minutes:g} 分钟，"
+        f"{'批隔离（不使用跨窗口信息）' if batch_isolated else '跨窗口有状态'}，"
+        f"输出 {output_path}",
         flush=True,
     )
 
     alarm_stream, skip_stats = _iter_window_alarms(alarms_path)
-    # 缓冲内永远只有 ts ∈ [window_start, window_start + window_sec) 的告警。
+    # 缓冲近似保有当前窗口的告警。对输入顺序不做假设：乱序只影响告警
+    # 被切进哪一批，聚合判定由 matcher 按告警自身时间完成，与顺序无关。
     buffer = deque()
     window_start = None
     window_count = 0
@@ -186,15 +202,7 @@ def run_sliding_window_aggregation(
                 flush=True,
             )
 
-        last_ts = None
         for ts, group_id, generated_alarm in alarm_stream:
-            # 滑动窗口的逐出与结算都依赖输入按 ts 非降序；乱序会静默污染
-            # 后续窗口，这里直接报错终止。
-            if last_ts is not None and ts < last_ts:
-                raise ValueError(
-                    f"排序告警缓存乱序：ts={ts} 出现在 ts={last_ts} 之后"
-                )
-            last_ts = ts
             if window_start is None:
                 window_start = _align_to_step(ts)
             # 新告警越过当前窗口右界：依次结算已完整的窗口并滑动。
@@ -239,6 +247,7 @@ def main():
         associate_time=args.associate_time,
         max_group_time=args.max_group_time,
         max_group_member=args.max_group_member,
+        batch_isolated=args.batch_isolated,
     )
     print(
         f"完成：结算窗口 {stats['window_count']} 个，"

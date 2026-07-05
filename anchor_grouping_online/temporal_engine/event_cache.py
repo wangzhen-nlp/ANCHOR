@@ -14,7 +14,8 @@ class TemporalGraphEngineEventCacheMixin:
             return
 
         while q and (current_ts - q[0]["ts"]) > self._get_event_ttl(q[0]["alarm"]):
-            q.popleft()
+            expired_event = q.popleft()
+            self._forget_batch_cached_event(node, expired_event)
 
         if not q:
             self.event_cache.pop(node, None)
@@ -37,6 +38,7 @@ class TemporalGraphEngineEventCacheMixin:
                 and str(cached_event.get("alarm_source", "") or "") == target_alarm_source
             )
             if matches_clear:
+                self._forget_batch_cached_event(node, cached_event)
                 continue
             kept.append(cached_event)
 
@@ -46,18 +48,13 @@ class TemporalGraphEngineEventCacheMixin:
         if not removed_event_keys_by_rule:
             return set()
 
-        affected_rule_names = set()
         removed_trigger_seqs = set()
         for rule_name, removed_event_keys in removed_event_keys_by_rule.items():
             trigger_key = (node, rule_name)
             trigger_events = self.trigger_event_index.get(trigger_key)
             if not trigger_events:
-                if trigger_key in self.pending_triggers:
-                    affected_rule_names.add(rule_name)
                 continue
 
-            pending_anchor = self.pending_triggers.get(trigger_key)
-            pending_anchor_kept = pending_anchor is None
             kept = collections.deque()
             for trigger_event in trigger_events:
                 event_ts, alarm_id, event_seq, alarm_type, alarm_source = (
@@ -73,23 +70,11 @@ class TemporalGraphEngineEventCacheMixin:
                     removed_trigger_seqs.add(event_seq)
                     continue
                 kept.append(trigger_event)
-                if pending_anchor == (event_ts, event_seq):
-                    pending_anchor_kept = True
             if kept:
                 self.trigger_event_index[trigger_key] = kept
             else:
                 self.trigger_event_index.pop(trigger_key, None)
-            if not pending_anchor_kept:
-                affected_rule_names.add(rule_name)
 
-        # 已消费的 trigger event 可能正是某个尚未成熟 pending 的锚点。
-        # trigger index 删除后必须同步推进或移除 pending，否则旧锚点成熟时还会
-        # 触发一次无效规则评估，并在此期间阻止后续 trigger 建立新 pending。
-        if affected_rule_names:
-            self._refresh_pending_triggers_for_node(
-                node,
-                affected_rule_names=affected_rule_names,
-            )
         return removed_trigger_seqs
 
     def _prune_node_alarm_history_before(
@@ -121,7 +106,11 @@ class TemporalGraphEngineEventCacheMixin:
                 updated_events.append(event)
                 continue
 
-            updated_event = dict(event)
+            updated_event = event
+            if getattr(self, "_batch_event_by_alarm_id", None) is None:
+                # 在线/隔离模式保持既有复制替换语义；持久批处理必须原地
+                # 更新，确保 eid 索引继续指向缓存中的同一个事件对象。
+                updated_event = dict(event)
             updated_event["consumed_trigger_rules"] = frozenset(
                 set(event.get("consumed_trigger_rules", ())) | matched_rules
             )

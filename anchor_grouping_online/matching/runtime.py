@@ -5,7 +5,6 @@ import zipfile
 from dataclasses import dataclass
 
 from anchor_grouping_online.alarm_types import CRITICAL_ALARMS
-from anchor_grouping_online.tools.progress_utils import ProgressBar
 from anchor_grouping_online.alarm_events.io import (
     is_clear_alarm,
     iter_topology_valid_alarm_events,
@@ -16,7 +15,6 @@ from anchor_grouping_online.alarm_events.io import (
 )
 from anchor_grouping_online.alarm_events.generator import (
     AlarmGenerator,
-    to_matching_alarm,
 )
 from anchor_grouping_online.rule_config import (
     OUTPUT_ELIGIBLE_RULE_FIELD,
@@ -41,7 +39,6 @@ from anchor_grouping_online.site_topology import (
 from anchor_grouping_online.link_peer_index import build_peer_index
 from anchor_grouping_online.resource_buffer import load_resource_buffer
 from anchor_grouping_online.time_config import (
-    DEFAULT_AGGREGATION_WAIT_SEC,
     DEFAULT_CLEAR_DELAY_SEC,
 )
 
@@ -256,12 +253,10 @@ def build_fault_pattern_filter(static_context):
 
 def initialize_engine(args, static_context, rules_config):
     print("⏳ 正在初始化时序图引擎与拓扑映射...")
-    print(f"聚合等待时间: {DEFAULT_AGGREGATION_WAIT_SEC:g} 秒")
     engine = TemporalGraphEngine(
         rules_config,
         static_context.site_domain_map,
         alarm_source_domain_map=static_context.alarm_source_domain_map,
-        aggregation_wait_sec=DEFAULT_AGGREGATION_WAIT_SEC,
         topo_downstream_map=static_context.topo_downstream_map,
         site_chain_index=static_context.site_chain_index,
         ne_graph_data=static_context.ne_graph_data,
@@ -383,46 +378,6 @@ def print_alarm_load_summary(alarm_load_result):
 
 def default_valid_alarm_titles():
     return CRITICAL_ALARMS
-
-
-def run_matching_pipeline(
-    engine,
-    alarm_generator,
-    output_session,
-):
-    process_progress = ProgressBar(len(alarm_generator), "处理有效告警")
-    process_progress.set_extra_text(
-        output_session.build_progress_extra_text(),
-        force=True,
-    )
-
-    print("⏱️ 每条告警到来时直接触发检查")
-    try:
-        for generated_alarm in alarm_generator:
-            alarm = to_matching_alarm(generated_alarm)
-            alarm_payload = None
-            if alarm["physical_port_name"]:
-                alarm_payload = {"物理端口名称": alarm["physical_port_name"]}
-            matches = engine.process_event(
-                node=alarm["site_id"],
-                alarm_source=alarm["alarm_source"],
-                alarm_type=alarm["alarm_title"],
-                ts=alarm["ts"],
-                alarm_id=alarm["alarm_id"],
-                alarm_payload=alarm_payload,
-                is_clear=alarm["is_clear"],
-            )
-            if matches:
-                output_session.write_matches(matches)
-            process_progress.set_extra_text(output_session.build_progress_extra_text())
-            process_progress.update()
-    finally:
-        process_progress.close()
-
-    print("⏳ 数据流读取完毕，正在清空并计算延迟聚合队列...")
-    final_matches = engine.flush_pending()
-    if final_matches:
-        output_session.write_matches(final_matches)
 
 
 def print_final_summary(engine, processed_count, filtered_count, match_count, elapsed):

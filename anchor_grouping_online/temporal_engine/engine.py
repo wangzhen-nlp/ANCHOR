@@ -1,11 +1,9 @@
 import collections
-import heapq
 
 from anchor_grouping_online.emitted_group_store import EmittedGroupStore
 from anchor_grouping_online.alarm_events.identity import require_eid
 from anchor_grouping_online.node_rule_helper import NodeRuleHelper
 from anchor_grouping_online.time_config import (
-    DEFAULT_AGGREGATION_WAIT_SEC,
     DEFAULT_EVENT_TTL_SEC,
     DEFAULT_POWER_ALARM_TTL_SEC,
 )
@@ -17,14 +15,12 @@ from anchor_grouping_online.temporal_engine.dependencies import TemporalGraphEng
 from anchor_grouping_online.temporal_engine.evaluator import TemporalGraphEngineEvaluatorMixin
 from anchor_grouping_online.temporal_engine.indexes import RoleSiteIndex
 from anchor_grouping_online.temporal_engine.output import TemporalGraphEngineOutputMixin
-from anchor_grouping_online.temporal_engine.runtime import TemporalGraphEngineRuntimeMixin
 from anchor_grouping_online.temporal_engine.traversal import TemporalGraphEngineTraversalMixin
 from anchor_grouping_online.temporal_engine.utils import (
     add_merge_stats,
     build_pattern_adj,
     build_empty_merge_stats,
     matches_expected_alarm,
-    merge_match_batch,
 )
 
 class TemporalGraphEngine(
@@ -33,7 +29,6 @@ class TemporalGraphEngine(
     TemporalGraphEngineConstraintMixin,
     TemporalGraphEngineEvaluatorMixin,
     TemporalGraphEngineOutputMixin,
-    TemporalGraphEngineRuntimeMixin,
     TemporalGraphEngineEventCacheMixin,
     TemporalGraphEngineTraversalMixin,
 ):
@@ -199,9 +194,19 @@ class TemporalGraphEngine(
         link_peer_index,
         topo_downstream_map=None,
         alarm_source_domain_map=None,
-        aggregation_wait_sec=DEFAULT_AGGREGATION_WAIT_SEC,
+        prune_on_ingest=True,
+        enable_batch_upsert_indexes=False,
+        shared_static_context=None,
     ):
-        """初始化拓扑、缓存、触发索引以及历史故障组状态。"""
+        """初始化拓扑、缓存、触发索引以及历史故障组状态。
+
+        shared_static_context 用于跨引擎复用与「规则边时间窗 / max_stay」
+        无关的静态结构（拓扑邻接、NE 映射、trigger 索引、role_site_index）。
+        提供时直接引用、跳过重建；这些结构构造后只读，跨引擎共享安全。
+        仅执行计划（依赖各引擎自己的边时间窗）始终按本引擎的规则重编。
+        要求各引擎的规则共享同一批 node_config 对象（batch 侧浅拷贝规则时
+        保持 node 身份不变），以保证 role_site_index 的 id(node_config) 命中。
+        """
         # 规则配置总表：按规则名保存匹配图、触发角色和节点约束。
         self.rules = rules_config
         if self._rules_require_link_peer_index(self.rules) and not link_peer_index:
@@ -213,18 +218,30 @@ class TemporalGraphEngine(
 
         # 规则匹配只使用 site_chains；缺少站点时直接无候选，不做站点拓扑 BFS。
         # 这里保留派生拓扑字段仅为构造参数兼容，不参与规则候选遍历。
-        self.topo_down = topo_downstream_map or {}
-        self.topo_up = collections.defaultdict(list)
-        for upstream_site, downstream_sites in self.topo_down.items():
-            for downstream_site in downstream_sites:
-                self.topo_up[downstream_site].append(upstream_site)
+        if shared_static_context is not None:
+            self.topo_down = shared_static_context["topo_down"]
+            self.topo_up = shared_static_context["topo_up"]
+        else:
+            self.topo_down = topo_downstream_map or {}
+            self.topo_up = collections.defaultdict(list)
+            for upstream_site, downstream_sites in self.topo_down.items():
+                for downstream_site in downstream_sites:
+                    self.topo_up[downstream_site].append(upstream_site)
 
         # event_cache: 站点 -> deque[事件 dict]，保留原始告警 payload 供后续端口/对端解析
         self.event_cache = collections.defaultdict(collections.deque)
+        # 持久批处理会话可选的幂等写入索引。在线模式及隔离临时会话不建，
+        # 避免无必要的常驻内存；启用后当前批告警可按 eid O(1) 覆盖缓存。
+        self._batch_event_by_alarm_id = (
+            {} if enable_batch_upsert_indexes else None
+        )
         # 默认告警缓存保留时长，单位秒
         self.global_ttl = DEFAULT_EVENT_TTL_SEC
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
         self.power_alarm_ttl = DEFAULT_POWER_ALARM_TTL_SEC
+        # 喂流时是否做按站点 TTL 清理。批处理二次汇聚在每批开始统一按
+        # 视界清扫，喂流清理恒为空转，可关闭省掉逐条检查。
+        self._prune_on_ingest = bool(prune_on_ingest)
 
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
@@ -240,19 +257,9 @@ class TemporalGraphEngine(
         self.global_role_filtered_neighbor_cache = collections.OrderedDict()
         self.max_role_filtered_neighbor_cache_size = 20000
 
-        # 故障传播等待时间
-        self.aggregation_wait_sec = aggregation_wait_sec
-
         # 已到达事件的时间上界。
         self.latest_arrived_event_ts = 0.0
 
-        # 延迟触发队列：记录“当前仍在等待聚合”的 trigger 起点锚点，结构为 (ts, seq)
-        self.pending_triggers = {}
-        # node -> {(node, rule_name)} 反向索引，供 _expand_matches_with_pending_context
-        # 按本批 non-trigger 节点直接定位相关 pending，避免扫全量。
-        self._pending_triggers_by_node = collections.defaultdict(set)
-        # 延迟触发最小堆：按 ready_ts 排序，快速摘取已成熟的 pending trigger
-        self.pending_trigger_heap = []
         # 保存某个 (node, rule) 下所有还能作为 trigger 候选的事件，结构为 (ts, alarm_id, seq, alarm_type, alarm_source)
         self.trigger_event_index = collections.defaultdict(collections.deque)
         # trigger 候选事件的全局递增序号，用于精确定位“下一条”事件。
@@ -262,55 +269,80 @@ class TemporalGraphEngine(
         self.emitted_group_store = EmittedGroupStore()
 
         # 负责站点结构匹配、告警窗口校验和失败原因解释
+        event_cache = self.event_cache
         self.node_rule_helper = NodeRuleHelper(
-            lambda node: self.event_cache.get(node, []),
+            lambda node, cache=event_cache: cache.get(node, []),
             self.alarm_source_domain_map,
         )
-        self.role_site_index = RoleSiteIndex(
-            self.rules,
-            self.sites_domain_map,
-            self.node_rule_helper,
-        )
-
         # NE 级拓扑数据（用于 alarm_source_ne_anchor 约束）。
         # ne_graph_data: {ne_id: {"site_id": ..., "link": {neighbor_ne_id: {...}}}}
         # site_to_ne_ids: {site_id: (ne_id, ...)}
         self._ne_graph_data = ne_graph_data
-        self._ne_to_site = {}
-        for ne_id, info in self._ne_graph_data.items():
-            if not isinstance(info, dict):
-                continue
-            site_id = str(info.get("site_id", "") or "").strip()
-            if not site_id:
-                continue
-            self._ne_to_site[ne_id] = site_id
-            self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
-        self._site_to_ne_ids = {
-            site_id: tuple(ne_ids)
-            for site_id, ne_ids in site_to_ne_ids.items()
-        }
-        if not self._site_to_ne_ids:
-            raise ValueError("必须提供非空 site_to_ne_ids")
         self._link_peer_index = link_peer_index
-        self._ne_adjacency = self._build_ne_adjacency()
+        if shared_static_context is not None:
+            self.role_site_index = shared_static_context["role_site_index"]
+            self._ne_to_site = shared_static_context["ne_to_site"]
+            self._site_to_ne_ids = shared_static_context["site_to_ne_ids"]
+            self._ne_adjacency = shared_static_context["ne_adjacency"]
+        else:
+            self.role_site_index = RoleSiteIndex(
+                self.rules,
+                self.sites_domain_map,
+                self.node_rule_helper,
+            )
+            self._ne_to_site = {}
+            for ne_id, info in self._ne_graph_data.items():
+                if not isinstance(info, dict):
+                    continue
+                site_id = str(info.get("site_id", "") or "").strip()
+                if not site_id:
+                    continue
+                self._ne_to_site[ne_id] = site_id
+                self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
+            self._site_to_ne_ids = {
+                site_id: tuple(ne_ids)
+                for site_id, ne_ids in site_to_ne_ids.items()
+            }
+            if not self._site_to_ne_ids:
+                raise ValueError("必须提供非空 site_to_ne_ids")
+            self._ne_adjacency = self._build_ne_adjacency()
         # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
         # 不含规则名，跨规则、跨 trigger 自动复用。
         self._anchor_ne_reachable_cache = {}
 
-        # 每条规则的静态执行计划：提前把模式图邻接、遍历顺序和 root roles 预编译出来。
+        # 每条规则的静态执行计划：依赖本引擎自身的边时间窗，始终按本引擎规则
+        # 编译（不参与跨引擎共享）。
         self.rule_execution_plans = {}
         self._compile_rule_execution_plans()
 
         # 站点可以作为 trigger 的规则+告警组合，{node: ((rule, (alarm_type, ...)), ...)}
-        self.trigger_specs_by_node = {}
-        self._build_trigger_indexes()
-        
+        if shared_static_context is not None:
+            self.trigger_specs_by_node = shared_static_context["trigger_specs_by_node"]
+        else:
+            self.trigger_specs_by_node = {}
+            self._build_trigger_indexes()
+
         # 分批清理过期节点状态时的游标
         self._prune_cursor = 0
         # 每轮清理最多处理的节点数，避免单次 prune 开销过大
         self._prune_batch_size = 256
-        # 当 heap 脏条目过多时触发重建的倍率阈值
-        self._pending_heap_rebuild_factor = 3
+
+    def export_static_context(self):
+        """导出可跨引擎共享的静态结构。
+
+        这些结构只依赖拓扑与规则的 node 结构，与规则边时间窗 / max_stay
+        无关，构造后只读；可注入其他引擎（shared_static_context）避免重建。
+        执行计划因依赖各引擎自身的边时间窗，不在此列。
+        """
+        return {
+            "topo_down": self.topo_down,
+            "topo_up": self.topo_up,
+            "role_site_index": self.role_site_index,
+            "ne_to_site": self._ne_to_site,
+            "site_to_ne_ids": self._site_to_ne_ids,
+            "ne_adjacency": self._ne_adjacency,
+            "trigger_specs_by_node": self.trigger_specs_by_node,
+        }
 
     def process_event(
         self,
@@ -321,15 +353,28 @@ class TemporalGraphEngine(
         alarm_source="",
         is_clear=False,
         alarm_payload=None,
+        index_trigger=True,
+        cache_event=True,
+        trigger_candidates=None,
     ):
-        """接收单条事件，更新内部状态并收割已成熟的故障组。"""
+        """接收单条事件，更新事件缓存与 trigger 索引。
+
+        批处理不做在线延迟聚合：本方法只维护 event_cache 与 trigger 索引，
+        命中 trigger 的事件写入 trigger_candidates 供调用方按批收割，不在此
+        触发任何规则评估。
+        index_trigger=False 用于加载只作为症状候选的历史告警：事件仍进入
+        event_cache，但不建立 trigger 索引。
+        cache_event=False 用于当前批重发历史告警：复用已有缓存事件，
+        只按当前告警语义处理 trigger（清除告警仍会删除已有缓存）。
+        """
         alarm_id = require_eid({"eid": alarm_id})
         # 1. 按已到达事件推进时间上界。
         self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
         # 2. 先清理过期缓存，再按上报/清除事件更新状态。
-        self._prune_expired_raw_events_in_place(node, ts)
-        self._prune_expired_trigger_index(node, ts)
+        if self._prune_on_ingest:
+            self._prune_expired_raw_events_in_place(node, ts)
+            self._prune_expired_trigger_index(node, ts)
 
         if is_clear:
             self._remove_cleared_raw_event(
@@ -338,29 +383,30 @@ class TemporalGraphEngine(
                 alarm_type=alarm_type,
                 alarm_source=alarm_source,
             )
-            affected_rule_names = self._remove_cleared_trigger_events(
+            self._remove_cleared_trigger_events(
                 node,
                 alarm_id,
                 alarm_type=alarm_type,
                 alarm_source=alarm_source,
             )
-            if affected_rule_names:
-                self._refresh_pending_triggers_for_node(
-                    node,
-                    affected_rule_names=affected_rule_names
-                )
-        else:
-            self.event_cache[node].append({
+        elif cache_event:
+            cached_event = {
                 "ts": ts,
                 "eid": alarm_id,
                 "alarm": alarm_type,
                 "alarm_source": alarm_source,
                 "alarm_payload": alarm_payload if isinstance(alarm_payload, dict) else {},
                 "consumed_trigger_rules": frozenset(),
-            })
+            }
+            self.event_cache[node].append(cached_event)
+            batch_event_index = getattr(
+                self, "_batch_event_by_alarm_id", None
+            )
+            if batch_event_index is not None:
+                batch_event_index[alarm_id] = cached_event
 
-        # 3. 命中 trigger 的事件只负责入 pending，不在这里直接做匹配评估。
-        if not is_clear:
+        # 3. 命中 trigger 的事件写入 trigger 索引，并汇报到本批候选。
+        if index_trigger and not is_clear:
             alarm_source_domain = self.alarm_source_domain_map.get(alarm_source, "")
             for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
                 if any(
@@ -370,54 +416,160 @@ class TemporalGraphEngine(
                     trigger_key = (node, rule_name)
                     self._trigger_seq += 1
                     trigger_seq = self._trigger_seq
-                    self.trigger_event_index[trigger_key].append(
-                        (ts, alarm_id, trigger_seq, alarm_type, str(alarm_source or ""))
-                    )
-                    # 如果这段时间内已经触发过，就不更新时间，以“第一声警报”为准
-                    if trigger_key not in self.pending_triggers:
-                        self._set_pending_trigger(trigger_key, ts, trigger_seq)
-
-        # 快路径：没有 mature pending trigger 时跳过评估。
-        heap = self.pending_trigger_heap
-        if heap and heap[0][0] <= self.latest_arrived_event_ts:
-            return self._collect_pending_matches(force=False)
+                    self.trigger_event_index[trigger_key].append((
+                        ts,
+                        alarm_id,
+                        trigger_seq,
+                        alarm_type,
+                        str(alarm_source or ""),
+                    ))
+                    if trigger_candidates is not None:
+                        trigger_candidates.append((ts, trigger_seq, trigger_key))
 
         return []
 
+    def process_batch_event(
+        self,
+        node,
+        alarm_type,
+        ts,
+        alarm_id,
+        alarm_source="",
+        is_clear=False,
+        alarm_payload=None,
+        index_trigger=True,
+    ):
+        """持久批处理幂等写入当前告警，返回本批新建 trigger 候选。
+
+        当前批再次提供同一 eid 时原地刷新事件并清空历史消费标记。trigger
+        只属于当前调用，每次均重新建立，不跨批复用；index_trigger=False
+        用于外置调用结束时仅把当前事件同步进持久缓存。
+        该接口要求构造引擎时启用 batch event upsert 索引。
+        """
+        event_index = self._batch_event_by_alarm_id
+        if event_index is None:
+            raise RuntimeError("process_batch_event 需要启用 batch upsert 索引")
+
+        alarm_id = require_eid({"eid": alarm_id})
+        self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
+        if self._prune_on_ingest:
+            self._prune_expired_raw_events_in_place(node, ts)
+            self._prune_expired_trigger_index(node, ts)
+
+        if is_clear:
+            self._remove_cleared_raw_event(
+                node,
+                alarm_id,
+                alarm_type=alarm_type,
+                alarm_source=alarm_source,
+            )
+            self._remove_cleared_trigger_events(
+                node,
+                alarm_id,
+                alarm_type=alarm_type,
+                alarm_source=alarm_source,
+            )
+            return []
+
+        cached = event_index.get(alarm_id)
+        payload = alarm_payload if isinstance(alarm_payload, dict) else {}
+        if cached is None:
+            cached_event = {
+                "ts": ts,
+                "eid": alarm_id,
+                "alarm": alarm_type,
+                "alarm_source": alarm_source,
+                "alarm_payload": payload,
+                "consumed_trigger_rules": frozenset(),
+            }
+            self._insert_batch_cached_event(node, cached_event)
+            event_index[alarm_id] = cached_event
+        else:
+            cached_event = cached
+            previous_ts = cached_event.get("ts")
+            if previous_ts != ts:
+                raise ValueError(
+                    f"同一告警 {alarm_id!r} 的发生时间从 {previous_ts!r}"
+                    f" 变为 {ts!r}，无法幂等覆盖"
+                )
+            if (
+                cached_event.get("alarm") != alarm_type
+                or str(cached_event.get("alarm_source", "") or "")
+                != str(alarm_source or "")
+            ):
+                raise ValueError(
+                    f"同一告警 {alarm_id!r} 的类型或告警源发生变化，"
+                    "无法幂等覆盖"
+                )
+            cached_event.update({
+                "ts": ts,
+                "alarm": alarm_type,
+                "alarm_source": alarm_source,
+                "alarm_payload": payload,
+                # 出现在当前批即重新获得 trigger 资格；本批前序匹配仍会
+                # 再次写入消费标记并使后续 trigger 失效。
+                "consumed_trigger_rules": frozenset(),
+            })
+
+        if not index_trigger:
+            return []
+
+        alarm_source_domain = self.alarm_source_domain_map.get(alarm_source, "")
+        trigger_candidates = []
+        for rule_name, expected_list in self.trigger_specs_by_node.get(node, ()):
+            if not any(
+                matches_expected_alarm(alarm_type, expected, alarm_source_domain)
+                for expected in expected_list
+            ):
+                continue
+            trigger_key = (node, rule_name)
+            self._trigger_seq += 1
+            trigger_seq = self._trigger_seq
+            self._insert_batch_trigger_event(
+                trigger_key,
+                (
+                    ts,
+                    alarm_id,
+                    trigger_seq,
+                    alarm_type,
+                    str(alarm_source or ""),
+                ),
+            )
+            trigger_candidates.append((ts, trigger_seq, trigger_key))
+        return trigger_candidates
+
+    def _insert_batch_cached_event(self, node, cached_event):
+        """按 ts 插入持久批处理缓存；顺序到达保持 O(1) 追加快路径。"""
+        events = self.event_cache[node]
+        ts = cached_event["ts"]
+        if not events or events[-1]["ts"] <= ts:
+            events.append(cached_event)
+            return
+        for index, event in enumerate(events):
+            if event["ts"] > ts:
+                events.insert(index, cached_event)
+                return
+        events.append(cached_event)
+
+    def _insert_batch_trigger_event(self, trigger_key, trigger_event):
+        """O(1) 追加到本次调用的临时 trigger 工作集。
+
+        收割候选会独立按 (ts, seq) 排序；消费删除按事件键过滤整条 deque，
+        因而临时索引无需维护时间顺序，也不参与跨批 TTL。
+        """
+        self.trigger_event_index[trigger_key].append(trigger_event)
+
+    def _forget_batch_cached_event(self, node, cached_event):
+        event_index = getattr(self, "_batch_event_by_alarm_id", None)
+        if event_index is None:
+            return
+        alarm_id = cached_event.get("eid")
+        indexed = event_index.get(alarm_id)
+        if indexed is cached_event:
+            event_index.pop(alarm_id, None)
+
     def _get_event_ttl(self, alarm_type):
         return self.power_alarm_ttl if alarm_type in POWER_ALARMS else self.global_ttl
-
-    def _set_pending_trigger(self, trigger_key, first_trigger_ts, trigger_seq):
-        trigger_anchor = (first_trigger_ts, trigger_seq)
-        self.pending_triggers[trigger_key] = trigger_anchor
-        # 反向索引同步维护：set.add 幂等，重复 set 同一 trigger_key 也安全。
-        self._pending_triggers_by_node[trigger_key[0]].add(trigger_key)
-        ready_ts = first_trigger_ts + self.aggregation_wait_sec
-        heapq.heappush(self.pending_trigger_heap, (ready_ts, first_trigger_ts, trigger_seq, trigger_key))
-        self._maybe_rebuild_pending_heap()
-
-    def _remove_pending_trigger(self, trigger_key):
-        """从 pending_triggers 和反向索引同时移除。返回原 anchor 或 None。"""
-        anchor = self.pending_triggers.pop(trigger_key, None)
-        if anchor is None:
-            return None
-        node = trigger_key[0]
-        bucket = self._pending_triggers_by_node.get(node)
-        if bucket is not None:
-            bucket.discard(trigger_key)
-            if not bucket:
-                del self._pending_triggers_by_node[node]
-        return anchor
-
-    def _maybe_rebuild_pending_heap(self):
-        if len(self.pending_trigger_heap) <= max(64, len(self.pending_triggers) * self._pending_heap_rebuild_factor):
-            return
-
-        self.pending_trigger_heap = [
-            (trigger_ts + self.aggregation_wait_sec, trigger_ts, trigger_seq, trigger_key)
-            for trigger_key, (trigger_ts, trigger_seq) in self.pending_triggers.items()
-        ]
-        heapq.heapify(self.pending_trigger_heap)
 
     def _collect_trigger_expected_list(self, trigger_node_domain, trigger_config):
         expected_list = []
@@ -456,33 +608,6 @@ class TemporalGraphEngine(
                 trigger_specs_by_node[node] = tuple(specs)
 
         self.trigger_specs_by_node = trigger_specs_by_node
-
-    def _collect_mature_pending(self, force=False):
-        """摘取当前已成熟的 pending trigger。"""
-        mature_items = []
-        latest_event_ts = self.latest_arrived_event_ts
-
-        if force:
-            for trigger_key, trigger_anchor in list(self.pending_triggers.items()):
-                self._remove_pending_trigger(trigger_key)
-                mature_items.append((trigger_key, trigger_anchor))
-            return mature_items
-
-        while self.pending_trigger_heap:
-            ready_ts, first_trigger_ts, trigger_seq, trigger_key = self.pending_trigger_heap[0]
-            if ready_ts > latest_event_ts:
-                break
-
-            heapq.heappop(self.pending_trigger_heap)
-            current_pending_anchor = self.pending_triggers.get(trigger_key)
-            if current_pending_anchor != (first_trigger_ts, trigger_seq):
-                continue
-
-            self._remove_pending_trigger(trigger_key)
-            self._prune_trigger_index_before(trigger_key, trigger_seq)
-            mature_items.append((trigger_key, (first_trigger_ts, trigger_seq)))
-
-        return mature_items
 
     def _prune_consumed_alarm_history(self, matches):
         """回收命中 trigger_role 的告警历史，返回被删除的 trigger 序号集合。"""
@@ -557,8 +682,6 @@ class TemporalGraphEngine(
 
             if not trigger_events:
                 self.trigger_event_index.pop(trigger_key, None)
-                self._remove_pending_trigger(trigger_key)
-        self._maybe_rebuild_pending_heap()
 
     def _prune_trigger_index_before(self, trigger_key, cutoff_seq):
         """删除某个 trigger_key 下序号不大于 cutoff_seq 的已消费 trigger 事件。"""
@@ -584,27 +707,20 @@ class TemporalGraphEngine(
         alarm_type,
         alarm_source,
     ):
-        """按 alarm_id 从 trigger 索引中移除已清除的触发事件。
-
-        返回值是“当前 pending anchor 也被清掉”的 rule 名集合。只有这些 rule
-        需要把 pending 起点推进到下一条 trigger；如果删掉的只是后续候选，
-        pending 应保持不变。
-        """
-        affected_rule_names = set()
+        """按 alarm_id 从 trigger 索引中移除已清除的触发事件。"""
+        target_alarm_source = str(alarm_source or "")
         for rule_name, _ in self.trigger_specs_by_node.get(node, ()):
             trigger_key = (node, rule_name)
             trigger_events = self.trigger_event_index.get(trigger_key)
             if not trigger_events:
                 continue
 
-            current_pending_anchor = self.pending_triggers.get(trigger_key)
             kept = collections.deque()
-            target_alarm_source = str(alarm_source or "")
             for trigger_event in trigger_events:
                 (
-                    event_ts,
+                    _event_ts,
                     indexed_event_id,
-                    indexed_seq,
+                    _indexed_seq,
                     indexed_alarm_type,
                     indexed_alarm_source,
                 ) = self._unpack_trigger_event(trigger_event)
@@ -614,8 +730,6 @@ class TemporalGraphEngine(
                     and indexed_alarm_source == target_alarm_source
                 )
                 if matches_clear:
-                    if current_pending_anchor == (event_ts, indexed_seq):
-                        affected_rule_names.add(rule_name)
                     continue
                 kept.append(trigger_event)
 
@@ -623,46 +737,6 @@ class TemporalGraphEngine(
                 self.trigger_event_index[trigger_key] = kept
             else:
                 self.trigger_event_index.pop(trigger_key, None)
-
-        return affected_rule_names
-
-    def _refresh_pending_triggers_for_node(self, node, affected_rule_names):
-        """在 trigger 候选被删除后，重新校正该节点对应 rule 的 pending 起点。"""
-        rule_names = [rule_name for rule_name in affected_rule_names if rule_name]
-
-        for rule_name in rule_names:
-            trigger_key = (node, rule_name)
-            if trigger_key not in self.pending_triggers:
-                continue
-
-            original_pending_anchor = self.pending_triggers[trigger_key]
-            # 清除后只允许把 pending 起点推进到“原 trigger 之后”的下一条，避免回退到同一时间更早的故障上下文。
-            next_trigger_anchor = self._find_next_trigger_anchor(node, rule_name, original_pending_anchor)
-            if next_trigger_anchor is None:
-                self._remove_pending_trigger(trigger_key)
-            else:
-                next_trigger_ts, next_trigger_seq = next_trigger_anchor
-                self._set_pending_trigger(trigger_key, next_trigger_ts, next_trigger_seq)
-        self._maybe_rebuild_pending_heap()
-
-    def _find_next_trigger_anchor(self, node, rule_name, lower_bound_anchor):
-        """找到严格晚于 lower_bound_anchor 的下一条可用 trigger。"""
-        trigger_events = self.trigger_event_index.get((node, rule_name))
-        if not trigger_events:
-            return None
-
-        _lower_bound_ts, lower_bound_seq = lower_bound_anchor
-        for trigger_event in trigger_events:
-            event_ts, _alarm_id, event_seq, _alarm_type, _alarm_source = (
-                self._unpack_trigger_event(trigger_event)
-            )
-            if event_seq > lower_bound_seq:
-                return event_ts, event_seq
-        return None
-
-    def flush_pending(self):
-        """流处理结束时，强制执行所有还在等待的触发器"""
-        return self._collect_pending_matches(force=True)
 
     def _prune_expired_state(self, current_ts):
         """分批清理长期未再触达节点的过期缓存，避免状态无限滞留。"""
@@ -708,73 +782,6 @@ class TemporalGraphEngine(
 
         self._prune_consumed_alarm_history(finalized)
         return finalized
-
-    def _get_trigger_roles_for_match(self, match_result):
-        merged_rules = match_result["merged_rules"]
-        return {
-            self.rules[rule_name]["trigger_role"]
-            for rule_name in merged_rules
-            if rule_name in self.rules and self.rules[rule_name].get("trigger_role")
-        }
-
-    def _get_non_trigger_nodes_for_match(self, match_result):
-        trigger_roles = self._get_trigger_roles_for_match(match_result)
-        non_trigger_nodes = set()
-
-        for role, nodes in match_result["role_mapping"].items():
-            if role in trigger_roles:
-                continue
-            for node in nodes:
-                if node not in (None, ""):
-                    non_trigger_nodes.add(node)
-
-        return non_trigger_nodes
-
-    def _expand_matches_with_pending_context(self, matches, eval_caches=None):
-        """只读扩充当前批次：汇总整批非 trigger 节点上的 pending，再和当前批统一做一次批内合并。"""
-        if not matches:
-            return matches, build_empty_merge_stats()
-
-        non_trigger_nodes = set()
-        for match_result in matches:
-            non_trigger_nodes.update(self._get_non_trigger_nodes_for_match(match_result))
-
-        if not non_trigger_nodes:
-            return matches, build_empty_merge_stats()
-
-        # 通过反向索引按 non_trigger_nodes 直接取 pending，避免扫全量 pending_triggers。
-        pending_candidates = [
-            (trigger_key, self.pending_triggers[trigger_key])
-            for node in non_trigger_nodes
-            for trigger_key in self._pending_triggers_by_node.get(node, ())
-        ]
-
-        if not pending_candidates:
-            return matches, build_empty_merge_stats()
-
-        extra_matches = []
-        for (node, rule_name), trigger_anchor in pending_candidates:
-            rule = self.rules.get(rule_name)
-            if not rule:
-                continue
-            trigger_ts, _trigger_seq = trigger_anchor
-            results = self._evaluate_rule(
-                rule_name,
-                rule,
-                node,
-                trigger_ts,
-                eval_caches=eval_caches,
-            )
-            if results:
-                extra_matches.extend(results)
-
-        if not extra_matches:
-            return matches, build_empty_merge_stats()
-
-        return merge_match_batch(
-            list(matches) + extra_matches,
-            return_stats=True,
-        )
 
     def _record_batch_merge_stats(self, merge_stats):
         self.last_batch_merge_stats = build_empty_merge_stats()
