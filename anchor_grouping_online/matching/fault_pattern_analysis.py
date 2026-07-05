@@ -7,25 +7,15 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from anchor_grouping_online.alarm_types import OFFLINE_ALARMS
-from anchor_grouping_online.site_topology import build_site_topology_from_ne_graph
 
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 ROUTER_DEVICE_DOMAINS = {"DATA"}
-OTHER_FAULT_PATTERNS = {"ip_ring_others"}
 _EMPTY_NEIGHBORS = frozenset()
-PATTERN_PRIORITY = {
-    "ip_chain_single_link": 0,
-    "ip_chain_multi_link": 1,
-    "ip_ring_single_upstream": 2,
-    "ip_ring_multi_upstream": 3,
-    "ip_ring_others": 4,
-    "unknown": 99,
-}
 
 # —— 性能保护参数 ——
 # longest_path_in_component 对链/环走线性快路径，其余 ≤N 个站的分量用 bitmask 记忆化
 # 求精确最长简单链。该问题本身仍是指数级；双 BFS 近似在带环分量上偏差严重
-    # （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown。
+# （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown。
 #
 # 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
 # unknown -> 该故障组被丢弃，而不是给出错误的近似链。
@@ -135,7 +125,7 @@ def extract_offline_sites(record, ne_to_site):
 
 
 class SiteRelationIndex:
-    def __init__(self, ne_graph_data=None):
+    def __init__(self):
         self.site_chains = {}
         self.downstream_direct = defaultdict(set)
         self.upstream_direct = defaultdict(set)
@@ -146,15 +136,7 @@ class SiteRelationIndex:
         self._supplemental_upstream_distances_cache = {}
         self.precomputed_upstream_hops_complete = False
 
-        if ne_graph_data:
-            downstream_map, _valid_sites = build_site_topology_from_ne_graph(ne_graph_data)
-            for upstream_site, downstream_sites in downstream_map.items():
-                for downstream_site in downstream_sites:
-                    self.downstream_direct[upstream_site].add(downstream_site)
-                    self.upstream_direct[downstream_site].add(upstream_site)
-
     def _load_direct_relations_from_site_chains(self):
-        self._invalidate_neighbor_caches()
         for site_id, chain_info in self.site_chains.items():
             for downstream_site, hop in chain_info.get("downstream_site_hops", {}).items():
                 if hop == 1:
@@ -167,10 +149,6 @@ class SiteRelationIndex:
             for neighbor_site in chain_info.get("bidirectional_sites", set()):
                 self.bidirectional_direct[site_id].add(neighbor_site)
                 self.bidirectional_direct[neighbor_site].add(site_id)
-
-    def _invalidate_neighbor_caches(self):
-        self._undirected_neighbors_cache.clear()
-        self._ring_neighbors_cache.clear()
 
     def _supplemental_upstream_distances(self, downstream_site, precomputed_hops):
         if self.precomputed_upstream_hops_complete:
@@ -282,9 +260,6 @@ class SiteRelationIndex:
             )
         )
 
-    def bidirectional_neighbors(self, site_id):
-        return sorted(self.bidirectional_neighbor_set(site_id))
-
     def undirected_neighbors_in(self, site_id, site_set):
         return {
             neighbor
@@ -304,7 +279,6 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
     remaining = set(site_ids)
     unmanaged_sites = set(initial_unmanaged_sites) & remaining
     absorbed_by = {}
-    absorb_steps = []
 
     # 每个 unmanaged 站点维护一个局部上游候选堆；全局堆只放每个站点当前
     # 最优候选，将全局 heap 操作从 O(候选总数) 降为接近 O(站点数)。
@@ -343,7 +317,7 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
         seed_candidates(unmanaged_site)
 
     while candidates:
-        distance, unmanaged_site, parent_site = heapq.heappop(candidates)
+        _distance, unmanaged_site, parent_site = heapq.heappop(candidates)
         if unmanaged_site not in remaining:
             continue
         if parent_site not in remaining:
@@ -358,14 +332,7 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
         unmanaged_sites.add(parent_site)
         if not parent_was_unmanaged:
             seed_candidates(parent_site)
-        absorb_steps.append({
-            "site": unmanaged_site,
-            "absorbed_by": parent_site,
-            "upstream_hops": distance,
-            "new_unmanaged_site": parent_site,
-        })
-
-    return remaining, unmanaged_sites & remaining, absorbed_by, absorb_steps
+    return remaining, unmanaged_sites & remaining, absorbed_by
 
 
 def iter_connected_components(nodes, relation_index):
@@ -382,10 +349,6 @@ def iter_connected_components(nodes, relation_index):
                 component.add(neighbor)
                 queue.append(neighbor)
         yield component
-
-
-def connected_components(nodes, relation_index):
-    return list(iter_connected_components(nodes, relation_index))
 
 
 def projected_active_components_by_original_graph(
@@ -408,15 +371,11 @@ def projected_active_components_by_original_graph(
 
 @dataclass
 class PreparedPatternCase:
-    """单条记录的模式分析中间结果，供过滤与分类共享。"""
+    """单条匹配的模式判定中间结果。"""
 
-    site_ids: list
-    offline_sites: set
     router_device_sites: set
-    active_sites: set
     active_unmanaged_sites: set
     absorbed_by: dict
-    absorb_steps: list
     projected_components: list
 
 
@@ -440,7 +399,7 @@ def prepare_case_record(
         site_has_router_device,
         site_ids,
     )
-    active_sites, active_unmanaged_sites, absorbed_by, absorb_steps = (
+    active_sites, active_unmanaged_sites, absorbed_by = (
         absorb_unmanaged_downstream_sites(
             site_ids,
             offline_sites,
@@ -454,13 +413,9 @@ def prepare_case_record(
         max_components=component_limit,
     )
     return PreparedPatternCase(
-        site_ids=site_ids,
-        offline_sites=offline_sites,
         router_device_sites=router_device_sites,
-        active_sites=active_sites,
         active_unmanaged_sites=active_unmanaged_sites,
         absorbed_by=absorbed_by,
-        absorb_steps=absorb_steps,
         projected_components=projected_components,
     )
 
@@ -578,52 +533,15 @@ def longest_path_in_component(component, relation_index):
     return []
 
 
-def classify_chain_uplink(chain, component_sites, relation_index):
-    chain = list(chain)
-    chain_set = set(chain)
-    other_sites = set(component_sites) - chain_set
-    external_connected_chain_sites = {
-        chain_site
-        for chain_site in chain
-        if not relation_index.undirected_neighbors(chain_site).isdisjoint(other_sites)
-    }
-    endpoints = {chain[0], chain[-1]} if chain else set()
-    subtype = "single_uplink" if external_connected_chain_sites <= endpoints else "multi_uplink"
-    return subtype, sorted(external_connected_chain_sites)
-
-
-def build_context_edges_for_anchors(anchors, related_sites_by_anchor, relation_type):
-    context_edges = []
-    seen = set()
-    for anchor_site in anchors:
-        for related_site in sorted(related_sites_by_anchor.get(anchor_site, set())):
-            if related_site == anchor_site:
-                continue
-            edge_key = (related_site, anchor_site, relation_type)
-            if edge_key in seen:
-                continue
-            seen.add(edge_key)
-            context_edges.append({
-                "supplemental_site": related_site,
-                "anchor_site": anchor_site,
-                "relation": relation_type,
-            })
-    return context_edges
-
-
-def bidirectional_or_upstream_neighbors(site_id, relation_index):
-    return relation_index.ring_neighbors(site_id)
-
-
 def has_two_bidirectional_or_upstream_neighbors(site_id, relation_index):
-    return len(bidirectional_or_upstream_neighbors(site_id, relation_index)) == 2
+    return len(relation_index.ring_neighbors(site_id)) == 2
 
 
 def classify_ip_ring_chain(chain, relation_index):
     chain = list(chain)
     chain_set = set(chain)
     if len(chain) < 2:
-        return "ip_ring_others", [], []
+        return "ip_ring_others"
 
     endpoints = [chain[0], chain[-1]]
     endpoint_set = set(endpoints)
@@ -633,15 +551,7 @@ def classify_ip_ring_chain(chain, relation_index):
     }
 
     if all(has_two_bidirectional_or_upstream_neighbors(site_id, relation_index) for site_id in chain):
-        context_edges = build_context_edges_for_anchors(
-            endpoints,
-            {
-                endpoint: endpoint_bidir[endpoint] - chain_set
-                for endpoint in endpoints
-            },
-            "bidirectional",
-        )
-        return "ip_ring_single_upstream", context_edges, []
+        return "ip_ring_single_upstream"
 
     internal_sites = [site_id for site_id in chain if site_id not in endpoint_set]
     internal_ring_degree_ok = all(
@@ -656,32 +566,21 @@ def classify_ip_ring_chain(chain, relation_index):
         endpoint: relation_index.direct_upstream_neighbor_set(endpoint)
         for endpoint in endpoints
     }
-    common_bidir_sites = sorted((endpoint_bidir[endpoints[0]] & endpoint_bidir[endpoints[1]]) - chain_set)
-    common_upstream_sites = sorted((endpoint_upstream[endpoints[0]] & endpoint_upstream[endpoints[1]]) - chain_set)
+    has_common_bidir_site = bool(
+        (endpoint_bidir[endpoints[0]] & endpoint_bidir[endpoints[1]]) - chain_set
+    )
+    has_common_upstream_site = bool(
+        (endpoint_upstream[endpoints[0]] & endpoint_upstream[endpoints[1]]) - chain_set
+    )
 
-    if internal_ring_degree_ok and endpoint_condition_failed and (common_bidir_sites or common_upstream_sites):
-        bidir_edges = build_context_edges_for_anchors(
-            endpoints,
-            {
-                endpoint: endpoint_bidir[endpoint] - chain_set
-                for endpoint in endpoints
-            },
-            "bidirectional",
-        )
-        upstream_edges = build_context_edges_for_anchors(
-            endpoints,
-            {
-                endpoint: endpoint_upstream[endpoint] - chain_set
-                for endpoint in endpoints
-            },
-            "upstream",
-        )
-        return "ip_ring_multi_upstream", bidir_edges + upstream_edges, [
-            {"relation": "common_bidirectional", "sites": common_bidir_sites},
-            {"relation": "common_upstream", "sites": common_upstream_sites},
-        ]
+    if (
+        internal_ring_degree_ok
+        and endpoint_condition_failed
+        and (has_common_bidir_site or has_common_upstream_site)
+    ):
+        return "ip_ring_multi_upstream"
 
-    return "ip_ring_others", [], []
+    return "ip_ring_others"
 
 
 def has_absorbed_site_for_final(final_site, absorbed_by):
@@ -706,26 +605,13 @@ def classify_component(
     relation_index,
     router_device_sites=None,
     absorbed_by=None,
-    recognized_patterns_only=False,
-    cap_hits=None,
 ):
     component_sites = set(component_sites)
     component_unmanaged_sites = set(unmanaged_sites) & component_sites
     router_device_sites = set(router_device_sites or [])
     absorbed_by = absorbed_by or {}
-    non_router_sites = component_sites - router_device_sites
-
-    if non_router_sites:
-        return {
-            "pattern": "unknown",
-            "sites": sorted(component_sites),
-            "unmanaged_sites": sorted(component_unmanaged_sites),
-            "managed_sites": [],
-            "final_site": "",
-            "final_managed_site": "",
-            "chains": [],
-            "non_router_sites": sorted(non_router_sites),
-        }
+    if component_sites - router_device_sites:
+        return "unknown"
 
     if len(component_unmanaged_sites) == 1:
         candidate = next(iter(component_unmanaged_sites))
@@ -738,206 +624,43 @@ def classify_component(
             pattern = "unknown"
         if pattern == "ip_chain_single_link" and not has_absorbed_site_for_final(candidate, absorbed_by):
             pattern = "unknown"
+        return pattern
 
-        if pattern == "unknown":
-            return {
-                "pattern": "unknown",
-                "sites": sorted(component_sites),
-                "unmanaged_sites": [candidate],
-                "managed_sites": [],
-                "final_site": "",
-                "final_managed_site": "",
-                "chains": [],
-                "non_downstream_connected_sites": non_downstream_neighbors,
-            }
-
-        return {
-            "pattern": pattern,
-            "sites": sorted(component_sites),
-            "unmanaged_sites": [candidate],
-            "managed_sites": [candidate],
-            "final_site": candidate if pattern == "ip_chain_single_link" else "",
-            "final_managed_site": candidate,
-            "non_downstream_connected_sites": non_downstream_neighbors,
-            "chains": [],
-        }
-
-    if recognized_patterns_only:
-        # 多断站分量最终只会保留两类 ring 模式：single 要求所有链节点满足
-        # “双向或上游邻居数 == 2”，multi 最多允许两个不满足条件的端点。
-        # 超过两个不合格站点时，无论最长链如何都只会落到 others/unknown，
-        # 可以在指数级最长路径搜索前安全丢弃。
-        ring_degree_mismatch_count = sum(
-            not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
-            for site_id in component_unmanaged_sites
-        )
-        if ring_degree_mismatch_count > 2:
-            return {
-                "pattern": "unknown",
-                "sites": sorted(component_sites),
-                "unmanaged_sites": sorted(component_unmanaged_sites),
-                "managed_sites": sorted(component_unmanaged_sites),
-                "final_site": "",
-                "final_managed_site": "",
-                "chains": [],
-            }
-
-    unmanaged_components = connected_components(component_unmanaged_sites, relation_index)
-    if recognized_patterns_only and len(unmanaged_components) != 1:
-        return {
-            "pattern": "unknown",
-            "sites": sorted(component_sites),
-            "unmanaged_sites": sorted(component_unmanaged_sites),
-            "managed_sites": sorted(component_unmanaged_sites),
-            "final_site": "",
-            "final_managed_site": "",
-            "chains": [],
-        }
-    unmanaged_chains = []
-    chain_covered_sites = set()
-    for unmanaged_component in unmanaged_components:
-        chain = longest_path_in_component(unmanaged_component, relation_index)
-        if not chain and len(unmanaged_component) > LONGEST_PATH_EXACT_MAX_SITES:
-            # longest_path 只在 >LONGEST_PATH_EXACT_MAX_SITES 的非链/环分量上放弃精确
-            # 搜索、返回空链（纯链/环走线性快路径不会返回空）。据此统计"因 18 上限被丢弃"。
-            if cap_hits is not None:
-                cap_hits[0] += 1
-        if len(chain) < 2:
-            continue
-        if set(chain) != set(unmanaged_component):
-            continue
-        subtype, external_sites = classify_chain_uplink(chain, component_sites, relation_index)
-        chain_covered_sites.update(chain)
-        unmanaged_chains.append({
-            "chain": chain,
-            "length": len(chain),
-            "uplink_type": subtype,
-            "external_connected_chain_sites": external_sites,
-        })
-    unmanaged_chains.sort(key=lambda item: (-item["length"], item["chain"]))
-
-    if len(unmanaged_chains) == 1 and chain_covered_sites == component_unmanaged_sites:
-        ring_chain = unmanaged_chains[0]["chain"]
-        ring_pattern, context_edges, ring_common_sites = classify_ip_ring_chain(ring_chain, relation_index)
-        return {
-            "pattern": ring_pattern,
-            "sites": sorted(component_sites),
-            "unmanaged_sites": sorted(component_unmanaged_sites),
-            "managed_sites": ring_chain,
-            "final_site": "",
-            "final_managed_site": "",
-            "chains": unmanaged_chains,
-            "supplemental_context_edges": context_edges,
-            "ring_common_sites": ring_common_sites,
-        }
-
-    return {
-        "pattern": "unknown",
-        "sites": sorted(component_sites),
-        "unmanaged_sites": sorted(component_unmanaged_sites),
-        "managed_sites": sorted(component_unmanaged_sites),
-        "final_site": "",
-        "final_managed_site": "",
-        "chains": unmanaged_chains,
-    }
-
-
-def update_analysis_patterns(analysis, component_records):
-    component_records = list(component_records)
-    primary_pattern = "none"
-    if component_records:
-        primary_pattern = min(
-            (item["pattern"] for item in component_records),
-            key=lambda pattern: PATTERN_PRIORITY.get(pattern, 99),
-        )
-    managed_sites = sorted({
-        site_id
-        for component in component_records
-        for site_id in component.get("managed_sites", [])
-    })
-    matched_unmanaged_sites = sorted({
-        site_id
-        for component in component_records
-        for site_id in component.get("unmanaged_sites", [])
-    })
-
-    analysis["pattern"] = primary_pattern
-    analysis["patterns"] = component_records
-    analysis["pattern_count"] = len(component_records)
-    analysis["active_unmanaged_sites"] = matched_unmanaged_sites
-    analysis["managed_sites"] = managed_sites
-    analysis["final_site"] = component_records[0].get("final_site", "") if len(component_records) == 1 else ""
-    analysis["final_managed_site"] = (
-        component_records[0].get("final_managed_site", "") if len(component_records) == 1 else ""
+    # 多断站分量只保留两类 ring 模式：single 要求所有链节点满足
+    # “双向或上游邻居数 == 2”，multi 最多允许两个不满足条件的端点。
+    ring_degree_mismatch_count = sum(
+        not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
+        for site_id in component_unmanaged_sites
     )
-    analysis["chains"] = [
-        chain
-        for component in component_records
-        for chain in component.get("chains", [])
-    ]
-    return analysis
+    if ring_degree_mismatch_count > 2:
+        return "unknown"
+
+    unmanaged_components = list(
+        iter_connected_components(component_unmanaged_sites, relation_index)
+    )
+    if len(unmanaged_components) != 1:
+        return "unknown"
+
+    unmanaged_component = unmanaged_components[0]
+    ring_chain = longest_path_in_component(unmanaged_component, relation_index)
+    if len(ring_chain) < 2 or set(ring_chain) != set(unmanaged_component):
+        return "unknown"
+    return classify_ip_ring_chain(ring_chain, relation_index)
 
 
-def filter_other_patterns(analysis):
-    patterns = analysis.get("patterns", [])
-    if not isinstance(patterns, list) or not patterns:
-        return analysis
-
-    filtered_patterns = [
-        pattern_info
-        for pattern_info in patterns
-        if as_dict(pattern_info).get("pattern") not in OTHER_FAULT_PATTERNS
-    ]
-    if len(filtered_patterns) == len(patterns):
-        return analysis
-    return update_analysis_patterns(dict(analysis), filtered_patterns)
-
-
-def analyze_prepared_case(
-    record,
-    prepared_case,
-    relation_index,
-    recognized_patterns_only=False,
-    cap_hits=None,
-):
-    """使用已计算的公共中间结果完成逐分量分类和分析对象构建。
-
-    cap_hits 传入 [int] 单元素列表时，会累计"因断站簇 > LONGEST_PATH_EXACT_MAX_SITES
-    放弃精确搜索"的次数，供调用方统计被 18 上限丢弃的故障组。
-    """
-    site_ids = prepared_case.site_ids
-    offline_sites = prepared_case.offline_sites
+def has_recognized_fault_pattern(prepared_case, relation_index):
+    """是否至少命中一个可参与二次汇聚的故障模式。"""
     router_device_sites = prepared_case.router_device_sites
-    active_sites = prepared_case.active_sites
     active_unmanaged_sites = prepared_case.active_unmanaged_sites
     absorbed_by = prepared_case.absorbed_by
-    absorb_steps = prepared_case.absorb_steps
-    projected_components = prepared_case.projected_components
-    component_records = []
-    for component_sites in projected_components:
-        component_record = classify_component(
+    for component_sites in prepared_case.projected_components:
+        pattern = classify_component(
             component_sites,
             active_unmanaged_sites,
             relation_index,
             router_device_sites=router_device_sites,
             absorbed_by=absorbed_by,
-            recognized_patterns_only=recognized_patterns_only,
-            cap_hits=cap_hits,
         )
-        if component_record.get("pattern") != "unknown":
-            component_records.append(component_record)
-    component_records.sort(key=lambda item: (item["pattern"], item["sites"]))
-
-    analysis = {
-        "rule": normalize_text(record.get("rule")),
-        "site_count": len(site_ids),
-        "sites": site_ids,
-        "component_count": len(projected_components),
-        "offline_sites": sorted(offline_sites),
-        "site_down_count": len(offline_sites),
-        "router_device_sites": sorted(router_device_sites & set(site_ids)),
-        "active_sites_after_absorption": sorted(active_sites),
-        "absorbed_by": absorbed_by,
-        "absorb_steps": absorb_steps,
-    }
-    return update_analysis_patterns(analysis, component_records)
+        if pattern not in {"unknown", "ip_ring_others"}:
+            return True
+    return False

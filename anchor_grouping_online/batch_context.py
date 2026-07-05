@@ -37,7 +37,7 @@ def load_static_context(args):
     )
     ne_graph_data = resources["ne_graph"]
     site_chain_resource = resources["site_chains"]
-    site_chain_index, _valid_sites = build_site_chain_index(site_chain_resource)
+    site_chain_index = build_site_chain_index(site_chain_resource)
     site_chain_upstream_hops_complete = site_chain_upstream_hops_are_complete(
         site_chain_resource
     )

@@ -1,68 +1,6 @@
 from collections import defaultdict
 
 
-def extract_link_direction_values(link_meta):
-    if isinstance(link_meta, dict):
-        raw_values = link_meta.values()
-    elif isinstance(link_meta, (list, tuple, set)):
-        raw_values = link_meta
-    else:
-        raw_values = (link_meta,)
-
-    direction_values = set()
-    for raw_value in raw_values:
-        text = str(raw_value or "").strip()
-        if text:
-            direction_values.add(text)
-    return direction_values
-
-
-def build_site_topology_from_ne_graph(ne_graph_data):
-    """基于 ne_graph 原始连边构建站点级 downstream 拓扑。"""
-    ne_to_site = {}
-    all_sites = set()
-
-    for ne_id, ne_info in ne_graph_data.items():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = str(ne_info.get("site_id", "") or "").strip()
-        if not site_id:
-            continue
-        ne_to_site[ne_id] = site_id
-        all_sites.add(site_id)
-
-    topo_downstream_map = defaultdict(set)
-    for site_id in all_sites:
-        topo_downstream_map.setdefault(site_id, set())
-
-    for source_ne, source_info in ne_graph_data.items():
-        if not isinstance(source_info, dict):
-            continue
-        source_site = ne_to_site.get(source_ne)
-        if not source_site:
-            continue
-
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-
-        for target_ne, link_meta in raw_links.items():
-            target_site = ne_to_site.get(target_ne)
-            if not target_site or target_site == source_site:
-                continue
-
-            direction_values = extract_link_direction_values(link_meta)
-            if any("<-" in direction for direction in direction_values):
-                topo_downstream_map[source_site].add(target_site)
-            if any("->" in direction for direction in direction_values):
-                topo_downstream_map[target_site].add(source_site)
-
-    return {
-        site_id: tuple(sorted(downstream_sites))
-        for site_id, downstream_sites in topo_downstream_map.items()
-    }, all_sites
-
-
 def normalize_site_chain_hops(hops_map):
     normalized = {}
     if not isinstance(hops_map, dict):
@@ -81,10 +19,9 @@ def normalize_site_chain_hops(hops_map):
 
 
 def build_site_chain_index(data):
-    """从已加载的 site_chains 数据构建上下游 hop 索引与有效站点集合。"""
+    """从已加载的 site_chains 数据构建上下游 hop 索引。"""
     raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
     site_chain_index = {}
-    valid_sites = set()
 
     for raw_site_id, raw_info in raw_sites.items():
         site_id = str(raw_site_id or "").strip()
@@ -103,12 +40,8 @@ def build_site_chain_index(data):
             "upstream_site_hops": upstream_hops,
             "bidirectional_sites": bidirectional_sites,
         }
-        valid_sites.add(site_id)
-        valid_sites.update(downstream_hops)
-        valid_sites.update(upstream_hops)
-        valid_sites.update(bidirectional_sites)
 
-    return site_chain_index, valid_sites
+    return site_chain_index
 
 
 def site_chain_upstream_hops_are_complete(data):

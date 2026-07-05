@@ -85,16 +85,10 @@ def _parse_sorted_alarm_cache_header(first_line, path):
     return metadata
 
 
-def read_sorted_alarm_cache_header(path):
-    line_iter = iter(_iter_sorted_alarm_cache_lines(path))
-    return _parse_sorted_alarm_cache_header(next(line_iter, ""), path)
-
-
-def iter_sorted_alarm_cache_items(path, metadata=None, show_progress=False):
+def iter_sorted_alarm_cache_items(path, show_progress=False):
     line_iter = iter(_iter_sorted_alarm_cache_lines(path))
     first_line = next(line_iter, "")
-    if metadata is None:
-        _parse_sorted_alarm_cache_header(first_line, path)
+    _parse_sorted_alarm_cache_header(first_line, path)
     for idx, line in enumerate(line_iter, start=1):
         line = line.strip()
         if not line:

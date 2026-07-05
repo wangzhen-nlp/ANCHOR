@@ -31,10 +31,7 @@ if __package__ in (None, ""):
     ensure_package_parent()
 
 from anchor_grouping_online.alarm_events.generator import generate_alarm
-from anchor_grouping_online.alarm_events.sorted_cache import (
-    iter_sorted_alarm_cache_items,
-    read_sorted_alarm_cache_header,
-)
+from anchor_grouping_online.alarm_events.sorted_cache import iter_sorted_alarm_cache_items
 from anchor_grouping_online.match_rules_batch import BatchFaultGroupMatcher
 from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
 
@@ -83,11 +80,9 @@ def _iter_window_alarms(alarms_path):
 
     返回的生成器带 skip 统计，结束后可读 .clear_skipped / .ungrouped_skipped。
     """
-    metadata = read_sorted_alarm_cache_header(alarms_path)
-
     def _generate():
         for item in iter_sorted_alarm_cache_items(
-            alarms_path, metadata=metadata, show_progress=True
+            alarms_path, show_progress=True
         ):
             generated_alarm = generate_alarm(item)
             if generated_alarm.get("是否清除"):

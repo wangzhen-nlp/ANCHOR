@@ -8,6 +8,7 @@
 - ne_graph:           NE 邻接图
 - link_peer_index:    端口对端索引
 - site_device_counts: 每个站点各 domain 的设备数量（由 ne_graph 派生）
+- site_chains:        预计算站点上下游 hop 索引
 
 读取过程共享，避免重复 IO：
 
@@ -690,7 +691,10 @@ def build_resource_buffer(ne_records, site_records, link_records, output_path,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="一次性生成单个资源缓冲文件（site_graph / ne_graph / link_peer_index / site_device_counts 各占一个字段）"
+        description=(
+            "一次性生成单个资源缓冲文件（site_graph / ne_graph / "
+            "link_peer_index / site_device_counts / site_chains）"
+        )
     )
     parser.add_argument(
         "--ne-dir",

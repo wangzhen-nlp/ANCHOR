@@ -1,8 +1,4 @@
 from anchor_grouping_online.alarm_types import OFFLINE_ALARMS, POWER_ALARMS, LINK_ALARMS
-from anchor_grouping_online.time_config import (
-  RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
-  RULE_DEFAULT_MAX_STAY_TIME_SEC,
-)
 
 # 规则字典上的可选布尔字段：标记为 True 的规则才可参与二次汇聚。
 # 只有 merged_rules 命中任意一个带 output_eligible=True 的规则，匹配组才会
@@ -94,7 +90,6 @@ data_link_adjacent_no_offline_rule = {
   "description": "本路由Data link且无Data offline，邻接路由无Data offline -> 下挂断站",
   # 终极/可输出规则：包含此规则的匹配组才可参与二次汇聚。
   "output_eligible": True,
-  "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "data_link_underneath_compound_node",
   "exclusive_site_roles": [
     "data_link_adjacent_data_neighbor_node",
@@ -110,14 +105,12 @@ data_link_adjacent_no_offline_rule = {
     {
       "source": "data_link_underneath_compound_node",
       "target": "data_link_parent_data_node",
-      "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC
+      "direction": "upstream"
     },
     {
       "source": "data_link_parent_data_node",
       "target": "data_link_adjacent_data_neighbor_node",
       "direction": ["bidirectional", "upstream", "downstream"],
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "max_hops": 1
     }
   ],
@@ -135,7 +128,6 @@ data_link_adjacent_no_offline_rule = {
 data_link_adjacent_offline_rule = {
   "pattern_name": "data_link_adjacent_offline_context",
   "description": "本路由Data link且无Data offline，邻接路由Data offline，下挂断站可有可无",
-  "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "data_link_offline_parent_data_node",
   "exclusive_site_roles": [
     "data_link_offline_adjacent_data_node",
@@ -152,14 +144,12 @@ data_link_adjacent_offline_rule = {
       "source": "data_link_offline_parent_data_node",
       "target": "data_link_offline_adjacent_data_node",
       "direction": ["bidirectional", "upstream", "downstream"],
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "max_hops": 1
     },
     {
       "source": "data_link_offline_underneath_compound_node",
       "target": "data_link_offline_parent_data_node",
       "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "optional": True
     }
   ]
@@ -170,7 +160,6 @@ data_no_offline_adjacent_optional_offline_rule = {
   "description": "本路由存在下挂断站，双向相邻路由自身Data offline或其下游存在offline",
   # 终极/可输出规则：包含此规则的匹配组才可参与二次汇聚。
   "output_eligible": True,
-  "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "current_underneath_compound_node",
   "exclusive_site_roles": [
     "current_parent_data_node",
@@ -188,21 +177,18 @@ data_no_offline_adjacent_optional_offline_rule = {
     {
       "source": "current_underneath_compound_node",
       "target": "current_parent_data_node",
-      "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC
+      "direction": "upstream"
     },
     {
       "source": "current_parent_data_node",
       "target": "adjacent_router_data_neighbor_node",
       "direction": ["bidirectional", "upstream", "downstream"],
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "max_hops": 1
     },
     {
       "source": "adjacent_router_underneath_compound_node",
       "target": "adjacent_router_data_neighbor_node",
       "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "optional": True
     }
   ],
@@ -225,7 +211,6 @@ data_no_offline_adjacent_optional_offline_rule = {
 data_offline_adjacent_offline_rule = {
   "pattern_name": "data_offline_adjacent_offline_context",
   "description": "本路由Data offline，双向相邻路由Data offline，本路由/相邻路由下挂offline可有可无",
-  "max_stay_time_sec": RULE_DEFAULT_MAX_STAY_TIME_SEC,
   "trigger_role": "offline_current_parent_data_node",
   "exclusive_site_roles": [
     "offline_current_parent_data_node",
@@ -244,7 +229,6 @@ data_offline_adjacent_offline_rule = {
       "source": "offline_current_parent_data_node",
       "target": "offline_adjacent_router_data_neighbor_node",
       "direction": ["bidirectional", "upstream", "downstream"],
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "max_hops": 1,
       "constraints": {
         "dedupe_symmetric_pair": True
@@ -254,14 +238,12 @@ data_offline_adjacent_offline_rule = {
       "source": "offline_adjacent_router_underneath_compound_node",
       "target": "offline_adjacent_router_data_neighbor_node",
       "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "optional": True
     },
     {
       "source": "offline_current_underneath_compound_node",
       "target": "offline_current_parent_data_node",
       "direction": "upstream",
-      "time_window_sec": RULE_DEFAULT_EDGE_TIME_WINDOW_SEC,
       "optional": True
     }
   ]

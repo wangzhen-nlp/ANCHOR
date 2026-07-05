@@ -71,13 +71,9 @@ def apply_clear_delay(first_occurrence_str, clear_time_str, clear_delay_sec):
 def load_valid_alarms(
     alarm_file_path,
     valid_alarm_titles,
-    valid_sites=None,
-    ne_to_site=None,
     start_ts=None,
     end_ts=None,
     clear_delay_sec=0.0,
-    allowed_alarm_sources=None,
-    region_filter_stats=None,
     show_progress=True,
 ):
     processed_count = 0
@@ -92,30 +88,7 @@ def load_valid_alarms(
         if alarm_title not in valid_alarm_titles:
             continue
 
-        alarm_source = str(alarm.get('告警源', '') or '').strip()
-        if allowed_alarm_sources is not None:
-            if region_filter_stats is not None:
-                region_filter_stats["raw_checked_alarm_count"] = (
-                    region_filter_stats.get("raw_checked_alarm_count", 0) + 1
-                )
-            if alarm_source not in allowed_alarm_sources:
-                if region_filter_stats is not None:
-                    region_filter_stats["raw_dropped_alarm_count"] = (
-                        region_filter_stats.get("raw_dropped_alarm_count", 0) + 1
-                    )
-                continue
-            if region_filter_stats is not None:
-                region_filter_stats["raw_kept_alarm_count"] = (
-                    region_filter_stats.get("raw_kept_alarm_count", 0) + 1
-                )
-
         site_id = str(alarm.get('站点ID', '') or '').strip()
-        if valid_sites is not None:
-            if not site_id or site_id not in valid_sites:
-                site_id = str((ne_to_site or {}).get(alarm_source, '') or '').strip()
-
-            if not site_id or site_id not in valid_sites:
-                continue
 
         first_occurrence_str = str(alarm.get("告警首次发生时间", "")).strip()
         first_occurrence_ts = parse_datetime_text(

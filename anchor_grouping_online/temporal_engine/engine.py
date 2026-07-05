@@ -3,11 +3,7 @@ import collections
 from anchor_grouping_online.emitted_group_store import EmittedGroupStore
 from anchor_grouping_online.alarm_events.identity import require_eid
 from anchor_grouping_online.node_rule_helper import NodeRuleHelper
-from anchor_grouping_online.time_config import (
-    DEFAULT_EVENT_TTL_SEC,
-    DEFAULT_POWER_ALARM_TTL_SEC,
-)
-from anchor_grouping_online.alarm_types import LINK_ALARMS, POWER_ALARMS
+from anchor_grouping_online.alarm_types import LINK_ALARMS
 from anchor_grouping_online.temporal_engine.event_cache import TemporalGraphEngineEventCacheMixin
 from anchor_grouping_online.temporal_engine.common import TemporalGraphEngineCommonMixin
 from anchor_grouping_online.temporal_engine.constraints import TemporalGraphEngineConstraintMixin
@@ -133,10 +129,11 @@ class TemporalGraphEngine(
             for rule_name, rule in self.rules.items()
         }
 
-    def _build_ne_adjacency(self):
+    @staticmethod
+    def _build_ne_adjacency(ne_graph_data):
         """从 ne_graph_data 构造 NE 级双向邻接表（任一方向有 link 即视为相邻）。"""
         adj = collections.defaultdict(set)
-        for src_ne, info in self._ne_graph_data.items():
+        for src_ne, info in ne_graph_data.items():
             if not src_ne or not isinstance(info, dict):
                 continue
             links = info.get("link")
@@ -190,6 +187,7 @@ class TemporalGraphEngine(
         ne_graph_data,
         site_to_ne_ids,
         link_peer_index,
+        event_ttl,
         alarm_source_domain_map=None,
         enable_batch_upsert_indexes=False,
         shared_static_context=None,
@@ -219,10 +217,8 @@ class TemporalGraphEngine(
         self._batch_event_by_alarm_id = (
             {} if enable_batch_upsert_indexes else None
         )
-        # 默认告警缓存保留时长，单位秒
-        self.global_ttl = DEFAULT_EVENT_TTL_SEC
-        # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
-        self.power_alarm_ttl = DEFAULT_POWER_ALARM_TTL_SEC
+        # 告警缓存保留时长，单位秒。
+        self.global_ttl = float(event_ttl)
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
         self.alarm_source_domain_map = alarm_source_domain_map or {}
@@ -254,7 +250,6 @@ class TemporalGraphEngine(
         # NE 级拓扑数据（用于 alarm_source_ne_anchor 约束）。
         # ne_graph_data: {ne_id: {"site_id": ..., "link": {neighbor_ne_id: {...}}}}
         # site_to_ne_ids: {site_id: (ne_id, ...)}
-        self._ne_graph_data = ne_graph_data
         self._link_peer_index = link_peer_index
         if shared_static_context is not None:
             self.role_site_index = shared_static_context["role_site_index"]
@@ -268,7 +263,7 @@ class TemporalGraphEngine(
                 self.node_rule_helper,
             )
             self._ne_to_site = {}
-            for ne_id, info in self._ne_graph_data.items():
+            for ne_id, info in ne_graph_data.items():
                 if not isinstance(info, dict):
                     continue
                 site_id = str(info.get("site_id", "") or "").strip()
@@ -282,7 +277,7 @@ class TemporalGraphEngine(
             }
             if not self._site_to_ne_ids:
                 raise ValueError("必须提供非空 site_to_ne_ids")
-            self._ne_adjacency = self._build_ne_adjacency()
+            self._ne_adjacency = self._build_ne_adjacency(ne_graph_data)
         # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
         # 不含规则名，跨规则、跨 trigger 自动复用。
         self._anchor_ne_reachable_cache = {}
@@ -365,9 +360,7 @@ class TemporalGraphEngine(
                 "consumed_trigger_rules": frozenset(),
             }
             self.event_cache[node].append(cached_event)
-            batch_event_index = getattr(
-                self, "_batch_event_by_alarm_id", None
-            )
+            batch_event_index = self._batch_event_by_alarm_id
             if batch_event_index is not None:
                 batch_event_index[alarm_id] = cached_event
 
@@ -523,16 +516,13 @@ class TemporalGraphEngine(
         self.trigger_event_index[trigger_key].append(trigger_event)
 
     def _forget_batch_cached_event(self, node, cached_event):
-        event_index = getattr(self, "_batch_event_by_alarm_id", None)
+        event_index = self._batch_event_by_alarm_id
         if event_index is None:
             return
         alarm_id = cached_event.get("eid")
         indexed = event_index.get(alarm_id)
         if indexed is cached_event:
             event_index.pop(alarm_id, None)
-
-    def _get_event_ttl(self, alarm_type):
-        return self.power_alarm_ttl if alarm_type in POWER_ALARMS else self.global_ttl
 
     def _collect_trigger_expected_list(self, trigger_node_domain, trigger_config):
         expected_list = []

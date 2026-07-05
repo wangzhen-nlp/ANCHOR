@@ -3,7 +3,7 @@
 对外接口只有 BatchFaultGroupMatcher.aggregate_alarm_groups：输入已成组的
 故障组集合 {故障组id: [告警, ...]}，输出
 {汇聚故障组id: [{故障组id: [告警, ...]}, ...], ...}。
-告警为告警生成器（alarm_events.generator.AlarmGenerator）yield 出的字典，
+告警为 alarm_events.generator.generate_alarm() 生成的字典，
 字段形如：
 
     {
@@ -30,7 +30,7 @@
    结束后丢弃剩余 trigger，不进入下一批；
 3. 本批 trigger 处理完后统一做批内合并（merge_match_batch），再执行历史
    合并与输出可见性过滤；
-4. 匹配出的故障组经可落盘规则过滤、故障模式过滤后，作为原始故障组之间的
+4. 匹配出的故障组经可参与二次汇聚规则过滤、故障模式过滤后，作为原始故障组之间的
    关联证据：同一匹配组覆盖到的本批原始组连到一起，并通过症状告警的既有
    归属挂到历史汇聚组上；输出为增量形式——key 是稳定的汇聚组 ID，
    value 只含本批输入的原始组条目（组 ID 及其告警）。
@@ -135,11 +135,10 @@ class BatchFaultGroupMatcher:
                 的告警列表（告警为告警生成器输出的字典，见模块 docstring）。
                 格式：{故障组id1: [告警1, ...], ...}
             associate_time   int              必选
-                关联告警的时间窗，单位分钟。即匹配阶段的规则边时间窗
-                （替换 RULE_DEFAULT_EDGE_TIME_WINDOW_SEC）。
+                关联告警的时间窗，单位分钟。即匹配阶段的规则边时间窗。
             max_group_time   int              必选
                 汇聚后故障组允许的最大时间窗，单位分钟。即匹配阶段的组保留
-                时长（替换 RULE_DEFAULT_MAX_STAY_TIME_SEC）。
+                时长。
             max_group_member int              必选
                 汇聚故障组允许包含的最大**原始故障组个数**。附着会
                 使组数超限时放弃附着；本批内部分量超限时按成员时间顺序
@@ -228,8 +227,7 @@ class BatchFaultGroupMatcher:
                 session = self._ensure_session(associate_time, max_group_time)
         engine = session["engine"]
         # trigger 只描述“本批哪些告警主动发起匹配”。持久会话只保留事件
-        # 缓存和汇聚归属；每次调用从空工作集开始，防御性清除旧版本残留。
-        engine.trigger_event_index.clear()
+        # 缓存和汇聚归属；上次调用的 trigger 工作集已在 finally 中清空。
 
         # 1. 登记本次输入。原始组的告警集/时间只作为本批的局部档案；
         #    会话里只记「告警 -> 汇聚组 ID」的归属。
@@ -242,9 +240,7 @@ class BatchFaultGroupMatcher:
         overlapping_generated_alarms = []
         batch_alarm_ids = set()
         batch_min_ts = None
-        use_batch_upsert = (
-            getattr(engine, "_batch_event_by_alarm_id", None) is not None
-        )
+        use_batch_upsert = engine._batch_event_by_alarm_id is not None
         # 持久会话通过 eid upsert 索引判断实际缓存；隔离/外置临时会话
         # 要么全新为空，要么由 old_agg 完整重建，登记状态即等于缓存状态。
         # 因此所有模式都无需再全量扫描 event_cache 构造 ID set。
@@ -827,12 +823,9 @@ class BatchFaultGroupMatcher:
             _override_rule_time_config(
                 self.rules_config, associate_window_sec, max_stay_sec
             ),
+            event_ttl=max_stay_sec,
             enable_batch_upsert_indexes=enable_batch_upsert_indexes,
         )
-        # TTL 只被批开始的视界清扫使用（以 batch_min_ts 为基准），
-        # 统一固定为 max_stay：清理线 = batch_min_ts − max_stay = 视界。
-        engine.global_ttl = max_stay_sec
-        engine.power_alarm_ttl = max_stay_sec
         session = {
             "engine": engine,
             "associate_window_sec": associate_window_sec,
@@ -933,7 +926,12 @@ class BatchFaultGroupMatcher:
             trigger_candidates=trigger_candidates,
         )
 
-    def _new_engine(self, rules_config, enable_batch_upsert_indexes=False):
+    def _new_engine(
+        self,
+        rules_config,
+        event_ttl,
+        enable_batch_upsert_indexes=False,
+    ):
         """新建批处理引擎：喂流只维护事件缓存与 trigger 索引，不触发规则
         评估、也不做 TTL 清理（历史回收统一在每批开始的视界清扫完成）。"""
         static_context = self.static_context
@@ -946,6 +944,7 @@ class BatchFaultGroupMatcher:
             ne_graph_data=static_context.ne_graph_data,
             site_to_ne_ids=static_context.site_to_ne_ids,
             link_peer_index=static_context.link_peer_index,
+            event_ttl=event_ttl,
             enable_batch_upsert_indexes=enable_batch_upsert_indexes,
             shared_static_context=shared_static_context,
         )
@@ -962,9 +961,8 @@ class BatchFaultGroupMatcher:
         按首触发时间升序处理，因此消费回收的 cutoff 只会清理不晚于本组
         症状时间的历史，不影响更晚的独立故障。
         每次汇聚成功后立即调用引擎既有的 _prune_consumed_alarm_history：
-        被故障组消费的 trigger 告警会从 trigger_event_index 中删除
-            后续 trigger 若已被消费
-        会被直接跳过，不再重复汇聚。
+        被故障组消费的 trigger 告警会从 trigger_event_index 中删除；
+        后续 trigger 若已被消费，会被直接跳过，不再重复汇聚。
 
         trigger_candidates 是喂流阶段直接返回的本批候选三元组
         (ts, seq, trigger_key)，无需再扫描 trigger_event_index 筛本批序号。
@@ -1012,7 +1010,7 @@ class BatchFaultGroupMatcher:
         return engine._apply_output_visibility_filters_to_matches(finalized_matches)
 
     def _iter_output_matches(self, matches):
-        """按输出口径过滤 match：可落盘规则过滤 + 故障模式过滤。
+        """按二次汇聚口径过滤 match：规则过滤 + 故障模式过滤。
 
         通过过滤的匹配组才能作为原始故障组之间的汇聚证据。
         """
@@ -1027,22 +1025,18 @@ class BatchFaultGroupMatcher:
             yield match
 
     def _match_is_output_eligible(self, match):
-        """故障组是否满足可落盘规则要求。
+        """故障组是否满足可参与二次汇聚的规则要求。
 
         output_eligible_rules 为 None 时全部放行；否则要求 merged_rules（单个规则名
-        列表，权威来源）与可落盘规则集合有交集。merged_rules 缺失时退回到 rule 字段。
+        列表，权威来源）与可参与二次汇聚规则集合有交集。
         """
         eligible = self.output_eligible_rules
         if eligible is None:
             return True
-        merged_rules = match.get("merged_rules")
-        if isinstance(merged_rules, list):
-            for rule_name in merged_rules:
-                if str(rule_name).strip() in eligible:
-                    return True
-            return False
-        rule = match.get("rule")
-        return isinstance(rule, str) and rule.strip() in eligible
+        return any(
+            str(rule_name).strip() in eligible
+            for rule_name in match["merged_rules"]
+        )
 
 
 def _override_rule_time_config(rules_config, edge_window_sec, max_stay_sec):
@@ -1128,7 +1122,6 @@ def _update_session_time_params(session, associate_window_sec, max_stay_sec):
         rule["max_stay_time_sec"] = max_stay_sec
     engine._compile_rule_execution_plans()
     engine.global_ttl = max_stay_sec
-    engine.power_alarm_ttl = max_stay_sec
     session["associate_window_sec"] = associate_window_sec
     session["max_stay_sec"] = max_stay_sec
 

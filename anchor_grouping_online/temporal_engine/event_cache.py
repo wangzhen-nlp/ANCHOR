@@ -13,7 +13,7 @@ class TemporalGraphEngineEventCacheMixin:
         if not q:
             return
 
-        while q and (current_ts - q[0]["ts"]) > self._get_event_ttl(q[0]["alarm"]):
+        while q and (current_ts - q[0]["ts"]) > self.global_ttl:
             expired_event = q.popleft()
             self._forget_batch_cached_event(node, expired_event)
 
@@ -107,7 +107,7 @@ class TemporalGraphEngineEventCacheMixin:
                 continue
 
             updated_event = event
-            if getattr(self, "_batch_event_by_alarm_id", None) is None:
+            if self._batch_event_by_alarm_id is None:
                 # 隔离模式使用复制替换语义；持久批处理必须原地
                 # 更新，确保 eid 索引继续指向缓存中的同一个事件对象。
                 updated_event = dict(event)

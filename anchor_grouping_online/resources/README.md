@@ -8,17 +8,16 @@
 
 ## 默认约定的资源
 
-匹配/链路工具读取（运行时由上游产物或部署填入）：
+匹配器读取（运行时由上游产物或部署填入）：
 
-- `ne_graph.json` —— NE 邻接图
-- `site_chains.json` —— `generate_site_chains.py` 预计算的站点链路
-- `link_peer_index.json` —— 设备端口对端索引
-- `sys_link_1231.jsonl` —— 链路记录
+- `resource_buffer.jsonl` —— 包含 `ne_graph`、`site_chains`、
+  `link_peer_index` 等资源的缓冲文件
 
 资源缓冲构建工具读取的原始输入目录（仓库里只放占位 `.gitkeep`，不强制提交真实数据）：
 
-- `SYS_NE_0306/`
-- `SYS_SITE_0306/`
+- `SYS_NE_20260525/`
+- `SYS_SITE_20260525/`
+- `SYS_LINK_20260525/`
 
 ## 说明
 

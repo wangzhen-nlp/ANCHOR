@@ -2,20 +2,6 @@ from anchor_grouping_online.alarm_events.identity import require_alarm_identity
 from anchor_grouping_online.alarm_events.io import is_clear_alarm, parse_datetime_text
 
 
-class AlarmGenerator:
-    """将已过滤、已排序的告警数据惰性转换为对外告警字典。"""
-
-    def __init__(self, alarm_data):
-        self._alarm_data = alarm_data
-
-    def __len__(self):
-        return len(self._alarm_data)
-
-    def __iter__(self):
-        for item in self._alarm_data:
-            yield generate_alarm(item)
-
-
 def generate_alarm(item):
     if not isinstance(item, dict):
         raise ValueError("alarm data item must be a dict")

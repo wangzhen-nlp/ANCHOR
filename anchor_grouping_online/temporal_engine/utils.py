@@ -222,12 +222,6 @@ def merge_match_component(component_matches):
     return merged
 
 
-def build_empty_merge_stats():
-    return {
-        "eid_merge_group_count": 0,
-    }
-
-
 def normalize_match_symptoms(match):
     """按唯一告警 ID 去掉单个候选组内的重复发生。"""
     symptoms = match["symptoms"]
@@ -259,15 +253,13 @@ def normalize_match_symptoms(match):
     return normalized_match
 
 
-def merge_match_batch(matches, return_stats=False):
+def merge_match_batch(matches):
     """在同一轮收割内，先把共享 eid 的候选组合并后再输出。"""
-    merge_stats = build_empty_merge_stats()
     if len(matches) <= 1:
-        normalized_matches = [
+        return [
             normalize_match_symptoms(match)
             for match in matches
         ]
-        return (normalized_matches, merge_stats) if return_stats else normalized_matches
 
     parent = list(range(len(matches)))
 
@@ -277,15 +269,11 @@ def merge_match_batch(matches, return_stats=False):
             idx = parent[idx]
         return idx
 
-    def union(left, right, reason=None):
+    def union(left, right):
         left_root = find(left)
         right_root = find(right)
         if left_root != right_root:
             parent[right_root] = left_root
-            if reason:
-                stat_key = f"{reason}_merge_group_count"
-                if stat_key in merge_stats:
-                    merge_stats[stat_key] += 1
             return True
         return False
 
@@ -302,7 +290,7 @@ def merge_match_batch(matches, return_stats=False):
             continue
         head = indexes[0]
         for idx in indexes[1:]:
-            union(head, idx, reason="eid")
+            union(head, idx)
 
     groups = collections.defaultdict(list)
     group_indexes = collections.defaultdict(list)
@@ -318,7 +306,7 @@ def merge_match_batch(matches, return_stats=False):
             merged_matches.append(matches[indexes[0]])
             continue
         merged_matches.append(merge_match_component(component_matches))
-    return (merged_matches, merge_stats) if return_stats else merged_matches
+    return merged_matches
 
 
 def clone_instance_with_updates(inst, curr_role, surviving_curr_phys, tgt_role, tgt_nodes):

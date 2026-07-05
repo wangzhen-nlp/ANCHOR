@@ -4,29 +4,15 @@
 至少一个可识别故障模式时，匹配结果才可作为原始故障组之间的关联证据。
 """
 
-from dataclasses import dataclass
-
 from anchor_grouping_online.matching.fault_pattern_analysis import (
     MAX_ANALYSIS_SITES,
     SiteRelationIndex,
-    analyze_prepared_case,
     build_site_has_router_device_map,
     extract_case_sites,
-    filter_other_patterns,
+    has_recognized_fault_pattern,
     normalize_text,
     prepare_case_record,
 )
-
-
-@dataclass
-class FaultPatternFilterStats:
-    """二次汇聚前过滤丢弃统计（按阈值归因）。"""
-
-    # 整组总站点数 > MAX_ANALYSIS_SITES(200) 直接拒绝的故障组数。
-    dropped_by_max_analysis_sites: int = 0
-    # 因某个断站簇 > LONGEST_PATH_EXACT_MAX_SITES(18) 放弃精确搜索、
-    # 最终导致整组无可识别模式而被丢弃的故障组数。
-    dropped_by_longest_path_cap: int = 0
 
 
 class FaultPatternFilter:
@@ -41,7 +27,6 @@ class FaultPatternFilter:
         self._relation_index = relation_index
         self._ne_to_site = ne_to_site
         self._site_has_router_device = site_has_router_device
-        self.stats = FaultPatternFilterStats()
 
     @classmethod
     def from_static_context(
@@ -55,18 +40,14 @@ class FaultPatternFilter:
 
         site_chain_index 包含 downstream_site_hops、upstream_site_hops 和
         bidirectional_sites，可直接注入 SiteRelationIndex 并展开为直接上下游/双向
-        邻接关系；缺失时退化为仅凭 ne_graph 拓扑（此时没有双向环关系，无法识别
-        ip_ring_* 模式）。
+        邻接关系。
         """
-        if site_chain_index:
-            relation_index = SiteRelationIndex()
-            relation_index.site_chains = site_chain_index
-            relation_index.precomputed_upstream_hops_complete = bool(
-                precomputed_upstream_hops_complete
-            )
-            relation_index._load_direct_relations_from_site_chains()
-        else:
-            relation_index = SiteRelationIndex(ne_graph_data=ne_graph_data)
+        relation_index = SiteRelationIndex()
+        relation_index.site_chains = site_chain_index
+        relation_index.precomputed_upstream_hops_complete = bool(
+            precomputed_upstream_hops_complete
+        )
+        relation_index._load_direct_relations_from_site_chains()
         site_has_router_device = build_site_has_router_device_map(ne_graph_data)
         return cls(
             relation_index,
@@ -90,7 +71,6 @@ class FaultPatternFilter:
         """返回可用于二次汇聚的模式分析；不满足条件时返回 None。"""
         site_ids = self._extract_match_sites(match)
         if len(site_ids) > MAX_ANALYSIS_SITES:
-            self.stats.dropped_by_max_analysis_sites += 1
             return None
 
         prepared_case = prepare_case_record(
@@ -105,19 +85,9 @@ class FaultPatternFilter:
         if len(prepared_case.projected_components) != 1:
             return None
 
-        cap_hits = [0]
-        analysis = analyze_prepared_case(
-            match,
+        if not has_recognized_fault_pattern(
             prepared_case,
             self._relation_index,
-            recognized_patterns_only=True,
-            cap_hits=cap_hits,
-        )
-        analysis = filter_other_patterns(analysis)
-        if not analysis.get("patterns"):
-            # 归因：仅当本组分析确实触发了 >LONGEST_PATH_EXACT_MAX_SITES 的精确搜索
-            # 放弃（cap_hits>0），才计入被 18 上限丢弃；其它无模式丢弃不计入。
-            if cap_hits[0] > 0:
-                self.stats.dropped_by_longest_path_cap += 1
+        ):
             return None
-        return analysis
+        return True
