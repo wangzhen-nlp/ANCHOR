@@ -108,7 +108,7 @@ class TemporalGraphEngineEventCacheMixin:
 
             updated_event = event
             if getattr(self, "_batch_event_by_alarm_id", None) is None:
-                # 在线/隔离模式保持既有复制替换语义；持久批处理必须原地
+                # 隔离模式使用复制替换语义；持久批处理必须原地
                 # 更新，确保 eid 索引继续指向缓存中的同一个事件对象。
                 updated_event = dict(event)
             updated_event["consumed_trigger_rules"] = frozenset(

@@ -1,6 +1,4 @@
-"""加载端口对端索引，并解析链路告警的本端与对端。"""
-
-import json
+"""构建端口对端索引，并解析链路告警的本端与对端。"""
 
 from dataclasses import dataclass
 
@@ -19,12 +17,6 @@ class LinkAlarmEndpoints:
 class PeerDevice:
     ne_native_id: str
     port_name: str = ""
-
-
-def load_peer_index(path):
-    with open(path, "r", encoding="utf-8") as file_obj:
-        data = json.load(file_obj)
-    return build_peer_index(data)
 
 
 def build_peer_index(data):

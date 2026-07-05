@@ -1,5 +1,4 @@
 import collections
-import uuid
 
 from anchor_grouping_online.alarm_events.identity import require_eid
 
@@ -190,7 +189,6 @@ def merge_match_component(component_matches):
     })
     combined_rule_name = " + ".join(merged_rules)
     merged = {
-        "uuid": str(uuid.uuid4()),
         "rule": combined_rule_name,
         "merged_rules": merged_rules,
         "inferred_roots": {},
@@ -198,7 +196,6 @@ def merge_match_component(component_matches):
         "symptoms": []
     }
 
-    related_group_uuids = set()
     expire_ts_hint = max(source["_expire_ts_hint"] for source in component_matches)
     symptom_map = {}
 
@@ -219,11 +216,7 @@ def merge_match_component(component_matches):
             else:
                 symptom_map[alarm_key] = merge_symptom_role_metadata(existing_symptom, symptom)
 
-        related_group_uuids.update(source.get("related_group_uuids", []))
-
     merged["symptoms"] = list(symptom_map.values())
-    if related_group_uuids:
-        merged["related_group_uuids"] = sorted(related_group_uuids)
     merged["_expire_ts_hint"] = expire_ts_hint
 
     return merged
@@ -233,16 +226,6 @@ def build_empty_merge_stats():
     return {
         "eid_merge_group_count": 0,
     }
-
-
-def add_merge_stats(*stats_list):
-    total = build_empty_merge_stats()
-    for stats in stats_list:
-        if not stats:
-            continue
-        for key in total:
-            total[key] += int(stats.get(key, 0) or 0)
-    return total
 
 
 def normalize_match_symptoms(match):

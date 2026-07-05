@@ -1,5 +1,3 @@
-import json
-
 from collections import defaultdict
 
 
@@ -80,13 +78,6 @@ def normalize_site_chain_hops(hops_map):
         if hop > 0:
             normalized[related_site_id] = hop
     return normalized
-
-
-def load_site_chain_index(site_chains_path):
-    """加载 generate_site_chains.py 产出的预计算上下游 hop 索引。"""
-    with open(site_chains_path, "r", encoding="utf-8") as file_obj:
-        data = json.load(file_obj)
-    return build_site_chain_index(data)
 
 
 def build_site_chain_index(data):

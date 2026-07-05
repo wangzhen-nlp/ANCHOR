@@ -1,7 +1,7 @@
 """滑动窗口二次汇聚测试：排序告警流 -> 逐窗口 aggregate_alarm_groups -> jsonl。
 
-输入与 match_rules.py --stream-sorted-alarms 相同：prepare_sorted_alarms.py
-生成的排序告警缓存（JSONL/ZIP）。预处理按发生时间做滑动窗口切段（默认每段
+输入为 prepare_sorted_alarms.py 生成的排序告警缓存（JSONL/ZIP）。预处理按
+发生时间做滑动窗口切段（默认每段
 7 分钟、步长 1 分钟，一条告警最多落进 7 个段），全程流式，不整体加载：
 
 1. 逐条读取排序告警并转成生成器输出字典；清除告警与「故障组ID」为空的
@@ -117,7 +117,7 @@ def run_sliding_window_aggregation(
     """按滑动窗口切段并逐窗口二次汇聚，返回运行统计。
 
     默认 matcher 跨窗口持久（有状态）：本窗口的故障组可以与之前窗口喂入
-    的告警/故障组建立汇聚关系（match_rules.py 的在线语义）。
+    的告警/故障组建立汇聚关系。
     batch_isolated=True 时只做本窗口内的告警汇聚，不使用跨窗口信息，
     汇聚组 ID（UUID）每窗口独立生成，跨窗口比较无意义。
     """

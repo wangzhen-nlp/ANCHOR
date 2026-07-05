@@ -1,12 +1,4 @@
-"""故障模式分析与记录增强。
-
-主要功能：
-
-  1) 过滤判定：站点连通分量拆分、断站吸收、链/环模式识别（analyze_case_record、
-     filter_other_patterns / SiteRelationIndex 等）。
-  2) 记录增强：故障模式备注（note）、fault_pattern_* 字段、补充相关站点/网元/链路
-     （supplemental_fault_pattern_context，供 ne_propagation_visualizer.html 标红展示）。
-"""
+"""故障模式过滤分析：连通分量拆分、断站吸收及链/环模式识别。"""
 
 import heapq
 
@@ -15,10 +7,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from anchor_grouping_online.alarm_types import OFFLINE_ALARMS
-from anchor_grouping_online.site_topology import (
-    build_site_topology_from_ne_graph,
-    load_site_chain_index,
-)
+from anchor_grouping_online.site_topology import build_site_topology_from_ne_graph
 
 OFFLINE_ALARM_SET = set(OFFLINE_ALARMS)
 ROUTER_DEVICE_DOMAINS = {"DATA"}
@@ -36,7 +25,7 @@ PATTERN_PRIORITY = {
 # —— 性能保护参数 ——
 # longest_path_in_component 对链/环走线性快路径，其余 ≤N 个站的分量用 bitmask 记忆化
 # 求精确最长简单链。该问题本身仍是指数级；双 BFS 近似在带环分量上偏差严重
-# （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown，不可用于落盘判定。
+    # （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown。
 #
 # 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
 # unknown -> 该故障组被丢弃，而不是给出错误的近似链。
@@ -75,23 +64,9 @@ def normalize_site_list(values):
     return result
 
 
-def extract_record_uuid(record):
-    match_info = as_dict(record.get("match_info"))
-    return normalize_text(match_info.get("uuid") or record.get("uuid"))
-
-
 def extract_case_sites(record):
     site_ids = set()
-    group_info = as_dict(record.get("group_info"))
-    for group_meta in group_info.values():
-        if isinstance(group_meta, dict):
-            site_ids.update(normalize_site_list(group_meta.get("site_list", [])))
-
-    for field_name in ("ticket_sites", "associated_sites", "missing_sites"):
-        site_ids.update(normalize_site_list(record.get(field_name, [])))
-
-    match_info = as_dict(record.get("match_info"))
-    role_mapping = as_dict(match_info.get("role_mapping") or record.get("role_mapping"))
+    role_mapping = as_dict(record.get("role_mapping"))
     for value in role_mapping.values():
         site_ids.update(normalize_site_list(value if isinstance(value, list) else [value]))
 
@@ -107,30 +82,20 @@ def extract_case_sites(record):
 def extract_alarm_name(record):
     if not isinstance(record, dict):
         return ""
-    return (
-        normalize_text(record.get("alarm"))
-        or normalize_text(record.get("alarm_type"))
-        or normalize_text(record.get("告警标题"))
-    )
+    return normalize_text(record.get("alarm"))
 
 
 def extract_domain(record):
     if not isinstance(record, dict):
         return ""
-    return (
-        normalize_text(record.get("domain"))
-        or normalize_text(record.get("Domain"))
-        or normalize_text(record.get("DOMAIN"))
-        or normalize_text(record.get("alarm_source_domain"))
-        or normalize_text(record.get("告警源专业"))
-    ).upper()
+    return normalize_text(record.get("domain")).upper()
 
 
 def extract_record_site(record, ne_to_site):
-    site_id = normalize_text(record.get("node")) or normalize_text(record.get("site_id")) or normalize_text(record.get("站点ID"))
+    site_id = normalize_text(record.get("node"))
     if site_id:
         return site_id
-    alarm_source = normalize_text(record.get("alarm_source")) or normalize_text(record.get("告警源"))
+    alarm_source = normalize_text(record.get("alarm_source"))
     return normalize_text(ne_to_site.get(alarm_source, ""))
 
 
@@ -147,26 +112,12 @@ def build_site_has_router_device_map(ne_graph_data):
     return dict(site_has_router_device)
 
 
-def extract_case_router_device_sites(record, site_has_router_device, site_ids=None):
-    if site_ids is None:
-        site_ids = extract_case_sites(record)
-    router_sites = {
+def extract_case_router_device_sites(site_has_router_device, site_ids):
+    return {
         site_id
         for site_id in site_ids
         if site_has_router_device.get(site_id, False)
     }
-
-    for ne_meta in as_dict(record.get("ne_info")).values():
-        if not isinstance(ne_meta, dict):
-            continue
-        site_id = normalize_text(ne_meta.get("site_id"))
-        if site_id and extract_domain(ne_meta) in ROUTER_DEVICE_DOMAINS:
-            router_sites.add(site_id)
-        for alarm in ne_meta.get("alarm", []) or []:
-            if site_id and isinstance(alarm, dict) and extract_domain(alarm) in ROUTER_DEVICE_DOMAINS:
-                router_sites.add(site_id)
-
-    return router_sites
 
 
 def extract_offline_sites(record, ne_to_site):
@@ -180,32 +131,22 @@ def extract_offline_sites(record, ne_to_site):
             if site_id:
                 offline_sites.add(site_id)
 
-    for ne_id, ne_meta in as_dict(record.get("ne_info")).items():
-        site_id = normalize_text(as_dict(ne_meta).get("site_id")) or normalize_text(ne_to_site.get(ne_id, ""))
-        for alarm in as_dict(ne_meta).get("alarm", []) or []:
-            if isinstance(alarm, dict) and extract_alarm_name(alarm) in OFFLINE_ALARM_SET and site_id:
-                offline_sites.add(site_id)
-
     return offline_sites
 
 
 class SiteRelationIndex:
-    def __init__(self, ne_graph_data=None, site_chains_path=""):
+    def __init__(self, ne_graph_data=None):
         self.site_chains = {}
         self.downstream_direct = defaultdict(set)
         self.upstream_direct = defaultdict(set)
         self.bidirectional_direct = defaultdict(set)
         self._undirected_neighbors_cache = {}
         self._ring_neighbors_cache = {}
-        self._upstream_distance_cache = {}
         # 只缓存 site_chains 预计算索引中缺失、由 BFS 补出的距离；不复制原 hop dict。
         self._supplemental_upstream_distances_cache = {}
         self.precomputed_upstream_hops_complete = False
 
-        if site_chains_path:
-            self.site_chains, _valid_sites = load_site_chain_index(site_chains_path)
-            self._load_direct_relations_from_site_chains()
-        elif ne_graph_data:
+        if ne_graph_data:
             downstream_map, _valid_sites = build_site_topology_from_ne_graph(ne_graph_data)
             for upstream_site, downstream_sites in downstream_map.items():
                 for downstream_site in downstream_sites:
@@ -230,35 +171,6 @@ class SiteRelationIndex:
     def _invalidate_neighbor_caches(self):
         self._undirected_neighbors_cache.clear()
         self._ring_neighbors_cache.clear()
-
-    def upstream_distance(self, downstream_site, upstream_site):
-        if downstream_site == upstream_site:
-            return 0
-
-        chain_info = self.site_chains.get(downstream_site, {})
-        upstream_hops = chain_info.get("upstream_site_hops", {})
-        if upstream_site in upstream_hops:
-            return upstream_hops[upstream_site]
-
-        cache_key = (downstream_site, upstream_site)
-        if cache_key in self._upstream_distance_cache:
-            return self._upstream_distance_cache[cache_key]
-
-        queue = deque([(downstream_site, 0)])
-        visited = {downstream_site}
-        while queue:
-            site_id, hop = queue.popleft()
-            for parent_site in self.upstream_direct.get(site_id, set()):
-                if parent_site in visited:
-                    continue
-                if parent_site == upstream_site:
-                    self._upstream_distance_cache[cache_key] = hop + 1
-                    return hop + 1
-                visited.add(parent_site)
-                queue.append((parent_site, hop + 1))
-
-        self._upstream_distance_cache[cache_key] = None
-        return None
 
     def _supplemental_upstream_distances(self, downstream_site, precomputed_hops):
         if self.precomputed_upstream_hops_complete:
@@ -288,20 +200,6 @@ class SiteRelationIndex:
             and hop is not None
             and hop > 0
         )
-
-    def iter_upstream_distances(self, downstream_site):
-        """迭代某站点的全部可达上游及距离，不复制预计算 hop 字典。"""
-        chain_info = self.site_chains.get(downstream_site, {})
-        precomputed_hops = chain_info.get("upstream_site_hops", {})
-        for upstream_site, hop in precomputed_hops.items():
-            if self._valid_upstream_hop(downstream_site, upstream_site, hop):
-                yield upstream_site, hop
-
-        supplemental_distances = self._supplemental_upstream_distances(
-            downstream_site,
-            precomputed_hops,
-        )
-        yield from supplemental_distances.items()
 
     def iter_upstream_distances_in(self, downstream_site, allowed_sites):
         """只迭代 allowed_sites 内的可达上游，优先遍历较小集合。
@@ -349,16 +247,6 @@ class SiteRelationIndex:
             if upstream_site in allowed_site_set:
                 yield upstream_site, hop
 
-    def directly_connected(self, site_a, site_b):
-        if site_a == site_b:
-            return False
-        return (
-            site_b in self.downstream_direct.get(site_a, _EMPTY_NEIGHBORS)
-            or site_a in self.downstream_direct.get(site_b, _EMPTY_NEIGHBORS)
-            or site_b in self.bidirectional_direct.get(site_a, _EMPTY_NEIGHBORS)
-            or site_a in self.bidirectional_direct.get(site_b, _EMPTY_NEIGHBORS)
-        )
-
     def undirected_neighbors(self, site_id):
         cached = self._undirected_neighbors_cache.get(site_id)
         if cached is None:
@@ -387,10 +275,6 @@ class SiteRelationIndex:
     def direct_upstream_neighbor_set(self, site_id):
         return self.upstream_direct.get(site_id, _EMPTY_NEIGHBORS)
 
-    def direct_neighbors(self, site_id):
-        # 保留原有“返回可变 set”的公开行为；内部热路径直接使用缓存的 frozenset。
-        return set(self.undirected_neighbors(site_id))
-
     def non_downstream_neighbors(self, site_id):
         return sorted(
             self.undirected_neighbors(site_id).difference(
@@ -400,9 +284,6 @@ class SiteRelationIndex:
 
     def bidirectional_neighbors(self, site_id):
         return sorted(self.bidirectional_neighbor_set(site_id))
-
-    def direct_upstream_neighbors(self, site_id):
-        return sorted(self.direct_upstream_neighbor_set(site_id))
 
     def undirected_neighbors_in(self, site_id, site_set):
         return {
@@ -544,24 +425,20 @@ def prepare_case_record(
     relation_index,
     ne_to_site,
     site_has_router_device,
-    site_ids=None,
+    site_ids,
     component_limit=None,
 ):
     """提取并计算一次模式分析公共数据。
 
-    ``site_ids`` 允许调用方传入从原始 match 轻量提取的等价站点集合；
+    ``site_ids`` 是调用方从原始 match 提取的站点集合；
     ``component_limit=2`` 用于 one-component-only 过滤，发现第二个分量即可停止。
     """
-    if site_ids is None:
-        site_ids = extract_case_sites(record)
-    else:
-        site_ids = sorted(set(site_ids))
+    site_ids = sorted(set(site_ids))
     site_id_set = set(site_ids)
     offline_sites = extract_offline_sites(record, ne_to_site) & site_id_set
     router_device_sites = extract_case_router_device_sites(
-        record,
         site_has_router_device,
-        site_ids=site_ids,
+        site_ids,
     )
     active_sites, active_unmanaged_sites, absorbed_by, absorb_steps = (
         absorb_unmanaged_downstream_sites(
@@ -1052,8 +929,7 @@ def analyze_prepared_case(
     component_records.sort(key=lambda item: (item["pattern"], item["sites"]))
 
     analysis = {
-        "uuid": extract_record_uuid(record),
-        "rule": normalize_text(as_dict(record.get("match_info")).get("rule") or record.get("rule")),
+        "rule": normalize_text(record.get("rule")),
         "site_count": len(site_ids),
         "sites": site_ids,
         "component_count": len(projected_components),
@@ -1065,296 +941,3 @@ def analyze_prepared_case(
         "absorb_steps": absorb_steps,
     }
     return update_analysis_patterns(analysis, component_records)
-
-
-def analyze_case_record(record, relation_index, ne_to_site, site_has_router_device):
-    prepared_case = prepare_case_record(
-        record,
-        relation_index,
-        ne_to_site,
-        site_has_router_device,
-    )
-    return analyze_prepared_case(record, prepared_case, relation_index)
-
-
-def format_pattern_summary_line(pattern_info, index):
-    pattern = pattern_info.get("pattern", "unknown")
-    managed_sites = pattern_info.get("managed_sites", []) or []
-
-    if pattern.startswith("ip_ring"):
-        chains = pattern_info.get("chains", []) or []
-        chain = chains[0].get("chain", []) if chains and isinstance(chains[0], dict) else []
-        matched_text = "->".join(chain) if chain else "->".join(managed_sites)
-    else:
-        matched_text = "->".join(managed_sites)
-
-    return f"模式{index}：{pattern}（{matched_text or '无'}）"
-
-
-def build_pattern_note(analysis):
-    patterns = analysis.get("patterns", []) or []
-    if not patterns:
-        return ""
-
-    lines = ["故障模式挖掘："]
-    lines.extend(
-        format_pattern_summary_line(pattern_info, index)
-        for index, pattern_info in enumerate(patterns, 1)
-    )
-    return "\n".join(lines)
-
-
-def format_link_context(raw_link):
-    if isinstance(raw_link, dict):
-        return dict(raw_link)
-    if raw_link in (None, ""):
-        return {}
-    return {"connection_type": str(raw_link)}
-
-
-def build_context_ne_info(ne_id, ne_graph_entry, group_id, site_graph_entry=None):
-    site_graph_entry = as_dict(site_graph_entry)
-    return {
-        "link": {},
-        "group": group_id,
-        "name": ne_graph_entry.get("name", ne_id),
-        "site_id": normalize_text(ne_graph_entry.get("site_id")),
-        "site_name": (
-            normalize_text(ne_graph_entry.get("site_name"))
-            or normalize_text(site_graph_entry.get("site_name"))
-            or normalize_text(ne_graph_entry.get("site_id"))
-        ),
-        "type": normalize_text(ne_graph_entry.get("type")).upper(),
-        "network_type": normalize_text(ne_graph_entry.get("network_type")).upper(),
-        "manufacturer": normalize_text(ne_graph_entry.get("manufacturer")).upper(),
-        "running_status": ne_graph_entry.get("running_status", ne_graph_entry.get("status", "")),
-        "domain": normalize_text(ne_graph_entry.get("domain")).upper(),
-        "region_id": normalize_text(ne_graph_entry.get("region_id")) or normalize_text(site_graph_entry.get("region_id")),
-        "longitude": (
-            ne_graph_entry.get("longitude")
-            or ne_graph_entry.get("lon")
-            or ne_graph_entry.get("lng")
-            or site_graph_entry.get("longitude", "")
-        ),
-        "latitude": (
-            ne_graph_entry.get("latitude")
-            or ne_graph_entry.get("lat")
-            or site_graph_entry.get("latitude", "")
-        ),
-        "alarm": [],
-        "supplemental_fault_pattern_context": True,
-    }
-
-
-def add_bidirectional_link(ne_info, source_ne, target_ne, link_context):
-    if source_ne not in ne_info or target_ne not in ne_info:
-        return
-    if not link_context:
-        link_context = {"connection_type": "supplemental_fault_pattern_context"}
-    source_links = ne_info[source_ne].setdefault("link", {})
-    target_links = ne_info[target_ne].setdefault("link", {})
-    source_links.setdefault(target_ne, dict(link_context))
-    target_links.setdefault(source_ne, dict(link_context))
-
-
-def find_ne_link_context(source_ne, target_ne, ne_graph_data):
-    source_links = as_dict(as_dict(ne_graph_data.get(source_ne)).get("link"))
-    if target_ne in source_links:
-        return format_link_context(source_links.get(target_ne))
-    target_links = as_dict(as_dict(ne_graph_data.get(target_ne)).get("link"))
-    if source_ne in target_links:
-        return format_link_context(target_links.get(source_ne))
-    return {}
-
-
-def collect_supplemental_fault_pattern_sites(analysis, existing_sites, site_has_router_device=None):
-    existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
-    site_has_router_device = site_has_router_device or {}
-    supplemental_sites = []
-    seen = set()
-    for pattern_info in analysis.get("patterns", []) or []:
-        pattern = pattern_info.get("pattern")
-        if pattern not in {
-            "ip_chain_single_link",
-            "ip_chain_multi_link",
-            "ip_ring_single_upstream",
-            "ip_ring_multi_upstream",
-        }:
-            continue
-        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
-            normalized_site_id = normalize_text(as_dict(edge_info).get("supplemental_site"))
-            if (
-                normalized_site_id
-                and normalized_site_id not in existing_sites
-                and normalized_site_id not in seen
-                and site_has_router_device.get(normalized_site_id, False)
-            ):
-                seen.add(normalized_site_id)
-                supplemental_sites.append(normalized_site_id)
-        for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
-            normalized_site_id = normalize_text(site_id)
-            if (
-                normalized_site_id
-                and normalized_site_id not in existing_sites
-                and normalized_site_id not in seen
-                and site_has_router_device.get(normalized_site_id, False)
-            ):
-                seen.add(normalized_site_id)
-                supplemental_sites.append(normalized_site_id)
-    return supplemental_sites
-
-
-def collect_supplemental_fault_pattern_edges(analysis, existing_sites, supplemental_sites=None):
-    existing_sites = {normalize_text(site_id) for site_id in existing_sites if normalize_text(site_id)}
-    supplemental_site_set = {
-        normalize_text(site_id)
-        for site_id in (supplemental_sites or [])
-        if normalize_text(site_id)
-    }
-    supplemental_edges = []
-    seen = set()
-    for pattern_info in analysis.get("patterns", []) or []:
-        pattern = pattern_info.get("pattern")
-        if pattern not in {
-            "ip_chain_single_link",
-            "ip_chain_multi_link",
-            "ip_ring_single_upstream",
-            "ip_ring_multi_upstream",
-        }:
-            continue
-        for edge_info in pattern_info.get("supplemental_context_edges", []) or []:
-            edge_info = as_dict(edge_info)
-            supplemental_site = normalize_text(edge_info.get("supplemental_site"))
-            anchor_site = normalize_text(edge_info.get("anchor_site"))
-            if (
-                not supplemental_site
-                or not anchor_site
-                or supplemental_site in existing_sites
-                or supplemental_site not in supplemental_site_set
-            ):
-                continue
-            edge_key = (supplemental_site, anchor_site)
-            if edge_key in seen:
-                continue
-            seen.add(edge_key)
-            supplemental_edges.append({
-                "supplemental_site": supplemental_site,
-                "anchor_site": anchor_site,
-                "pattern": pattern,
-                "relation": normalize_text(edge_info.get("relation")),
-            })
-        unmanaged_sites = [
-            normalize_text(site_id)
-            for site_id in pattern_info.get("unmanaged_sites", []) or []
-            if normalize_text(site_id)
-        ]
-        if len(unmanaged_sites) != 1:
-            continue
-        anchor_site = unmanaged_sites[0]
-        for site_id in pattern_info.get("non_downstream_connected_sites", []) or []:
-            supplemental_site = normalize_text(site_id)
-            if (
-                not supplemental_site
-                or supplemental_site in existing_sites
-                or supplemental_site not in supplemental_site_set
-            ):
-                continue
-            edge_key = (supplemental_site, anchor_site)
-            if edge_key in seen:
-                continue
-            seen.add(edge_key)
-            supplemental_edges.append({
-                "supplemental_site": supplemental_site,
-                "anchor_site": anchor_site,
-                "pattern": pattern,
-            })
-    return supplemental_edges
-
-
-def augment_case_with_supplemental_fault_pattern_sites(
-    record,
-    analysis,
-    ne_graph_data,
-    site_to_ne_ids,
-    site_has_router_device=None,
-    site_graph_data=None,
-):
-    if not ne_graph_data:
-        return
-    site_graph_data = site_graph_data or {}
-
-    ne_info = record.setdefault("ne_info", {})
-    if not isinstance(ne_info, dict):
-        return
-
-    group_id = extract_record_uuid(record) or normalize_text(record.get("uuid")) or "fault_pattern_context"
-    existing_sites = extract_case_sites(record)
-    supplemental_sites = collect_supplemental_fault_pattern_sites(
-        analysis,
-        existing_sites,
-        site_has_router_device=site_has_router_device,
-    )
-    if not supplemental_sites:
-        return
-
-    existing_ne_ids = set(ne_info.keys())
-    supplemental_ne_ids = []
-    site_to_added_ne_ids = defaultdict(list)
-    for site_id in supplemental_sites:
-        for ne_id in site_to_ne_ids.get(site_id, ()):
-            ne_graph_entry = as_dict(ne_graph_data.get(ne_id))
-            if ne_id not in ne_info:
-                ne_info[ne_id] = build_context_ne_info(
-                    ne_id,
-                    ne_graph_entry,
-                    group_id,
-                    site_graph_entry=site_graph_data.get(site_id),
-                )
-            ne_info[ne_id]["supplemental_fault_pattern_context"] = True
-            supplemental_ne_ids.append(ne_id)
-            site_to_added_ne_ids[site_id].append(ne_id)
-
-    supplemental_edges = collect_supplemental_fault_pattern_edges(
-        analysis,
-        existing_sites,
-        supplemental_sites=supplemental_sites,
-    )
-    for edge in supplemental_edges:
-        supplemental_site = edge["supplemental_site"]
-        anchor_site = edge["anchor_site"]
-        source_ne_ids = site_to_added_ne_ids.get(supplemental_site, [])
-        target_ne_ids = [
-            ne_id
-            for ne_id in site_to_ne_ids.get(anchor_site, ())
-            if ne_id in ne_info
-        ]
-        for source_ne in source_ne_ids:
-            for target_ne in target_ne_ids:
-                link_context = find_ne_link_context(source_ne, target_ne, ne_graph_data)
-                if link_context:
-                    link_context["supplemental_fault_pattern_context"] = True
-                    add_bidirectional_link(ne_info, source_ne, target_ne, link_context)
-
-    group_info = record.setdefault("group_info", {})
-    if isinstance(group_info, dict):
-        group_entry = group_info.setdefault(group_id, {})
-        if isinstance(group_entry, dict):
-            group_entry["site_list"] = sorted(set(group_entry.get("site_list", [])) | set(supplemental_sites))
-            group_entry["ne_list"] = sorted(set(group_entry.get("ne_list", [])) | set(existing_ne_ids) | set(supplemental_ne_ids))
-            group_entry["supplemental_fault_pattern_sites"] = supplemental_sites
-
-    record["fault_pattern_supplemental_sites"] = supplemental_sites
-    record["fault_pattern_supplemental_ne_ids"] = sorted(set(supplemental_ne_ids))
-    record["fault_pattern_supplemental_edges"] = supplemental_edges
-
-
-def append_note(original_note, pattern_note):
-    original_note = normalize_text(original_note)
-    pattern_note = normalize_text(pattern_note)
-    if not pattern_note:
-        return original_note
-    if not original_note:
-        return pattern_note
-    if pattern_note in original_note:
-        return original_note
-    return f"{original_note.rstrip()}\n\n{pattern_note}"

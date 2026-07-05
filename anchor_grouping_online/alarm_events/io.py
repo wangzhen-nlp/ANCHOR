@@ -1,11 +1,7 @@
-import os
-
 from datetime import datetime
 
 from anchor_grouping_online.alarm_inputs import stream_alarm_inputs
 from anchor_grouping_online.alarm_events.identity import alarm_content_uuid, require_alarm_identity
-from anchor_grouping_online.alarm_events.sorted_cache import load_sorted_alarm_cache
-from anchor_grouping_online.time_config import DEFAULT_CLEAR_DELAY_SEC
 
 
 def parse_datetime_text(text, field_name="时间"):
@@ -163,36 +159,6 @@ def load_valid_alarms(
     return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
 
 
-def resolve_alarm_event_site(item, valid_sites, ne_to_site):
-    """按当前拓扑校验缓存事件的站点，必要时通过告警源补全站点。"""
-    site_id = str(item.get("site_id", "") or "").strip()
-    if not site_id or site_id not in valid_sites:
-        alarm_source = str(item.get("alarm_source", "") or "").strip()
-        site_id = str(ne_to_site.get(alarm_source, "") or "").strip()
-    if not site_id or site_id not in valid_sites:
-        return None
-    if site_id == item.get("site_id"):
-        return item
-    resolved = dict(item)
-    resolved["site_id"] = site_id
-    return resolved
-
-
-def iter_topology_valid_alarm_events(alarm_events, valid_sites, ne_to_site):
-    """过滤并补全缓存事件，同时删除过滤后位于末尾的清除事件。"""
-    trailing_clear_events = []
-    for item in alarm_events:
-        resolved = resolve_alarm_event_site(item, valid_sites, ne_to_site)
-        if resolved is None:
-            continue
-        if is_clear_alarm(resolved.get("alarm", {})):
-            trailing_clear_events.append(resolved)
-            continue
-        yield from trailing_clear_events
-        trailing_clear_events.clear()
-        yield resolved
-
-
 def trim_trailing_clear_alarms(valid_alarms):
     """删除尾部仅由清除告警组成的区段。"""
     last_non_clear_index = -1
@@ -204,44 +170,3 @@ def trim_trailing_clear_alarms(valid_alarms):
         return []
 
     return valid_alarms[: last_non_clear_index + 1]
-
-
-def load_sorted_alarm_cache_with_stats(cache_path, metadata):
-    metadata, valid_alarms = load_sorted_alarm_cache(
-        cache_path,
-        metadata,
-        show_progress=True,
-    )
-    normal_alarm_count = int(metadata["cached_normal_alarm_count"])
-    clear_alarm_count = int(metadata["cached_clear_alarm_count"])
-    if normal_alarm_count + clear_alarm_count != len(valid_alarms):
-        raise ValueError("排序告警缓存统计数量与实际告警数量不一致")
-    processed_count = int(metadata["processed_count"])
-    return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count, metadata
-
-
-def warn_sorted_alarm_cache_option_mismatch(metadata, args):
-    mismatches = []
-    expected_clear_delay = float(metadata["clear_delay_sec"])
-    if abs(float(DEFAULT_CLEAR_DELAY_SEC) - expected_clear_delay) > 1e-9:
-        mismatches.append(
-            f"clear_delay_sec: 缓存={expected_clear_delay:g}, 当前={float(DEFAULT_CLEAR_DELAY_SEC):g}"
-        )
-
-    cached_resource_buffer = str(metadata.get("resource_buffer", "") or "").strip()
-    current_resource_buffer = os.path.abspath(args.resource_buffer)
-    if cached_resource_buffer and os.path.normcase(os.path.normpath(cached_resource_buffer)) != os.path.normcase(
-        os.path.normpath(current_resource_buffer)
-    ):
-        mismatches.append(
-            "resource_buffer: "
-            f"缓存={cached_resource_buffer}, 当前={current_resource_buffer}"
-        )
-
-    if mismatches:
-        print(
-            "⚠️ 排序告警缓存已预先应用过滤/清除延迟参数，当前参数与缓存元信息不一致："
-        )
-        for item in mismatches:
-            print(f"   - {item}")
-        print("   如需使用新参数，请重新生成排序告警缓存。")

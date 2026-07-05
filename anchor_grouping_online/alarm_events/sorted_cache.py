@@ -42,13 +42,6 @@ def is_sorted_alarm_cache_header(record):
     )
 
 
-def try_read_sorted_alarm_cache_header(path):
-    try:
-        return read_sorted_alarm_cache_header(path)
-    except (OSError, zipfile.BadZipFile, UnicodeDecodeError, ValueError):
-        return None
-
-
 def _find_sorted_alarm_cache_member(zf):
     if SORTED_ALARM_CACHE_MEMBER in zf.namelist():
         return SORTED_ALARM_CACHE_MEMBER
@@ -113,19 +106,6 @@ def iter_sorted_alarm_cache_items(path, metadata=None, show_progress=False):
             print(f"  已流式读取排序告警 {idx} 条...", flush=True)
 
 
-class SortedAlarmCacheStream:
-    def __init__(self, path, metadata=None):
-        self.path = path
-        self.metadata = metadata or read_sorted_alarm_cache_header(path)
-        self.alarm_count = int(self.metadata["alarm_count"])
-
-    def __len__(self):
-        return self.alarm_count
-
-    def __iter__(self):
-        return iter_sorted_alarm_cache_items(self.path, metadata=self.metadata)
-
-
 def _write_sorted_alarm_cache_jsonl(stream, sorted_alarms, header):
     stream.write(json.dumps(header, ensure_ascii=False) + "\n")
     for item in sorted_alarms:
@@ -151,15 +131,3 @@ def write_sorted_alarm_cache(path, sorted_alarms, metadata=None):
             _write_sorted_alarm_cache_jsonl(fw, sorted_alarms, header)
 
     return header
-
-
-def load_sorted_alarm_cache(path, metadata, show_progress=False):
-    alarms = []
-    for item in iter_sorted_alarm_cache_items(
-        path,
-        metadata=metadata,
-        show_progress=show_progress,
-    ):
-        alarms.append(item)
-
-    return metadata, alarms

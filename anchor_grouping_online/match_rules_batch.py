@@ -1,4 +1,4 @@
-"""ANCHOR 二次汇聚（离线批处理入口，不依赖 match_rules.py）。
+"""ANCHOR 二次汇聚批处理入口。
 
 对外接口只有 BatchFaultGroupMatcher.aggregate_alarm_groups：输入已成组的
 故障组集合 {故障组id: [告警, ...]}，输出
@@ -16,20 +16,20 @@
         "是否清除": True,                   # 可选，缺省视为上报告警
     }
 
-与在线 match_rules.py 的流式收割不同，批处理不考虑聚合成熟时间：
+批处理不考虑实时聚合成熟时间：
 
 1. 整批告警喂给引擎，只更新事件缓存并建立本次调用的临时 trigger 工作集，
-   不建立在线 pending，过程中不做任何收割；持久会话按发生时间正序喂入，
+   不建立延迟等待队列，过程中不做任何收割；持久会话按发生时间正序喂入，
    隔离会话无后续 TTL 状态，省略这次预排序；
 2. 喂流结束后，只对本批输入产生的 trigger 逐一触发故障组汇聚（告警可以
-   是历史重发），按告警 ts 从早到晚进行（与在线成熟队列的收割顺序一致）；
+   是历史重发），按告警 ts 从早到晚进行；
    不在本批输入中的历史 trigger 不重新评估，但历史事件缓存仍可作为症状证据
    参与本批匹配；每次汇聚成功立即执行既有的
    消费回收逻辑（_prune_consumed_alarm_history），把已被故障组消费的 trigger
    告警从本批工作集中删除，后续同类 trigger 因此不再重复汇聚；本次调用
    结束后丢弃剩余 trigger，不进入下一批；
-3. 本批 trigger 处理完后统一做批内合并（merge_match_batch），再走与在线
-   一致的历史合并与输出可见性过滤；
+3. 本批 trigger 处理完后统一做批内合并（merge_match_batch），再执行历史
+   合并与输出可见性过滤；
 4. 匹配出的故障组经可落盘规则过滤、故障模式过滤后，作为原始故障组之间的
    关联证据：同一匹配组覆盖到的本批原始组连到一起，并通过症状告警的既有
    归属挂到历史汇聚组上；输出为增量形式——key 是稳定的汇聚组 ID，
@@ -42,7 +42,7 @@ import uuid
 from types import SimpleNamespace
 
 from anchor_grouping_online.alarm_events.generator import to_matching_alarm
-from anchor_grouping_online.matching.runtime import (
+from anchor_grouping_online.batch_context import (
     build_fault_pattern_filter,
     build_rules_config,
     collect_output_eligible_rules,
@@ -77,8 +77,8 @@ class BatchFaultGroupMatcher:
     """按批次做 ANCHOR 二次汇聚。
 
     静态拓扑上下文与规则配置在构造时加载一次；时序引擎与汇聚状态持久
-    保留，后一批可以关联到前面批次喂入的告警（match_rules.py 的在线
-    语义）。历史保留视界 = 本批最早告警时间 − max_group_time，每批
+    保留，后一批可以关联到前面批次喂入的告警。历史保留视界 = 本批最早
+    告警时间 − max_group_time，每批
     开始时统一清理。需要重新开始时调用 reset()。
     """
 
@@ -97,12 +97,12 @@ class BatchFaultGroupMatcher:
         self.output_eligible_rules = collect_output_eligible_rules(self.rules_config)
         self.fault_pattern_filter = build_fault_pattern_filter(static_context)
         # 引擎与汇聚状态持久保留，后一批可以关联到之前喂入的告警
-        # （match_rules.py 的在线语义）。
+        # 供后续批次继续关联。
         # batch_isolated=True 时每批处理前丢弃会话：只做本窗口（本批）
         # 内的告警汇聚。
         self.batch_isolated = bool(batch_isolated)
         self._session = None
-        # 跨引擎复用的静态结构（拓扑邻接、NE 映射、trigger 索引、
+        # 跨引擎复用的静态结构（NE 映射、trigger 索引、
         # role_site_index），首个引擎构造时算出后共享给后续每批临时引擎，
         # 避免隔离/外置模式每批重建。只依赖 rules_config 的 node 结构与静态
         # 拓扑，构造后只读，故可安全跨引擎共享；由于所有引擎的规则都由
@@ -172,7 +172,7 @@ class BatchFaultGroupMatcher:
 
         有状态语义
             引擎与汇聚状态持久保留：本批的故障组可以与之前喂入的告警
-            建立关联（等价于 match_rules.py 的在线语义）。
+            建立关联。
             要点：
             - 同一告警编码 ID 在 event_cache 中只保留一份；当前批重发时
               幂等覆盖并重新获得 trigger 资格，不追加重复缓存；
@@ -295,8 +295,7 @@ class BatchFaultGroupMatcher:
                 _touch_group(session, group_id, group_last_ts)
 
         # 2. 批开始的历史回收：统一视界 = 本批最早告警时间 − max_group_time。
-        #    这是唯一的 TTL 清理点：引擎喂流清理已关闭（prune_on_ingest=
-        #    False），TTL 固定为 max_group_time，prune 原语以 batch_min_ts
+        #    这是唯一的 TTL 清理点：TTL 固定为 max_group_time，prune 原语以 batch_min_ts
         #    为基准算出的清理线恰为视界。
         #    外置状态模式跳过：old_agg_alarm_groups 引入的告警/汇聚组不做
         #    视界过期，历史保留完全由调用方决定（传入即生效）。
@@ -741,7 +740,7 @@ class BatchFaultGroupMatcher:
 
         注册表按条目重建（告警/组的归属、汇聚组的组数/告警数/最晚时间），
         历史有效发生告警只写入全新引擎的 event_cache，作为本批的症状关联
-        证据，不建立历史 trigger/pending；新汇聚组 ID 为全新 UUID，不会
+        证据，不建立历史 trigger；新汇聚组 ID 为全新 UUID，不会
         与既有 ID 冲突。
 
         既有汇聚组不可变：同一原始组或同一告警若出现在多个
@@ -868,7 +867,7 @@ class BatchFaultGroupMatcher:
 
         持久会话排序以保证后续 TTL 能从队头正确清理；隔离会话用完即弃，
         可跳过预排序，最终 trigger 收割仍会独立按时间排序。
-        批处理不建立 pending；喂流阶段只累积事件缓存与 trigger 索引，
+        喂流阶段只累积事件缓存与 trigger 索引，
         不触发收割。
         """
         matching_events = [
@@ -943,8 +942,6 @@ class BatchFaultGroupMatcher:
             rules_config,
             static_context.site_domain_map,
             alarm_source_domain_map=static_context.alarm_source_domain_map,
-            prune_on_ingest=False,
-            topo_downstream_map=static_context.topo_downstream_map,
             site_chain_index=static_context.site_chain_index,
             ne_graph_data=static_context.ne_graph_data,
             site_to_ne_ids=static_context.site_to_ne_ids,
@@ -962,11 +959,11 @@ class BatchFaultGroupMatcher:
     def _aggregate_per_trigger(engine, trigger_candidates):
         """按 trigger 告警 ts 从早到晚逐个触发故障组汇聚，返回原始 match 列表。
 
-        顺序与在线成熟队列的收割顺序一致（首触发时间升序），因此消费回收的
-        cutoff 只会清理不晚于本组症状时间的历史，不影响更晚的独立故障。
+        按首触发时间升序处理，因此消费回收的 cutoff 只会清理不晚于本组
+        症状时间的历史，不影响更晚的独立故障。
         每次汇聚成功后立即调用引擎既有的 _prune_consumed_alarm_history：
         被故障组消费的 trigger 告警会从 trigger_event_index 中删除
-        （与在线收割后的 trigger 删除逻辑一致），后续 trigger 若已被消费
+            后续 trigger 若已被消费
         会被直接跳过，不再重复汇聚。
 
         trigger_candidates 是喂流阶段直接返回的本批候选三元组
@@ -1007,7 +1004,7 @@ class BatchFaultGroupMatcher:
 
     @staticmethod
     def _merge_batch_and_finalize(engine, raw_matches):
-        """批内合并 + 历史合并落库 + 输出可见性过滤（与在线收割尾部一致）。"""
+        """批内合并 + 历史合并 + 输出可见性过滤。"""
         if not raw_matches:
             return []
         merged_matches = merge_match_batch(raw_matches)
@@ -1017,8 +1014,7 @@ class BatchFaultGroupMatcher:
     def _iter_output_matches(self, matches):
         """按输出口径过滤 match：可落盘规则过滤 + 故障模式过滤。
 
-        与在线 match_rules.py 的落盘口径一致，通过过滤的匹配组才能作为
-        原始故障组之间的汇聚证据。
+        通过过滤的匹配组才能作为原始故障组之间的汇聚证据。
         """
         for match in matches:
             if not self._match_is_output_eligible(match):
@@ -1151,7 +1147,7 @@ def _merge_member_entries(groups_by_id, member_entries, matching_cache=None):
 
 def _prune_session_history(session, horizon_ts):
     """按三个最小堆增量回收视界之前的会话状态。"""
-    indexes = _ensure_history_expiry_indexes(session)
+    indexes = session["history_expiry_indexes"]
 
     alarm_registry = session["alarm_registry"]
     alarm_heap = indexes["alarm_heap"]
@@ -1209,38 +1205,6 @@ def _push_history_expiry(session, registry_name, item_id, ts):
         indexes[f"{registry_name}_heap"],
         (ts, indexes["seq"], item_id),
     )
-
-
-def _ensure_history_expiry_indexes(session):
-    """为旧会话/测试夹具一次性构建索引；正常持久会话创建时即为空索引。"""
-    indexes = session.get("history_expiry_indexes")
-    if indexes is not None:
-        return indexes
-
-    indexes = _new_history_expiry_indexes()
-    session["history_expiry_indexes"] = indexes
-    for alarm_id, entry in session["alarm_registry"].items():
-        _push_history_expiry(session, "alarm", alarm_id, entry[0])
-    for agg_id, entry in session["agg_registry"].items():
-        if entry[1] is None:
-            indexes["empty_agg_ids"].add(agg_id)
-        else:
-            _push_history_expiry(session, "agg", agg_id, entry[1])
-
-    # 兼容没有反向索引的旧会话：构建时顺便清理已经失效的归属指针。
-    for group_id, entry in list(session["group_registry"].items()):
-        _push_history_expiry(session, "group", group_id, entry[0])
-        owner_agg_id = entry[1]
-        if owner_agg_id is None:
-            continue
-        if owner_agg_id not in session["agg_registry"]:
-            if entry[0] is None:
-                del session["group_registry"][group_id]
-            else:
-                entry[1] = None
-            continue
-        indexes["groups_by_agg"].setdefault(owner_agg_id, set()).add(group_id)
-    return indexes
 
 
 def _register_alarm(session, alarm_id, ts, owner_agg_id):

@@ -17,9 +17,7 @@ from anchor_grouping_online.temporal_engine.indexes import RoleSiteIndex
 from anchor_grouping_online.temporal_engine.output import TemporalGraphEngineOutputMixin
 from anchor_grouping_online.temporal_engine.traversal import TemporalGraphEngineTraversalMixin
 from anchor_grouping_online.temporal_engine.utils import (
-    add_merge_stats,
     build_pattern_adj,
-    build_empty_merge_stats,
     matches_expected_alarm,
 )
 
@@ -192,16 +190,14 @@ class TemporalGraphEngine(
         ne_graph_data,
         site_to_ne_ids,
         link_peer_index,
-        topo_downstream_map=None,
         alarm_source_domain_map=None,
-        prune_on_ingest=True,
         enable_batch_upsert_indexes=False,
         shared_static_context=None,
     ):
         """初始化拓扑、缓存、触发索引以及历史故障组状态。
 
         shared_static_context 用于跨引擎复用与「规则边时间窗 / max_stay」
-        无关的静态结构（拓扑邻接、NE 映射、trigger 索引、role_site_index）。
+        无关的静态结构（NE 映射、trigger 索引、role_site_index）。
         提供时直接引用、跳过重建；这些结构构造后只读，跨引擎共享安全。
         仅执行计划（依赖各引擎自己的边时间窗）始终按本引擎的规则重编。
         要求各引擎的规则共享同一批 node_config 对象（batch 侧浅拷贝规则时
@@ -216,21 +212,9 @@ class TemporalGraphEngine(
         if not self.site_chain_index:
             raise ValueError("必须提供非空 site_chain_index")
 
-        # 规则匹配只使用 site_chains；缺少站点时直接无候选，不做站点拓扑 BFS。
-        # 这里保留派生拓扑字段仅为构造参数兼容，不参与规则候选遍历。
-        if shared_static_context is not None:
-            self.topo_down = shared_static_context["topo_down"]
-            self.topo_up = shared_static_context["topo_up"]
-        else:
-            self.topo_down = topo_downstream_map or {}
-            self.topo_up = collections.defaultdict(list)
-            for upstream_site, downstream_sites in self.topo_down.items():
-                for downstream_site in downstream_sites:
-                    self.topo_up[downstream_site].append(upstream_site)
-
         # event_cache: 站点 -> deque[事件 dict]，保留原始告警 payload 供后续端口/对端解析
         self.event_cache = collections.defaultdict(collections.deque)
-        # 持久批处理会话可选的幂等写入索引。在线模式及隔离临时会话不建，
+        # 持久批处理会话可选的幂等写入索引。隔离临时会话不建，
         # 避免无必要的常驻内存；启用后当前批告警可按 eid O(1) 覆盖缓存。
         self._batch_event_by_alarm_id = (
             {} if enable_batch_upsert_indexes else None
@@ -239,10 +223,6 @@ class TemporalGraphEngine(
         self.global_ttl = DEFAULT_EVENT_TTL_SEC
         # 电源类告警缓存单独保留 3 小时，避免长时间窗根因回看失效
         self.power_alarm_ttl = DEFAULT_POWER_ALARM_TTL_SEC
-        # 喂流时是否做按站点 TTL 清理。批处理二次汇聚在每批开始统一按
-        # 视界清扫，喂流清理恒为空转，可关闭省掉逐条检查。
-        self._prune_on_ingest = bool(prune_on_ingest)
-
         # 站点画像信息：供节点匹配领域使用
         self.sites_domain_map = site_domain_map
         self.alarm_source_domain_map = alarm_source_domain_map or {}
@@ -250,9 +230,6 @@ class TemporalGraphEngine(
         # 全局拓扑穿透缓存
         self.global_topo_cache = collections.OrderedDict()
         self.max_topo_cache_size = 10000
-        # 最近一次收割的批内合并统计，以及累计统计
-        self.last_batch_merge_stats = build_empty_merge_stats()
-        self.total_batch_merge_stats = build_empty_merge_stats()
         # role-filtered topology candidate cache: topology and role structure are static.
         self.global_role_filtered_neighbor_cache = collections.OrderedDict()
         self.max_role_filtered_neighbor_cache_size = 20000
@@ -322,11 +299,6 @@ class TemporalGraphEngine(
             self.trigger_specs_by_node = {}
             self._build_trigger_indexes()
 
-        # 分批清理过期节点状态时的游标
-        self._prune_cursor = 0
-        # 每轮清理最多处理的节点数，避免单次 prune 开销过大
-        self._prune_batch_size = 256
-
     def export_static_context(self):
         """导出可跨引擎共享的静态结构。
 
@@ -335,8 +307,6 @@ class TemporalGraphEngine(
         执行计划因依赖各引擎自身的边时间窗，不在此列。
         """
         return {
-            "topo_down": self.topo_down,
-            "topo_up": self.topo_up,
             "role_site_index": self.role_site_index,
             "ne_to_site": self._ne_to_site,
             "site_to_ne_ids": self._site_to_ne_ids,
@@ -359,7 +329,7 @@ class TemporalGraphEngine(
     ):
         """接收单条事件，更新事件缓存与 trigger 索引。
 
-        批处理不做在线延迟聚合：本方法只维护 event_cache 与 trigger 索引，
+        本方法只维护 event_cache 与 trigger 索引，
         命中 trigger 的事件写入 trigger_candidates 供调用方按批收割，不在此
         触发任何规则评估。
         index_trigger=False 用于加载只作为症状候选的历史告警：事件仍进入
@@ -371,11 +341,7 @@ class TemporalGraphEngine(
         # 1. 按已到达事件推进时间上界。
         self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
 
-        # 2. 先清理过期缓存，再按上报/清除事件更新状态。
-        if self._prune_on_ingest:
-            self._prune_expired_raw_events_in_place(node, ts)
-            self._prune_expired_trigger_index(node, ts)
-
+        # 2. 按上报/清除事件更新状态。批开始时由 matcher 统一做视界清理。
         if is_clear:
             self._remove_cleared_raw_event(
                 node,
@@ -452,9 +418,6 @@ class TemporalGraphEngine(
 
         alarm_id = require_eid({"eid": alarm_id})
         self.latest_arrived_event_ts = max(self.latest_arrived_event_ts, ts)
-        if self._prune_on_ingest:
-            self._prune_expired_raw_events_in_place(node, ts)
-            self._prune_expired_trigger_index(node, ts)
 
         if is_clear:
             self._remove_cleared_raw_event(
@@ -669,32 +632,6 @@ class TemporalGraphEngine(
             )
         return removed_trigger_seqs
 
-    def _prune_expired_trigger_index(self, node, current_ts):
-        """清理某个节点 trigger 索引中超出 TTL 的旧事件。"""
-        for rule_name, _ in self.trigger_specs_by_node.get(node, ()):
-            trigger_key = (node, rule_name)
-            trigger_events = self.trigger_event_index.get(trigger_key)
-            if not trigger_events:
-                continue
-
-            while trigger_events and (current_ts - trigger_events[0][0]) > self._get_event_ttl(trigger_events[0][3]):
-                trigger_events.popleft()
-
-            if not trigger_events:
-                self.trigger_event_index.pop(trigger_key, None)
-
-    def _prune_trigger_index_before(self, trigger_key, cutoff_seq):
-        """删除某个 trigger_key 下序号不大于 cutoff_seq 的已消费 trigger 事件。"""
-        trigger_events = self.trigger_event_index.get(trigger_key)
-        if not trigger_events:
-            return
-
-        while trigger_events and trigger_events[0][2] <= cutoff_seq:
-            trigger_events.popleft()
-
-        if not trigger_events:
-            self.trigger_event_index.pop(trigger_key, None)
-
     @staticmethod
     def _unpack_trigger_event(trigger_event):
         event_ts, alarm_id, event_seq, alarm_type, alarm_source = trigger_event
@@ -738,30 +675,13 @@ class TemporalGraphEngine(
             else:
                 self.trigger_event_index.pop(trigger_key, None)
 
-    def _prune_expired_state(self, current_ts):
-        """分批清理长期未再触达节点的过期缓存，避免状态无限滞留。"""
-        nodes = list(self.event_cache.keys())
-        if not nodes:
-            return
-
-        total_nodes = len(nodes)
-        batch_size = min(self._prune_batch_size, total_nodes)
-        start_idx = self._prune_cursor % total_nodes
-
-        for offset in range(batch_size):
-            node = nodes[(start_idx + offset) % total_nodes]
-            self._prune_expired_raw_events_in_place(node, current_ts)
-            self._prune_expired_trigger_index(node, current_ts)
-
-        self._prune_cursor = (start_idx + batch_size) % max(total_nodes, 1)
-
     def _finalize_matches_with_history(self, matches):
         """把当前批次结果与历史组做最终合并并落库。"""
         finalized = []
         self.emitted_group_store.prune_expired(self.latest_arrived_event_ts)
 
         for match_result in matches:
-            match_result, merged_group_indexes, related_group_uuids, should_emit = (
+            match_result, merged_group_indexes, should_emit = (
                 self.emitted_group_store.merge_with_related(match_result)
             )
             if not should_emit:
@@ -771,9 +691,6 @@ class TemporalGraphEngine(
                 )
                 continue
             match_result = self._apply_default_output_site_role_ownership(match_result)
-            if related_group_uuids:
-                existing_uuids = set(match_result.get("related_group_uuids", []))
-                match_result["related_group_uuids"] = sorted(existing_uuids | set(related_group_uuids))
             self.emitted_group_store.replace_and_store(
                 merged_group_indexes,
                 match_result
@@ -782,17 +699,3 @@ class TemporalGraphEngine(
 
         self._prune_consumed_alarm_history(finalized)
         return finalized
-
-    def _record_batch_merge_stats(self, merge_stats):
-        self.last_batch_merge_stats = build_empty_merge_stats()
-        self.last_batch_merge_stats.update(merge_stats or {})
-        self.total_batch_merge_stats = add_merge_stats(
-            self.total_batch_merge_stats,
-            self.last_batch_merge_stats,
-        )
-
-    def get_batch_merge_stats_snapshot(self):
-        return {
-            "last_batch": dict(self.last_batch_merge_stats),
-            "total": dict(self.total_batch_merge_stats),
-        }

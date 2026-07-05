@@ -33,7 +33,7 @@ def _structured_shallow_copy_match(match):
     """copy.deepcopy(match) 的快速等价实现。
 
     覆盖所有当前 codebase 里会被存进 EmittedGroupStore 的 match 字段，只在容器
-    层做隔离（顶层 dict、merged_rules / related_group_uuids 列表、inferred_roots /
+    层做隔离（顶层 dict、merged_rules 列表、inferred_roots /
     role_mapping 的 list value、symptoms 内的 dict 与已知 list 子字段）。
     其余字段都是 str / number / bool 等
     immutable 值，不需要复制。
@@ -43,8 +43,6 @@ def _structured_shallow_copy_match(match):
     """
     copied = dict(match)
     copied["merged_rules"] = list(match["merged_rules"])
-    if "related_group_uuids" in match:
-        copied["related_group_uuids"] = list(match["related_group_uuids"])
     for field in _MATCH_TOP_DICT_OF_LIST_FIELDS:
         copied[field] = {
             role: list(nodes)
@@ -99,10 +97,9 @@ class EmittedGroupStore:
             related_groups.append((idx, self.groups[idx]))
 
         if not related_groups:
-            return match_result, set(), set(), True
+            return match_result, set(), True
 
         merged = {
-            "uuid": match_result["uuid"],
             "rule": match_result["rule"],
             "merged_rules": list(match_result["merged_rules"]),
             "inferred_roots": self._qualified_role_mapping(match_result, "inferred_roots"),
@@ -124,7 +121,6 @@ class EmittedGroupStore:
                 )
 
         merged_group_indexes = set()
-        related_group_uuids = set()
         fully_containing_history_exists = False
         for idx, item in related_groups:
             merged_group_indexes.add(idx)
@@ -132,10 +128,6 @@ class EmittedGroupStore:
             previous_alarm_keys = item["alarm_keys"]
             if current_alarm_keys.issubset(previous_alarm_keys):
                 fully_containing_history_exists = True
-            previous_uuid = previous_match.get("uuid")
-            if previous_uuid:
-                related_group_uuids.add(previous_uuid)
-            related_group_uuids.update(previous_match.get("related_group_uuids", []))
             previous_merged_rules = previous_match["merged_rules"]
             merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
             for role, nodes in previous_match["inferred_roots"].items():
@@ -159,9 +151,9 @@ class EmittedGroupStore:
         merged["symptoms"] = list(symptom_map.values())
 
         if fully_containing_history_exists:
-            return merged, merged_group_indexes, related_group_uuids, False
+            return merged, merged_group_indexes, False
 
-        return merged, merged_group_indexes, related_group_uuids, True
+        return merged, merged_group_indexes, True
 
     def replace_and_store(self, merged_group_indexes, match_result):
         """删除被吸收的历史组，并把当前组作为新的历史版本落库。"""

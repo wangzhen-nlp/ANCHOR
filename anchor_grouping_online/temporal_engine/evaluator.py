@@ -1,5 +1,3 @@
-import uuid
-
 from datetime import datetime
 
 from anchor_grouping_online.alarm_types import LINK_ALARMS
@@ -647,7 +645,6 @@ class TemporalGraphEngineEvaluatorMixin:
         }
         symptoms_by_key, role_mapping = self._build_symptoms_and_role_mapping_from_instance(inst_roles, rule_name)
         match_result = {
-            "uuid": str(uuid.uuid4()),
             "rule": rule_name,
             "merged_rules": [rule_name],
             "inferred_roots": inferred_roots,

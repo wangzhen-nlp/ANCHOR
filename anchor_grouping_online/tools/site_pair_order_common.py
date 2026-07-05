@@ -432,25 +432,3 @@ def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
         "detail": "严格环模式：环块内部非入口相关连接强制保留双向",
     }]
     return updated, pair_result.get("relation") != "<->"
-
-
-def format_direction_count_summary(
-    total_count,
-    directed_count,
-    bidirectional_count,
-    unit="边",
-    label="上下行预测汇总",
-):
-    """格式化有向/双向结果数量与比例。"""
-    if total_count <= 0:
-        directed_ratio = 0.0
-        bidirectional_ratio = 0.0
-    else:
-        directed_ratio = directed_count / total_count
-        bidirectional_ratio = bidirectional_count / total_count
-
-    return (
-        f"{label}: 有向{unit} {directed_count}/{total_count} "
-        f"({directed_ratio:.2%})，双向{unit} {bidirectional_count}/{total_count} "
-        f"({bidirectional_ratio:.2%})"
-    )

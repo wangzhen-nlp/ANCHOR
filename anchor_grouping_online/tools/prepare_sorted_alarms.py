@@ -61,8 +61,8 @@ def build_sorted_alarms(
 
 
 def main():
-    parser = ArgumentParser(description="预处理 match_rules.py 输入，生成已排序告警缓存(JSONL/ZIP，包含清除告警)")
-    parser.add_argument("alarms", help="原始告警输入，支持 jsonl/csv/zip/目录，与 match_rules.py 一致")
+    parser = ArgumentParser(description="预处理批量汇聚输入，生成已排序告警缓存(JSONL/ZIP，包含清除告警)")
+    parser.add_argument("alarms", help="原始告警输入，支持 jsonl/csv/zip/目录")
     parser.add_argument("output", help="排序告警缓存输出；后缀为 .zip 时写压缩包，否则写 JSONL")
     parser.add_argument("--start_time", type=str, help="仅处理告警首次发生时间 >= 该时间")
     parser.add_argument("--end_time", type=str, help="仅处理告警首次发生时间 <= 该时间")
