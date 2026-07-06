@@ -161,9 +161,8 @@ def run_sliding_window_aggregation(
             )
             aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
             merged_input_group_count = sum(
-                len(member_group_ids)
-                for member_group_ids in agg_alarm_groups.values()
-                if len(member_group_ids) > 1
+                len(member_entries)
+                for member_entries in agg_alarm_groups.values()
             )
             record = {
                 "window_start": start,
