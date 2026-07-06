@@ -217,7 +217,12 @@ class BatchFaultGroupMatcher:
                 old_agg_alarm_groups,
                 associate_time,
                 max_group_time,
-                matching_cache=matching_cache,
+                # 隔离模式不会在后续同步阶段再次处理
+                # old_agg；历史转换结果写入 event_cache 后即可
+                # 释放，避免将 O(|old_agg|) 的转换缓存保留到
+                # 调用结束。非隔离模式后续还要同步 old_agg，
+                # 继续复用调用级缓存。
+                matching_cache=None if self.batch_isolated else matching_cache,
             )
         else:
             if self.batch_isolated:
@@ -248,6 +253,7 @@ class BatchFaultGroupMatcher:
             alarm_ids = set()
             kept_alarms = []
             min_ts = None
+            group_last_ts = None
             for generated_alarm in group_alarms or ():
                 matching_alarm = _matching_alarm(generated_alarm, matching_cache)
                 alarm_id = matching_alarm["alarm_id"]
@@ -264,9 +270,13 @@ class BatchFaultGroupMatcher:
                 owner_group_ids = local_alarm_owners.setdefault(alarm_id, [])
                 if group_id not in owner_group_ids:
                     owner_group_ids.append(group_id)
-                alarm_was_registered = alarm_id in session["alarm_registry"]
-                if not alarm_was_registered:
-                    _register_alarm(session, alarm_id, ts, None)
+                alarm_entry = session["alarm_registry"].get(alarm_id)
+                alarm_was_registered = alarm_entry is not None
+                if alarm_entry is None:
+                    alarm_entry = _register_alarm(session, alarm_id, ts, None)
+                registered_ts = alarm_entry[0]
+                if group_last_ts is None or registered_ts > group_last_ts:
+                    group_last_ts = registered_ts
                 if not use_batch_upsert:
                     if first_in_batch and (
                         not alarm_was_registered
@@ -279,11 +289,6 @@ class BatchFaultGroupMatcher:
             local_group_alarms[group_id] = kept_alarms
             local_group_min_ts[group_id] = min_ts
             # 组注册表：刷新最近告警时间（归属在第 4 步分配时写入）。
-            group_last_ts = max(
-                (session["alarm_registry"][a][0] for a in alarm_ids
-                 if a in session["alarm_registry"]),
-                default=None,
-            )
             group_entry = session["group_registry"].get(group_id)
             if group_entry is None:
                 _register_group(session, group_id, group_last_ts, None)
@@ -342,6 +347,10 @@ class BatchFaultGroupMatcher:
                     # 一样重新获得本批 trigger 资格。
                     trigger_only_alarms=overlapping_generated_alarms,
                     sort_events=not self.batch_isolated,
+                    # 本批告警在登记阶段已全部转换并写入
+                    # matching_cache。隔离模式无需排序，可直接
+                    # 流式喂入，不再构造 O(batch) 中间列表。
+                    preconverted_events=self.batch_isolated,
                     matching_cache=matching_cache,
                 )
             else:
@@ -351,6 +360,8 @@ class BatchFaultGroupMatcher:
                 raw_matches = self._aggregate_per_trigger(
                     engine,
                     trigger_candidates=batch_trigger_candidates,
+                    owns_trigger_candidates=True,
+                    trigger_candidates_sorted=not self.batch_isolated,
                 )
         finally:
             # trigger_event_index 仅服务本次收割期间的消费删除；剩余
@@ -747,6 +758,7 @@ class BatchFaultGroupMatcher:
         for raw_agg_id, member_entries in old_agg_alarm_groups.items():
             agg_id = raw_agg_id
             agg_entry = _ensure_agg(session, agg_id)
+            agg_last_ts = None
             for member_entry in member_entries or ():
                 for group_id, group_alarms in member_entry.items():
                     group_entry = session["group_registry"].get(group_id)
@@ -760,6 +772,7 @@ class BatchFaultGroupMatcher:
                             f"外置历史冲突：原始故障组 {group_id!r} 同时归属"
                             f" {group_entry[1]!r} 和 {agg_id!r}"
                         )
+                    group_last_ts = None
                     for generated_alarm in group_alarms or ():
                         matching_alarm = _matching_alarm(
                             generated_alarm, matching_cache
@@ -784,8 +797,14 @@ class BatchFaultGroupMatcher:
                                 f"外置历史冲突：告警 {alarm_id!r} 同时归属"
                                 f" {alarm_entry[1]!r} 和 {agg_id!r}"
                             )
-                        _touch_agg(session, agg_id, ts)
-                        _touch_group(session, group_id, ts)
+                        if agg_last_ts is None or ts > agg_last_ts:
+                            agg_last_ts = ts
+                        if group_last_ts is None or ts > group_last_ts:
+                            group_last_ts = ts
+                    if group_last_ts is not None:
+                        _touch_group(session, group_id, group_last_ts)
+            if agg_last_ts is not None:
+                _touch_agg(session, agg_id, agg_last_ts)
         return session
 
     def _ensure_session(self, associate_time, max_group_time):
@@ -854,6 +873,7 @@ class BatchFaultGroupMatcher:
         sort_events=True,
         upsert_events=False,
         index_trigger=True,
+        preconverted_events=False,
         matching_cache=None,
     ):
         """整批当前告警喂流；持久会话可按 eid 幂等覆盖。
@@ -863,16 +883,28 @@ class BatchFaultGroupMatcher:
         喂流阶段只累积事件缓存与 trigger 索引，
         不触发收割。
         """
-        matching_events = [
-            (_matching_alarm(alarm, matching_cache), True)
-            for alarm in generated_alarms
-        ]
-        matching_events.extend(
-            (_matching_alarm(alarm, matching_cache), False)
-            for alarm in trigger_only_alarms or ()
+        event_batches = (
+            (generated_alarms, True),
+            (trigger_only_alarms or (), False),
         )
-        if sort_events:
-            matching_events.sort(key=lambda item: item[0]["ts"])
+        if not sort_events and preconverted_events:
+            if matching_cache is None:
+                raise ValueError("preconverted_events 需要 matching_cache")
+            # 调用方已在修改引擎前完成全批转换；此处只按
+            # 原有顺序惰性读取，不改变异常原子性。
+            matching_events = (
+                (matching_cache[id(alarm)], cache_event)
+                for alarms, cache_event in event_batches
+                for alarm in alarms
+            )
+        else:
+            matching_events = [
+                (_matching_alarm(alarm, matching_cache), cache_event)
+                for alarms, cache_event in event_batches
+                for alarm in alarms
+            ]
+            if sort_events:
+                matching_events.sort(key=lambda item: item[0]["ts"])
         trigger_candidates = []
         for alarm, cache_event in matching_events:
             if upsert_events:
@@ -955,7 +987,12 @@ class BatchFaultGroupMatcher:
         return engine
 
     @staticmethod
-    def _aggregate_per_trigger(engine, trigger_candidates):
+    def _aggregate_per_trigger(
+        engine,
+        trigger_candidates,
+        owns_trigger_candidates=False,
+        trigger_candidates_sorted=False,
+    ):
         """按 trigger 告警 ts 从早到晚逐个触发故障组汇聚，返回原始 match 列表。
 
         按首触发时间升序处理，因此消费回收的 cutoff 只会清理不晚于本组
@@ -969,17 +1006,21 @@ class BatchFaultGroupMatcher:
         不在本批输入中的历史事件不会发起 trigger；本批 trigger 评估时仍可
         引用 event_cache 中的历史告警作为症状证据。
         """
-        trigger_candidates = list(trigger_candidates)
-        # ts 从早到晚；同一时刻按到达序号从先到后，保证顺序确定。
-        trigger_candidates.sort()
-        alive_trigger_seqs = {
-            event_seq
-            for _event_ts, event_seq, _trigger_key in trigger_candidates
-        }
+        # aggregate_alarm_groups 传入的是 _feed_engine 刚创建的
+        # 独占列表，可原地排序；其他直接调用默认仍复制，
+        # 不修改调用方容器。
+        if not owns_trigger_candidates or not isinstance(trigger_candidates, list):
+            trigger_candidates = list(trigger_candidates)
+        # 非隔离模式喂流前已按 ts 排序，同时 trigger seq
+        # 单调递增，候选已按 (ts, seq) 有序；隔离模式仍
+        # 在此排序，保证无序输入的收割语义。
+        if not trigger_candidates_sorted:
+            trigger_candidates.sort()
+        consumed_trigger_seqs = set()
 
         raw_matches = []
         for event_ts, event_seq, trigger_key in trigger_candidates:
-            if event_seq not in alive_trigger_seqs:
+            if event_seq in consumed_trigger_seqs:
                 continue
             trigger_node, rule_name = trigger_key
             rule = engine.rules.get(rule_name)
@@ -997,7 +1038,7 @@ class BatchFaultGroupMatcher:
                 continue
             raw_matches.extend(results)
             removed_trigger_seqs = engine._prune_consumed_alarm_history(results)
-            alive_trigger_seqs.difference_update(removed_trigger_seqs)
+            consumed_trigger_seqs.update(removed_trigger_seqs)
         return raw_matches
 
     @staticmethod

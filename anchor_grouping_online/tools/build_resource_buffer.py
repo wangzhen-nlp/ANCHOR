@@ -245,7 +245,7 @@ def iter_link_csv_records(link_input: str = SYS_LINK_DIR):
     """从当前 SYS_LINK CSV/zip 输入构造链路记录生成器，供 load_latest_link_records 消费。
 
     仅产出规范化后的字段（其余原始列被丢弃）：
-        collectTime / a_end_ne_nativeId / z_end_ne_nativeId /
+        a_end_ne_nativeId / z_end_ne_nativeId /
         linkLayer / a_end_port_name / z_end_port_name
 
     端点 ID 的两种原始列会归一到同一字段：a_end_ne_nativeId 或 a_end_ne_nativeId(')
@@ -253,7 +253,6 @@ def iter_link_csv_records(link_input: str = SYS_LINK_DIR):
     """
     for row in _iter_csv_records_with_progress(link_input, "  读取链路记录", require=True):
         yield {
-            'collectTime': row.get('last_Modified', ''),
             'a_end_ne_nativeId': _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')"),
             'z_end_ne_nativeId': _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')"),
             'linkLayer': row.get('link_layer', ''),
