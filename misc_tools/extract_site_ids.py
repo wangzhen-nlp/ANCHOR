@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""从字符串中抽取站点名称，返回 "site_id1,site_id2" 形式的字符串。
+"""从字符串中抽取 site_id，返回 "site_id1,site_id2" 形式的字符串。
 
 输入格式示例:
     07BNS0184: 150122_AMFPLB01,150122_vSGLPG01,GLTE_MUARA_PADANG_BNS_EP
 
-每行冒号后的逗号分隔项中，形如 "数字_xxx"（如 150122_AMFPLB01、
-150122_vSGLPG01）的是网元名，剩下的那一项即站点名称。
+每行冒号前的编号（如 07BNS0184）是 site_id；冒号后是该站点下的
+网元名（数字开头，如 150122_AMFPLB01）和站点名称（如 GLTE_xxx）。
 """
 
 import argparse
@@ -15,8 +15,17 @@ import re
 NE_PATTERN = re.compile(r"^\d+_\w+$")
 
 
+def extract_site_id(line: str):
+    """从单行中抽取 site_id（冒号前的编号），无法解析时返回 None。"""
+    line = line.strip()
+    if not line or ":" not in line:
+        return None
+    site_id, _, _ = line.partition(":")
+    return site_id.strip() or None
+
+
 def extract_site_name(line: str):
-    """从单行中抽取站点名称，无法解析时返回 None。"""
+    """从单行中抽取站点名称（冒号后非网元的那一项），无法解析时返回 None。"""
     line = line.strip()
     if not line or ":" not in line:
         return None
@@ -26,19 +35,19 @@ def extract_site_name(line: str):
     return names[0] if names else None
 
 
-def extract_site_names(text: str) -> str:
-    """从整段字符串中抽取所有站点名称，返回逗号拼接的字符串。"""
-    names = (extract_site_name(line) for line in text.splitlines())
-    return ",".join(name for name in names if name)
+def extract_site_ids(text: str) -> str:
+    """从整段字符串中抽取所有 site_id，返回逗号拼接的字符串。"""
+    ids = (extract_site_id(line) for line in text.splitlines())
+    return ",".join(site_id for site_id in ids if site_id)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="从字符串中抽取站点名称，输出 site_id1,site_id2 形式")
+        description="从字符串中抽取 site_id，输出 site_id1,site_id2 形式")
     parser.add_argument("text", nargs="?", default=DEMO,
                         help="待解析的多行字符串；缺省时使用内置示例数据")
     args = parser.parse_args()
-    print(extract_site_names(args.text))
+    print(extract_site_ids(args.text))
 
 
 DEMO = """\
