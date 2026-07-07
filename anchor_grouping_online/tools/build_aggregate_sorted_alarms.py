@@ -40,6 +40,7 @@ if __package__ in (None, ""):
     ensure_package_parent()
 
 from anchor_grouping_online.alarm_events.sorted_cache import write_sorted_alarm_cache
+from anchor_grouping_online.alarm_events.generator import port_vid_from_extendedattr
 
 
 SITE_PLACEHOLDER_PREFIX = "SITE::"
@@ -55,6 +56,27 @@ def _normalize_alarm_source(raw_source):
     if source.startswith(SITE_PLACEHOLDER_PREFIX):
         return ""
     return source
+
+
+def _physical_port_name_from_extendedattr(extendedattr, alarm_source, line_number):
+    port_vid = port_vid_from_extendedattr(extendedattr)
+    if not port_vid:
+        return ""
+    if not alarm_source:
+        raise ValueError(
+            f"第 {line_number} 行 symptom 有 portVid 但缺少 alarm_source，"
+            "无法还原物理端口名称"
+        )
+    expected_prefix = f"{alarm_source.upper()}|"
+    if not port_vid.startswith(expected_prefix):
+        raise ValueError(
+            f"第 {line_number} 行 symptom 的 portVid 与 alarm_source 不匹配: "
+            f"{port_vid!r} / {alarm_source!r}"
+        )
+    physical_port_name = port_vid[len(expected_prefix):]
+    if not physical_port_name:
+        raise ValueError(f"第 {line_number} 行 symptom 的 portVid 缺少端口名")
+    return physical_port_name
 
 
 def _symptom_to_alarm_event(symptom, line_number):
@@ -76,7 +98,11 @@ def _symptom_to_alarm_event(symptom, line_number):
     site_id = str(symptom.get("node", "") or "").strip()
     alarm_title = str(symptom.get("alarm", "") or "").strip()
     alarm_source = _normalize_alarm_source(symptom.get("alarm_source"))
-    physical_port_name = str(symptom.get("物理端口名称", "") or "").strip()
+    physical_port_name = _physical_port_name_from_extendedattr(
+        symptom.get("extendedattr", ""),
+        alarm_source,
+        line_number,
+    )
 
     alarm = {
         "站点ID": site_id,

@@ -70,7 +70,7 @@ def _matching_alarm_signature(matching_alarm):
         matching_alarm["alarm_title"],
         matching_alarm["ts"],
         matching_alarm["alarm_source"],
-        matching_alarm["physical_port_name"],
+        matching_alarm.get("extendedattr", ""),
         matching_alarm["is_clear"],
     )
 
@@ -301,7 +301,7 @@ def _build_visualization_record(state, ne_graph, site_graph):
                 "故障组ID": group_id,
                 "来源故障组UUID": f"alarm-{group_id}",
                 "告警清除时间": "",
-                "物理端口名称": matching_alarm["physical_port_name"],
+                "extendedattr": matching_alarm.get("extendedattr", ""),
             }
             symptoms.append(symptom)
 
@@ -324,9 +324,7 @@ def _build_visualization_record(state, ne_graph, site_graph):
                     "工单号": "",
                     "故障组ID": group_id,
                     "来源故障组UUID": f"alarm-{group_id}",
-                    "物理端口名称": generated_alarm.get(
-                        "物理端口名称", ""
-                    ),
+                    "extendedattr": matching_alarm.get("extendedattr", ""),
                     "ts": ts,
                 })
 

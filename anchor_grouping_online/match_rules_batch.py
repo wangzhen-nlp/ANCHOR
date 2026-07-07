@@ -19,7 +19,7 @@
 告警源取 neVid，为空时退回 ownerVid；站点用告警源在静态拓扑的
 ne_to_site（网元 ID -> 站点 ID）中反查得到，查不到时按无站点处理
 （匹配不上拓扑规则，仅能靠组 ID 连续性等与拓扑无关的逻辑参与汇聚）。
-物理端口名称从 extendedattr 的 portVid 条目解析。
+全局端口 VID 从 extendedattr 的 portVid 条目解析。
 生成器不再输出 是否清除（清除告警在流式入口按原始载荷过滤），
 调用方自带该字段时仍按清除告警处理。
 
@@ -1019,10 +1019,8 @@ class BatchFaultGroupMatcher:
         for alarm, cache_event in matching_events:
             if upsert_events:
                 alarm_payload = None
-                if alarm["physical_port_name"]:
-                    alarm_payload = {
-                        "物理端口名称": alarm["physical_port_name"]
-                    }
+                if alarm.get("extendedattr"):
+                    alarm_payload = {"extendedattr": alarm["extendedattr"]}
                 trigger_candidates.extend(engine.process_batch_event(
                     node=alarm["site_id"],
                     alarm_source=alarm["alarm_source"],
@@ -1053,8 +1051,8 @@ class BatchFaultGroupMatcher:
     ):
         """把已转换的告警写入批处理引擎（只维护缓存与 trigger 索引）。"""
         alarm_payload = None
-        if alarm["physical_port_name"]:
-            alarm_payload = {"物理端口名称": alarm["physical_port_name"]}
+        if alarm.get("extendedattr"):
+            alarm_payload = {"extendedattr": alarm["extendedattr"]}
         engine.process_event(
             node=alarm["site_id"],
             alarm_source=alarm["alarm_source"],

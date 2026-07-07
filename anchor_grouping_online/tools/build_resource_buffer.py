@@ -10,11 +10,12 @@
 - site_device_counts: 每个站点各 domain 的设备数量（由 ne_graph 派生）
 - site_chains:        预计算站点上下游 hop 索引
 
-读取过程共享，避免重复 IO：
+默认读取过程：
 
 - SYS_NE 读取 1 次（得到完整 NE 信息，并据此派生 nativeId->site_id 映射）
 - SYS_SITE 读取 1 次（站点信息驻留内存，供 site 图与 ne 图共用）
-- 链路读取 + 去重 1 次（单趟遍历同时聚合 site 邻接、ne 邻接与端口对端索引）
+- SYS_LINK 由 NE-NE、端口-端口、NE-端口三个生成器分别派生；当前 CSV/zip
+  适配会分别读取链路输入，后续可替换成其它数据源直接生成三类关系
 """
 
 import json
@@ -190,8 +191,8 @@ def iter_csv_records(input_path: str, progress: ProgressBar = None, *,
 
 # --------------------------------------------------------------------------- #
 # 记录生成器：把“从哪读取原始记录”与“如何去重构图”解耦。
-# 下面三个生成器基于当前 CSV/zip 构造，也可换成其它数据源（DB / 接口等），
-# 只要逐条产出与 CSV 同结构的 dict 记录即可喂给对应的 load_* 函数。
+# 下面生成器基于当前 CSV/zip 构造，也可换成其它数据源（DB / 接口等）。
+# 各类 vid / linkLayer 的归一化必须在生成器阶段完成，消费端不再兜底归一化。
 # --------------------------------------------------------------------------- #
 def _iter_csv_records_with_progress(input_path: str, label: str, *,
                                     name_keyword: str = None, require: bool = False):
@@ -207,21 +208,33 @@ def _iter_csv_records_with_progress(input_path: str, label: str, *,
     progress.close()
 
 
+def _normalize_ne_vid_for_generator(value) -> str:
+    return str(value or '').strip().upper()
+
+
+def _normalize_site_vid_for_generator(value) -> str:
+    return str(value or '').strip().upper()
+
+
+def _normalize_link_layer_for_generator(value) -> str:
+    return str(value or '').strip().upper()
+
+
 def iter_ne_csv_records(data_dir: str = SYS_NE_DIR):
     """从当前 SYS_NE CSV 目录构造 NE 记录生成器，供 load_ne_info 消费。
 
     仅产出规范化后的字段（其余原始列被丢弃）：
-        nativeId / domain / typeId / networkType / name / vender / siteId
+        vid / domain / typeId / networkType / name / vender / siteId
     """
     for row in _iter_csv_records_with_progress(data_dir, "  读取NE记录", name_keyword='SYS_NE'):
         yield {
-            'nativeId': row.get('nativeId', ''),
+            'vid': _normalize_ne_vid_for_generator(row.get('nativeId', '')),
             'domain': row.get('domain', ''),
             'typeId': row.get('typeId', ''),
             'networkType': row.get('network_type', ''),
             'name': row.get('name', ''),
             'vender': row.get('manufacturer', ''),
-            'siteId': row.get('ne_site_id', ''),
+            'siteId': _normalize_site_vid_for_generator(row.get('ne_site_id', '')),
         }
 
 
@@ -229,49 +242,101 @@ def iter_site_csv_records(data_dir: str = SYS_SITE_DIR):
     """从当前 SYS_SITE CSV 目录构造站点记录生成器，供 load_site_info 消费。
 
     仅产出规范化后的字段（其余原始列被丢弃）：
-        nativeId / name / longitude / latitude / is_hub
+        vid / name / longitude / latitude / isHub
     """
     for row in _iter_csv_records_with_progress(data_dir, "  读取站点记录", name_keyword='SYS_SITE'):
         yield {
-            'nativeId': row.get('site_id', ''),
+            'vid': _normalize_site_vid_for_generator(row.get('site_id', '')),
             'name': row.get('name', ''),
             'longitude': row.get('longitude', ''),
             'latitude': row.get('latitude', ''),
-            'is_hub': row.get('is_hub', ''),
+            'isHub': row.get('is_hub', ''),
         }
 
 
-def iter_link_csv_records(link_input: str = SYS_LINK_DIR):
-    """从当前 SYS_LINK CSV/zip 输入构造链路记录生成器，供 load_latest_link_records 消费。
+def _make_port_vid(ne_id: str, port_name: str) -> str:
+    """用 NE ID + 端口名构造全局唯一端口 VID；格式与对端索引 key 保持一致。"""
+    return make_key(ne_id, port_name)
 
-    仅产出规范化后的字段（其余原始列被丢弃）：
-        a_end_ne_nativeId / z_end_ne_nativeId /
-        linkLayer / a_end_port_name / z_end_port_name
 
-    端点 ID 的两种原始列会归一到同一字段：a_end_ne_nativeId 或 a_end_ne_nativeId(')
-    取第一个非空值填入 a_end_ne_nativeId；z 端同理。
+def iter_ne_ne_link(link_input: str = SYS_LINK_DIR):
+    """从 SYS_LINK 构造 NE-NE 链路记录。
+
+    输出字段：
+        src_vid / dst_vid / linkLayer
     """
-    for row in _iter_csv_records_with_progress(link_input, "  读取链路记录", require=True):
+    for row in _iter_csv_records_with_progress(link_input, "  读取NE-NE链路", require=True):
         yield {
-            'a_end_ne_nativeId': _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')"),
-            'z_end_ne_nativeId': _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')"),
-            'linkLayer': row.get('link_layer', ''),
-            'a_end_port_name': row.get('a_end_port_name', ''),
-            'z_end_port_name': row.get('z_end_port_name', ''),
+            'src_vid': _normalize_ne_vid_for_generator(
+                _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
+            ),
+            'dst_vid': _normalize_ne_vid_for_generator(
+                _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')")
+            ),
+            'linkLayer': _normalize_link_layer_for_generator(row.get('link_layer', '')),
         }
+
+
+def iter_port_port(link_input: str = SYS_LINK_DIR):
+    """从 SYS_LINK 构造端口-端口链路记录。
+
+    输出字段：
+        src_vid / dst_vid / linkLayer
+
+    src_vid 和 dst_vid 使用 NE ID + 端口名构造的端口 VID，而非裸端口名，避免不同
+    NE 上的同名端口互相冲突。两端 NE 与端口名均非空时才产出记录。
+    """
+    for row in _iter_csv_records_with_progress(link_input, "  读取端口-端口链路", require=True):
+        a_ne = _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
+        z_ne = _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')")
+        a_port = _get_record_value(row, 'a_end_port_name')
+        z_port = _get_record_value(row, 'z_end_port_name')
+        if not (a_ne and z_ne and a_port and z_port):
+            continue
+        yield {
+            'src_vid': _make_port_vid(a_ne, a_port),
+            'dst_vid': _make_port_vid(z_ne, z_port),
+            'linkLayer': _normalize_link_layer_for_generator(row.get('link_layer', '')),
+        }
+
+
+def iter_ne_port_link(link_input: str = SYS_LINK_DIR):
+    """从 SYS_LINK 构造 NE-端口归属关系记录。
+
+    输出字段：
+        src_vid / dst_vid
+
+    src_vid 为 NE VID；dst_vid 为由 NE ID + 端口名构造的端口 VID。一条 SYS_LINK
+    记录最多产出 a/z 两条归属关系。
+    """
+    for row in _iter_csv_records_with_progress(link_input, "  读取NE-端口关系", require=True):
+        a_ne = _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
+        z_ne = _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')")
+        a_port = _get_record_value(row, 'a_end_port_name')
+        z_port = _get_record_value(row, 'z_end_port_name')
+        if a_ne and a_port:
+            yield {
+                'src_vid': _normalize_ne_vid_for_generator(a_ne),
+                'dst_vid': _make_port_vid(a_ne, a_port),
+            }
+        if z_ne and z_port:
+            yield {
+                'src_vid': _normalize_ne_vid_for_generator(z_ne),
+                'dst_vid': _make_port_vid(z_ne, z_port),
+            }
 
 
 # --------------------------------------------------------------------------- #
 # 基础数据加载（去重取最新）
 # --------------------------------------------------------------------------- #
 def load_ne_info(records, report_duplicates: bool = False) -> dict:
-    """从记录生成器加载 NE 信息；同 nativeId 冲突时按出现顺序后者直接覆盖前者，不做字段合并。
+    """从记录生成器加载 NE 信息；同 vid 冲突时按出现顺序后者直接覆盖前者，不做字段合并。
 
     records 为逐条产出规范化 NE 记录（dict）的可迭代对象，可由 iter_ne_csv_records 从当前
-    SYS_NE CSV 构造，也可替换成其它数据源；期望字段见 iter_ne_csv_records。
+    SYS_NE CSV 构造，也可替换成其它数据源；期望字段见 iter_ne_csv_records（NE ID 为 vid）。
 
     Returns:
-        {nativeId: {domain, type, network_type, name, manufacturer, site_id}}
+        {vid: {domain, type, network_type, name, manufacturer, site_id}}
     """
     result = {}
     duplicates = defaultdict(int) if report_duplicates else None
@@ -279,24 +344,25 @@ def load_ne_info(records, report_duplicates: bool = False) -> dict:
     row_count = 0
     for row in records:
         row_count += 1
-        nativeId = sys.intern((row.get('nativeId') or '').strip().upper())
-        if not nativeId:
+        vid = row.get('vid') or ''
+        if not vid:
             continue
-        if duplicates is not None and nativeId in result:
-            duplicates[nativeId] += 1
+        vid = sys.intern(vid)
+        if duplicates is not None and vid in result:
+            duplicates[vid] += 1
         # 低基数/高重复字段做 intern：同值只留一份对象，大幅压缩百万级记录的重复占用。
         # name 为高基数（设备名各异），不 intern 以免污染 intern 表。
-        result[nativeId] = {
+        result[vid] = {
             'domain': sys.intern((row.get('domain') or '').strip()),
             'type': sys.intern((row.get('typeId') or '').strip()),
             'network_type': sys.intern((row.get('networkType') or '').strip()),
             'name': (row.get('name') or '').strip(),
             'manufacturer': sys.intern((row.get('vender') or '').strip()),
-            'site_id': sys.intern((row.get('siteId') or '').strip().upper()),
+            'site_id': sys.intern(row.get('siteId') or ''),
         }
 
     print(f"  读取 {row_count} 行，去重后 {len(result)} 个NE")
-    _report_duplicate_detail(duplicates, 'nativeId')
+    _report_duplicate_detail(duplicates, 'vid')
     return result
 
 
@@ -304,7 +370,7 @@ def load_site_info(records, report_duplicates: bool = False) -> dict:
     """从记录生成器加载站点信息；同 site_id 冲突时按出现顺序后者直接替换前者，不做字段合并。
 
     records 为逐条产出规范化站点记录（dict）的可迭代对象，可由 iter_site_csv_records 从当前
-    SYS_SITE CSV 构造，也可替换成其它数据源；期望字段见 iter_site_csv_records（站点 ID 为 nativeId）。
+    SYS_SITE CSV 构造，也可替换成其它数据源；期望字段见 iter_site_csv_records（站点 ID 为 vid）。
 
     Returns:
         {site_id: {site_name, longitude, latitude, is_hub}}
@@ -315,9 +381,10 @@ def load_site_info(records, report_duplicates: bool = False) -> dict:
     row_count = 0
     for row in records:
         row_count += 1
-        site_id = sys.intern((row.get('nativeId') or '').strip().upper())
+        site_id = row.get('vid') or ''
         if not site_id:
             continue
+        site_id = sys.intern(site_id)
         if duplicates is not None and site_id in result:
             duplicates[site_id] += 1
         # site_name 与经纬度高基数不 intern。
@@ -325,7 +392,7 @@ def load_site_info(records, report_duplicates: bool = False) -> dict:
             'site_name': (row.get('name') or '').strip(),
             'longitude': (row.get('longitude') or '').strip(),
             'latitude': (row.get('latitude') or '').strip(),
-            'is_hub': _parse_bool(row.get('is_hub', '')),
+            'is_hub': _parse_bool(row.get('isHub', '')),
         }
 
     print(f"  读取 {row_count} 行，去重后 {len(result)} 个站点")
@@ -341,68 +408,13 @@ def _get_record_value(record, *field_names):
     return ""
 
 
-@dataclass(slots=True)
-class LatestLink:
-    """驻留的紧凑链路记录；字段均已按构图口径完成解析。"""
-
-    a_ne: str
-    z_ne: str
-    link_type: str
-    a_port: str
-    z_port: str
-
-
-def _parse_latest_link(record: dict) -> LatestLink:
-    """把规范化链路记录压缩成 build_graphs 实际使用的语义字段。"""
-    # NE 端点(基数=设备数，跨链路高度重复)、link_type 做 intern，与 NE/站点加载共用
-    # 同一 intern 表，端点对象可与 ne_graph 的 key 共享。端口名基数高，不 intern。
-    return LatestLink(
-        a_ne=sys.intern((record.get('a_end_ne_nativeId') or '').strip().upper()),
-        z_ne=sys.intern((record.get('z_end_ne_nativeId') or '').strip().upper()),
-        link_type=sys.intern((record.get('linkLayer') or '').strip().upper()),
-        a_port=_get_record_value(record, "a_end_port_name"),
-        z_port=_get_record_value(record, "z_end_port_name"),
-    )
-
-
-def _consume_links(records: list):
-    """保持既有顺序逐条产出，弹出后即置空槽位，使已构图记录尽早回收。
-
-    入参为普通 list，消费阶段只剩一段随消费逐步缩小的指针数组。
-    """
-    for index, payload in enumerate(records):
-        records[index] = None
-        yield payload
-    records.clear()
-
-
-def load_latest_link_records(records):
-    """从记录生成器读取链路记录：不再去重，按出现顺序全部保留。
-
-    records 为逐条产出规范化链路记录（dict）的可迭代对象，可由 iter_link_csv_records 从当前
-    SYS_LINK CSV/zip 构造，也可替换成其它数据源；期望字段见 iter_link_csv_records。
-
-    把每条记录解析为 slots 紧凑对象，不在内存中驻留字段字典；返回惰性可迭代对象，
-    调用方单趟遍历并逐条弹出，避免完整链路列表与完整图长期重叠。保持出现顺序以保证
-    build_graphs 中“同 (ne,port) 键后写覆盖”等顺序相关行为稳定。
-    """
-    parsed = []
-    row_count = 0
-    for record in records:
-        row_count += 1
-        parsed.append(_parse_latest_link(record))
-
-    print(f"  读取 {row_count} 条链路记录")
-    return _consume_links(parsed)
-
-
 # --------------------------------------------------------------------------- #
 # 端口对端索引
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
 class PeerDevice:
     ne_native_id: str
-    port_name: str = ""
+    port_vid: str = ""
 
 
 def _json_default(obj):
@@ -434,8 +446,12 @@ def _add_bidirectional_edge(graph: dict, a: str, b: str, link_type: str) -> None
         rev[link_type] = '<-'
 
 
-def build_graphs(latest_links, ne_info: dict):
-    """单趟遍历去重后的链路，同时构建 site 邻接图、ne 邻接图与端口对端索引。
+def build_graphs_from_relations(ne_ne_links, port_port_links, ne_port_links, ne_info: dict):
+    """消费三类拓扑关系，构建 site 邻接图、NE 邻接图与端口对端索引。
+
+    port_vid 是不透明的全局端口 ID。当前 SYS_LINK 生成器用 NE+port 构造它，
+    迁移到其它数据源时只要三类生成器对同一端口使用同一个 port_vid 即可。
+    输入记录的各类 vid / linkLayer 必须已在生成器阶段完成归一化。
 
     Returns:
         (site_links, ne_links, peer_index, stats)
@@ -449,40 +465,59 @@ def build_graphs(latest_links, ne_info: dict):
         'ne_mapped_count': 0,
         'site_link_count': 0,
         'site_mapped_count': 0,
+        'port_link_count': 0,
+        'port_mapped_count': 0,
     }
 
-    for record in latest_links:
-        a_ne = record.a_ne
-        z_ne = record.z_ne
-        link_type = record.link_type
+    for record in ne_ne_links:
+        src_ne = record.get('src_vid') or ''
+        dst_ne = record.get('dst_vid') or ''
+        link_type = record.get('linkLayer') or ''
 
-        if a_ne and z_ne:
-            # NE 邻接图
-            stats['ne_link_count'] += 1
-            stats['ne_mapped_count'] += 1
-            _add_bidirectional_edge(ne_links, a_ne, z_ne, link_type)
+        if not (src_ne and dst_ne):
+            continue
 
-            # 站点邻接图：两端 NE 都能映射到站点时才登记
-            stats['site_link_count'] += 1
-            a_site = ne_info.get(a_ne, {}).get('site_id')
-            z_site = ne_info.get(z_ne, {}).get('site_id')
-            if a_site and z_site:
-                stats['site_mapped_count'] += 1
-                _add_bidirectional_edge(site_links, a_site, z_site, link_type)
+        # NE 邻接图
+        stats['ne_link_count'] += 1
+        stats['ne_mapped_count'] += 1
+        _add_bidirectional_edge(ne_links, src_ne, dst_ne, link_type)
 
-            # 端口对端索引：还需两端端口名
-            a_port = record.a_port
-            z_port = record.z_port
-            if a_port and z_port:
-                peer_index[make_key(a_ne, a_port)] = PeerDevice(
-                    # a_ne/z_ne 已按构图口径归一化；直接复用，避免每条索引再复制 NE ID。
-                    ne_native_id=z_ne,
-                    port_name=z_port,
-                )
-                peer_index[make_key(z_ne, z_port)] = PeerDevice(
-                    ne_native_id=a_ne,
-                    port_name=a_port,
-                )
+        # 站点邻接图：两端 NE 都能映射到站点时才登记
+        stats['site_link_count'] += 1
+        src_site = ne_info.get(src_ne, {}).get('site_id')
+        dst_site = ne_info.get(dst_ne, {}).get('site_id')
+        if src_site and dst_site:
+            stats['site_mapped_count'] += 1
+            _add_bidirectional_edge(site_links, src_site, dst_site, link_type)
+
+    port_to_ne = {}
+    for record in ne_port_links:
+        ne_vid = record.get('src_vid') or ''
+        port_vid = record.get('dst_vid') or ''
+        if ne_vid and port_vid:
+            port_to_ne[port_vid] = sys.intern(ne_vid)
+
+    for record in port_port_links:
+        src_port_vid = record.get('src_vid') or ''
+        dst_port_vid = record.get('dst_vid') or ''
+        if not (src_port_vid and dst_port_vid):
+            continue
+
+        stats['port_link_count'] += 1
+        src_ne = port_to_ne.get(src_port_vid)
+        dst_ne = port_to_ne.get(dst_port_vid)
+        if not (src_ne and dst_ne):
+            continue
+
+        stats['port_mapped_count'] += 1
+        peer_index[src_port_vid] = PeerDevice(
+            ne_native_id=dst_ne,
+            port_vid=dst_port_vid,
+        )
+        peer_index[dst_port_vid] = PeerDevice(
+            ne_native_id=src_ne,
+            port_vid=src_port_vid,
+        )
 
     return site_links, ne_links, peer_index, stats
 
@@ -594,14 +629,14 @@ def _write_resource_line(output_file, resource_type: str, data) -> None:
     output_file.write('}\n')
 
 
-def build_resource_buffer(ne_records, site_records, link_records, output_path,
-                          report_duplicates: bool = False):
-    """消费三路资源记录生成器，产出单个资源缓冲文件（JSONL）。
+def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_records,
+                          ne_port_records, output_path, report_duplicates: bool = False):
+    """消费资源记录生成器，产出单个资源缓冲文件（JSONL）。
 
-    ne_records / site_records / link_records 均为逐条产出原始记录（dict）的可迭代对象，
-    是本工具与“数据从哪来”之间的唯一耦合点：默认由 iter_ne_csv_records /
-    iter_site_csv_records / iter_link_csv_records 从当前 CSV 构造，后续可整体替换成
-    DB / 接口等其它数据源，本函数与下游构图逻辑均无需改动。
+    ne_records / site_records / ne_ne_records / port_port_records / ne_port_records
+    均为逐条产出规范化记录（dict）的可迭代对象，是本工具与“数据从哪来”之间的
+    唯一耦合点。默认由当前 CSV 构造，后续可整体替换成 DB / 接口等其它数据源。
+    消费端假定这些记录中的 vid / linkLayer 已归一化。
     """
     # 1) NE 读取一次，得到完整 NE 信息（其中含 site_id）
     print("加载NE信息...")
@@ -612,13 +647,17 @@ def build_resource_buffer(ne_records, site_records, link_records, output_path,
     print("\n加载站点信息...")
     site_info = load_site_info(site_records, report_duplicates)
 
-    # 3) 链路读取一次（不去重），单趟遍历产出三张图
+    # 3) 消费三类拓扑关系，产出三张图
     print("\n生成传播图与对端索引...")
-    latest_links = load_latest_link_records(link_records)
-    site_links, ne_links, peer_index, stats = build_graphs(latest_links, ne_info=ne_info)
-    del latest_links  # 释放链路记录（slim 记录）
+    site_links, ne_links, peer_index, stats = build_graphs_from_relations(
+        ne_ne_records,
+        port_port_records,
+        ne_port_records,
+        ne_info=ne_info,
+    )
     print(f"  站点图: 处理 {stats['site_link_count']} 条链路，成功映射 {stats['site_mapped_count']} 条")
     print(f"  NE图:   处理 {stats['ne_link_count']} 条链路，成功映射 {stats['ne_mapped_count']} 条")
+    print(f"  端口对端: 处理 {stats['port_link_count']} 条链路，成功映射 {stats['port_mapped_count']} 条")
 
     # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出
     site_graph = assemble_site_graph(site_info, site_links)
@@ -726,12 +765,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # 唯一耦合点：从当前 CSV 构造三路记录生成器。要换数据源，只需在这里换成
-    # 别的生成器（产出同结构 dict 记录），build_resource_buffer 无需改动。
+    # 唯一耦合点：从当前 CSV 构造资源记录生成器。要换数据源，只需在这里换成
+    # 产出同结构 dict 记录的生成器，build_resource_buffer 无需改动。
     build_resource_buffer(
         ne_records=iter_ne_csv_records(args.ne_dir),
         site_records=iter_site_csv_records(args.site_dir),
-        link_records=iter_link_csv_records(args.link_input),
+        ne_ne_records=iter_ne_ne_link(args.link_input),
+        port_port_records=iter_port_port(args.link_input),
+        ne_port_records=iter_ne_port_link(args.link_input),
         output_path=args.output,
         report_duplicates=args.report_duplicates,
     )

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from anchor_grouping_online.peer_index_keys import make_key, normalize_ne_key
+from anchor_grouping_online.alarm_events.generator import port_vid_from_extendedattr
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class LinkAlarmEndpoints:
 @dataclass(frozen=True)
 class PeerDevice:
     ne_native_id: str
-    port_name: str = ""
+    port_vid: str = ""
 
 
 def build_peer_index(data):
@@ -33,18 +33,30 @@ def resolve_link_alarm_endpoints_from_peer_index(
 ):
     alarm_info = alarm_info if isinstance(alarm_info, dict) else {}
     local_ne = str(alarm_source or alarm_info.get("告警源", "") or "").strip()
-    local_port = str(alarm_info.get("物理端口名称", "") or "").strip()
-    if not peer_index or not local_ne or not local_port:
-        return LinkAlarmEndpoints(local_ne=local_ne, local_port=local_port)
+    local_port_vid = port_vid_from_extendedattr(alarm_info.get("extendedattr", ""))
+    if not peer_index:
+        return LinkAlarmEndpoints(
+            local_ne=local_ne,
+            local_port=local_port_vid,
+        )
 
-    peer = peer_index.get(make_key(local_ne, local_port))
+    if not local_port_vid:
+        return LinkAlarmEndpoints(
+            local_ne=local_ne,
+            local_port="",
+        )
+
+    peer = peer_index.get(local_port_vid)
     if peer is None:
-        return LinkAlarmEndpoints(local_ne=local_ne, local_port=local_port)
+        return LinkAlarmEndpoints(
+            local_ne=local_ne,
+            local_port=local_port_vid,
+        )
     if isinstance(peer, dict):
         peer = PeerDevice(**peer)
     return LinkAlarmEndpoints(
-        local_ne=normalize_ne_key(local_ne),
-        local_port=local_port,
+        local_ne=local_ne,
+        local_port=local_port_vid,
         remote_ne=peer.ne_native_id,
-        remote_port=peer.port_name,
+        remote_port=peer.port_vid,
     )
