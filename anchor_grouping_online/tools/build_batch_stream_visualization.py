@@ -87,7 +87,7 @@ def _new_aggregate_state(agg_id):
     }
 
 
-def _load_window_aggregates(input_path):
+def _load_window_aggregates(input_path, ne_to_site):
     """流式读取滑窗输出，返回按首次出现顺序保存的二次汇聚状态。"""
     aggregates = {}
     window_record_count = 0
@@ -162,7 +162,9 @@ def _load_window_aggregates(input_path):
                                     f"第 {line_number} 行原始组 {group_id!r} "
                                     "包含非对象告警"
                                 )
-                            matching_alarm = to_matching_alarm(generated_alarm)
+                            matching_alarm = to_matching_alarm(
+                                generated_alarm, ne_to_site
+                            )
                             if matching_alarm["is_clear"]:
                                 raise ValueError(
                                     f"第 {line_number} 行原始组 {group_id!r} "
@@ -399,8 +401,6 @@ def build_visualization_jsonl(
     if input_resolved == output_resolved:
         raise ValueError("输入文件和输出文件不能是同一路径")
 
-    print(f"读取滑窗二次汇聚输出: {input_path}", flush=True)
-    aggregates, window_record_count = _load_window_aggregates(input_path)
     print(f"加载可视化拓扑资源: {resource_buffer}", flush=True)
     resources = load_resource_buffer(
         resource_buffer,
@@ -408,6 +408,17 @@ def build_visualization_jsonl(
     )
     ne_graph = resources["ne_graph"]
     site_graph = resources["site_graph"]
+    # 告警不携带站点字段：解析时用 告警源 在网元拓扑中反查站点。
+    ne_to_site = {
+        ne_id: str(ne_info.get("site_id", "")).strip()
+        for ne_id, ne_info in ne_graph.items()
+        if str(ne_info.get("site_id", "")).strip()
+    }
+
+    print(f"读取滑窗二次汇聚输出: {input_path}", flush=True)
+    aggregates, window_record_count = _load_window_aggregates(
+        input_path, ne_to_site
+    )
 
     aggregate_states = sorted(
         aggregates.values(),

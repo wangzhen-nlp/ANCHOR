@@ -7,14 +7,21 @@
 字段形如：
 
     {
-        "站点ID": "site-1",
-        "告警标题": "Link Down",
-        "告警首次发生时间": 123.5,          # 数值时间戳或时间文本
-        "告警编码ID": "eid-1::<uuid>",
-        "告警源": "ne-1",
-        "物理端口名称": "port-1",
+        "alarmName": "Link Down",
+        "firstOccurrence": 123.5,           # 数值时间戳或时间文本
+        "vid": "eid-1::<uuid>",             # 告警唯一 ID
+        "neVid": "ne-1",                    # 网元 vid，可空
+        "ownerVid": "site-1",               # 归属资源 vid，neVid 为空时兜底
+        "extendedattr": "portVid:port-1",   # 自由键值文本，取 portVid 条目
         "是否清除": True,                   # 可选，缺省视为上报告警
     }
+
+告警源取 neVid，为空时退回 ownerVid；站点用告警源在静态拓扑的
+ne_to_site（网元 ID -> 站点 ID）中反查得到，查不到时按无站点处理
+（匹配不上拓扑规则，仅能靠组 ID 连续性等与拓扑无关的逻辑参与汇聚）。
+物理端口名称从 extendedattr 的 portVid 条目解析。
+生成器不再输出 是否清除（清除告警在流式入口按原始载荷过滤），
+调用方自带该字段时仍按清除告警处理。
 
 批处理不考虑实时聚合成熟时间：
 
@@ -54,7 +61,7 @@ from anchor_grouping_online.temporal_engine.utils import merge_match_batch
 from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
 
 
-def _matching_alarm(generated_alarm, cache):
+def _matching_alarm(generated_alarm, cache, ne_to_site):
     """按对象身份缓存 to_matching_alarm 结果，避免同一告警在批内重复转换。
 
     to_matching_alarm 内含多次 str.strip 及可能的时间文本解析，一条告警在
@@ -63,13 +70,14 @@ def _matching_alarm(generated_alarm, cache):
     / old_agg 在整个调用期间持有，id() 稳定不复用；按对象身份而非 alarm_id
     做键，保证同 eid 的上报/清除两条告警（is_clear 不同）各自独立转换。
     cache 为 None 时退回逐次转换（等价旧行为，供私有方法被单独调用时使用）。
+    ne_to_site 为静态拓扑的网元->站点映射，站点由 告警源 反查得到。
     """
     if cache is None:
-        return to_matching_alarm(generated_alarm)
+        return to_matching_alarm(generated_alarm, ne_to_site)
     key = id(generated_alarm)
     cached = cache.get(key)
     if cached is None:
-        cached = to_matching_alarm(generated_alarm)
+        cached = to_matching_alarm(generated_alarm, ne_to_site)
         cache[key] = cached
     return cached
 
@@ -224,6 +232,7 @@ class BatchFaultGroupMatcher:
         # 本次调用内共享的告警转换缓存：登记、外置重建、喂流、输出、外置
         # 合并各阶段复用同一份 to_matching_alarm 结果，避免重复转换。
         matching_cache = {}
+        ne_to_site = self.static_context.ne_to_site
         # 外置历史在临时引擎里只保留 max_group_time 视界内的
         # 告警匹配证据。会话必须先于本批登记重建，因此这里先做一次
         # O(batch) 的时间下界预计算；转换结果写入 matching_cache，后续
@@ -233,7 +242,9 @@ class BatchFaultGroupMatcher:
             external_batch_min_ts = None
             for group_alarms in alarm_groups.values():
                 for generated_alarm in group_alarms or ():
-                    ts = _matching_alarm(generated_alarm, matching_cache)["ts"]
+                    ts = _matching_alarm(
+                        generated_alarm, matching_cache, ne_to_site
+                    )["ts"]
                     if external_batch_min_ts is None or ts < external_batch_min_ts:
                         external_batch_min_ts = ts
             if external_batch_min_ts is not None:
@@ -294,7 +305,9 @@ class BatchFaultGroupMatcher:
             min_ts = None
             group_last_ts = None
             for generated_alarm in group_alarms or ():
-                matching_alarm = _matching_alarm(generated_alarm, matching_cache)
+                matching_alarm = _matching_alarm(
+                    generated_alarm, matching_cache, ne_to_site
+                )
                 alarm_id = matching_alarm["alarm_id"]
                 ts = matching_alarm["ts"]
                 first_in_batch = alarm_id not in batch_alarm_ids
@@ -377,6 +390,7 @@ class BatchFaultGroupMatcher:
                     sort_events=True,
                     upsert_events=True,
                     matching_cache=matching_cache,
+                    ne_to_site=ne_to_site,
                 )
             elif new_generated_alarms or overlapping_generated_alarms:
                 batch_trigger_candidates = self._feed_engine(
@@ -391,6 +405,7 @@ class BatchFaultGroupMatcher:
                     # 流式喂入，不再构造 O(batch) 中间列表。
                     preconverted_events=self.batch_isolated,
                     matching_cache=matching_cache,
+                    ne_to_site=ne_to_site,
                 )
             else:
                 batch_trigger_candidates = []
@@ -562,7 +577,9 @@ class BatchFaultGroupMatcher:
             if session["agg_registry"][agg_id][0] < 2:
                 continue
             groups_by_id = {}
-            _merge_member_entries(groups_by_id, member_entries, matching_cache)
+            _merge_member_entries(
+                groups_by_id, member_entries, matching_cache, ne_to_site
+            )
             batch_increment_by_agg[agg_id] = [
                 {group_id: list(alarms_by_id.values())}
                 for group_id, alarms_by_id in groups_by_id.items()
@@ -619,8 +636,11 @@ class BatchFaultGroupMatcher:
                 groups_by_id,
                 old_agg_alarm_groups.get(agg_id) or (),
                 matching_cache,
+                ne_to_site,
             )
-            _merge_member_entries(groups_by_id, batch_entries, matching_cache)
+            _merge_member_entries(
+                groups_by_id, batch_entries, matching_cache, ne_to_site
+            )
             agg_alarm_groups[agg_id] = [
                 {group_id: list(alarms_by_id.values())}
                 for group_id, alarms_by_id in groups_by_id.items()
@@ -652,13 +672,16 @@ class BatchFaultGroupMatcher:
         无界增长。
         """
         session = self._ensure_session(associate_time, max_group_time)
+        ne_to_site = self.static_context.ne_to_site
         current_alarm_records_by_group = {}
         current_matching_alarms_by_id = {}
         current_generated_alarms_by_id = {}
         for group_id, group_alarms in (raw_alarm_groups or {}).items():
             records = []
             for generated_alarm in group_alarms or ():
-                matching_alarm = _matching_alarm(generated_alarm, matching_cache)
+                matching_alarm = _matching_alarm(
+                    generated_alarm, matching_cache, ne_to_site
+                )
                 records.append((generated_alarm, matching_alarm))
                 current_matching_alarms_by_id.setdefault(
                     matching_alarm["alarm_id"], matching_alarm
@@ -670,14 +693,14 @@ class BatchFaultGroupMatcher:
 
         def resolve_matching_alarm(generated_alarm):
             if isinstance(generated_alarm, dict):
-                raw_alarm_id = generated_alarm.get("告警编码ID")
+                raw_alarm_id = generated_alarm.get("vid")
                 if isinstance(raw_alarm_id, str):
                     current_alarm = current_matching_alarms_by_id.get(
                         raw_alarm_id.strip()
                     )
                     if current_alarm is not None:
                         return current_alarm
-            return _matching_alarm(generated_alarm, matching_cache)
+            return _matching_alarm(generated_alarm, matching_cache, ne_to_site)
 
         # 先做全量归属校验，再修改会话，避免中途发现冲突时
         # 留下一部分已写入、一部分未写入的状态。agg_output 是完整外置
@@ -808,6 +831,7 @@ class BatchFaultGroupMatcher:
                 upsert_events=True,
                 index_trigger=False,
                 matching_cache=matching_cache,
+                ne_to_site=ne_to_site,
             )
         # 视界清理：本批告警均不早于 batch_min_ts，只会清掉更早的历史。
         if batch_min_ts is not None:
@@ -835,6 +859,7 @@ class BatchFaultGroupMatcher:
         临时会话不写回 self._session：外置调用不以整份会话落库。
         """
         session = self._new_session(associate_time, max_group_time)
+        ne_to_site = self.static_context.ne_to_site
         for raw_agg_id, member_entries in old_agg_alarm_groups.items():
             agg_id = raw_agg_id
             agg_entry = _ensure_agg(session, agg_id)
@@ -855,7 +880,7 @@ class BatchFaultGroupMatcher:
                     group_last_ts = None
                     for generated_alarm in group_alarms or ():
                         matching_alarm = _matching_alarm(
-                            generated_alarm, matching_cache
+                            generated_alarm, matching_cache, ne_to_site
                         )
                         if matching_alarm["is_clear"]:
                             raise ValueError(
@@ -959,6 +984,7 @@ class BatchFaultGroupMatcher:
         index_trigger=True,
         preconverted_events=False,
         matching_cache=None,
+        ne_to_site=None,
     ):
         """整批当前告警喂流；持久会话可按 eid 幂等覆盖。
 
@@ -983,7 +1009,7 @@ class BatchFaultGroupMatcher:
             )
         else:
             matching_events = [
-                (_matching_alarm(alarm, matching_cache), cache_event)
+                (_matching_alarm(alarm, matching_cache, ne_to_site), cache_event)
                 for alarms, cache_event in event_batches
                 for alarm in alarms
             ]
@@ -1251,14 +1277,16 @@ def _update_session_time_params(session, associate_window_sec, max_stay_sec):
     session["max_stay_sec"] = max_stay_sec
 
 
-def _merge_member_entries(groups_by_id, member_entries, matching_cache=None):
+def _merge_member_entries(
+    groups_by_id, member_entries, matching_cache=None, ne_to_site=None
+):
     """把增量原始组条目并入待输出映射，组内告警按 ID 去重。"""
     for member_entry in member_entries:
         for group_id, group_alarms in member_entry.items():
             alarms_by_id = groups_by_id.setdefault(group_id, {})
             for generated_alarm in group_alarms:
                 alarm_id = _matching_alarm(
-                    generated_alarm, matching_cache
+                    generated_alarm, matching_cache, ne_to_site
                 )["alarm_id"]
                 alarms_by_id.setdefault(alarm_id, generated_alarm)
 

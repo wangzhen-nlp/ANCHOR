@@ -31,6 +31,7 @@ if __package__ in (None, ""):
     ensure_package_parent()
 
 from anchor_grouping_online.alarm_events.generator import generate_alarm
+from anchor_grouping_online.alarm_events.io import is_clear_alarm
 from anchor_grouping_online.alarm_events.sorted_cache import iter_sorted_alarm_cache_items
 from anchor_grouping_online.match_rules_batch import BatchFaultGroupMatcher
 from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
@@ -84,10 +85,12 @@ def _iter_window_alarms(alarms_path):
         for item in iter_sorted_alarm_cache_items(
             alarms_path, show_progress=True
         ):
-            generated_alarm = generate_alarm(item)
-            if generated_alarm.get("是否清除"):
+            # 生成器输出不再携带清除标记，清除告警在这里按原始
+            # 载荷的「清除告警」字段过滤，不进入汇聚。
+            if is_clear_alarm(item.get("alarm", {})):
                 stats["clear_skipped"] += 1
                 continue
+            generated_alarm = generate_alarm(item)
             group_id = str(item.get("alarm", {}).get("故障组ID", "") or "").strip()
             if not group_id:
                 stats["ungrouped_skipped"] += 1
