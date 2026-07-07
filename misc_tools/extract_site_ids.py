@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """从字符串中抽取 site_id，返回 "site_id1,site_id2" 形式的字符串。
 
-输入格式示例:
+支持两种输入格式:
     07BNS0184: 150122_AMFPLB01,150122_vSGLPG01,GLTE_MUARA_PADANG_BNS_EP
+    24TSL0013  ///该站未见上报告警
 
-每行冒号前的编号（如 07BNS0184）是 site_id；冒号后是该站点下的
-网元名（数字开头，如 150122_AMFPLB01）和站点名称（如 GLTE_xxx）。
+带冒号时取冒号前的编号（如 07BNS0184）；不带冒号时取行首第一个词，
+行尾的注释（如 ///xxx）会被忽略。
 """
 
 import argparse
@@ -16,11 +17,11 @@ NE_PATTERN = re.compile(r"^\d+_\w+$")
 
 
 def extract_site_id(line: str):
-    """从单行中抽取 site_id（冒号前的编号），无法解析时返回 None。"""
-    line = line.strip()
-    if not line or ":" not in line:
+    """从单行中抽取 site_id，无法解析时返回 None。"""
+    line = line.split("//")[0].strip()
+    if not line:
         return None
-    site_id, _, _ = line.partition(":")
+    site_id = line.partition(":")[0] if ":" in line else line.split()[0]
     return site_id.strip() or None
 
 
