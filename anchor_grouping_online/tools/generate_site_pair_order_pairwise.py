@@ -476,69 +476,36 @@ def build_global_gap_result(
     }
 
 
-def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_graph_metrics, args):
-    left_metrics = site_metrics[left_site]
-    right_metrics = site_metrics[right_site]
-    pair_key = tuple(sorted((left_site, right_site)))
-    pair_domain_counts = inputs["pair_site_domain_counts"].get(pair_key, {})
-    graph_metrics = pair_graph_metrics.get(
-        pair_key,
-        {
-            "is_bridge": False,
-            "has_alternative_path": True,
-            "shared_neighbor_count": 0,
-            "shared_neighbors": [],
-        },
-    )
-
-    # 全局层级场清晰时直接按层级差定向，跳过局部 7 特征投票。
-    # 短路阈值与投票的 effective_margin 一样对非桥边/共享邻居更保守：层级差不够大时
-    # 不短路，交回投票，由其保守 margin 把不确定的环路/多路径边判成双向。
-    left_level = left_metrics.get("level_score_smoothed", left_metrics["level_score"])
-    right_level = right_metrics.get("level_score_smoothed", right_metrics["level_score"])
-    gap = left_level - right_level
-    effective_threshold = args.global_gap_threshold
-    if not graph_metrics["is_bridge"]:
-        effective_threshold += args.global_gap_nonbridge_bonus
-    effective_threshold += (
-        min(graph_metrics["shared_neighbor_count"], args.max_shared_neighbor_bonus_count)
-        * args.global_gap_shared_neighbor_bonus
-    )
-    if gap != 0.0 and abs(gap) >= effective_threshold:
-        return build_global_gap_result(
-            left_site, right_site, left_level, right_level, gap,
-            effective_threshold, graph_metrics, args,
-        )
-
-    score_container = {
-        left_site: {"score": 0.0, "breakdown": []},
-        right_site: {"score": 0.0, "breakdown": []},
-    }
-
+def _vote_core_distance(score_container, left_site, right_site, left_metrics, right_metrics, args):
+    """特征投票：谁离汇聚 anchor 更近。"""
     left_distance = left_metrics.get("core_distance")
     right_distance = right_metrics.get("core_distance")
-    if left_distance is not None and right_distance is not None and left_distance != right_distance:
-        delta = min(abs(left_distance - right_distance), args.max_core_distance_delta)
-        amount = delta * args.core_distance_weight
-        if left_distance < right_distance:
-            _add_direction_evidence(
-                score_container,
-                left_site,
-                right_site,
-                "core_distance",
-                amount,
-                f"{left_site} 更接近汇聚 anchor ({left_distance} < {right_distance})",
-            )
-        else:
-            _add_direction_evidence(
-                score_container,
-                right_site,
-                left_site,
-                "core_distance",
-                amount,
-                f"{right_site} 更接近汇聚 anchor ({right_distance} < {left_distance})",
-            )
+    if left_distance is None or right_distance is None or left_distance == right_distance:
+        return
+    delta = min(abs(left_distance - right_distance), args.max_core_distance_delta)
+    amount = delta * args.core_distance_weight
+    if left_distance < right_distance:
+        _add_direction_evidence(
+            score_container,
+            left_site,
+            right_site,
+            "core_distance",
+            amount,
+            f"{left_site} 更接近汇聚 anchor ({left_distance} < {right_distance})",
+        )
+    else:
+        _add_direction_evidence(
+            score_container,
+            right_site,
+            left_site,
+            "core_distance",
+            amount,
+            f"{right_site} 更接近汇聚 anchor ({right_distance} < {left_distance})",
+        )
 
+
+def _vote_score_gaps(score_container, left_site, right_site, left_metrics, right_metrics, args):
+    """特征投票：层级分与汇聚候选分差距。"""
     level_gap = left_metrics["level_score"] - right_metrics["level_score"]
     if abs(level_gap) >= args.min_level_gap:
         amount = min(abs(level_gap), args.max_level_score_delta) * args.level_score_weight
@@ -571,7 +538,8 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
                 right_site,
                 "base_core_score",
                 amount,
-                f"{left_site} 汇聚候选分更高 ({left_metrics['base_core_score']:.3f} > {right_metrics['base_core_score']:.3f})",
+                f"{left_site} 汇聚候选分更高 "
+                f"({left_metrics['base_core_score']:.3f} > {right_metrics['base_core_score']:.3f})",
             )
         else:
             _add_direction_evidence(
@@ -580,9 +548,16 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
                 left_site,
                 "base_core_score",
                 amount,
-                f"{right_site} 汇聚候选分更高 ({right_metrics['base_core_score']:.3f} > {left_metrics['base_core_score']:.3f})",
+                f"{right_site} 汇聚候选分更高 "
+                f"({right_metrics['base_core_score']:.3f} > {left_metrics['base_core_score']:.3f})",
             )
 
+
+def _vote_data_domains(
+    score_container, left_site, right_site, left_metrics, right_metrics,
+    pair_domain_counts, args,
+):
+    """特征投票：Data 设备存在性与站点对连接中的 Data 暴露量。"""
     left_has_data = left_metrics["domain_counts"].get("Data", 0) > 0
     right_has_data = right_metrics["domain_counts"].get("Data", 0) > 0
     if left_has_data != right_has_data:
@@ -629,6 +604,9 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
                 f"{right_site} 在该站点对连接中出现更多 Data 设备 ({right_pair_data} > {left_pair_data})",
             )
 
+
+def _vote_topology_shape(score_container, left_site, right_site, left_metrics, right_metrics, args):
+    """特征投票：邻接站点数量与叶子站点倾向。"""
     neighbor_gap = left_metrics["neighbor_count"] - right_metrics["neighbor_count"]
     if abs(neighbor_gap) >= args.min_neighbor_gap:
         amount = min(abs(neighbor_gap), args.max_neighbor_delta) * args.neighbor_direction_weight
@@ -673,10 +651,9 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
                 f"{left_site} 更像叶子站点 (neighbor_count <= {args.leaf_neighbor_threshold})",
             )
 
-    left_score = score_container[left_site]["score"]
-    right_score = score_container[right_site]["score"]
-    score_gap = left_score - right_score
 
+def _effective_direction_margin(graph_metrics, args):
+    """按桥边/共享邻居情况放大判向 margin，返回 (margin, 不确定性说明)。"""
     effective_margin = args.direction_margin
     uncertainty_reasons = []
     if not graph_metrics["is_bridge"]:
@@ -704,6 +681,60 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
                 "detail": f"两端共享 {graph_metrics['shared_neighbor_count']} 个邻居站点，局部多路径更明显",
             }
         )
+    return effective_margin, uncertainty_reasons
+
+
+def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_graph_metrics, args):
+    left_metrics = site_metrics[left_site]
+    right_metrics = site_metrics[right_site]
+    pair_key = tuple(sorted((left_site, right_site)))
+    pair_domain_counts = inputs["pair_site_domain_counts"].get(pair_key, {})
+    graph_metrics = pair_graph_metrics.get(
+        pair_key,
+        {
+            "is_bridge": False,
+            "has_alternative_path": True,
+            "shared_neighbor_count": 0,
+            "shared_neighbors": [],
+        },
+    )
+
+    # 全局层级场清晰时直接按层级差定向，跳过局部 7 特征投票。
+    # 短路阈值与投票的 effective_margin 一样对非桥边/共享邻居更保守：层级差不够大时
+    # 不短路，交回投票，由其保守 margin 把不确定的环路/多路径边判成双向。
+    left_level = left_metrics.get("level_score_smoothed", left_metrics["level_score"])
+    right_level = right_metrics.get("level_score_smoothed", right_metrics["level_score"])
+    gap = left_level - right_level
+    effective_threshold = args.global_gap_threshold
+    if not graph_metrics["is_bridge"]:
+        effective_threshold += args.global_gap_nonbridge_bonus
+    effective_threshold += (
+        min(graph_metrics["shared_neighbor_count"], args.max_shared_neighbor_bonus_count)
+        * args.global_gap_shared_neighbor_bonus
+    )
+    if gap != 0.0 and abs(gap) >= effective_threshold:
+        return build_global_gap_result(
+            left_site, right_site, left_level, right_level, gap,
+            effective_threshold, graph_metrics, args,
+        )
+
+    score_container = {
+        left_site: {"score": 0.0, "breakdown": []},
+        right_site: {"score": 0.0, "breakdown": []},
+    }
+
+    _vote_core_distance(score_container, left_site, right_site, left_metrics, right_metrics, args)
+    _vote_score_gaps(score_container, left_site, right_site, left_metrics, right_metrics, args)
+    _vote_data_domains(
+        score_container, left_site, right_site, left_metrics, right_metrics,
+        pair_domain_counts, args,
+    )
+    _vote_topology_shape(score_container, left_site, right_site, left_metrics, right_metrics, args)
+
+    left_score = score_container[left_site]["score"]
+    right_score = score_container[right_site]["score"]
+    score_gap = left_score - right_score
+    effective_margin, uncertainty_reasons = _effective_direction_margin(graph_metrics, args)
 
     if abs(score_gap) < effective_margin:
         relation = "<->"

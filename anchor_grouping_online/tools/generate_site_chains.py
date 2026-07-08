@@ -283,31 +283,25 @@ def reachable_downstream_sites(adjacency, first_hop_adjacency, source_site, max_
     }
 
 
-def build_site_chains_from_data(
+def _apply_relation_options(
     data,
-    *,
-    ne_graph=None,
-    prediction_label=None,
-    ne_graph_label=None,
-    enrich_relation=False,
-    restrict_relation=False,
-    directed_only=False,
-    max_depth=None,
-    show_progress=True,
+    ne_graph,
+    ne_graph_label,
+    enrich_relation,
+    restrict_relation,
+    adjacency,
+    first_hop_adjacency,
+    bidirectional_neighbors,
+    all_sites,
+    warnings,
+    directed_only,
+    show_progress,
 ):
-    """从已加载的 prediction 数据与可选 ne_graph 生成站点链路；不读盘，供内存复用。
+    """按 ne_graph 关系选项做增强/限制准备，原地补充 warnings。
 
-    prediction_label / ne_graph_label 仅用于 meta 中的来源标注。
+    返回 (relation_data, augmentation_stats, restriction_stats)。
     """
     has_ne_graph = ne_graph is not None
-
-    adjacency, first_hop_adjacency, all_sites, adjacency_source, edge_stats, warnings = build_adjacency(
-        data,
-        directed_only=directed_only,
-    )
-    warnings = list(warnings or [])
-    bidirectional_neighbors, bidirectional_sites, bidirectional_source = build_bidirectional_neighbors(data)
-    all_sites.update(bidirectional_sites)
     relation_data = None
     augmentation_stats = None
     restriction_stats = None
@@ -354,15 +348,20 @@ def build_site_chains_from_data(
             "downstream_relation_count_after": 0,
             "removed_downstream_relation_count": 0,
         }
+    return relation_data, augmentation_stats, restriction_stats
 
-    all_sites.update(adjacency.keys())
-    all_sites.update(first_hop_adjacency.keys())
-    for downstream_sites in adjacency.values():
-        all_sites.update(downstream_sites)
-    for downstream_sites in first_hop_adjacency.values():
-        all_sites.update(downstream_sites)
 
-    sorted_sites = sorted(all_sites)
+def _populate_site_chains(
+    sorted_sites,
+    adjacency,
+    first_hop_adjacency,
+    bidirectional_neighbors,
+    relation_data,
+    restriction_stats,
+    max_depth,
+    show_progress,
+):
+    """生成每站点链路集合；开启限制时原地累加 restriction_stats 计数。"""
     site_chains = {
         site_id: {
             "bidirectional_sites": sorted(bidirectional_neighbors.get(site_id, set())),
@@ -401,10 +400,71 @@ def build_site_chains_from_data(
             # site_id 按 sorted_sites 递增处理，因此每个 upstream dict 的插入顺序稳定。
             for downstream_site, hop in downstream_site_hops.items():
                 site_chains[downstream_site]["upstream_site_hops"][site_id] = hop
+    return site_chains
 
-    edge_stats = edge_stats or {}
-    meta = {
-        "input_config": {
+
+def build_site_chains_from_data(
+    data,
+    *,
+    ne_graph=None,
+    prediction_label=None,
+    ne_graph_label=None,
+    enrich_relation=False,
+    restrict_relation=False,
+    directed_only=False,
+    max_depth=None,
+    show_progress=True,
+):
+    """从已加载的 prediction 数据与可选 ne_graph 生成站点链路；不读盘，供内存复用。
+
+    prediction_label / ne_graph_label 仅用于 meta 中的来源标注。
+    """
+    has_ne_graph = ne_graph is not None
+
+    adjacency, first_hop_adjacency, all_sites, adjacency_source, edge_stats, warnings = build_adjacency(
+        data,
+        directed_only=directed_only,
+    )
+    warnings = list(warnings or [])
+    bidirectional_neighbors, bidirectional_sites, bidirectional_source = build_bidirectional_neighbors(data)
+    all_sites.update(bidirectional_sites)
+    relation_data, augmentation_stats, restriction_stats = _apply_relation_options(
+        data,
+        ne_graph,
+        ne_graph_label,
+        enrich_relation,
+        restrict_relation,
+        adjacency,
+        first_hop_adjacency,
+        bidirectional_neighbors,
+        all_sites,
+        warnings,
+        directed_only,
+        show_progress,
+    )
+
+    all_sites.update(adjacency.keys())
+    all_sites.update(first_hop_adjacency.keys())
+    for downstream_sites in adjacency.values():
+        all_sites.update(downstream_sites)
+    for downstream_sites in first_hop_adjacency.values():
+        all_sites.update(downstream_sites)
+
+    sorted_sites = sorted(all_sites)
+    site_chains = _populate_site_chains(
+        sorted_sites,
+        adjacency,
+        first_hop_adjacency,
+        bidirectional_neighbors,
+        relation_data,
+        restriction_stats,
+        max_depth,
+        show_progress,
+    )
+
+    meta = _build_site_chains_meta(
+        site_chains,
+        input_config={
             "prediction_json": prediction_label,
             "ne_graph": ne_graph_label,
             "max_depth": max_depth,
@@ -412,10 +472,45 @@ def build_site_chains_from_data(
             "enrich_relation": enrich_relation,
             "restrict_relation": restrict_relation,
         },
+        adjacency_source=adjacency_source,
+        bidirectional_source=bidirectional_source,
+        site_count=len(sorted_sites),
+        warnings=warnings,
+        edge_stats=edge_stats or {},
+        has_ne_graph=has_ne_graph,
+        enrich_relation=enrich_relation,
+        restrict_relation=restrict_relation,
+        augmentation_stats=augmentation_stats,
+        restriction_stats=restriction_stats,
+    )
+    return {
+        "meta": meta,
+        "sites": site_chains,
+    }
+
+
+def _build_site_chains_meta(
+    site_chains,
+    *,
+    input_config,
+    adjacency_source,
+    bidirectional_source,
+    site_count,
+    warnings,
+    edge_stats,
+    has_ne_graph,
+    enrich_relation,
+    restrict_relation,
+    augmentation_stats,
+    restriction_stats,
+):
+    """组装输出 meta：来源标注、关系选项、统计与告警列表。"""
+    meta = {
+        "input_config": input_config,
         "adjacency_source": adjacency_source,
         "bidirectional_source": bidirectional_source,
         "first_hop_downstream_only": True,
-        "site_count": len(sorted_sites),
+        "site_count": site_count,
         "warning_count": len(warnings),
         "warnings": warnings,
         "edge_stats": edge_stats,
@@ -450,11 +545,7 @@ def build_site_chains_from_data(
         "total_bidirectional_directed_relations": total_bidirectional_relations,
         "total_bidirectional_edges": total_bidirectional_relations // 2,
     })
-
-    return {
-        "meta": meta,
-        "sites": site_chains,
-    }
+    return meta
 
 
 def build_site_chains(

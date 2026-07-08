@@ -251,33 +251,9 @@ class TemporalGraphEngine(
         # ne_graph_data: {ne_id: {"site_id": ..., "link": {neighbor_ne_id: {...}}}}
         # site_to_ne_ids: {site_id: (ne_id, ...)}
         self._link_peer_index = link_peer_index
-        if shared_static_context is not None:
-            self.role_site_index = shared_static_context["role_site_index"]
-            self._ne_to_site = shared_static_context["ne_to_site"]
-            self._site_to_ne_ids = shared_static_context["site_to_ne_ids"]
-            self._ne_adjacency = shared_static_context["ne_adjacency"]
-        else:
-            self.role_site_index = RoleSiteIndex(
-                self.rules,
-                self.sites_domain_map,
-                self.node_rule_helper,
-            )
-            self._ne_to_site = {}
-            for ne_id, info in ne_graph_data.items():
-                if not isinstance(info, dict):
-                    continue
-                site_id = str(info.get("site_id", "") or "").strip()
-                if not site_id:
-                    continue
-                self._ne_to_site[ne_id] = site_id
-                self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
-            self._site_to_ne_ids = {
-                site_id: tuple(ne_ids)
-                for site_id, ne_ids in site_to_ne_ids.items()
-            }
-            if not self._site_to_ne_ids:
-                raise ValueError("必须提供非空 site_to_ne_ids")
-            self._ne_adjacency = self._build_ne_adjacency(ne_graph_data)
+        self._init_topology_indexes(
+            ne_graph_data, site_to_ne_ids, shared_static_context
+        )
         # 缓存键: (anchor_site, max_ne_hops) -> frozenset(reachable_ne_ids)
         # 不含规则名，跨规则、跨 trigger 自动复用。
         self._anchor_ne_reachable_cache = {}
@@ -293,6 +269,38 @@ class TemporalGraphEngine(
         else:
             self.trigger_specs_by_node = {}
             self._build_trigger_indexes()
+
+    def _init_topology_indexes(
+        self, ne_graph_data, site_to_ne_ids, shared_static_context
+    ):
+        """构建（或直接复用共享的）NE 级静态结构与 role_site_index。"""
+        if shared_static_context is not None:
+            self.role_site_index = shared_static_context["role_site_index"]
+            self._ne_to_site = shared_static_context["ne_to_site"]
+            self._site_to_ne_ids = shared_static_context["site_to_ne_ids"]
+            self._ne_adjacency = shared_static_context["ne_adjacency"]
+            return
+        self.role_site_index = RoleSiteIndex(
+            self.rules,
+            self.sites_domain_map,
+            self.node_rule_helper,
+        )
+        self._ne_to_site = {}
+        for ne_id, info in ne_graph_data.items():
+            if not isinstance(info, dict):
+                continue
+            site_id = str(info.get("site_id", "") or "").strip()
+            if not site_id:
+                continue
+            self._ne_to_site[ne_id] = site_id
+            self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
+        self._site_to_ne_ids = {
+            site_id: tuple(ne_ids)
+            for site_id, ne_ids in site_to_ne_ids.items()
+        }
+        if not self._site_to_ne_ids:
+            raise ValueError("必须提供非空 site_to_ne_ids")
+        self._ne_adjacency = self._build_ne_adjacency(ne_graph_data)
 
     def export_static_context(self):
         """导出可跨引擎共享的静态结构。
@@ -427,45 +435,10 @@ class TemporalGraphEngine(
             )
             return []
 
-        cached = event_index.get(alarm_id)
         payload = alarm_payload if isinstance(alarm_payload, dict) else {}
-        if cached is None:
-            cached_event = {
-                "ts": ts,
-                "eid": alarm_id,
-                "alarm": alarm_type,
-                "alarm_source": alarm_source,
-                "alarm_payload": payload,
-                "consumed_trigger_rules": frozenset(),
-            }
-            self._insert_batch_cached_event(node, cached_event)
-            event_index[alarm_id] = cached_event
-        else:
-            cached_event = cached
-            previous_ts = cached_event.get("ts")
-            if previous_ts != ts:
-                raise ValueError(
-                    f"同一告警 {alarm_id!r} 的发生时间从 {previous_ts!r}"
-                    f" 变为 {ts!r}，无法幂等覆盖"
-                )
-            if (
-                cached_event.get("alarm") != alarm_type
-                or str(cached_event.get("alarm_source", "") or "")
-                != str(alarm_source or "")
-            ):
-                raise ValueError(
-                    f"同一告警 {alarm_id!r} 的类型或告警源发生变化，"
-                    "无法幂等覆盖"
-                )
-            cached_event.update({
-                "ts": ts,
-                "alarm": alarm_type,
-                "alarm_source": alarm_source,
-                "alarm_payload": payload,
-                # 出现在当前批即重新获得 trigger 资格；本批前序匹配仍会
-                # 再次写入消费标记并使后续 trigger 失效。
-                "consumed_trigger_rules": frozenset(),
-            })
+        self._upsert_batch_cached_event(
+            node, alarm_id, alarm_type, alarm_source, ts, payload
+        )
 
         if not index_trigger:
             return []
@@ -493,6 +466,52 @@ class TemporalGraphEngine(
             )
             trigger_candidates.append((ts, trigger_seq, trigger_key))
         return trigger_candidates
+
+    def _upsert_batch_cached_event(
+        self, node, alarm_id, alarm_type, alarm_source, ts, payload
+    ):
+        """新建或按 eid 幂等覆盖持久缓存事件。
+
+        同一 eid 的发生时间、类型或告警源发生变化时报错；覆盖时清空历史
+        消费标记（出现在当前批即重新获得 trigger 资格，本批前序匹配仍会
+        再次写入消费标记并使后续 trigger 失效）。
+        """
+        event_index = self._batch_event_by_alarm_id
+        cached_event = event_index.get(alarm_id)
+        if cached_event is None:
+            cached_event = {
+                "ts": ts,
+                "eid": alarm_id,
+                "alarm": alarm_type,
+                "alarm_source": alarm_source,
+                "alarm_payload": payload,
+                "consumed_trigger_rules": frozenset(),
+            }
+            self._insert_batch_cached_event(node, cached_event)
+            event_index[alarm_id] = cached_event
+            return
+        previous_ts = cached_event.get("ts")
+        if previous_ts != ts:
+            raise ValueError(
+                f"同一告警 {alarm_id!r} 的发生时间从 {previous_ts!r}"
+                f" 变为 {ts!r}，无法幂等覆盖"
+            )
+        if (
+            cached_event.get("alarm") != alarm_type
+            or str(cached_event.get("alarm_source", "") or "")
+            != str(alarm_source or "")
+        ):
+            raise ValueError(
+                f"同一告警 {alarm_id!r} 的类型或告警源发生变化，"
+                "无法幂等覆盖"
+            )
+        cached_event.update({
+            "ts": ts,
+            "alarm": alarm_type,
+            "alarm_source": alarm_source,
+            "alarm_payload": payload,
+            "consumed_trigger_rules": frozenset(),
+        })
 
     def _insert_batch_cached_event(self, node, cached_event):
         """按 ts 插入持久批处理缓存；顺序到达保持 O(1) 追加快路径。"""

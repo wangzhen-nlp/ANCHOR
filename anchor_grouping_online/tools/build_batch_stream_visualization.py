@@ -137,65 +137,74 @@ def _load_window_aggregates(input_path, ne_to_site):
                     state["last_window_end"], window_end
                 )
 
-                for member_entry in member_entries:
-                    _require_mapping(member_entry, "原始故障组成员", line_number)
-                    for raw_group_id, generated_alarms in member_entry.items():
-                        group_id = _normalize_text(raw_group_id)
-                        if not group_id:
-                            raise ValueError(
-                                f"第 {line_number} 行汇聚组 {agg_id!r} "
-                                "存在空的原始故障组 ID"
-                            )
-                        if not isinstance(generated_alarms, list):
-                            raise ValueError(
-                                f"第 {line_number} 行原始组 {group_id!r} "
-                                "的告警必须是列表"
-                            )
-                        group_state = state["groups"].setdefault(
-                            group_id,
-                            {"group_id": group_id, "alarms": {}},
-                        )
-
-                        for generated_alarm in generated_alarms:
-                            if not isinstance(generated_alarm, dict):
-                                raise ValueError(
-                                    f"第 {line_number} 行原始组 {group_id!r} "
-                                    "包含非对象告警"
-                                )
-                            matching_alarm = to_matching_alarm(
-                                generated_alarm, ne_to_site
-                            )
-                            if matching_alarm["is_clear"]:
-                                raise ValueError(
-                                    f"第 {line_number} 行原始组 {group_id!r} "
-                                    "包含清除告警"
-                                )
-                            alarm_id = matching_alarm["alarm_id"]
-                            existing_owner = state["alarm_group_by_id"].get(alarm_id)
-                            if existing_owner is not None and existing_owner != group_id:
-                                raise ValueError(
-                                    f"第 {line_number} 行告警 {alarm_id!r} 同时属于"
-                                    f" {existing_owner!r} 和 {group_id!r}"
-                                )
-                            state["alarm_group_by_id"][alarm_id] = group_id
-
-                            existing_alarm = group_state["alarms"].get(alarm_id)
-                            if existing_alarm is not None:
-                                if (
-                                    _matching_alarm_signature(existing_alarm["matching"])
-                                    != _matching_alarm_signature(matching_alarm)
-                                ):
-                                    raise ValueError(
-                                        f"第 {line_number} 行告警 {alarm_id!r} "
-                                        "跨窗口内容不一致"
-                                    )
-                                continue
-                            group_state["alarms"][alarm_id] = {
-                                "generated": dict(generated_alarm),
-                                "matching": matching_alarm,
-                            }
+                _merge_member_entries_into_state(
+                    state, member_entries, agg_id, line_number, ne_to_site
+                )
 
     return aggregates, window_record_count
+
+
+def _merge_member_entries_into_state(
+    state, member_entries, agg_id, line_number, ne_to_site
+):
+    """把一行窗口记录中某汇聚组的成员条目并入其跨窗口状态并校验一致性。"""
+    for member_entry in member_entries:
+        _require_mapping(member_entry, "原始故障组成员", line_number)
+        for raw_group_id, generated_alarms in member_entry.items():
+            group_id = _normalize_text(raw_group_id)
+            if not group_id:
+                raise ValueError(
+                    f"第 {line_number} 行汇聚组 {agg_id!r} "
+                    "存在空的原始故障组 ID"
+                )
+            if not isinstance(generated_alarms, list):
+                raise ValueError(
+                    f"第 {line_number} 行原始组 {group_id!r} "
+                    "的告警必须是列表"
+                )
+            group_state = state["groups"].setdefault(
+                group_id,
+                {"group_id": group_id, "alarms": {}},
+            )
+
+            for generated_alarm in generated_alarms:
+                if not isinstance(generated_alarm, dict):
+                    raise ValueError(
+                        f"第 {line_number} 行原始组 {group_id!r} "
+                        "包含非对象告警"
+                    )
+                matching_alarm = to_matching_alarm(
+                    generated_alarm, ne_to_site
+                )
+                if matching_alarm["is_clear"]:
+                    raise ValueError(
+                        f"第 {line_number} 行原始组 {group_id!r} "
+                        "包含清除告警"
+                    )
+                alarm_id = matching_alarm["alarm_id"]
+                existing_owner = state["alarm_group_by_id"].get(alarm_id)
+                if existing_owner is not None and existing_owner != group_id:
+                    raise ValueError(
+                        f"第 {line_number} 行告警 {alarm_id!r} 同时属于"
+                        f" {existing_owner!r} 和 {group_id!r}"
+                    )
+                state["alarm_group_by_id"][alarm_id] = group_id
+
+                existing_alarm = group_state["alarms"].get(alarm_id)
+                if existing_alarm is not None:
+                    if (
+                        _matching_alarm_signature(existing_alarm["matching"])
+                        != _matching_alarm_signature(matching_alarm)
+                    ):
+                        raise ValueError(
+                            f"第 {line_number} 行告警 {alarm_id!r} "
+                            "跨窗口内容不一致"
+                        )
+                    continue
+                group_state["alarms"][alarm_id] = {
+                    "generated": dict(generated_alarm),
+                    "matching": matching_alarm,
+                }
 
 
 def _build_site_placeholder_ne_id(site_id):
@@ -249,8 +258,8 @@ def _build_ne_meta(ne_id, site_id, agg_id, ne_graph, site_graph):
     }
 
 
-def _build_visualization_record(state, ne_graph, site_graph):
-    agg_id = state["agg_id"]
+def _collect_visualization_entries(state, agg_id, ne_graph, site_graph):
+    """逐原始组收集症状、网元条目与站点/网元集合，供可视化记录组装。"""
     symptoms = []
     ne_info = {}
     all_site_ids = set()
@@ -336,6 +345,14 @@ def _build_visualization_record(state, ne_graph, site_graph):
             "first_alarm_ts": min(group_timestamps) if group_timestamps else None,
             "last_alarm_ts": max(group_timestamps) if group_timestamps else None,
         })
+    return symptoms, ne_info, all_site_ids, all_ne_ids, raw_group_summaries
+
+
+def _build_visualization_record(state, ne_graph, site_graph):
+    agg_id = state["agg_id"]
+    symptoms, ne_info, all_site_ids, all_ne_ids, raw_group_summaries = (
+        _collect_visualization_entries(state, agg_id, ne_graph, site_graph)
+    )
 
     symptoms.sort(key=lambda item: (item["ts"], item["eid"]))
     for ne_meta in ne_info.values():

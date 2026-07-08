@@ -101,6 +101,65 @@ def _iter_window_alarms(alarms_path):
     return _generate(), stats
 
 
+def _settle_window(
+    buffer, matcher, output_file, start, window_sec,
+    associate_time, max_group_time, max_group_member,
+    window_index, emitted_row_number,
+):
+    """结算 [start, start + window_sec) 窗口：组装 -> 汇聚 -> 追加一行。
+
+    缓冲为空时不输出，返回是否写出了记录。
+    """
+    if not buffer:
+        return False
+    alarm_groups = {}
+    for _ts, group_id, generated_alarm in buffer:
+        alarm_groups.setdefault(group_id, []).append(generated_alarm)
+    aggregation_started_at = time.perf_counter()
+    agg_alarm_groups = matcher.aggregate_alarm_groups(
+        alarm_groups,
+        associate_time=associate_time,
+        max_group_time=max_group_time,
+        max_group_member=max_group_member,
+    )
+    aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
+    merged_input_group_count = sum(
+        len(member_entries)
+        for member_entries in agg_alarm_groups.values()
+    )
+    record = {
+        "window_start": start,
+        "window_end": start + window_sec,
+        "window_start_time": _format_ts(start),
+        "window_end_time": _format_ts(start + window_sec),
+        "input_group_count": len(alarm_groups),
+        "input_alarm_count": len(buffer),
+        "agg_group_count": len(agg_alarm_groups),
+        "merged_input_group_count": merged_input_group_count,
+        "aggregation_elapsed_seconds": round(
+            aggregation_elapsed_seconds, 6
+        ),
+        "agg_alarm_groups": agg_alarm_groups,
+    }
+    output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # 每个窗口结果立即落盘，方便运行期间通过 tail -f
+    # 查看完整中间结果，不必等到文件关闭。
+    output_file.flush()
+    print(
+        f"  [窗口 {window_index}] "
+        f"{record['window_start_time']} ~ {record['window_end_time']}："
+        f"{record['input_alarm_count']} 条告警 / "
+        f"{record['input_group_count']} 个原始组 -> "
+        f"{record['agg_group_count']} 个汇聚组，"
+        f"其中合并原始组 {merged_input_group_count} 个，"
+        f"汇聚耗时 {aggregation_elapsed_seconds:.3f} 秒"
+        f"（已写入第 "
+        f"{emitted_row_number} 行）",
+        flush=True,
+    )
+    return True
+
+
 def run_sliding_window_aggregation(
     alarms_path,
     output_path,
@@ -147,57 +206,14 @@ def run_sliding_window_aggregation(
     with open(output_path, "w", encoding="utf-8") as output_file:
 
         def settle_window(start):
-            """结算 [start, start + window_sec) 窗口：组装 -> 汇聚 -> 追加一行。"""
             nonlocal window_count, emitted_window_count
             window_count += 1
-            if not buffer:
-                return
-            alarm_groups = {}
-            for _ts, group_id, generated_alarm in buffer:
-                alarm_groups.setdefault(group_id, []).append(generated_alarm)
-            aggregation_started_at = time.perf_counter()
-            agg_alarm_groups = matcher.aggregate_alarm_groups(
-                alarm_groups,
-                associate_time=associate_time,
-                max_group_time=max_group_time,
-                max_group_member=max_group_member,
-            )
-            aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
-            merged_input_group_count = sum(
-                len(member_entries)
-                for member_entries in agg_alarm_groups.values()
-            )
-            record = {
-                "window_start": start,
-                "window_end": start + window_sec,
-                "window_start_time": _format_ts(start),
-                "window_end_time": _format_ts(start + window_sec),
-                "input_group_count": len(alarm_groups),
-                "input_alarm_count": len(buffer),
-                "agg_group_count": len(agg_alarm_groups),
-                "merged_input_group_count": merged_input_group_count,
-                "aggregation_elapsed_seconds": round(
-                    aggregation_elapsed_seconds, 6
-                ),
-                "agg_alarm_groups": agg_alarm_groups,
-            }
-            output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            # 每个窗口结果立即落盘，方便运行期间通过 tail -f
-            # 查看完整中间结果，不必等到文件关闭。
-            output_file.flush()
-            emitted_window_count += 1
-            print(
-                f"  [窗口 {window_count}] "
-                f"{record['window_start_time']} ~ {record['window_end_time']}："
-                f"{record['input_alarm_count']} 条告警 / "
-                f"{record['input_group_count']} 个原始组 -> "
-                f"{record['agg_group_count']} 个汇聚组，"
-                f"其中合并原始组 {merged_input_group_count} 个，"
-                f"汇聚耗时 {aggregation_elapsed_seconds:.3f} 秒"
-                f"（已写入第 "
-                f"{emitted_window_count} 行）",
-                flush=True,
-            )
+            if _settle_window(
+                buffer, matcher, output_file, start, window_sec,
+                associate_time, max_group_time, max_group_member,
+                window_count, emitted_window_count + 1,
+            ):
+                emitted_window_count += 1
 
         for ts, group_id, generated_alarm in alarm_stream:
             if window_start is None:

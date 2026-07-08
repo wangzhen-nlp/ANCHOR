@@ -86,7 +86,11 @@ class NodeRuleHelper:
             return None
         return None
 
-    def validate_node(self, physical_node, physical_node_domain, node_config, reference_ts, edge_window, exclude_consumed_trigger_rule=None, allowed_alarm_source_nes=None):
+    def validate_node(
+        self, physical_node, physical_node_domain, node_config, reference_ts,
+        edge_window, exclude_consumed_trigger_rule=None,
+        allowed_alarm_source_nes=None,
+    ):
         """按结构与时间窗口告警共同校验一个节点是否满足规则定义。
 
         allowed_alarm_source_nes: 可选 frozenset，若提供则仅保留 alarm_source 在该集合内

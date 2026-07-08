@@ -430,6 +430,27 @@ def longest_path_in_component(component, relation_index):
         for site_id in component
     }
 
+    # 链和环是模式识别的常见输入。度数 ≤2 且连通时可线性构造精确最长链，
+    # 无需进入通用的指数级搜索；同时保持旧实现“最长后取字典序最小”的结果。
+    if all(len(neighbors) <= 2 for neighbors in adjacency.values()):
+        path = _degree_two_longest_path(component, adjacency)
+        if path is not None:
+            return path
+
+    # 其余 ≤N 分量使用 bitmask 记忆化求精确最长简单链。相同的
+    # (末端节点, 已访问集合) 只计算一次，避免旧 DFS 对同一子问题反复穷举。
+    if len(component) <= LONGEST_PATH_EXACT_MAX_SITES:
+        return _exact_longest_path(component, adjacency)
+
+    # >N 的分量不采用误差较大的双 BFS 近似，直接返回空链。classify_component 的
+    # `set(chain) != set(unmanaged_component)` 覆盖校验会因此跳过该分量，最终落为
+    # unknown -> 故障组被丢弃，避免给出错误的模式分类。
+    return []
+
+
+def _degree_two_longest_path(component, adjacency):
+    """度数 ≤2 分量的线性最长链构造；无法整链覆盖时返回 None 回退穷举。"""
+
     def traverse_degree_two_component(start, first_neighbor):
         path = [start]
         previous = None
@@ -446,91 +467,84 @@ def longest_path_in_component(component, relation_index):
             next_site = unvisited_neighbors[0] if unvisited_neighbors else None
         return path
 
-    # 链和环是模式识别的常见输入。度数 ≤2 且连通时可线性构造精确最长链，
-    # 无需进入通用的指数级搜索；同时保持旧实现“最长后取字典序最小”的结果。
-    if all(len(neighbors) <= 2 for neighbors in adjacency.values()):
-        endpoints = sorted(
-            site_id for site_id, neighbors in adjacency.items() if len(neighbors) == 1
+    endpoints = sorted(
+        site_id for site_id, neighbors in adjacency.items() if len(neighbors) == 1
+    )
+    if len(endpoints) == 2:
+        path = traverse_degree_two_component(
+            endpoints[0],
+            adjacency[endpoints[0]][0],
         )
-        if len(endpoints) == 2:
-            path = traverse_degree_two_component(
-                endpoints[0],
-                adjacency[endpoints[0]][0],
+        if len(path) == len(component):
+            reversed_path = list(reversed(path))
+            return min(path, reversed_path)
+    elif not endpoints and all(len(neighbors) == 2 for neighbors in adjacency.values()):
+        start = min(component)
+        candidates = [
+            traverse_degree_two_component(start, neighbor)
+            for neighbor in adjacency[start]
+        ]
+        covering_paths = [
+            path for path in candidates if len(path) == len(component)
+        ]
+        if covering_paths:
+            return min(covering_paths)
+    return None
+
+
+def _exact_longest_path(component, adjacency):
+    """bitmask 记忆化求精确最长简单链，并按记忆化结果回溯重建路径。"""
+    nodes = sorted(component)
+    node_to_index = {site_id: index for index, site_id in enumerate(nodes)}
+    adjacency_indexes = [
+        tuple(node_to_index[neighbor] for neighbor in adjacency[site_id])
+        for site_id in nodes
+    ]
+
+    @lru_cache(maxsize=None)
+    def best_length(last_index, visited_mask):
+        best = 1
+        for neighbor_index in adjacency_indexes[last_index]:
+            neighbor_bit = 1 << neighbor_index
+            if visited_mask & neighbor_bit:
+                continue
+            candidate = 1 + best_length(
+                neighbor_index,
+                visited_mask | neighbor_bit,
             )
-            if len(path) == len(component):
-                reversed_path = list(reversed(path))
-                return min(path, reversed_path)
-        elif not endpoints and all(len(neighbors) == 2 for neighbors in adjacency.values()):
-            start = min(component)
-            candidates = [
-                traverse_degree_two_component(start, neighbor)
-                for neighbor in adjacency[start]
-            ]
-            covering_paths = [
-                path for path in candidates if len(path) == len(component)
-            ]
-            if covering_paths:
-                return min(covering_paths)
+            if candidate > best:
+                best = candidate
+        return best
 
-    # 其余 ≤N 分量使用 bitmask 记忆化求精确最长简单链。相同的
-    # (末端节点, 已访问集合) 只计算一次，避免旧 DFS 对同一子问题反复穷举。
-    if len(component) <= LONGEST_PATH_EXACT_MAX_SITES:
-        nodes = sorted(component)
-        node_to_index = {site_id: index for index, site_id in enumerate(nodes)}
-        adjacency_indexes = [
-            tuple(node_to_index[neighbor] for neighbor in adjacency[site_id])
-            for site_id in nodes
-        ]
+    start_lengths = [
+        best_length(index, 1 << index)
+        for index in range(len(nodes))
+    ]
+    remaining_length = max(start_lengths)
+    current_index = next(
+        index
+        for index, length in enumerate(start_lengths)
+        if length == remaining_length
+    )
+    visited_mask = 1 << current_index
+    path = [nodes[current_index]]
 
-        @lru_cache(maxsize=None)
-        def best_length(last_index, visited_mask):
-            best = 1
-            for neighbor_index in adjacency_indexes[last_index]:
-                neighbor_bit = 1 << neighbor_index
-                if visited_mask & neighbor_bit:
-                    continue
-                candidate = 1 + best_length(
-                    neighbor_index,
-                    visited_mask | neighbor_bit,
-                )
-                if candidate > best:
-                    best = candidate
-            return best
-
-        start_lengths = [
-            best_length(index, 1 << index)
-            for index in range(len(nodes))
-        ]
-        remaining_length = max(start_lengths)
-        current_index = next(
-            index
-            for index, length in enumerate(start_lengths)
-            if length == remaining_length
-        )
-        visited_mask = 1 << current_index
-        path = [nodes[current_index]]
-
-        while remaining_length > 1:
-            for neighbor_index in adjacency_indexes[current_index]:
-                neighbor_bit = 1 << neighbor_index
-                if visited_mask & neighbor_bit:
-                    continue
-                next_mask = visited_mask | neighbor_bit
-                if best_length(neighbor_index, next_mask) != remaining_length - 1:
-                    continue
-                current_index = neighbor_index
-                visited_mask = next_mask
-                path.append(nodes[current_index])
-                remaining_length -= 1
-                break
-            else:  # pragma: no cover - 防御性兜底，理论上不会发生
-                break
-        return path
-
-    # >N 的分量不采用误差较大的双 BFS 近似，直接返回空链。classify_component 的
-    # `set(chain) != set(unmanaged_component)` 覆盖校验会因此跳过该分量，最终落为
-    # unknown -> 故障组被丢弃，避免给出错误的模式分类。
-    return []
+    while remaining_length > 1:
+        for neighbor_index in adjacency_indexes[current_index]:
+            neighbor_bit = 1 << neighbor_index
+            if visited_mask & neighbor_bit:
+                continue
+            next_mask = visited_mask | neighbor_bit
+            if best_length(neighbor_index, next_mask) != remaining_length - 1:
+                continue
+            current_index = neighbor_index
+            visited_mask = next_mask
+            path.append(nodes[current_index])
+            remaining_length -= 1
+            break
+        else:  # pragma: no cover - 防御性兜底，理论上不会发生
+            break
+    return path
 
 
 def has_two_bidirectional_or_upstream_neighbors(site_id, relation_index):

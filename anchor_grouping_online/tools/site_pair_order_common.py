@@ -233,6 +233,72 @@ def iter_unique_cross_site_links(
                 }
 
 
+def _collect_ring_component(start_site, non_bridge_neighbors, visited):
+    """BFS 收集一个非桥边连通块的站点列表（原地更新 visited）。"""
+    queue = deque([start_site])
+    visited.add(start_site)
+    component_sites = []
+    while queue:
+        site_id = queue.popleft()
+        component_sites.append(site_id)
+        for neighbor_site in sorted(non_bridge_neighbors.get(site_id, ())):
+            if neighbor_site in visited:
+                continue
+            visited.add(neighbor_site)
+            queue.append(neighbor_site)
+    return component_sites
+
+
+def _summarize_ring_component(
+    component_set, internal_pairs, entry_exit_sites, site_scores, component_id
+):
+    """构造环块摘要：出入口打分并选定 entry/exit/start 站点。"""
+    start_site = (
+        entry_exit_sites[0]
+        if len(entry_exit_sites) == 1
+        else None
+    )
+    scored_entry_exit_sites = [
+        {
+            "site_id": site_id,
+            "score": round(float(site_scores.get(site_id, 0.0)), 6),
+            "has_score": site_id in site_scores,
+        }
+        for site_id in entry_exit_sites
+    ]
+    scored_sites = [
+        site_id
+        for site_id in entry_exit_sites
+        if site_id in site_scores
+    ]
+    entry_site = None
+    exit_site = None
+    if len(entry_exit_sites) == 1:
+        entry_site = entry_exit_sites[0]
+    elif scored_sites:
+        ranked_boundary_sites = sorted(
+            entry_exit_sites,
+            key=lambda site_id: (
+                float(site_scores.get(site_id, 0.0)),
+                str(site_id),
+            ),
+        )
+        exit_site = ranked_boundary_sites[0]
+        entry_site = ranked_boundary_sites[-1]
+    return {
+        "component_id": component_id,
+        "sites": sorted(component_set),
+        "site_count": len(component_set),
+        "internal_pair_count": len(internal_pairs),
+        "external_start_candidates": entry_exit_sites,
+        "entry_exit_sites": entry_exit_sites,
+        "entry_exit_site_scores": scored_entry_exit_sites,
+        "entry_site": entry_site,
+        "exit_site": exit_site,
+        "start_site": start_site,
+    }
+
+
 def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
     """
     构造严格环约束上下文。
@@ -267,19 +333,9 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
         if start_site in visited:
             continue
 
-        queue = deque([start_site])
-        visited.add(start_site)
-        component_sites = []
-
-        while queue:
-            site_id = queue.popleft()
-            component_sites.append(site_id)
-            for neighbor_site in sorted(non_bridge_neighbors.get(site_id, ())):
-                if neighbor_site in visited:
-                    continue
-                visited.add(neighbor_site)
-                queue.append(neighbor_site)
-
+        component_sites = _collect_ring_component(
+            start_site, non_bridge_neighbors, visited
+        )
         component_set = set(component_sites)
         internal_pairs = []
         entry_exit_sites = set()
@@ -300,51 +356,14 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
 
         component_id = len(component_summaries)
         entry_exit_sites = sorted(entry_exit_sites)
-        start_site = (
-            entry_exit_sites[0]
-            if len(entry_exit_sites) == 1
-            else None
+        summary = _summarize_ring_component(
+            component_set, internal_pairs, entry_exit_sites,
+            site_scores, component_id,
         )
-        scored_entry_exit_sites = [
-            {
-                "site_id": site_id,
-                "score": round(float(site_scores.get(site_id, 0.0)), 6),
-                "has_score": site_id in site_scores,
-            }
-            for site_id in entry_exit_sites
-        ]
-        scored_sites = [
-            site_id
-            for site_id in entry_exit_sites
-            if site_id in site_scores
-        ]
-        entry_site = None
-        exit_site = None
-        if len(entry_exit_sites) == 1:
-            entry_site = entry_exit_sites[0]
-        elif scored_sites:
-            ranked_boundary_sites = sorted(
-                entry_exit_sites,
-                key=lambda site_id: (
-                    float(site_scores.get(site_id, 0.0)),
-                    str(site_id),
-                ),
-            )
-            exit_site = ranked_boundary_sites[0]
-            entry_site = ranked_boundary_sites[-1]
-
-        component_summaries.append({
-            "component_id": component_id,
-            "sites": sorted(component_set),
-            "site_count": len(component_set),
-            "internal_pair_count": len(internal_pairs),
-            "external_start_candidates": entry_exit_sites,
-            "entry_exit_sites": entry_exit_sites,
-            "entry_exit_site_scores": scored_entry_exit_sites,
-            "entry_site": entry_site,
-            "exit_site": exit_site,
-            "start_site": start_site,
-        })
+        start_site = summary["start_site"]
+        entry_site = summary["entry_site"]
+        exit_site = summary["exit_site"]
+        component_summaries.append(summary)
 
         for pair_key in internal_pairs:
             entry_related = entry_site is not None and entry_site in pair_key

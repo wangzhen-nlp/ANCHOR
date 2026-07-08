@@ -129,7 +129,10 @@ class EmittedGroupStore:
             if current_alarm_keys.issubset(previous_alarm_keys):
                 fully_containing_history_exists = True
             previous_merged_rules = previous_match["merged_rules"]
-            merged["merged_rules"] = sorted(set(merged["merged_rules"]) | {rule for rule in previous_merged_rules if rule})
+            merged["merged_rules"] = sorted(
+                set(merged["merged_rules"])
+                | {rule for rule in previous_merged_rules if rule}
+            )
             for role, nodes in previous_match["inferred_roots"].items():
                 role_key = _role_key_for_merged_source(previous_match, role)
                 _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
