@@ -19,6 +19,13 @@ SYS_NE_DIR = resource_path("SYS_NE_20260525")
 SYS_SITE_DIR = resource_path("SYS_SITE_20260525")
 RESOURCE_BUFFER_JSONL = resource_path("resource_buffer.jsonl")
 
+# online 版输入文件（.csv 或内含 CSV 的 .zip），文件名为暂定占位，待数据源确定后调整
+NE_FILE = resource_path("ne.csv")
+SITE_FILE = resource_path("site.csv")
+NE_NE_FILE = resource_path("ne_ne.csv")
+PORT_PORT_FILE = resource_path("port_port.csv")
+NE_PORT_FILE = resource_path("ne_port.csv")
+
 
 __all__ = [
     "RESOURCE_DIR",
@@ -29,4 +36,9 @@ __all__ = [
     "SYS_NE_DIR",
     "SYS_SITE_DIR",
     "RESOURCE_BUFFER_JSONL",
+    "NE_FILE",
+    "SITE_FILE",
+    "NE_NE_FILE",
+    "PORT_PORT_FILE",
+    "NE_PORT_FILE",
 ]

@@ -38,7 +38,12 @@ if __package__ in (None, ""):
 from anchor_grouping_online.peer_index_keys import make_key
 from anchor_grouping_online.tools.progress_utils import ProgressBar
 from anchor_grouping_online.tools.topology_resources import (
+    NE_FILE,
+    NE_NE_FILE,
+    NE_PORT_FILE,
+    PORT_PORT_FILE,
     RESOURCE_BUFFER_JSONL,
+    SITE_FILE,
     SYS_LINK_DIR,
     SYS_NE_DIR,
     SYS_SITE_DIR,
@@ -158,27 +163,19 @@ def _iter_csv_or_zip_file(file_path: str):
         raise SystemExit(f"不支持的文件格式: {file_path}（支持 .csv/.zip）")
 
 
-def iter_csv_records(input_path: str, progress: ProgressBar = None, *,
-                     name_keyword: str = None, require: bool = False):
+def iter_csv_records(input_path: str, progress: ProgressBar = None):
     """迭代 .csv / .zip(内含 CSV) 记录。
 
-    input_path 可以是单个文件，也可以是包含这些文件的目录；目录模式下 name_keyword
-    非空时只取文件名含该关键字的文件。目录内无匹配文件时：require=True 报错退出，
-    否则仅打印警告并跳过。
+    input_path 可以是单个文件，也可以是包含这些文件的目录。目录内无匹配文件时
+    报错退出。
     """
     if os.path.isdir(input_path):
         file_names = sorted(
             name for name in os.listdir(input_path)
             if name.lower().endswith(CSV_FILE_SUFFIXES)
-            and (name_keyword is None or name_keyword in name)
         )
         if not file_names:
-            scope = f"文件名含 {name_keyword} 的 " if name_keyword else ""
-            message = f"目录中未找到{scope}.csv/.zip 文件: {input_path}"
-            if require:
-                raise SystemExit(message)
-            print(f"警告: {message}")
-            return
+            raise SystemExit(f"目录中未找到 .csv/.zip 文件: {input_path}")
         for name in file_names:
             if progress is not None:
                 progress.set_extra_text(name, force=True)
@@ -194,12 +191,11 @@ def iter_csv_records(input_path: str, progress: ProgressBar = None, *,
 # 下面生成器基于当前 CSV/zip 构造，也可换成其它数据源（DB / 接口等）。
 # 各类 vid / linkLayer 的归一化必须在生成器阶段完成，消费端不再兜底归一化。
 # --------------------------------------------------------------------------- #
-def _iter_csv_records_with_progress(input_path: str, label: str, *,
-                                    name_keyword: str = None, require: bool = False):
+def _iter_csv_records_with_progress(input_path: str, label: str):
     """在 iter_csv_records 之上叠加行级进度显示，逐条产出原始记录。"""
     progress = ProgressBar(0, label)
     row_count = 0
-    for row in iter_csv_records(input_path, progress, name_keyword=name_keyword, require=require):
+    for row in iter_csv_records(input_path, progress):
         row_count += 1
         if row_count % PROGRESS_ROW_STEP == 0:
             progress.set(row_count)
@@ -226,7 +222,7 @@ def iter_ne_csv_records(data_dir: str = SYS_NE_DIR):
     仅产出规范化后的字段（其余原始列被丢弃）：
         vid / domain / typeId / networkType / name / vender / siteId
     """
-    for row in _iter_csv_records_with_progress(data_dir, "  读取NE记录", name_keyword='SYS_NE'):
+    for row in _iter_csv_records_with_progress(data_dir, "  读取NE记录"):
         yield {
             'vid': _normalize_ne_vid_for_generator(row.get('nativeId', '')),
             'domain': row.get('domain', ''),
@@ -244,7 +240,7 @@ def iter_site_csv_records(data_dir: str = SYS_SITE_DIR):
     仅产出规范化后的字段（其余原始列被丢弃）：
         vid / name / longitude / latitude / isHub
     """
-    for row in _iter_csv_records_with_progress(data_dir, "  读取站点记录", name_keyword='SYS_SITE'):
+    for row in _iter_csv_records_with_progress(data_dir, "  读取站点记录"):
         yield {
             'vid': _normalize_site_vid_for_generator(row.get('site_id', '')),
             'name': row.get('name', ''),
@@ -265,7 +261,7 @@ def iter_ne_ne_link(link_input: str = SYS_LINK_DIR):
     输出字段：
         src_vid / dst_vid / linkLayer
     """
-    for row in _iter_csv_records_with_progress(link_input, "  读取NE-NE链路", require=True):
+    for row in _iter_csv_records_with_progress(link_input, "  读取NE-NE链路"):
         yield {
             'src_vid': _normalize_ne_vid_for_generator(
                 _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
@@ -286,7 +282,7 @@ def iter_port_port(link_input: str = SYS_LINK_DIR):
     src_vid 和 dst_vid 使用 NE ID + 端口名构造的端口 VID，而非裸端口名，避免不同
     NE 上的同名端口互相冲突。两端 NE 与端口名均非空时才产出记录。
     """
-    for row in _iter_csv_records_with_progress(link_input, "  读取端口-端口链路", require=True):
+    for row in _iter_csv_records_with_progress(link_input, "  读取端口-端口链路"):
         a_ne = _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
         z_ne = _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')")
         a_port = _get_record_value(row, 'a_end_port_name')
@@ -309,7 +305,7 @@ def iter_ne_port_link(link_input: str = SYS_LINK_DIR):
     src_vid 为 NE VID；dst_vid 为由 NE ID + 端口名构造的端口 VID。一条 SYS_LINK
     记录最多产出 a/z 两条归属关系。
     """
-    for row in _iter_csv_records_with_progress(link_input, "  读取NE-端口关系", require=True):
+    for row in _iter_csv_records_with_progress(link_input, "  读取NE-端口关系"):
         a_ne = _get_record_value(row, 'a_end_ne_nativeId', "a_end_ne_nativeId(')")
         z_ne = _get_record_value(row, 'z_end_ne_nativeId', "z_end_ne_nativeId(')")
         a_port = _get_record_value(row, 'a_end_port_name')
@@ -324,6 +320,50 @@ def iter_ne_port_link(link_input: str = SYS_LINK_DIR):
                 'src_vid': _normalize_ne_vid_for_generator(z_ne),
                 'dst_vid': _make_port_vid(z_ne, z_port),
             }
+
+
+# --------------------------------------------------------------------------- #
+# online 版记录生成器：CSV/zip 原始行原样透传，不做任何改动（不筛选列、不归一化、
+# 不构造 VID），假定数据源已直接产出消费端期望的字段与值。
+# --------------------------------------------------------------------------- #
+def iter_ne_records_online(input_path: str = NE_FILE):
+    """从 online CSV 原样透传 NE 记录，供 load_ne_info 消费。
+
+    期望列：vid / domain / typeId / networkType / name / vender / siteId
+    """
+    yield from _iter_csv_records_with_progress(input_path, "  读取NE记录")
+
+
+def iter_site_records_online(input_path: str = SITE_FILE):
+    """从 online CSV 原样透传站点记录，供 load_site_info 消费。
+
+    期望列：vid / name / longitude / latitude / isHub
+    """
+    yield from _iter_csv_records_with_progress(input_path, "  读取站点记录")
+
+
+def iter_ne_ne_link_online(input_path: str = NE_NE_FILE):
+    """从 online CSV 原样透传 NE-NE 链路记录（src_vid / dst_vid 为两端 NE VID）。
+
+    期望列：src_vid / dst_vid / linkLayer
+    """
+    yield from _iter_csv_records_with_progress(input_path, "  读取NE-NE链路")
+
+
+def iter_port_port_online(input_path: str = PORT_PORT_FILE):
+    """从 online CSV 原样透传端口-端口链路记录（src_vid / dst_vid 为两端端口 VID）。
+
+    期望列：src_vid / dst_vid / linkLayer
+    """
+    yield from _iter_csv_records_with_progress(input_path, "  读取端口-端口链路")
+
+
+def iter_ne_port_link_online(input_path: str = NE_PORT_FILE):
+    """从 online CSV 原样透传 NE-端口归属关系记录（src_vid 为 NE VID，dst_vid 为端口 VID）。
+
+    期望列：src_vid / dst_vid
+    """
+    yield from _iter_csv_records_with_progress(input_path, "  读取NE-端口关系")
 
 
 # --------------------------------------------------------------------------- #
