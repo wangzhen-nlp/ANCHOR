@@ -86,6 +86,8 @@ class App:
         if not output_name:
             messagebox.showwarning("提示", "请填写输出文件名")
             return
+        if not output_name.lower().endswith('.json'):
+            output_name += '.json'
         try:
             n = int(self.n_entry.get().strip())
         except ValueError:
