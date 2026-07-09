@@ -548,6 +548,64 @@ def _build_site_chains_meta(
     return meta
 
 
+def verify_cross_domain_constraints(site_chains, constraints):
+    """校验最终 site_chains 是否满足跨类型方向约束；只统计不修复。
+
+    对每条约束 upstream->downstream 检查上行站点视角的三类关系：
+    - downstream 出现在其 bidirectional_sites  -> 平行违例
+    - downstream 出现在其 upstream_site_hops   -> 反向违例
+    - downstream 出现在其 downstream_site_hops -> 满足（按 hop 区分直连/多跳）
+    - 三者皆无                                  -> 不可达（只计数，不注入）
+
+    site_chains 为 {site_id: {...}}（即产物的 sites 字段）。
+    """
+    stats = {
+        "constraint_count": len(constraints),
+        "satisfied_direct_count": 0,
+        "satisfied_multi_hop_count": 0,
+        "unreachable_count": 0,
+        "reverse_violation_count": 0,
+        "bidirectional_violation_count": 0,
+    }
+    violations = []
+    for constraint in constraints:
+        upstream_site = normalize_site_id(constraint.get("upstream_site"))
+        downstream_site = normalize_site_id(constraint.get("downstream_site"))
+        upstream_info = site_chains.get(upstream_site) or {}
+        downstream_hops = upstream_info.get("downstream_site_hops") or {}
+        upstream_hops = upstream_info.get("upstream_site_hops") or {}
+        has_violation = False
+        if downstream_site in (upstream_info.get("bidirectional_sites") or ()):
+            stats["bidirectional_violation_count"] += 1
+            has_violation = True
+            violations.append({
+                "type": "bidirectional",
+                "upstream_site": upstream_site,
+                "downstream_site": downstream_site,
+            })
+        if downstream_site in upstream_hops:
+            stats["reverse_violation_count"] += 1
+            has_violation = True
+            violations.append({
+                "type": "reverse",
+                "upstream_site": upstream_site,
+                "downstream_site": downstream_site,
+                "hop": upstream_hops[downstream_site],
+            })
+        if downstream_site in downstream_hops:
+            if downstream_hops[downstream_site] <= 1:
+                stats["satisfied_direct_count"] += 1
+            else:
+                stats["satisfied_multi_hop_count"] += 1
+        elif not has_violation:
+            stats["unreachable_count"] += 1
+    return {
+        "stats": stats,
+        "violations": violations[:100],
+        "violation_detail_truncated": len(violations) > 100,
+    }
+
+
 def build_site_chains(
     prediction_path,
     *,

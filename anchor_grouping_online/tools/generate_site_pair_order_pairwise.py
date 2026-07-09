@@ -24,6 +24,7 @@ from anchor_grouping_online.tools.site_pair_order_common import (
     _get_site_id,
     apply_strict_ring_pairwise_override,
     build_strict_ring_context,
+    cross_domain_priority,
     iter_unique_cross_site_links,
     normalize_domain,
 )
@@ -53,7 +54,7 @@ def compact_pairwise_prediction(pair_result):
     }
 
 
-def build_site_pair_inputs(ne_graph, show_progress=False):
+def build_site_pair_inputs(ne_graph, show_progress=False, collect_cross_domain=False):
     site_domain_counts = defaultdict(Counter)
     site_neighbors = defaultdict(set)
     site_external_edge_count = Counter()
@@ -61,6 +62,11 @@ def build_site_pair_inputs(ne_graph, show_progress=False):
     site_transmission_edge_count = Counter()
     pair_edge_count = Counter()
     pair_site_domain_counts = defaultdict(lambda: defaultdict(Counter))
+    # 跨类型连边证据：{pair_key: {site_priority, direction_votes, link_count}}。
+    # 收集口径为全部跨 domain 连边（含被拓扑过滤的），只用于方向约束，不进拓扑。
+    cross_domain_pair_evidence = defaultdict(
+        lambda: {"site_priority": {}, "direction_votes": Counter(), "link_count": 0}
+    )
     all_sites = set()
 
     with ProgressReporter(len(ne_graph), "pairwise: 聚合站点设备", show_progress) as progress:
@@ -75,18 +81,40 @@ def build_site_pair_inputs(ne_graph, show_progress=False):
             site_domain_counts[site_id][normalize_domain(ne_info.get("domain", ""))] += 1
 
     with ProgressReporter(0, "pairwise: 扫描跨站链路", show_progress) as progress:
-        for link in iter_unique_cross_site_links(ne_graph):
+        for link in iter_unique_cross_site_links(
+            ne_graph,
+            include_filtered_cross_domain=collect_cross_domain,
+        ):
             progress.update()
             left_site = link["source_site"]
             right_site = link["target_site"]
             pair_key = tuple(sorted((left_site, right_site)))
+            left_domain = link["source_domain"]
+            right_domain = link["target_domain"]
+
+            if collect_cross_domain and left_domain != right_domain:
+                left_priority = cross_domain_priority(left_domain)
+                right_priority = cross_domain_priority(right_domain)
+                # 只有两端优先级都已知且不同的连边才构成方向证据
+                if left_priority and right_priority and left_priority != right_priority:
+                    evidence = cross_domain_pair_evidence[pair_key]
+                    evidence["link_count"] += 1
+                    site_priority = evidence["site_priority"]
+                    if left_priority > site_priority.get(left_site, 0):
+                        site_priority[left_site] = left_priority
+                    if right_priority > site_priority.get(right_site, 0):
+                        site_priority[right_site] = right_priority
+                    winner = left_site if left_priority > right_priority else right_site
+                    evidence["direction_votes"][winner] += 1
+
+            # 被拓扑过滤的跨 domain 连边只贡献约束证据，不参与任何拓扑聚合
+            if not link.get("included_in_topology", True):
+                continue
 
             site_neighbors[left_site].add(right_site)
             site_neighbors[right_site].add(left_site)
             pair_edge_count[pair_key] += 1
 
-            left_domain = link["source_domain"]
-            right_domain = link["target_domain"]
             pair_site_domain_counts[pair_key][left_site][left_domain] += 1
             pair_site_domain_counts[pair_key][right_site][right_domain] += 1
 
@@ -115,7 +143,112 @@ def build_site_pair_inputs(ne_graph, show_progress=False):
         "site_transmission_edge_count": site_transmission_edge_count,
         "pair_edge_count": pair_edge_count,
         "pair_site_domain_counts": pair_site_domain_counts,
+        "cross_domain_pair_evidence": cross_domain_pair_evidence,
     }
+
+
+def _find_directed_cycle(constraint_adjacency):
+    """在约束有向图中找一个环，返回环上约束的 pair_key 列表；无环返回 None。"""
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {}
+    for root in sorted(constraint_adjacency):
+        if color.get(root, WHITE) != WHITE:
+            continue
+        color[root] = GRAY
+        stack = [(root, iter(sorted(constraint_adjacency.get(root, ()))))]
+        path_nodes = [root]
+        path_edges = []
+        while stack:
+            node, edge_iter = stack[-1]
+            next_entry = None
+            for next_site, pair_key in edge_iter:
+                state = color.get(next_site, WHITE)
+                if state == GRAY:
+                    cycle_start = path_nodes.index(next_site)
+                    return path_edges[cycle_start:] + [pair_key]
+                if state == WHITE:
+                    next_entry = (next_site, pair_key)
+                    break
+            if next_entry is None:
+                stack.pop()
+                color[node] = BLACK
+                path_nodes.pop()
+                if path_edges:
+                    path_edges.pop()
+            else:
+                next_site, pair_key = next_entry
+                color[next_site] = GRAY
+                stack.append(
+                    (next_site, iter(sorted(constraint_adjacency.get(next_site, ()))))
+                )
+                path_nodes.append(next_site)
+                path_edges.append(pair_key)
+    return None
+
+
+def _break_constraint_cycles(constraints):
+    """在约束有向图上原地消圈：每次找到一个环，丢弃环上证据最少的约束。
+
+    约束成环说明跨类型证据互相矛盾；层级投影要求约束集无环，否则不收敛。
+    返回被丢弃的 pair_key 列表。
+    """
+    dropped_pairs = []
+    while constraints:
+        constraint_adjacency = defaultdict(list)
+        for pair_key, constraint in constraints.items():
+            constraint_adjacency[constraint["upstream_site"]].append(
+                (constraint["downstream_site"], pair_key)
+            )
+        cycle_pairs = _find_directed_cycle(constraint_adjacency)
+        if not cycle_pairs:
+            break
+        weakest_pair = min(
+            cycle_pairs,
+            key=lambda pk: (constraints[pk]["evidence_link_count"], pk),
+        )
+        dropped_pairs.append(weakest_pair)
+        del constraints[weakest_pair]
+    return dropped_pairs
+
+
+def build_cross_domain_constraints(pair_evidence, pair_edge_count):
+    """从跨类型连边证据构建站点对方向约束：优先级高的一侧为上行。
+
+    对内冲突消解：比较两端在该站点对全部跨类型连边上暴露过的最高优先级 domain，
+    高者为上行；平局则该对不产生约束（计入 tie_pair_count）。跨对约束成环时
+    按证据数丢弃最弱者。
+
+    Returns:
+        (constraints, stats)；constraints 为 {pair_key: {upstream_site,
+        downstream_site, evidence_link_count, total_cross_link_count,
+        has_topology_edge}}。
+    """
+    constraints = {}
+    tie_pair_count = 0
+    for pair_key in sorted(pair_evidence):
+        evidence = pair_evidence[pair_key]
+        site_a, site_b = pair_key
+        priority_a = evidence["site_priority"].get(site_a, 0)
+        priority_b = evidence["site_priority"].get(site_b, 0)
+        if not priority_a or not priority_b or priority_a == priority_b:
+            tie_pair_count += 1
+            continue
+        upstream_site, downstream_site = (
+            (site_a, site_b) if priority_a > priority_b else (site_b, site_a)
+        )
+        constraints[pair_key] = {
+            "upstream_site": upstream_site,
+            "downstream_site": downstream_site,
+            "evidence_link_count": int(evidence["direction_votes"].get(upstream_site, 0)),
+            "total_cross_link_count": int(evidence["link_count"]),
+            "has_topology_edge": pair_key in pair_edge_count,
+        }
+    dropped_pairs = _break_constraint_cycles(constraints)
+    stats = {
+        "tie_pair_count": tie_pair_count,
+        "cycle_dropped_pair_count": len(dropped_pairs),
+    }
+    return constraints, stats
 
 
 def compute_connected_components(all_sites, site_neighbors, show_progress=False):
@@ -319,21 +452,66 @@ def smooth_level_scores(
     alpha,
     max_iter,
     tol,
+    constraints=None,
+    constraint_gap=1.0,
     show_progress=False,
 ):
     """对站点 level_score 做标签传播平滑，得到全局一致的层级场。
 
     - anchor 站点被钉住（保持原始 level_score），充当稳定参照系；
     - 其余站点按 new = alpha * 自身原始分 + (1-alpha) * 邻居均值 迭代，直到收敛。
+    - 传入 constraints（跨类型方向约束）时，每轮迭代后做一次软投影：对每条约束
+      upstream->downstream 保证 level(up) >= level(down) + constraint_gap，不足则
+      抬升上行侧/压低下行侧各半（锚点侧不动）。抬压量随平滑扩散到邻居，让约束
+      周边站点的层级顺势重排。收尾再用“只抬升上行侧”的单调投影补齐链式约束
+      （A->B->C 需逐级传导）。
 
     注意自锚项用的是**原始 level_score**（固定值，软 Dirichlet 约束），而非当前迭代值；
     否则不动点退化为纯调和场，非 anchor 站点会全部塌缩到最近 anchor，抹掉层级落差。
 
-    复杂度 O(max_iter * E)，纯线性迭代，无路径枚举/优化器。
+    复杂度 O(max_iter * (E + C))，纯线性迭代，无路径枚举/优化器。
+
+    Returns:
+        (scores, stats)；stats 含 unsatisfied_constraint_count——收尾后仍不满足的
+        约束数，仅在两端都被锚点钉死等无法调整的情形下非零。
     """
     base_level = {site_id: metrics["level_score"] for site_id, metrics in site_metrics.items()}
     scores = dict(base_level)
     anchors = set(anchor_sites)
+
+    constraint_pairs = []
+    if constraints:
+        for pair_key in sorted(constraints):
+            constraint = constraints[pair_key]
+            upstream_site = constraint["upstream_site"]
+            downstream_site = constraint["downstream_site"]
+            if upstream_site in scores and downstream_site in scores:
+                constraint_pairs.append((upstream_site, downstream_site))
+
+    def _project_constraints(target_scores):
+        """软投影：缺口两侧各补一半；锚点侧不动，双锚点无法调整则跳过。"""
+        for upstream_site, downstream_site in constraint_pairs:
+            deficit = (
+                target_scores[downstream_site] + constraint_gap
+                - target_scores[upstream_site]
+            )
+            if deficit <= 0.0:
+                continue
+            upstream_pinned = upstream_site in anchors
+            downstream_pinned = downstream_site in anchors
+            if upstream_pinned and downstream_pinned:
+                continue
+            if upstream_pinned:
+                target_scores[downstream_site] -= deficit
+            elif downstream_pinned:
+                target_scores[upstream_site] += deficit
+            else:
+                half = deficit / 2.0
+                target_scores[upstream_site] += half
+                target_scores[downstream_site] -= half
+
+    if constraint_pairs:
+        _project_constraints(scores)
 
     # 预先算好每个非 anchor 站点的有效邻居列表，避免每轮重复过滤/成员判断
     pending = {}
@@ -354,14 +532,43 @@ def smooth_level_scores(
                 value = alpha * base_level[site_id] + (1.0 - alpha) * neighbor_avg
                 new_scores[site_id] = value
                 max_delta = max(max_delta, abs(value - scores[site_id]))
+            if constraint_pairs:
+                _project_constraints(new_scores)
             scores = new_scores
             if max_delta < tol:
                 break
 
-    return scores
+    unsatisfied_constraint_count = 0
+    if constraint_pairs:
+        # 收尾单调投影：优先抬升上行侧（上行被锚点钉住则压低下行侧），
+        # 反复扫描直至稳定，保证链式约束在最终场上逐级满足。
+        for _ in range(min(len(constraint_pairs), 200) + 1):
+            changed = False
+            for upstream_site, downstream_site in constraint_pairs:
+                deficit = (
+                    scores[downstream_site] + constraint_gap - scores[upstream_site]
+                )
+                if deficit <= 1e-9:
+                    continue
+                if upstream_site not in anchors:
+                    scores[upstream_site] += deficit
+                elif downstream_site not in anchors:
+                    scores[downstream_site] -= deficit
+                else:
+                    continue
+                changed = True
+            if not changed:
+                break
+        unsatisfied_constraint_count = sum(
+            1
+            for upstream_site, downstream_site in constraint_pairs
+            if scores[upstream_site] < scores[downstream_site] + constraint_gap - 1e-6
+        )
+
+    return scores, {"unsatisfied_constraint_count": unsatisfied_constraint_count}
 
 
-def build_pairwise_site_metrics(inputs, args, show_progress=False):
+def build_pairwise_site_metrics(inputs, args, show_progress=False, constraints=None):
     base_scores = {
         site_id: compute_base_core_score(site_id, inputs, args)
         for site_id in inputs["all_sites"]
@@ -416,19 +623,21 @@ def build_pairwise_site_metrics(inputs, args, show_progress=False):
     anchor_sites = set()
     for summary in component_summaries:
         anchor_sites.update(summary["anchor_sites"])
-    smoothed = smooth_level_scores(
+    smoothed, smoothing_stats = smooth_level_scores(
         site_metrics,
         inputs["site_neighbors"],
         anchor_sites,
         args.smooth_alpha,
         args.smooth_iters,
         args.smooth_tol,
+        constraints=constraints,
+        constraint_gap=float(getattr(args, "constraint_level_gap", 1.0)),
         show_progress=show_progress,
     )
     for site_id, metrics in site_metrics.items():
         metrics["level_score_smoothed"] = round(smoothed[site_id], 6)
 
-    return site_metrics, component_summaries
+    return site_metrics, component_summaries, smoothing_stats
 
 
 def _add_direction_evidence(score_container, winner, loser, feature, amount, detail):
@@ -771,6 +980,42 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
     }
 
 
+def apply_cross_domain_constraint_override(pair_result, constraint):
+    """按跨类型方向约束覆盖 pairwise 输出：强制 upstream->downstream。
+
+    约束优先级高于严格环与投票结果；原判定保留在 original_* 字段。
+    """
+    upstream_site = constraint["upstream_site"]
+    downstream_site = constraint["downstream_site"]
+    changed = (
+        pair_result.get("relation") != "->"
+        or pair_result.get("preferred_source") != upstream_site
+        or pair_result.get("preferred_target") != downstream_site
+    )
+    updated = dict(pair_result)
+    updated["original_relation"] = pair_result.get("relation")
+    updated["original_preferred_source"] = pair_result.get("preferred_source")
+    updated["original_preferred_target"] = pair_result.get("preferred_target")
+    updated["relation"] = "->"
+    updated["preferred_source"] = upstream_site
+    updated["preferred_target"] = downstream_site
+    updated["cross_domain_constraint"] = True
+    updated["cross_domain_constraint_evidence_link_count"] = constraint[
+        "evidence_link_count"
+    ]
+    updated["uncertainty_adjustments"] = list(
+        updated.get("uncertainty_adjustments", [])
+    ) + [{
+        "feature": "cross_domain_priority_constraint",
+        "amount": 0.0,
+        "detail": (
+            f"跨类型连边约束：{upstream_site} 端设备 domain 优先级更高，"
+            f"强制 {upstream_site}->{downstream_site}"
+        ),
+    }]
+    return updated, changed
+
+
 def build_pairwise_orders(
     inputs,
     site_metrics,
@@ -778,6 +1023,7 @@ def build_pairwise_orders(
     args,
     show_progress=False,
     compact_output=False,
+    constraints=None,
 ):
     pair_orders = {}
     compact_edges = [] if compact_output else None
@@ -808,6 +1054,31 @@ def build_pairwise_orders(
     )
     strict_ring_pair_context = strict_ring_context["pair_context"]
 
+    # 环块解除：含任一约束端点站点的环块整体退出严格环覆盖（含入口强制），
+    # 块内边交回 gap-first/投票，由已注入约束的平滑层级场决定方向。
+    constraints = constraints or {}
+    constraint_forced_pair_count = 0
+    constraint_changed_pair_count = 0
+    strict_ring_released_pair_count = 0
+    released_component_ids = set()
+    if constraints:
+        constraint_sites = set()
+        for constraint in constraints.values():
+            constraint_sites.add(constraint["upstream_site"])
+            constraint_sites.add(constraint["downstream_site"])
+        for component in strict_ring_context["components"]:
+            if constraint_sites.intersection(component["sites"]):
+                component["released_by_constraint"] = True
+                released_component_ids.add(component["component_id"])
+    if released_component_ids:
+        retained_pair_context = {}
+        for ring_pair_key, ring_context in strict_ring_pair_context.items():
+            if ring_context["component_id"] in released_component_ids:
+                strict_ring_released_pair_count += 1
+            else:
+                retained_pair_context[ring_pair_key] = ring_context
+        strict_ring_pair_context = retained_pair_context
+
     with ProgressReporter(len(inputs["pair_edge_count"]), "pairwise: 判断站点对方向", show_progress) as progress:
         for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
             progress.update()
@@ -836,6 +1107,15 @@ def build_pairwise_orders(
                     strict_ring_entry_direction_pair_count += 1
                 if strict_ring_changed:
                     strict_ring_changed_pair_count += 1
+            constraint_info = constraints.get(pair_key)
+            if constraint_info is not None:
+                pair_result, constraint_changed = apply_cross_domain_constraint_override(
+                    pair_result,
+                    constraint_info,
+                )
+                constraint_forced_pair_count += 1
+                if constraint_changed:
+                    constraint_changed_pair_count += 1
             if compact_output:
                 compact_edges.append(compact_pairwise_prediction(pair_result))
             else:
@@ -866,6 +1146,10 @@ def build_pairwise_orders(
         "strict_ring_forced_pair_count": strict_ring_forced_pair_count,
         "strict_ring_entry_direction_pair_count": strict_ring_entry_direction_pair_count,
         "strict_ring_changed_pair_count": strict_ring_changed_pair_count,
+        "strict_ring_released_component_count": len(released_component_ids),
+        "strict_ring_released_pair_count": strict_ring_released_pair_count,
+        "cross_domain_constraint_forced_pair_count": constraint_forced_pair_count,
+        "cross_domain_constraint_changed_pair_count": constraint_changed_pair_count,
     }
     if compact_output:
         output["compact_edges"] = compact_edges
@@ -904,14 +1188,31 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
 
     与 main 的非 full-output 路径产物一致，可直接作为下游 site_chains 的 prediction 输入，
     省去落盘再读盘。
+
+    args.cross_domain_priority_constraint 开启时，跨类型连边（如 Data-Ran）按
+    domain 优先级产生硬方向约束：注入层级平滑（周边站点顺势重排）、解除含约束
+    端点的严格环块、并对有拓扑直连边的约束对强制判向；约束集随结果的
+    cross_domain_constraints 字段导出，供 site_chains 侧校验。
     """
-    inputs = build_site_pair_inputs(ne_graph, show_progress=show_progress)
+    constraint_enabled = bool(getattr(args, "cross_domain_priority_constraint", False))
+    inputs = build_site_pair_inputs(
+        ne_graph,
+        show_progress=show_progress,
+        collect_cross_domain=constraint_enabled,
+    )
+    constraints = {}
+    constraint_stats = {"tie_pair_count": 0, "cycle_dropped_pair_count": 0}
+    if constraint_enabled:
+        constraints, constraint_stats = build_cross_domain_constraints(
+            inputs["cross_domain_pair_evidence"],
+            inputs["pair_edge_count"],
+        )
     pair_graph_metrics = build_pairwise_graph_metrics(inputs, show_progress=show_progress)
     bridge_pair_count = sum(
         1 for graph_metrics in pair_graph_metrics.values() if graph_metrics["is_bridge"]
     )
-    site_metrics, component_summaries = build_pairwise_site_metrics(
-        inputs, args, show_progress=show_progress
+    site_metrics, component_summaries, smoothing_stats = build_pairwise_site_metrics(
+        inputs, args, show_progress=show_progress, constraints=constraints
     )
     pair_outputs = build_pairwise_orders(
         inputs,
@@ -920,12 +1221,42 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
         args,
         show_progress=show_progress,
         compact_output=True,
+        constraints=constraints,
     )
     meta = build_pairwise_meta(
         args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
     )
-    return {
+    meta["cross_domain_priority_constraint"] = constraint_enabled
+    if constraint_enabled:
+        direct_pair_count = sum(
+            1 for constraint in constraints.values() if constraint["has_topology_edge"]
+        )
+        meta.update({
+            "cross_domain_constraint_pair_count": len(constraints),
+            "cross_domain_constraint_direct_pair_count": direct_pair_count,
+            "cross_domain_constraint_multi_hop_pair_count": len(constraints) - direct_pair_count,
+            "cross_domain_constraint_tie_pair_count": constraint_stats["tie_pair_count"],
+            "cross_domain_constraint_cycle_dropped_pair_count": constraint_stats["cycle_dropped_pair_count"],
+            "cross_domain_constraint_level_unsatisfied_count": smoothing_stats["unsatisfied_constraint_count"],
+            "cross_domain_constraint_forced_pair_count": pair_outputs["cross_domain_constraint_forced_pair_count"],
+            "cross_domain_constraint_changed_pair_count": pair_outputs["cross_domain_constraint_changed_pair_count"],
+            "strict_ring_released_component_count": pair_outputs["strict_ring_released_component_count"],
+            "strict_ring_released_pair_count": pair_outputs["strict_ring_released_pair_count"],
+        })
+    result = {
         "meta": meta,
         "edges": pair_outputs["compact_edges"],
         "downstream_map": pair_outputs["downstream_map"],
     }
+    if constraint_enabled:
+        result["cross_domain_constraints"] = [
+            {
+                "upstream_site": constraint["upstream_site"],
+                "downstream_site": constraint["downstream_site"],
+                "evidence_link_count": constraint["evidence_link_count"],
+                "total_cross_link_count": constraint["total_cross_link_count"],
+                "has_topology_edge": constraint["has_topology_edge"],
+            }
+            for _, constraint in sorted(constraints.items())
+        ]
+    return result

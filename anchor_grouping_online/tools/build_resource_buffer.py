@@ -49,7 +49,10 @@ from anchor_grouping_online.tools.topology_resources import (
     SYS_SITE_DIR,
     resource_display,
 )
-from anchor_grouping_online.tools.generate_site_chains import build_site_chains_from_data
+from anchor_grouping_online.tools.generate_site_chains import (
+    build_site_chains_from_data,
+    verify_cross_domain_constraints,
+)
 from anchor_grouping_online.tools.generate_site_pair_order_pairwise import build_pairwise_prediction
 
 # 单文件缓冲产物的默认输出路径（JSONL：每行一个资源）
@@ -112,6 +115,10 @@ def _resource_buffer_pairwise_args():
         global_gap_threshold=1.0,
         global_gap_nonbridge_bonus=2.0,
         global_gap_shared_neighbor_bonus=0.5,
+        # 跨类型连边方向约束（Data > Microwave/Transmission > Ran 优先级高者为上行）：
+        # 注入层级平滑、解除含约束端点的严格环块、强制直连对判向
+        cross_domain_priority_constraint=True,
+        constraint_level_gap=1.0,
         full_output=False,
         no_progress=True,
     )
@@ -636,7 +643,7 @@ def build_site_chains_field(ne_graph: dict) -> dict:
         _resource_buffer_pairwise_args(),
         show_progress=False,
     )
-    return build_site_chains_from_data(
+    site_chains = build_site_chains_from_data(
         prediction,
         ne_graph=ne_graph,
         prediction_label="<resource_buffer: pairwise prediction>",
@@ -644,6 +651,13 @@ def build_site_chains_field(ne_graph: dict) -> dict:
         restrict_relation=True,
         show_progress=False,
     )
+    # 跨类型方向约束校验：只统计不修复，结果并入 meta 供落盘后核对
+    constraints = prediction.get("cross_domain_constraints")
+    if constraints:
+        site_chains["meta"]["cross_domain_constraint_check"] = (
+            verify_cross_domain_constraints(site_chains.get("sites", {}), constraints)
+        )
+    return site_chains
 
 
 # 紧凑 JSON 分隔符：去掉默认的空格，进一步压缩体积
@@ -765,6 +779,21 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
     print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")
     print(f"    下游可达关系数: {site_chains_meta.get('total_downstream_relations', 0)}")
     print(f"    双向直接边数: {site_chains_meta.get('total_bidirectional_edges', 0)}")
+
+    constraint_check_stats = (
+        site_chains_meta.get('cross_domain_constraint_check') or {}
+    ).get('stats') or {}
+    if constraint_check_stats:
+        print(
+            f"    跨类型约束: {constraint_check_stats.get('constraint_count', 0)} 条 "
+            f"(直连满足 {constraint_check_stats.get('satisfied_direct_count', 0)}, "
+            f"多跳满足 {constraint_check_stats.get('satisfied_multi_hop_count', 0)}, "
+            f"不可达 {constraint_check_stats.get('unreachable_count', 0)})"
+        )
+        print(
+            f"    约束违例: 反向 {constraint_check_stats.get('reverse_violation_count', 0)}, "
+            f"平行 {constraint_check_stats.get('bidirectional_violation_count', 0)}"
+        )
 
 
 def main():

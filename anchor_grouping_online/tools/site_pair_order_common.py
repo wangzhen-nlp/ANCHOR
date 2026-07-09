@@ -55,6 +55,21 @@ def _get_site_id(ne_info):
     return str(ne_info.get("site_id", "")).strip().upper()
 
 
+# 跨类型连边的 domain 优先级（数值大者为上行侧）：Data > Microwave/Transmission > Ran。
+# 未知/其它 domain 记 0，不参与跨类型方向约束。
+CROSS_DOMAIN_PRIORITY = {
+    "Data": 3,
+    "Microwave": 2,
+    "Transmission": 2,
+    "Ran": 1,
+}
+
+
+def cross_domain_priority(domain):
+    """返回 domain 在跨类型方向约束中的优先级；未知 domain 返回 0（不参与约束）。"""
+    return CROSS_DOMAIN_PRIORITY.get(normalize_domain(domain), 0)
+
+
 def classify_device_role(domain: str) -> str:
     """归一化设备类型: wireless / microwave / router / unknown。"""
     text = normalize_domain(domain or "")
@@ -165,11 +180,16 @@ def iter_unique_cross_site_links(
     *,
     assume_symmetric=False,
     wireless_only_sites=None,
+    include_filtered_cross_domain=False,
 ):
     """按 NE 对 + link_type 去重，遍历跨站点链路。
 
     assume_symmetric=True 仅用于已知双向存储的 ne_graph：按 NE ID 规范侧遍历，
     避免维护与物理边数同规模的 seen 集合。
+
+    include_filtered_cross_domain=True 时，被 should_include_cross_site_link
+    过滤的跨 domain 连边也会产出（included_in_topology=False），供跨类型方向
+    约束提取使用；消费端必须自行跳过这些记录，不得计入拓扑。
     """
     seen = None if assume_symmetric else set()
     site_role_counts = (
@@ -198,13 +218,14 @@ def iter_unique_cross_site_links(
                 continue
 
             target_domain = normalize_domain(target_info.get("domain", ""))
-            if not should_include_cross_site_link(
+            included_in_topology = should_include_cross_site_link(
                 source_site,
                 source_domain,
                 target_site,
                 target_domain,
                 site_role_counts,
-            ):
+            )
+            if not included_in_topology and not include_filtered_cross_domain:
                 continue
 
             link_types = (
@@ -230,6 +251,7 @@ def iter_unique_cross_site_links(
                     "source_domain": source_domain,
                     "target_domain": target_domain,
                     "link_type": str(link_type),
+                    "included_in_topology": included_in_topology,
                 }
 
 
