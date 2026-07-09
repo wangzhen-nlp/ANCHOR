@@ -308,6 +308,148 @@ def reachable_downstream_sites(adjacency, first_hop_adjacency, source_site, max_
     }
 
 
+def _downstream_bfs_parents(
+    adjacency,
+    first_hop_adjacency,
+    source_site,
+    max_depth=None,
+    stop_targets=None,
+):
+    """与 reachable_downstream_sites 同语义的 BFS，额外记录父指针用于还原路径。
+
+    stop_targets 非空时，找齐全部目标即提前结束。返回 {site: parent}。
+    """
+    source_site = normalize_site_id(source_site)
+    parents = {source_site: None}
+    depth = {source_site: 0}
+    remaining = set(stop_targets or ()) - {source_site}
+    queue = [source_site]
+    head = 0
+
+    while head < len(queue):
+        current_site = queue[head]
+        head += 1
+        current_depth = depth[current_site]
+        if max_depth is not None and current_depth >= max_depth:
+            continue
+
+        next_sites = (
+            first_hop_adjacency.get(current_site, ())
+            if current_depth == 0
+            else adjacency.get(current_site, ())
+        )
+        for next_site in sorted(next_sites):
+            if next_site in parents:
+                continue
+            parents[next_site] = current_site
+            depth[next_site] = current_depth + 1
+            queue.append(next_site)
+            if remaining:
+                remaining.discard(next_site)
+                if not remaining:
+                    return parents
+
+    return parents
+
+
+def _complete_data_upstream_chains(
+    site_chains,
+    adjacency,
+    first_hop_adjacency,
+    data_sites,
+    max_depth,
+    show_progress,
+):
+    """后处理：非 Data 站点若有 Data 站点作为多跳上行，则把传播路径上的
+    非 Data 中间站点依次补为该站点的上行（hop 取路径距离）。
+
+    与新增上行关系冲突的原有关系被删除：
+    - 该对原判为平行（双向）：双侧移出 bidirectional_sites；
+    - 该对原判为反向（中间站点是该站点的下行）：删除原下行/上行记录。
+    已存在的同向上行关系只做 hop 取小，不重复计数。
+
+    路径按与 reachable_downstream_sites 相同的 BFS 语义重建（第一跳走显式
+    有向边，后续可经双向边），因此补出的 hop 与既有多跳 hop 口径一致。
+    补全的关系不受 restrict 裁剪约束（中间站点与目标站点可以不直接相邻）。
+    """
+    stats = {
+        "target_site_count": 0,
+        "added_upstream_relation_count": 0,
+        "replaced_bidirectional_pair_count": 0,
+        "replaced_reverse_relation_count": 0,
+        "path_not_found_count": 0,
+    }
+
+    # 按 Data 上行站点分组：{data_site: {target_site: hop}}，一个源只跑一次 BFS
+    pending = defaultdict(dict)
+    for site_id, info in site_chains.items():
+        if site_id in data_sites:
+            continue
+        for upstream_site, hop in info["upstream_site_hops"].items():
+            if hop > 1 and upstream_site in data_sites:
+                pending[upstream_site][site_id] = hop
+
+    with ProgressReporter(len(pending), "site_chains: 补全Data多跳上行链路", show_progress) as progress:
+        for data_site in sorted(pending):
+            progress.update()
+            targets = pending[data_site]
+            bfs_depth = max(targets.values())
+            if max_depth is not None:
+                bfs_depth = min(bfs_depth, max_depth)
+            parents = _downstream_bfs_parents(
+                adjacency,
+                first_hop_adjacency,
+                data_site,
+                max_depth=bfs_depth,
+                stop_targets=set(targets),
+            )
+            for target_site in sorted(targets):
+                if target_site not in parents:
+                    stats["path_not_found_count"] += 1
+                    continue
+                # 还原 data_site -> ... -> target_site 的最短路径
+                path = [target_site]
+                while path[-1] != data_site:
+                    path.append(parents[path[-1]])
+                path.reverse()
+
+                target_info = site_chains[target_site]
+                target_changed = False
+                path_hop_total = len(path) - 1
+                for position in range(1, path_hop_total):
+                    mid_site = path[position]
+                    if mid_site in data_sites:
+                        continue
+                    mid_info = site_chains[mid_site]
+                    hop_to_target = path_hop_total - position
+
+                    # 删除与新上行关系冲突的原有关系
+                    if mid_site in target_info["downstream_site_hops"]:
+                        del target_info["downstream_site_hops"][mid_site]
+                        mid_info["upstream_site_hops"].pop(target_site, None)
+                        stats["replaced_reverse_relation_count"] += 1
+                    if target_site in mid_info["bidirectional_sites"]:
+                        mid_info["bidirectional_sites"] = [
+                            s for s in mid_info["bidirectional_sites"] if s != target_site
+                        ]
+                        target_info["bidirectional_sites"] = [
+                            s for s in target_info["bidirectional_sites"] if s != mid_site
+                        ]
+                        stats["replaced_bidirectional_pair_count"] += 1
+
+                    existing_hop = target_info["upstream_site_hops"].get(mid_site)
+                    if existing_hop is None:
+                        stats["added_upstream_relation_count"] += 1
+                        target_changed = True
+                    if existing_hop is None or hop_to_target < existing_hop:
+                        target_info["upstream_site_hops"][mid_site] = hop_to_target
+                        mid_info["downstream_site_hops"][target_site] = hop_to_target
+                if target_changed:
+                    stats["target_site_count"] += 1
+
+    return stats
+
+
 def _apply_relation_options(
     data,
     ne_graph,
@@ -440,11 +582,15 @@ def build_site_chains_from_data(
     restrict_relation=False,
     directed_only=False,
     max_depth=None,
+    complete_data_upstream_chains=False,
     show_progress=True,
 ):
     """从已加载的 prediction 数据与可选 ne_graph 生成站点链路；不读盘，供内存复用。
 
     prediction_label / ne_graph_label 仅用于 meta 中的来源标注。
+    complete_data_upstream_chains 开启时执行后处理：非 Data 站点若有 Data 站点
+    作为多跳上行，把传播路径上的非 Data 中间站点依次补为其上行，冲突的
+    平行/反向关系删除；需要提供 ne_graph（用于识别含 Data 设备的站点）。
     """
     has_ne_graph = ne_graph is not None
 
@@ -496,6 +642,27 @@ def build_site_chains_from_data(
         show_progress,
     )
 
+    completion_stats = None
+    if complete_data_upstream_chains:
+        if not has_ne_graph:
+            warnings.append("complete_data_upstream_chains 未生效：未提供 ne_graph")
+        else:
+            data_sites = {
+                normalize_site_id(_get_site_id(ne_info))
+                for ne_info in ne_graph.values()
+                if isinstance(ne_info, dict)
+                and normalize_domain(ne_info.get("domain", "")) == "Data"
+                and _get_site_id(ne_info)
+            }
+            completion_stats = _complete_data_upstream_chains(
+                site_chains,
+                adjacency,
+                first_hop_adjacency,
+                data_sites,
+                max_depth,
+                show_progress,
+            )
+
     meta = _build_site_chains_meta(
         site_chains,
         input_config={
@@ -505,6 +672,7 @@ def build_site_chains_from_data(
             "directed_only": directed_only,
             "enrich_relation": enrich_relation,
             "restrict_relation": restrict_relation,
+            "complete_data_upstream_chains": complete_data_upstream_chains,
         },
         adjacency_source=adjacency_source,
         bidirectional_source=bidirectional_source,
@@ -517,6 +685,8 @@ def build_site_chains_from_data(
         augmentation_stats=augmentation_stats,
         restriction_stats=restriction_stats,
     )
+    if completion_stats is not None:
+        meta["data_upstream_chain_completion"] = completion_stats
     return {
         "meta": meta,
         "sites": site_chains,
@@ -648,6 +818,7 @@ def build_site_chains(
     restrict_relation=False,
     directed_only=False,
     max_depth=None,
+    complete_data_upstream_chains=False,
     show_progress=True,
 ):
     """从文件读取 prediction 与可选 ne_graph 后生成站点链路（CLI 入口的薄封装）。"""
@@ -668,6 +839,7 @@ def build_site_chains(
         restrict_relation=restrict_relation,
         directed_only=directed_only,
         max_depth=max_depth,
+        complete_data_upstream_chains=complete_data_upstream_chains,
         show_progress=show_progress,
     )
 
@@ -719,6 +891,15 @@ def parse_args():
         "--directed-only",
         action="store_true",
         help="所有 hop 都只沿显式 upstream_site -> downstream_site 边遍历，忽略 bidirectional 边",
+    )
+    parser.add_argument(
+        "--complete-data-upstream-chains",
+        action="store_true",
+        help=(
+            "后处理：非 Data 站点若有 Data 站点作为多跳上行，把传播路径上的"
+            "非 Data 中间站点依次补为其上行（冲突的平行/反向关系删除）；"
+            "需要提供 --ne-graph"
+        ),
     )
     parser.add_argument("--no-progress", action="store_true", help="关闭进度显示")
     args = parser.parse_args()
@@ -778,6 +959,7 @@ def main():
         restrict_relation=args.restrict_relation,
         directed_only=args.directed_only,
         max_depth=args.max_depth,
+        complete_data_upstream_chains=args.complete_data_upstream_chains,
         show_progress=not args.no_progress,
     )
 

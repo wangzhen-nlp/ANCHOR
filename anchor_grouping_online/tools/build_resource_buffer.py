@@ -126,6 +126,9 @@ def _resource_buffer_pairwise_args():
         constraint_hard_override=True,
         # 势场投影：约束注入层级平滑（抬上行/压下行+扩散），多跳约束的唯一作用通道
         constraint_level_projection=True,
+        # site_chains 后处理：非 Data 站点有 Data 多跳上行时，路径上的非 Data
+        # 中间站点依次补为其上行（冲突的平行/反向关系删除）
+        complete_data_upstream_chains=True,
         # 误连接预处理：Data 站点与 Trans+Ran(无 Data) 站点之间只有传输连边、
         # 无 Data-Ran 佐证时，剔除两者间全部传输类连边
         transmission_misconnection_filter=True,
@@ -648,9 +651,10 @@ def build_site_chains_field(ne_graph: dict) -> dict:
 
     两步都直接吃内存里的 ne_graph，省去中间落盘再读盘。
     """
+    pairwise_args = _resource_buffer_pairwise_args()
     prediction = build_pairwise_prediction(
         ne_graph,
-        _resource_buffer_pairwise_args(),
+        pairwise_args,
         show_progress=False,
     )
     site_chains = build_site_chains_from_data(
@@ -659,6 +663,9 @@ def build_site_chains_field(ne_graph: dict) -> dict:
         prediction_label="<resource_buffer: pairwise prediction>",
         ne_graph_label="<resource_buffer: ne_graph>",
         restrict_relation=True,
+        complete_data_upstream_chains=bool(
+            getattr(pairwise_args, "complete_data_upstream_chains", True)
+        ),
         show_progress=False,
     )
     # 跨类型方向约束校验：只统计不修复，结果并入 meta 供落盘后核对
@@ -794,6 +801,15 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
     print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")
     print(f"    下游可达关系数: {site_chains_meta.get('total_downstream_relations', 0)}")
     print(f"    双向直接边数: {site_chains_meta.get('total_bidirectional_edges', 0)}")
+
+    completion_stats = site_chains_meta.get('data_upstream_chain_completion') or {}
+    if completion_stats:
+        print(
+            f"    Data多跳上行补全: 受益站点 {completion_stats.get('target_site_count', 0)}, "
+            f"新增上行关系 {completion_stats.get('added_upstream_relation_count', 0)}, "
+            f"替换平行 {completion_stats.get('replaced_bidirectional_pair_count', 0)}, "
+            f"替换反向 {completion_stats.get('replaced_reverse_relation_count', 0)}"
+        )
 
     if 'transmission_misconnection_pair_count' in site_chains_meta:
         print(
