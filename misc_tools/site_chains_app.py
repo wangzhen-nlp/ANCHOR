@@ -111,9 +111,10 @@ def meta_summary(meta: dict) -> str:
 
 
 class RelationTable(ttk.Frame):
-    def __init__(self, parent, relation_key: str):
+    def __init__(self, parent, relation_key: str, on_site_open=None):
         super().__init__(parent)
         self.relation_key = relation_key
+        self.on_site_open = on_site_open
         self.count_var = tk.StringVar(value="0 个站点")
 
         header = ttk.Frame(self)
@@ -138,6 +139,7 @@ class RelationTable(ttk.Frame):
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", self._on_double_click)
 
     def set_rows(self, rows):
         for item in self.tree.get_children():
@@ -146,6 +148,19 @@ class RelationTable(ttk.Frame):
             hop_text = str(hop) if self.relation_key != "parallel" else "-"
             self.tree.insert("", "end", values=(hop_text, site_id))
         self.count_var.set(f"{len(rows)} 个站点")
+
+    def _on_double_click(self, event):
+        if not self.on_site_open:
+            return
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        values = self.tree.item(item_id, "values")
+        if len(values) < 2:
+            return
+        site_id = str(values[1]).strip()
+        if site_id:
+            self.on_site_open(site_id)
 
 
 class App:
@@ -203,7 +218,7 @@ class App:
         self.notebook.grid(row=4, column=0, columnspan=4, sticky="nsew", pady=(2, 0))
         self.tables = {}
         for relation_key in ("downstream", "upstream", "parallel"):
-            table = RelationTable(self.notebook, relation_key)
+            table = RelationTable(self.notebook, relation_key, on_site_open=self._open_related_site)
             self.tables[relation_key] = table
             self.notebook.add(table, text=RELATION_LABELS[relation_key])
 
@@ -311,6 +326,11 @@ class App:
             f"上游 {len(rows['upstream'])} 个; "
             f"平行 {len(rows['parallel'])} 个"
         )
+
+    def _open_related_site(self, site_id: str):
+        self.site_var.set(site_id)
+        self._query()
+        self.site_entry.focus_set()
 
     def _clear_tables(self):
         for table in self.tables.values():
