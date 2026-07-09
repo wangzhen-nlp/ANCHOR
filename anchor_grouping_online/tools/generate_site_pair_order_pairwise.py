@@ -1095,11 +1095,13 @@ def build_pairwise_orders(
     strict_ring_pair_context = strict_ring_context["pair_context"]
 
     # 环块解除（constraint_ring_release，默认关闭）：约束两端同环块时解除该块的
-    # 严格环覆盖。默认不启用——环块/BCC 都会把共边环与双归下游融合进来，
+    # 严格环覆盖。默认不启用——环块会把共边环与双归下游一并融合进来，
     # “约束所在的环”在共边网状结构上没有唯一定义，解除范围无法正确圈定；
     # 约束仍通过直连对硬覆盖与势场投影生效。
     constraints = constraints or {}
     constraint_ring_release = bool(getattr(args, "constraint_ring_release", False))
+    # 直连约束对硬覆盖开关：关闭后约束不再改写任何边的判向（观察/评估模式）
+    constraint_hard_override = bool(getattr(args, "constraint_hard_override", True))
     constraint_forced_pair_count = 0
     constraint_changed_pair_count = 0
     strict_ring_released_pair_count = 0
@@ -1158,7 +1160,7 @@ def build_pairwise_orders(
                 if strict_ring_changed:
                     strict_ring_changed_pair_count += 1
             constraint_info = constraints.get(pair_key)
-            if constraint_info is not None:
+            if constraint_info is not None and constraint_hard_override:
                 pair_result, constraint_changed = apply_cross_domain_constraint_override(
                     pair_result,
                     constraint_info,
@@ -1276,8 +1278,15 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
     bridge_pair_count = sum(
         1 for graph_metrics in pair_graph_metrics.values() if graph_metrics["is_bridge"]
     )
+    # 势场投影开关：关闭后约束不再注入层级平滑（多跳约束将失去全部判向影响）
+    constraint_level_projection = bool(
+        getattr(args, "constraint_level_projection", True)
+    )
     site_metrics, component_summaries, smoothing_stats = build_pairwise_site_metrics(
-        inputs, args, show_progress=show_progress, constraints=constraints
+        inputs,
+        args,
+        show_progress=show_progress,
+        constraints=constraints if constraint_level_projection else None,
     )
     pair_outputs = build_pairwise_orders(
         inputs,
@@ -1305,6 +1314,13 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
             1 for constraint in constraints.values() if constraint["has_topology_edge"]
         )
         meta.update({
+            "cross_domain_constraint_hard_override": bool(
+                getattr(args, "constraint_hard_override", True)
+            ),
+            "cross_domain_constraint_level_projection": constraint_level_projection,
+            "cross_domain_constraint_ring_release": bool(
+                getattr(args, "constraint_ring_release", False)
+            ),
             "cross_domain_constraint_pair_count": len(constraints),
             "cross_domain_constraint_direct_pair_count": direct_pair_count,
             "cross_domain_constraint_multi_hop_pair_count": len(constraints) - direct_pair_count,
