@@ -115,7 +115,7 @@ def _resource_buffer_pairwise_args():
         global_gap_threshold=1.0,
         global_gap_nonbridge_bonus=2.0,
         global_gap_shared_neighbor_bonus=0.5,
-        # 跨类型连边方向约束（Data > Microwave/Transmission > Ran 优先级高者为上行）：
+        # 跨类型连边方向约束（Data > Transmission > Ran 优先级高者为上行）：
         # 注入层级平滑、解除含约束端点的严格环块、强制直连对判向
         cross_domain_priority_constraint=True,
         constraint_level_gap=1.0,
@@ -808,6 +808,21 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
             f"    约束违例: 反向 {constraint_check_stats.get('reverse_violation_count', 0)}, "
             f"平行 {constraint_check_stats.get('bidirectional_violation_count', 0)}"
         )
+        reverse_violations = [
+            violation
+            for violation in (
+                site_chains_meta.get('cross_domain_constraint_check') or {}
+            ).get('violations', [])
+            if violation.get('type') == 'reverse'
+        ]
+        if reverse_violations:
+            print("    反向违例明细:")
+            for violation in reverse_violations:
+                print(
+                    f"      {violation.get('upstream_site')} -> "
+                    f"{violation.get('downstream_site')} "
+                    f"(最终反向 hop={violation.get('hop')})"
+                )
 
 
 def main():

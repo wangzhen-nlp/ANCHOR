@@ -55,11 +55,10 @@ def _get_site_id(ne_info):
     return str(ne_info.get("site_id", "")).strip().upper()
 
 
-# 跨类型连边的 domain 优先级（数值大者为上行侧）：Data > Microwave/Transmission > Ran。
+# 跨类型连边的 domain 优先级（数值大者为上行侧）：Data > Transmission > Ran。
 # 未知/其它 domain 记 0，不参与跨类型方向约束。
 CROSS_DOMAIN_PRIORITY = {
     "Data": 3,
-    "Microwave": 2,
     "Transmission": 2,
     "Ran": 1,
 }
@@ -71,14 +70,14 @@ def cross_domain_priority(domain):
 
 
 def is_transmission_domain(domain):
-    """domain 是否属于传输类（Transmission/Microwave）；入参需已 normalize。"""
-    return CROSS_DOMAIN_PRIORITY.get(domain, 0) == 2
+    """domain 是否属于传输类（Transmission）；入参需已 normalize。"""
+    return normalize_domain(domain) == "Transmission"
 
 
 def build_transmission_misconnection_pairs(ne_graph):
     """预处理：识别疑似误连接的站点对，返回 (pair_key 集合, stats)。
 
-    规则：站点 X 含 Data 设备，站点 Y 含 Transmission/Microwave 与 Ran 设备但
+    规则：站点 X 含 Data 设备，站点 Y 含 Transmission 与 Ran 设备但
     不含 Data（含 Data 的站点间传输连边视为骨干边，不在此列），两站点之间存在
     Transmission 相关连边（任一端为传输类 domain）却没有 Data-Ran 连边佐证时，
     认为这些 Transmission 相关连边是误连接。命中站点对之间的传输类连边应从
