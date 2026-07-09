@@ -1094,22 +1094,30 @@ def build_pairwise_orders(
     )
     strict_ring_pair_context = strict_ring_context["pair_context"]
 
-    # 环块解除：含任一约束端点站点的环块整体退出严格环覆盖（含入口强制），
-    # 块内边交回 gap-first/投票，由已注入约束的平滑层级场决定方向。
+    # 环块解除：仅当同一条约束的上行、下行两个端点都落在同一环块内时，该块
+    # 退出严格环覆盖（含入口强制），块内边交回 gap-first/投票，由已注入约束的
+    # 平滑层级场决定方向。单个端点在块内（约束对跨块/多跳到块外）不触发解除。
     constraints = constraints or {}
     constraint_forced_pair_count = 0
     constraint_changed_pair_count = 0
     strict_ring_released_pair_count = 0
     released_component_ids = set()
     if constraints:
-        constraint_sites = set()
-        for constraint in constraints.values():
-            constraint_sites.add(constraint["upstream_site"])
-            constraint_sites.add(constraint["downstream_site"])
+        site_component_ids = {}
         for component in strict_ring_context["components"]:
-            if constraint_sites.intersection(component["sites"]):
+            for component_site in component["sites"]:
+                site_component_ids[component_site] = component["component_id"]
+        for constraint in constraints.values():
+            upstream_component_id = site_component_ids.get(constraint["upstream_site"])
+            if upstream_component_id is None:
+                continue
+            if upstream_component_id == site_component_ids.get(
+                constraint["downstream_site"]
+            ):
+                released_component_ids.add(upstream_component_id)
+        for component in strict_ring_context["components"]:
+            if component["component_id"] in released_component_ids:
                 component["released_by_constraint"] = True
-                released_component_ids.add(component["component_id"])
     if released_component_ids:
         retained_pair_context = {}
         for ring_pair_key, ring_context in strict_ring_pair_context.items():
