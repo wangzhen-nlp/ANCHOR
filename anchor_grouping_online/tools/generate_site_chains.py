@@ -24,6 +24,7 @@ from anchor_grouping_online.tools.find_site_chain import (
 from anchor_grouping_online.tools.site_pair_order_common import (
     ProgressReporter,
     _get_site_id,
+    is_transmission_domain,
     normalize_domain,
 )
 
@@ -87,8 +88,16 @@ def domain_tuple_index(domain):
     return None
 
 
-def iter_raw_unique_cross_site_links(ne_graph, show_progress=False):
-    """不做 domain 过滤，按 NE 对 + link_type 去重遍历原始跨站连边。"""
+def iter_raw_unique_cross_site_links(
+    ne_graph,
+    show_progress=False,
+    transmission_misconnection_pairs=None,
+):
+    """不做 domain 过滤，按 NE 对 + link_type 去重遍历原始跨站连边。
+
+    transmission_misconnection_pairs（pair_key 集合）非空时，命中站点对之间
+    任一端为传输类 domain 的连边被视为误连接，直接跳过。
+    """
     seen = set()
 
     with ProgressReporter(len(ne_graph), "site_chains: 扫描原始 ne_graph 连边", show_progress) as progress:
@@ -116,6 +125,17 @@ def iter_raw_unique_cross_site_links(ne_graph, show_progress=False):
                     continue
 
                 target_domain = normalize_domain(target_info.get("domain", ""))
+                if transmission_misconnection_pairs and (
+                    is_transmission_domain(source_domain)
+                    or is_transmission_domain(target_domain)
+                ):
+                    misconnection_key = (
+                        (source_site, target_site)
+                        if source_site <= target_site
+                        else (target_site, source_site)
+                    )
+                    if misconnection_key in transmission_misconnection_pairs:
+                        continue
                 link_types = (
                     sorted(link_meta.keys())
                     if isinstance(link_meta, dict) and link_meta
@@ -144,6 +164,7 @@ def collect_ne_graph_relation_data(
     *,
     collect_missing_counts=False,
     show_progress=False,
+    transmission_misconnection_pairs=None,
 ):
     """收集 ne_graph 中真实出现过跨站连边的站点对，可选统计缺失关系补边证据。"""
     prediction_pairs = prediction_pairs or set()
@@ -152,7 +173,11 @@ def collect_ne_graph_relation_data(
     skipped_prediction_link_count = 0
     raw_cross_site_link_count = 0
 
-    for link in iter_raw_unique_cross_site_links(ne_graph, show_progress=show_progress):
+    for link in iter_raw_unique_cross_site_links(
+        ne_graph,
+        show_progress=show_progress,
+        transmission_misconnection_pairs=transmission_misconnection_pairs,
+    ):
         source_site = normalize_site_id(link["source_site"])
         target_site = normalize_site_id(link["target_site"])
         if not source_site or not target_site or source_site == target_site:
@@ -296,6 +321,7 @@ def _apply_relation_options(
     warnings,
     directed_only,
     show_progress,
+    transmission_misconnection_pairs=None,
 ):
     """按 ne_graph 关系选项做增强/限制准备，原地补充 warnings。
 
@@ -313,6 +339,7 @@ def _apply_relation_options(
             prediction_pairs=prediction_pairs,
             collect_missing_counts=enrich_relation,
             show_progress=show_progress,
+            transmission_misconnection_pairs=transmission_misconnection_pairs,
         )
         if enrich_relation:
             augmentation_stats = apply_ne_graph_augmentation_from_counts(
@@ -428,6 +455,12 @@ def build_site_chains_from_data(
     warnings = list(warnings or [])
     bidirectional_neighbors, bidirectional_sites, bidirectional_source = build_bidirectional_neighbors(data)
     all_sites.update(bidirectional_sites)
+    # prediction 携带的疑似误连接站点对：restrict 裁剪与 pairwise 拓扑保持同一剔除口径
+    transmission_misconnection_pairs = {
+        tuple(pair)
+        for pair in data.get("transmission_misconnection_pairs") or ()
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    }
     relation_data, augmentation_stats, restriction_stats = _apply_relation_options(
         data,
         ne_graph,
@@ -441,6 +474,7 @@ def build_site_chains_from_data(
         warnings,
         directed_only,
         show_progress,
+        transmission_misconnection_pairs=transmission_misconnection_pairs,
     )
 
     all_sites.update(adjacency.keys())

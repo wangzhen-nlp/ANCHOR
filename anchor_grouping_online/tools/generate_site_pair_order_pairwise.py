@@ -24,6 +24,7 @@ from anchor_grouping_online.tools.site_pair_order_common import (
     _get_site_id,
     apply_strict_ring_pairwise_override,
     build_strict_ring_context,
+    build_transmission_misconnection_pairs,
     cross_domain_priority,
     iter_unique_cross_site_links,
     normalize_domain,
@@ -54,7 +55,12 @@ def compact_pairwise_prediction(pair_result):
     }
 
 
-def build_site_pair_inputs(ne_graph, show_progress=False, collect_cross_domain=False):
+def build_site_pair_inputs(
+    ne_graph,
+    show_progress=False,
+    collect_cross_domain=False,
+    transmission_misconnection_pairs=None,
+):
     site_domain_counts = defaultdict(Counter)
     site_neighbors = defaultdict(set)
     site_external_edge_count = Counter()
@@ -84,6 +90,7 @@ def build_site_pair_inputs(ne_graph, show_progress=False, collect_cross_domain=F
         for link in iter_unique_cross_site_links(
             ne_graph,
             include_filtered_cross_domain=collect_cross_domain,
+            transmission_misconnection_pairs=transmission_misconnection_pairs,
         ):
             progress.update()
             left_site = link["source_site"]
@@ -1195,10 +1202,24 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
     cross_domain_constraints 字段导出，供 site_chains 侧校验。
     """
     constraint_enabled = bool(getattr(args, "cross_domain_priority_constraint", False))
+
+    # 预处理：疑似误连接的站点对（Data 站点 <-> Trans+Ran 站点之间只有传输连边、
+    # 无 Data-Ran 佐证），其传输类连边从拓扑/约束/裁剪口径整体剔除
+    misconnection_enabled = bool(
+        getattr(args, "transmission_misconnection_filter", False)
+    )
+    misconnection_pairs = set()
+    misconnection_stats = {"candidate_pair_count": 0, "misconnection_pair_count": 0}
+    if misconnection_enabled:
+        misconnection_pairs, misconnection_stats = (
+            build_transmission_misconnection_pairs(ne_graph)
+        )
+
     inputs = build_site_pair_inputs(
         ne_graph,
         show_progress=show_progress,
         collect_cross_domain=constraint_enabled,
+        transmission_misconnection_pairs=misconnection_pairs,
     )
     constraints = {}
     constraint_stats = {"tie_pair_count": 0, "cycle_dropped_pair_count": 0}
@@ -1227,6 +1248,14 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
         args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
     )
     meta["cross_domain_priority_constraint"] = constraint_enabled
+    meta["transmission_misconnection_filter"] = misconnection_enabled
+    if misconnection_enabled:
+        meta["transmission_misconnection_candidate_pair_count"] = (
+            misconnection_stats["candidate_pair_count"]
+        )
+        meta["transmission_misconnection_pair_count"] = (
+            misconnection_stats["misconnection_pair_count"]
+        )
     if constraint_enabled:
         direct_pair_count = sum(
             1 for constraint in constraints.values() if constraint["has_topology_edge"]
@@ -1258,5 +1287,10 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
                 "has_topology_edge": constraint["has_topology_edge"],
             }
             for _, constraint in sorted(constraints.items())
+        ]
+    if misconnection_enabled:
+        # 随产物导出，供 site_chains 的 restrict 裁剪按同一口径剔除误连接
+        result["transmission_misconnection_pairs"] = [
+            list(pair_key) for pair_key in sorted(misconnection_pairs)
         ]
     return result

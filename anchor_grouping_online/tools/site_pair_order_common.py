@@ -70,6 +70,102 @@ def cross_domain_priority(domain):
     return CROSS_DOMAIN_PRIORITY.get(normalize_domain(domain), 0)
 
 
+def is_transmission_domain(domain):
+    """domain 是否属于传输类（Transmission/Microwave）；入参需已 normalize。"""
+    return CROSS_DOMAIN_PRIORITY.get(domain, 0) == 2
+
+
+def build_transmission_misconnection_pairs(ne_graph):
+    """预处理：识别疑似误连接的站点对，返回 (pair_key 集合, stats)。
+
+    规则：站点 X 含 Data 设备，站点 Y 含 Transmission/Microwave 与 Ran 设备但
+    不含 Data（含 Data 的站点间传输连边视为骨干边，不在此列），两站点之间存在
+    Transmission 相关连边（任一端为传输类 domain）却没有 Data-Ran 连边佐证时，
+    认为这些 Transmission 相关连边是误连接。命中站点对之间的传输类连边应从
+    拓扑推断、方向约束与裁剪口径中一并剔除（由消费端按返回集合过滤）。
+    """
+    site_domains = defaultdict(set)
+    for ne_info in ne_graph.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _get_site_id(ne_info)
+        if not site_id:
+            continue
+        site_domains[site_id].add(normalize_domain(ne_info.get("domain", "")))
+
+    def _matches(data_side_domains, ran_side_domains):
+        return (
+            "Data" in data_side_domains
+            and "Data" not in ran_side_domains
+            and "Ran" in ran_side_domains
+            and any(is_transmission_domain(d) for d in ran_side_domains)
+        )
+
+    def _pair_precondition(site_a, site_b):
+        domains_a = site_domains.get(site_a, ())
+        domains_b = site_domains.get(site_b, ())
+        return _matches(domains_a, domains_b) or _matches(domains_b, domains_a)
+
+    # 原始连边遍历（不做 domain 过滤——误连接判定要看全部连边），按 NE 对去重
+    candidate_flags = {}
+    seen_ne_pairs = set()
+    for source_ne, source_info in ne_graph.items():
+        if not isinstance(source_info, dict):
+            continue
+        source_site = _get_site_id(source_info)
+        if not source_site:
+            continue
+        source_domain = normalize_domain(source_info.get("domain", ""))
+        raw_links = source_info.get("link", {})
+        if not isinstance(raw_links, dict):
+            continue
+        for target_ne in raw_links:
+            target_info = ne_graph.get(target_ne)
+            if not isinstance(target_info, dict):
+                continue
+            target_site = _get_site_id(target_info)
+            if not target_site or target_site == source_site:
+                continue
+            ne_key = (
+                (source_ne, target_ne)
+                if source_ne <= target_ne
+                else (target_ne, source_ne)
+            )
+            if ne_key in seen_ne_pairs:
+                continue
+            seen_ne_pairs.add(ne_key)
+
+            pair_key = tuple(sorted((source_site, target_site)))
+            flags = candidate_flags.get(pair_key)
+            if flags is None:
+                if not _pair_precondition(source_site, target_site):
+                    candidate_flags[pair_key] = False
+                    continue
+                flags = {"has_transmission_link": False, "has_data_ran_link": False}
+                candidate_flags[pair_key] = flags
+            elif flags is False:
+                continue
+
+            target_domain = normalize_domain(target_info.get("domain", ""))
+            if is_transmission_domain(source_domain) or is_transmission_domain(target_domain):
+                flags["has_transmission_link"] = True
+            if {source_domain, target_domain} == {"Data", "Ran"}:
+                flags["has_data_ran_link"] = True
+
+    misconnection_pairs = {
+        pair_key
+        for pair_key, flags in candidate_flags.items()
+        if flags and flags["has_transmission_link"] and not flags["has_data_ran_link"]
+    }
+    stats = {
+        "candidate_pair_count": sum(
+            1 for flags in candidate_flags.values() if flags is not False
+        ),
+        "misconnection_pair_count": len(misconnection_pairs),
+    }
+    return misconnection_pairs, stats
+
+
 def classify_device_role(domain: str) -> str:
     """归一化设备类型: wireless / microwave / router / unknown。"""
     text = normalize_domain(domain or "")
@@ -181,6 +277,7 @@ def iter_unique_cross_site_links(
     assume_symmetric=False,
     wireless_only_sites=None,
     include_filtered_cross_domain=False,
+    transmission_misconnection_pairs=None,
 ):
     """按 NE 对 + link_type 去重，遍历跨站点链路。
 
@@ -190,6 +287,9 @@ def iter_unique_cross_site_links(
     include_filtered_cross_domain=True 时，被 should_include_cross_site_link
     过滤的跨 domain 连边也会产出（included_in_topology=False），供跨类型方向
     约束提取使用；消费端必须自行跳过这些记录，不得计入拓扑。
+
+    transmission_misconnection_pairs（pair_key 集合）非空时，命中站点对之间
+    任一端为传输类 domain 的连边被视为误连接，直接跳过（拓扑与约束证据均不产出）。
     """
     seen = None if assume_symmetric else set()
     site_role_counts = (
@@ -218,6 +318,17 @@ def iter_unique_cross_site_links(
                 continue
 
             target_domain = normalize_domain(target_info.get("domain", ""))
+            if transmission_misconnection_pairs and (
+                is_transmission_domain(source_domain)
+                or is_transmission_domain(target_domain)
+            ):
+                misconnection_key = (
+                    (source_site, target_site)
+                    if source_site <= target_site
+                    else (target_site, source_site)
+                )
+                if misconnection_key in transmission_misconnection_pairs:
+                    continue
             included_in_topology = should_include_cross_site_link(
                 source_site,
                 source_domain,

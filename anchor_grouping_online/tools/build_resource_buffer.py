@@ -119,6 +119,9 @@ def _resource_buffer_pairwise_args():
         # 注入层级平滑、解除含约束端点的严格环块、强制直连对判向
         cross_domain_priority_constraint=True,
         constraint_level_gap=1.0,
+        # 误连接预处理：Data 站点与 Trans+Ran(无 Data) 站点之间只有传输连边、
+        # 无 Data-Ran 佐证时，剔除两者间全部传输类连边
+        transmission_misconnection_filter=True,
         full_output=False,
         no_progress=True,
     )
@@ -657,6 +660,11 @@ def build_site_chains_field(ne_graph: dict) -> dict:
         site_chains["meta"]["cross_domain_constraint_check"] = (
             verify_cross_domain_constraints(site_chains.get("sites", {}), constraints)
         )
+    # 误连接预处理计数随 site_chains meta 落盘，便于核对剔除规模
+    if prediction["meta"].get("transmission_misconnection_filter"):
+        site_chains["meta"]["transmission_misconnection_pair_count"] = (
+            prediction["meta"].get("transmission_misconnection_pair_count", 0)
+        )
     return site_chains
 
 
@@ -779,6 +787,12 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
     print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")
     print(f"    下游可达关系数: {site_chains_meta.get('total_downstream_relations', 0)}")
     print(f"    双向直接边数: {site_chains_meta.get('total_bidirectional_edges', 0)}")
+
+    if 'transmission_misconnection_pair_count' in site_chains_meta:
+        print(
+            f"    误连接剔除站点对数: "
+            f"{site_chains_meta['transmission_misconnection_pair_count']}"
+        )
 
     constraint_check_stats = (
         site_chains_meta.get('cross_domain_constraint_check') or {}
