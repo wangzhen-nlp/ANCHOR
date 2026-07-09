@@ -55,6 +55,18 @@ def compact_pairwise_prediction(pair_result):
     }
 
 
+def _site_cross_domain_priority(site_id, site_domain_counts):
+    """站点自身最高 domain 优先级；未知/其它 domain 不参与。"""
+    return max(
+        (
+            cross_domain_priority(domain)
+            for domain, count in site_domain_counts.get(site_id, {}).items()
+            if count > 0
+        ),
+        default=0,
+    )
+
+
 def build_site_pair_inputs(
     ne_graph,
     show_progress=False,
@@ -102,17 +114,37 @@ def build_site_pair_inputs(
             if collect_cross_domain and left_domain != right_domain:
                 left_priority = cross_domain_priority(left_domain)
                 right_priority = cross_domain_priority(right_domain)
-                # 只有两端优先级都已知且不同的连边才构成方向证据
+                left_site_priority = _site_cross_domain_priority(
+                    left_site, site_domain_counts
+                )
+                right_site_priority = _site_cross_domain_priority(
+                    right_site, site_domain_counts
+                )
+                endpoint_winner = (
+                    left_site if left_priority > right_priority else right_site
+                )
+                site_winner = (
+                    left_site
+                    if left_site_priority > right_site_priority
+                    else right_site
+                )
+                # 只有两端设备优先级都已知且不同，并且站点自身最高优先级支持
+                # 同一方向时，才构成跨 domain 方向证据。
                 if left_priority and right_priority and left_priority != right_priority:
-                    evidence = cross_domain_pair_evidence[pair_key]
-                    evidence["link_count"] += 1
-                    site_priority = evidence["site_priority"]
-                    if left_priority > site_priority.get(left_site, 0):
-                        site_priority[left_site] = left_priority
-                    if right_priority > site_priority.get(right_site, 0):
-                        site_priority[right_site] = right_priority
-                    winner = left_site if left_priority > right_priority else right_site
-                    evidence["direction_votes"][winner] += 1
+                    if (
+                        left_site_priority
+                        and right_site_priority
+                        and left_site_priority != right_site_priority
+                        and endpoint_winner == site_winner
+                    ):
+                        evidence = cross_domain_pair_evidence[pair_key]
+                        evidence["link_count"] += 1
+                        site_priority = evidence["site_priority"]
+                        if left_site_priority > site_priority.get(left_site, 0):
+                            site_priority[left_site] = left_site_priority
+                        if right_site_priority > site_priority.get(right_site, 0):
+                            site_priority[right_site] = right_site_priority
+                        evidence["direction_votes"][site_winner] += 1
 
             # 被拓扑过滤的跨 domain 连边只贡献约束证据，不参与任何拓扑聚合
             if not link.get("included_in_topology", True):
@@ -221,7 +253,8 @@ def _break_constraint_cycles(constraints):
 def build_cross_domain_constraints(pair_evidence, pair_edge_count):
     """从跨类型连边证据构建站点对方向约束：优先级高的一侧为上行。
 
-    对内冲突消解：比较两端在该站点对全部跨类型连边上暴露过的最高优先级 domain，
+    方向证据必须同时满足：连边端点 domain 优先级给出的方向，与两端站点自身
+    最高 domain 优先级给出的方向一致。对内冲突消解时比较两端站点优先级，
     高者为上行；平局则该对不产生约束（计入 tie_pair_count）。跨对约束成环时
     按证据数丢弃最弱者。
 
@@ -1196,10 +1229,11 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
     与 main 的非 full-output 路径产物一致，可直接作为下游 site_chains 的 prediction 输入，
     省去落盘再读盘。
 
-    args.cross_domain_priority_constraint 开启时，跨类型连边（如 Data-Ran）按
-    domain 优先级产生硬方向约束：注入层级平滑（周边站点顺势重排）、解除含约束
-    端点的严格环块、并对有拓扑直连边的约束对强制判向；约束集随结果的
-    cross_domain_constraints 字段导出，供 site_chains 侧校验。
+    args.cross_domain_priority_constraint 开启时，跨类型连边（如 Data-Ran）在
+    连边端点优先级与站点自身优先级方向一致时产生硬方向约束：注入层级平滑
+    （周边站点顺势重排）、解除含约束端点的严格环块、并对有拓扑直连边的约束对
+    强制判向；约束集随结果的 cross_domain_constraints 字段导出，供 site_chains
+    侧校验。
     """
     constraint_enabled = bool(getattr(args, "cross_domain_priority_constraint", False))
 
