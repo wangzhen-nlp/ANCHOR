@@ -1094,15 +1094,17 @@ def build_pairwise_orders(
     )
     strict_ring_pair_context = strict_ring_context["pair_context"]
 
-    # 环块解除：仅当同一条约束的上行、下行两个端点都落在同一环块内时，该块
-    # 退出严格环覆盖（含入口强制），块内边交回 gap-first/投票，由已注入约束的
-    # 平滑层级场决定方向。单个端点在块内（约束对跨块/多跳到块外）不触发解除。
+    # 环块解除（constraint_ring_release，默认关闭）：约束两端同环块时解除该块的
+    # 严格环覆盖。默认不启用——环块/BCC 都会把共边环与双归下游融合进来，
+    # “约束所在的环”在共边网状结构上没有唯一定义，解除范围无法正确圈定；
+    # 约束仍通过直连对硬覆盖与势场投影生效。
     constraints = constraints or {}
+    constraint_ring_release = bool(getattr(args, "constraint_ring_release", False))
     constraint_forced_pair_count = 0
     constraint_changed_pair_count = 0
     strict_ring_released_pair_count = 0
     released_component_ids = set()
-    if constraints:
+    if constraints and constraint_ring_release:
         site_component_ids = {}
         for component in strict_ring_context["components"]:
             for component_site in component["sites"]:

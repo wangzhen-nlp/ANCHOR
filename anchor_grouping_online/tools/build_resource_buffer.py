@@ -119,6 +119,9 @@ def _resource_buffer_pairwise_args():
         # 注入层级平滑、解除含约束端点的严格环块、强制直连对判向
         cross_domain_priority_constraint=True,
         constraint_level_gap=1.0,
+        # 约束触发的环块解除：默认关闭（环块会把共边环/双归下游一并放开，
+        # 解除范围无法正确圈定）；约束仅经直连对硬覆盖与势场投影生效
+        constraint_ring_release=False,
         # 误连接预处理：Data 站点与 Trans+Ran(无 Data) 站点之间只有传输连边、
         # 无 Data-Ran 佐证时，剔除两者间全部传输类连边
         transmission_misconnection_filter=True,
