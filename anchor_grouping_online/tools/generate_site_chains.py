@@ -359,6 +359,7 @@ def _complete_data_upstream_chains(
     data_sites,
     max_depth,
     show_progress,
+    allowed_pairs=None,
 ):
     """后处理：非 Data 站点若有 Data 站点作为多跳上行，则把传播路径上的
     非 Data 中间站点依次补为该站点的上行（hop 取路径距离）。
@@ -370,13 +371,18 @@ def _complete_data_upstream_chains(
 
     路径按与 reachable_downstream_sites 相同的 BFS 语义重建（第一跳走显式
     有向边，后续可经双向边），因此补出的 hop 与既有多跳 hop 口径一致。
-    补全的关系不受 restrict 裁剪约束（中间站点与目标站点可以不直接相邻）。
+
+    allowed_pairs 非 None 时（restrict_relation 开启，传入 ne_graph 物理直连
+    站点对集合），补全与 restrict 保持同一口径：中间站点与目标站点不直连的
+    关系不补（计入 skipped_by_restrict_count），保证“输出关系必有跨站连边”
+    的不变量整体成立。
     """
     stats = {
         "target_site_count": 0,
         "added_upstream_relation_count": 0,
         "replaced_bidirectional_pair_count": 0,
         "replaced_reverse_relation_count": 0,
+        "skipped_by_restrict_count": 0,
         "path_not_found_count": 0,
     }
 
@@ -419,6 +425,12 @@ def _complete_data_upstream_chains(
                 for position in range(1, path_hop_total):
                     mid_site = path[position]
                     if mid_site in data_sites:
+                        continue
+                    # restrict 口径一致：不与目标物理直连的中间站不补
+                    if allowed_pairs is not None and (
+                        site_pair_key(mid_site, target_site) not in allowed_pairs
+                    ):
+                        stats["skipped_by_restrict_count"] += 1
                         continue
                     mid_info = site_chains[mid_site]
                     hop_to_target = path_hop_total - position
@@ -654,6 +666,11 @@ def build_site_chains_from_data(
                 and normalize_domain(ne_info.get("domain", "")) == "Data"
                 and _get_site_id(ne_info)
             }
+            # restrict 开启时补全走同一物理直连口径（ne_graph_pairs 已在
+            # _apply_relation_options 中算好）；关闭时不限制
+            completion_allowed_pairs = None
+            if restriction_stats and restriction_stats.get("enabled") and relation_data:
+                completion_allowed_pairs = relation_data["ne_graph_pairs"]
             completion_stats = _complete_data_upstream_chains(
                 site_chains,
                 adjacency,
@@ -661,6 +678,7 @@ def build_site_chains_from_data(
                 data_sites,
                 max_depth,
                 show_progress,
+                allowed_pairs=completion_allowed_pairs,
             )
 
     meta = _build_site_chains_meta(
