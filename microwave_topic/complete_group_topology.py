@@ -1785,6 +1785,12 @@ def complete_group_topology(
                 "raw_upstream_site_hops": raw_site_chain.get("upstream_site_hops", {}),
                 "found_upstream_site_hops": found_upstream_hops,
                 "no_upstream": not bool(found_upstream_hops),
+                "self_fallback_added": DEBUG_SITE_ID in set(
+                    completion.get("no_upstream_data_self_fallback_site_ids") or ()
+                ),
+                "fallback_selection": (
+                    completion.get("farthest_upstream_sites") or {}
+                ).get(DEBUG_SITE_ID),
             }, ensure_ascii=False, sort_keys=True),
             file=sys.stderr,
         )
@@ -1852,6 +1858,32 @@ def complete_group_topology(
         set(ran_data_upstream_diagnostics.get("generated_highlight_site_ids") or ())
         - set(ran_data_upstream_diagnostics["final_highlight_site_ids"])
     )
+    if DEBUG_SITE_ID in alarm_sites:
+        final_highlight_entries = [
+            item
+            for item in topology_highlight_sites
+            if item.get("site_id") == DEBUG_SITE_ID
+        ]
+        filtered_by = []
+        for filter_name, filtered_site_ids in (
+            ("hub", hub_filtered_ancestor_site_ids),
+            ("ran_without_data_link", ran_without_data_link_filtered_ancestor_site_ids),
+            ("data_link", data_link_pruned_ancestor_site_ids),
+            ("shared_data_link", shared_data_link_pruned_ancestor_site_ids),
+            ("single_data_ancestor", single_data_ancestor_pruned_site_ids),
+        ):
+            if DEBUG_SITE_ID in set(filtered_site_ids or ()):
+                filtered_by.append(filter_name)
+        print(
+            "[topology-debug:final-highlight] "
+            + json.dumps({
+                "site_id": DEBUG_SITE_ID,
+                "is_final_highlight": bool(final_highlight_entries),
+                "highlight_entries": final_highlight_entries,
+                "filtered_by": filtered_by,
+            }, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+        )
 
     pruned_output_site_ids = (
         set(data_link_pruned_ancestor_site_ids)
