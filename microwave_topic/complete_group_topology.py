@@ -920,8 +920,15 @@ def _build_ran_data_upstream_highlight_sites(
     site_links,
     directed_edge_types,
     site_chain_components,
+    diagnostics=None,
 ):
     site_has_data = set(site_has_data or ())
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    source_evaluations = {
+        item.get("site_id"): item
+        for item in diagnostics.get("source_evaluations") or []
+        if isinstance(item, dict) and item.get("site_id")
+    }
     data_neighbors_by_site = {}
     for site_id in source_site_ids:
         site_id = _normalize_text(site_id)
@@ -933,26 +940,32 @@ def _build_ran_data_upstream_highlight_sites(
             if peer_site in site_has_data
             and ("Ran", "Data") in (directed_edge_types or {}).get((site_id, peer_site), set())
         ]
+        evaluation = source_evaluations.get(site_id)
+        if evaluation is not None:
+            evaluation["ran_data_neighbor_site_ids"] = data_neighbor_sites
+            evaluation["site_chain_component_id"] = (site_chain_components or {}).get(site_id)
         if data_neighbor_sites:
             data_neighbors_by_site[site_id] = data_neighbor_sites
-    if len(data_neighbors_by_site) < 2:
-        return []
 
     # 至少两个经 site_chains 连通的候选源站必须共同连接到同一个 Data 站点；
     # 各自连接不同 Data 站点或只有一个源站连接到该 Data 站点时不补标。
     site_chain_components = site_chain_components or {}
     sources_by_component_and_data_site = defaultdict(set)
+    sources_by_data_site = defaultdict(set)
     for site_id, data_neighbor_sites in data_neighbors_by_site.items():
         component = site_chain_components.get(site_id)
-        if component is None:
-            continue
         for peer_site in data_neighbor_sites:
+            sources_by_data_site[peer_site].add(site_id)
+            if component is None:
+                continue
             sources_by_component_and_data_site[(component, peer_site)].add(site_id)
 
     marks_by_site = {}
+    qualified_source_site_ids = set()
     for (_component, peer_site), source_sites in sorted(sources_by_component_and_data_site.items()):
         if len(source_sites) < 2:
             continue
+        qualified_source_site_ids.update(source_sites)
         mark = marks_by_site.setdefault(peer_site, {
             "site_id": peer_site,
             "role": "ran_data_upstream_site",
@@ -965,6 +978,57 @@ def _build_ran_data_upstream_highlight_sites(
         mark = marks_by_site[peer_site]
         mark["source_sites"] = sorted(set(mark["source_sites"]))
         result.append(mark)
+
+    shared_data_site_evaluations = []
+    for data_site_id in sorted(sources_by_data_site):
+        source_sites = sorted(sources_by_data_site[data_site_id])
+        component_groups = []
+        for (component, peer_site), component_source_sites in sorted(
+            sources_by_component_and_data_site.items()
+        ):
+            if peer_site != data_site_id:
+                continue
+            component_groups.append({
+                "component_id": component,
+                "source_site_ids": sorted(component_source_sites),
+                "passes": len(component_source_sites) >= 2,
+            })
+        shared_data_site_evaluations.append({
+            "data_site_id": data_site_id,
+            "source_site_ids": source_sites,
+            "component_groups": component_groups,
+            "passes": any(group["passes"] for group in component_groups),
+        })
+
+    for site_id in source_site_ids:
+        evaluation = source_evaluations.get(site_id)
+        if evaluation is None:
+            continue
+        neighbor_sites = data_neighbors_by_site.get(site_id, [])
+        component = site_chain_components.get(site_id)
+        if not neighbor_sites:
+            evaluation["result"] = "no_ran_data_neighbor"
+        elif component is None:
+            evaluation["result"] = "missing_site_chain_component"
+        elif site_id in qualified_source_site_ids:
+            evaluation["result"] = "qualified"
+        elif any(len(sources_by_data_site[peer_site]) >= 2 for peer_site in neighbor_sites):
+            evaluation["result"] = "shared_data_neighbor_different_components"
+        else:
+            evaluation["result"] = "data_neighbor_not_shared"
+
+    diagnostics["eligible_source_site_ids"] = sorted(set(source_site_ids))
+    diagnostics["sources_with_ran_data_neighbor_site_ids"] = sorted(data_neighbors_by_site)
+    diagnostics["shared_data_site_evaluations"] = shared_data_site_evaluations
+    diagnostics["generated_highlight_site_ids"] = [item["site_id"] for item in result]
+    if result:
+        diagnostics["status"] = "produced"
+    elif len(set(source_site_ids)) < 2:
+        diagnostics["status"] = "insufficient_eligible_source_sites"
+    elif len(data_neighbors_by_site) < 2:
+        diagnostics["status"] = "insufficient_sources_with_ran_data_neighbor"
+    else:
+        diagnostics["status"] = "no_shared_data_site_in_same_component"
     return result
 
 
@@ -974,12 +1038,22 @@ def _build_topology_highlight_sites(
     site_links,
     directed_edge_types,
     site_chain_components,
+    ran_data_diagnostics=None,
 ):
     common_upstream_sites = list(completion.get("common_upstream_sites") or [])
     common_upstream_site = completion.get("common_upstream_site")
     if common_upstream_site and common_upstream_site not in common_upstream_sites:
         common_upstream_sites.insert(0, common_upstream_site)
     if common_upstream_sites:
+        if isinstance(ran_data_diagnostics, dict):
+            ran_data_diagnostics.update({
+                "status": "skipped_common_upstream",
+                "source_evaluations": [],
+                "eligible_source_site_ids": [],
+                "sources_with_ran_data_neighbor_site_ids": [],
+                "shared_data_site_evaluations": [],
+                "generated_highlight_site_ids": [],
+            })
         promotions_by_source = defaultdict(list)
         for promotion in completion.get("data_ancestor_promotions") or []:
             if isinstance(promotion, dict) and promotion.get("from_site_id"):
@@ -1052,23 +1126,46 @@ def _build_topology_highlight_sites(
         if _normalize_text(site_id)
     }
     source_site_ids = []
+    source_evaluations = []
     for site_id, upstream_hops in (completion.get("upstream_site_hops") or {}).items():
         site_id = _normalize_text(site_id)
-        if not site_id or site_id in normalized_data_site_ids:
+        if not site_id:
             continue
         upstream_site_ids = {
             _normalize_text(upstream_site_id)
             for upstream_site_id in (upstream_hops or {})
             if _normalize_text(upstream_site_id) and _normalize_text(upstream_site_id) != site_id
         }
-        if upstream_site_ids.isdisjoint(normalized_data_site_ids):
+        data_upstream_site_ids = sorted(upstream_site_ids & normalized_data_site_ids)
+        evaluation = {
+            "site_id": site_id,
+            "is_data_site": site_id in normalized_data_site_ids,
+            "upstream_site_ids": sorted(upstream_site_ids),
+            "data_upstream_site_ids": data_upstream_site_ids,
+            "eligible": False,
+            "ran_data_neighbor_site_ids": [],
+            "site_chain_component_id": (site_chain_components or {}).get(site_id),
+        }
+        if site_id in normalized_data_site_ids:
+            evaluation["result"] = "source_is_data_site"
+        elif data_upstream_site_ids:
+            evaluation["result"] = "has_data_upstream"
+        else:
+            evaluation["eligible"] = True
             source_site_ids.append(site_id)
+        source_evaluations.append(evaluation)
+    if isinstance(ran_data_diagnostics, dict):
+        ran_data_diagnostics.update({
+            "status": "evaluating",
+            "source_evaluations": source_evaluations,
+        })
     result.extend(_build_ran_data_upstream_highlight_sites(
         source_site_ids,
         site_has_data,
         site_links,
         directed_edge_types,
         site_chain_components,
+        ran_data_diagnostics,
     ))
     return result
 
@@ -1588,12 +1685,14 @@ def complete_group_topology(
     # 上游祖先仍只由断站/Offline 告警站点推断，但只要站点上存在任意告警，
     # 就应把该站点纳入设备展开范围，补齐站内没有告警的设备。
     selected_sites = set(completion["selected_sites"]) | set(alarm_sites)
+    ran_data_upstream_diagnostics = {}
     topology_highlight_sites = _build_topology_highlight_sites(
         completion,
         site_has_data,
         site_links,
         directed_edge_types,
         site_chain_components,
+        ran_data_upstream_diagnostics,
     )
     topology_highlight_sites, hub_filtered_ancestor_site_ids = _filter_hub_highlight_sites(
         topology_highlight_sites,
@@ -1637,6 +1736,15 @@ def complete_group_topology(
         item["site_id"]
         for item in topology_highlight_sites
         if item.get("site_id")
+    )
+    ran_data_upstream_diagnostics["final_highlight_site_ids"] = sorted(
+        item["site_id"]
+        for item in topology_highlight_sites
+        if item.get("role") == "ran_data_upstream_site" and item.get("site_id")
+    )
+    ran_data_upstream_diagnostics["filtered_out_highlight_site_ids"] = sorted(
+        set(ran_data_upstream_diagnostics.get("generated_highlight_site_ids") or ())
+        - set(ran_data_upstream_diagnostics["final_highlight_site_ids"])
     )
 
     pruned_output_site_ids = (
@@ -1761,6 +1869,7 @@ def complete_group_topology(
         "single_data_ancestor_pruned_site_ids": single_data_ancestor_pruned_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
+        "ran_data_upstream_diagnostics": ran_data_upstream_diagnostics,
         "auto_root_cause_annotations": auto_root_cause_annotations,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(offline_alarm_sites) <= 1,
         "offline_site_max_duration_seconds": _serialize_offline_durations(offline_site_max_durations),

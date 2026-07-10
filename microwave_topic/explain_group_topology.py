@@ -44,6 +44,24 @@ ROOT_CAUSE_REASONS = {
     "transmission_device": "站内没有告警，选择下游连接最多的微波设备",
 }
 
+RAN_DATA_STATUS_REASONS = {
+    "skipped_common_upstream": "已找到最低公共 upstream，因此没有执行 Ran-Data 补标",
+    "produced": "已找到至少两个同组件源站共同连接的 Data 站点",
+    "insufficient_eligible_source_sites": "排除 Data 源站和存在 Data upstream 的源站后，候选源站少于两个",
+    "insufficient_sources_with_ran_data_neighbor": "候选源站不少于两个，但具有 Ran->Data 直连邻站的源站少于两个",
+    "no_shared_data_site_in_same_component": "存在多个 Ran->Data 邻接源站，但没有同一组件内至少两个源站共同连接同一个 Data 站点",
+}
+
+RAN_DATA_SOURCE_RESULT_REASONS = {
+    "source_is_data_site": "源站自身是 Data 站点",
+    "has_data_upstream": "upstream 闭包中存在 Data 站点",
+    "no_ran_data_neighbor": "没有 Ran->Data 直连的 Data 邻站",
+    "missing_site_chain_component": "源站不在 site_chains 组件索引中",
+    "data_neighbor_not_shared": "相邻 Data 站点没有被其他候选源站共同连接",
+    "shared_data_neighbor_different_components": "Data 邻站虽然相同，但共同连接它的源站不在同一组件",
+    "qualified": "满足条件并参与公共 Data 站点补标",
+}
+
 ALARM_TITLE_FIELDS = ("告警标题", "告警标准名", "alarm_type", "title", "alarm")
 
 
@@ -286,11 +304,6 @@ def _append_data_reasoning(lines, completion, site_names):
     highlights = _as_list(completion.get("highlight_sites"))
     if not highlights:
         lines.append("最终没有高亮祖先站点。")
-    ran_data_highlights = [
-        item
-        for item in highlights
-        if isinstance(item, dict) and item.get("role") == "ran_data_upstream_site"
-    ]
     for item in highlights:
         if not isinstance(item, dict):
             continue
@@ -315,15 +328,61 @@ def _append_data_reasoning(lines, completion, site_names):
             )
             lines.append(f"  upstream 跳数: {details}")
 
-    if not ran_data_highlights:
-        if _as_list(completion.get("common_upstream_sites")) or _text(completion.get("common_upstream_site")):
-            lines.append("Ran-Data 补标未执行: 已找到最低公共 upstream，算法直接采用公共 upstream 结果。")
-        else:
-            lines.append("Ran-Data 补标没有产生最终结果。")
+def _append_ran_data_diagnostic_trace(lines, diagnostics, site_names):
+    status = _text(diagnostics.get("status"))
+    lines.append(f"诊断结论: {RAN_DATA_STATUS_REASONS.get(status, status or '状态未知')}")
+
+    source_evaluations = _as_list(diagnostics.get("source_evaluations"))
+    if source_evaluations:
+        lines.append("源站逐项检查:")
+    for evaluation in source_evaluations:
+        if not isinstance(evaluation, dict):
+            continue
+        site_id = _text(evaluation.get("site_id"))
+        result = _text(evaluation.get("result"))
+        lines.append(
+            f"- {_site_label(site_id, site_names)}: "
+            f"{RAN_DATA_SOURCE_RESULT_REASONS.get(result, result or '尚无最终结果')}"
+        )
+        data_upstream_site_ids = _as_list(evaluation.get("data_upstream_site_ids"))
+        if data_upstream_site_ids:
+            lines.append(f"  Data upstream: {_site_list(data_upstream_site_ids, site_names)}")
+        neighbor_site_ids = _as_list(evaluation.get("ran_data_neighbor_site_ids"))
+        if neighbor_site_ids:
+            lines.append(f"  Ran->Data 邻站: {_site_list(neighbor_site_ids, site_names)}")
+        component_id = _text(evaluation.get("site_chain_component_id"))
+        if component_id:
+            lines.append(f"  站点链路组件: {component_id}")
+
+    shared_data_evaluations = _as_list(diagnostics.get("shared_data_site_evaluations"))
+    if shared_data_evaluations:
+        lines.append("相邻 Data 站点聚合检查:")
+    for evaluation in shared_data_evaluations:
+        if not isinstance(evaluation, dict):
+            continue
+        data_site_id = _text(evaluation.get("data_site_id"))
+        source_site_ids = _as_list(evaluation.get("source_site_ids"))
+        lines.append(
+            f"- {_site_label(data_site_id, site_names)}: 连接源站 "
+            f"{_site_list(source_site_ids, site_names)}；"
+            f"{'通过' if evaluation.get('passes') else '未通过'}"
+        )
+        component_groups = _as_list(evaluation.get("component_groups"))
+        for group in component_groups:
+            if not isinstance(group, dict):
+                continue
             lines.append(
-                "可复核范围: per-file 未保存落选候选、站点组件和原始设备链路，"
-                "无法仅凭此文件区分是候选不足、没有共享同一 Data 邻站、组件不连通，还是未满足 Ran-Data 链路。"
+                f"  组件 {_text(group.get('component_id')) or '未知'}: "
+                f"{_site_list(group.get('source_site_ids'), site_names)} "
+                f"({'达到至少两个源站' if group.get('passes') else '不足两个源站'})"
             )
+
+    filtered_site_ids = _as_list(diagnostics.get("filtered_out_highlight_site_ids"))
+    if filtered_site_ids:
+        lines.append(
+            "已生成但在后处理阶段被移除的 Data 站点: "
+            + _site_list(filtered_site_ids, site_names)
+        )
 
 
 def _append_shared_data_neighbors(lines, group, completion, site_names):
@@ -332,10 +391,18 @@ def _append_shared_data_neighbors(lines, group, completion, site_names):
         for item in _as_list(completion.get("highlight_sites"))
         if isinstance(item, dict) and item.get("role") == "ran_data_upstream_site"
     ]
+    _append_section(lines, "无 Data upstream -> 公共 Data 邻站")
+    diagnostics = completion.get("ran_data_upstream_diagnostics")
     if not highlights:
+        if isinstance(diagnostics, dict) and diagnostics:
+            _append_ran_data_diagnostic_trace(lines, diagnostics, site_names)
+        else:
+            lines.append(
+                "这个 per-file 没有 ran_data_upstream_diagnostics，无法确定未产出原因；"
+                "请使用最新版 complete_group_topology.py 重新生成该文件。"
+            )
         return
 
-    _append_section(lines, "无 Data upstream -> 公共 Data 邻站")
     ne_info = group.get("ne_info") if isinstance(group.get("ne_info"), dict) else {}
     roles_by_site = _site_role_index(ne_info)
     data_site_ids = {
@@ -377,7 +444,11 @@ def _append_shared_data_neighbors(lines, group, completion, site_names):
                 "  Ran->Data 直连检查: "
                 + ("通过" if _has_ran_data_link(source_site, data_site, ne_info) else "未能从 per-file 的设备链路中复核")
             )
-        lines.append("站点链路组件检查: per-file 未保存组件编号，只能看到算法记录的最终通过结果。")
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            lines.append("站点链路组件检查: 旧版 per-file 未保存组件编号，只能看到算法记录的最终通过结果。")
+    if isinstance(diagnostics, dict) and diagnostics:
+        lines.append("生成时诊断记录:")
+        _append_ran_data_diagnostic_trace(lines, diagnostics, site_names)
 
 
 def _append_filters(lines, completion, site_names):
