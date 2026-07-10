@@ -28,6 +28,7 @@ from topology_resources import (
 
 
 BLOCKED_ANCESTOR_SITE_IDS = {"13PWK0024"}
+DEBUG_SITE_ID = "13SRN0089"
 OFFLINE_ALARM_KEYS = {str(alarm or "").strip().upper() for alarm in OFFLINE_ALARMS} | {"OFFLINE"}
 
 # --filter 使用：每条规则为 (offline 持续时间阈值秒数, 需要满足的站点数)。
@@ -1714,6 +1715,25 @@ def complete_group_topology(
     non_offline_alarm_sites = sorted(set(alarm_sites) - set(offline_alarm_sites))
     if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
         site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
+    if DEBUG_SITE_ID in alarm_sites:
+        site_device_domains = {
+            ne_id: _ne_domain_text(ne_info)
+            for ne_id, ne_info in (
+                ne_graph_data.items() if isinstance(ne_graph_data, dict) else ()
+            )
+            if isinstance(ne_info, dict)
+            and _normalize_text(ne_info.get("site_id", "")) == DEBUG_SITE_ID
+        }
+        print(
+            "[topology-debug:data-site] "
+            + json.dumps({
+                "site_id": DEBUG_SITE_ID,
+                "in_data_site_ids": DEBUG_SITE_ID in set(site_has_data or ()),
+                "needs_upstream": DEBUG_SITE_ID in set(offline_alarm_sites),
+                "device_domains": site_device_domains,
+            }, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+        )
     if site_chain_components is None:
         site_chain_components = _build_site_chain_component_index(site_chain_index)
     completion = _build_site_completion(
@@ -1723,6 +1743,31 @@ def complete_group_topology(
         upstream_adjacency,
         data_site_ids=site_has_data,
     )
+    if DEBUG_SITE_ID in offline_alarm_sites:
+        raw_site_chain = (
+            site_chain_index.get(DEBUG_SITE_ID, {})
+            if isinstance(site_chain_index, dict)
+            else {}
+        )
+        resolved_hops = (completion.get("upstream_site_hops") or {}).get(
+            DEBUG_SITE_ID, {}
+        )
+        found_upstream_hops = {
+            site_id: hop
+            for site_id, hop in resolved_hops.items()
+            if site_id != DEBUG_SITE_ID
+        }
+        print(
+            "[topology-debug:upstream] "
+            + json.dumps({
+                "site_id": DEBUG_SITE_ID,
+                "restrict_relation": restrict_relation,
+                "raw_upstream_site_hops": raw_site_chain.get("upstream_site_hops", {}),
+                "found_upstream_site_hops": found_upstream_hops,
+                "no_upstream": not bool(found_upstream_hops),
+            }, ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+        )
     # 上游祖先仍只由断站/Offline 告警站点推断，但只要站点上存在任意告警，
     # 就应把该站点纳入设备展开范围，补齐站内没有告警的设备。
     selected_sites = set(completion["selected_sites"]) | set(alarm_sites)
