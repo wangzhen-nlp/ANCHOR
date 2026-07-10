@@ -786,13 +786,9 @@ def _build_site_completion(
     site_chain_index,
     restrict_relation,
     upstream_adjacency=None,
-    excluded_ancestor_site_ids=None,
     data_site_ids=None,
 ):
     alarm_sites = sorted({_normalize_text(site) for site in alarm_sites if _normalize_text(site)})
-    excluded_ancestor_site_ids = {
-        _normalize_text(site) for site in (excluded_ancestor_site_ids or []) if _normalize_text(site)
-    }
     data_site_ids = {_normalize_text(site) for site in (data_site_ids or ()) if _normalize_text(site)}
     selected_sites = set(alarm_sites)
 
@@ -825,7 +821,7 @@ def _build_site_completion(
 
     common_candidates = None
     for site_id in common_upstream_source_sites:
-        candidates = set(reach_by_site[site_id]) - excluded_ancestor_site_ids
+        candidates = set(reach_by_site[site_id])
         common_candidates = candidates if common_candidates is None else common_candidates & candidates
     common_candidates = common_candidates or set()
 
@@ -902,7 +898,7 @@ def _build_site_completion(
             hops = {
                 upstream_site: hop
                 for upstream_site, hop in reach_by_site[site_id].items()
-                if upstream_site != site_id and upstream_site not in excluded_ancestor_site_ids
+                if upstream_site != site_id
             }
             if not hops:
                 _append_unique(no_upstream_sites, site_id)
@@ -1703,7 +1699,6 @@ def complete_group_topology(
         site_chain_index,
         restrict_relation,
         upstream_adjacency,
-        excluded_ancestor_site_ids=non_offline_alarm_sites,
         data_site_ids=site_has_data,
     )
     # 上游祖先仍只由断站/Offline 告警站点推断，但只要站点上存在任意告警，

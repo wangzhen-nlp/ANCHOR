@@ -219,7 +219,10 @@ def _append_summary(lines, group, completion, site_names):
     lines.append(f"原始告警设备 ({len(original_ne_ids)}): {', '.join(map(str, original_ne_ids)) or '无'}")
     lines.append(f"原始告警站点 ({len(original_site_ids)}): {_site_list(original_site_ids, site_names)}")
     lines.append(f"用于 upstream 推断的 Offline 站点 ({len(source_site_ids)}): {_site_list(source_site_ids, site_names)}")
-    lines.append(f"不参与祖先推断的非 Offline 告警站点 ({len(non_offline_site_ids)}): {_site_list(non_offline_site_ids, site_names)}")
+    lines.append(
+        f"不作为推断源、但可作为 upstream 候选的非 Offline 告警站点 "
+        f"({len(non_offline_site_ids)}): {_site_list(non_offline_site_ids, site_names)}"
+    )
     lines.append(f"最终选中站点: {_site_list(completion.get('selected_site_ids'), site_names)}")
     lines.append(f"拓扑新增站点: {_site_list(completion.get('added_site_ids'), site_names)}")
     added_ne_ids = _as_list(completion.get("added_ne_ids"))
@@ -286,7 +289,7 @@ def _append_upstream_reasoning(lines, completion, site_names):
                     detail += f"，再提升到 Data 祖先 {_site_label(router_site, site_names)}"
                 lines.append(f"- {_site_label(source_site, site_names)}: {detail}")
             elif source_site in _as_list(completion.get("no_upstream_sites")):
-                lines.append(f"- {_site_label(source_site, site_names)}: 没有可用 upstream")
+                lines.append(f"- {_site_label(source_site, site_names)}: 没有 upstream")
 
     chains = completion.get("intermediate_site_chains") or {}
     if isinstance(chains, dict) and chains:
@@ -592,7 +595,6 @@ def _append_consistency_checks(lines, group, completion, site_names):
         else "ancestor_source_site_ids"
     )
     source_sites = [_text(site_id) for site_id in _as_list(completion.get(common_source_field))]
-    excluded_sites = set(map(_text, _as_list(completion.get("non_offline_alarm_site_ids")))) - {""}
     upstream_hops = completion.get("upstream_site_hops") or {}
     common_candidates = None
     for source_site in source_sites:
@@ -600,7 +602,7 @@ def _append_consistency_checks(lines, group, completion, site_names):
         candidates = {
             _text(site_id)
             for site_id in source_hops
-            if _text(site_id) and _text(site_id) not in excluded_sites
+            if _text(site_id)
         }
         common_candidates = candidates if common_candidates is None else common_candidates & candidates
     common_candidates = common_candidates or set()
