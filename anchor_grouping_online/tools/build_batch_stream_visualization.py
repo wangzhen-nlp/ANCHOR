@@ -1,7 +1,8 @@
 """把 match_rules_batch_stream.py 输出转换为 visualization 可加载的 JSONL。
 
 输入文件每行是一个滑动窗口记录，其中 ``agg_alarm_groups`` 为本窗口的
-二次汇聚增量输出。脚本按二次汇聚 ID 跨窗口累积：
+二次汇聚输出，单组包含 ``is_alive`` 和 ``group_members``。脚本同时兼容
+旧版直接以成员列表作为单组 value 的记录，并按二次汇聚 ID 跨窗口累积：
 
 1. 同一二次汇聚组的原始故障组全部合并到一条可视化记录；
 2. 同一原始故障组跨窗口重复出现时，按告警编码 ID 去重并补齐新增告警；
@@ -113,7 +114,17 @@ def _load_window_aggregates(input_path, ne_to_site):
             window_start = record.get("window_start")
             window_end = record.get("window_end")
 
-            for raw_agg_id, member_entries in agg_alarm_groups.items():
+            for raw_agg_id, aggregate_value in agg_alarm_groups.items():
+                if isinstance(aggregate_value, dict):
+                    if "group_members" not in aggregate_value:
+                        raise ValueError(
+                            f"第 {line_number} 行汇聚组 {raw_agg_id!r} "
+                            "缺少 group_members"
+                        )
+                    member_entries = aggregate_value["group_members"]
+                else:
+                    # 兼容旧版 agg_id -> 成员列表结构。
+                    member_entries = aggregate_value
                 _merge_window_aggregate(
                     aggregates, raw_agg_id, member_entries,
                     window_start, window_end, line_number, ne_to_site,

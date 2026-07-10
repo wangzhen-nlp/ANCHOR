@@ -140,8 +140,8 @@ def _build_window_record(
 ):
     """组装单窗口的输出记录。"""
     merged_input_group_count = sum(
-        len(member_entries)
-        for member_entries in agg_alarm_groups.values()
+        len(aggregate_state.get("group_members", ()))
+        for aggregate_state in agg_alarm_groups.values()
     )
     return {
         "window_start": start,
