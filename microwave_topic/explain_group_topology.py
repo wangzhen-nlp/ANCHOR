@@ -280,16 +280,27 @@ def _append_upstream_reasoning(lines, completion, site_names):
         for source_site in source_site_ids:
             selected = farthest.get(source_site) if isinstance(farthest, dict) else None
             if isinstance(selected, dict) and _text(selected.get("site_id")):
-                detail = (
-                    f"选择 {_site_label(selected.get('site_id'), site_names)}"
-                    f"（{selected.get('hop', '?')} 跳）作为最远 upstream"
-                )
+                if selected.get("self_fallback"):
+                    detail = "没有 upstream，但源站包含 Data 设备，逐站回退选择源站自身（0 跳）"
+                else:
+                    detail = (
+                        f"选择 {_site_label(selected.get('site_id'), site_names)}"
+                        f"（{selected.get('hop', '?')} 跳）作为最远 upstream"
+                    )
                 router_site = _text(selected.get("router_ancestor_site_id"))
                 if router_site:
                     detail += f"，再提升到 Data 祖先 {_site_label(router_site, site_names)}"
                 lines.append(f"- {_site_label(source_site, site_names)}: {detail}")
             elif source_site in _as_list(completion.get("no_upstream_sites")):
-                lines.append(f"- {_site_label(source_site, site_names)}: 没有 upstream")
+                if source_site in _as_list(
+                    completion.get("no_upstream_non_data_excluded_site_ids")
+                ):
+                    lines.append(
+                        f"- {_site_label(source_site, site_names)}: "
+                        "没有 upstream 且源站不含 Data 设备，不加入逐站回退结果"
+                    )
+                else:
+                    lines.append(f"- {_site_label(source_site, site_names)}: 没有 upstream")
 
     chains = completion.get("intermediate_site_chains") or {}
     if isinstance(chains, dict) and chains:

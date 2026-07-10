@@ -830,6 +830,8 @@ def _build_site_completion(
     common_upstream_hops = {}
     common_upstream_hops_by_site = {}
     farthest_upstream_sites = {}
+    no_upstream_data_self_fallback_site_ids = []
+    no_upstream_non_data_excluded_site_ids = []
     intermediate_site_chains = {}
     intermediate_site_chains_by_target = {}
     data_ancestor_promotions = []
@@ -895,20 +897,28 @@ def _build_site_completion(
         )
     else:
         for site_id in alarm_sites:
+            # 有 upstream 时选择最远 upstream；没有 upstream 时，只有包含 Data 设备的
+            # 源站才允许回退到自身（hop=0），非 Data 源站不加入回退结果。
             hops = {
                 upstream_site: hop
                 for upstream_site, hop in reach_by_site[site_id].items()
                 if upstream_site != site_id
             }
-            if not hops:
+            if not hops and site_id not in data_site_ids:
                 _append_unique(no_upstream_sites, site_id)
+                _append_unique(no_upstream_non_data_excluded_site_ids, site_id)
                 continue
+            if not hops:
+                hops = {site_id: 0}
+                _append_unique(no_upstream_data_self_fallback_site_ids, site_id)
             max_hop = max(hops.values())
             farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
             farthest_upstream_sites[site_id] = {
                 "site_id": farthest_site,
                 "hop": max_hop,
             }
+            if farthest_site == site_id:
+                farthest_upstream_sites[site_id]["self_fallback"] = True
             router_site = _promote_selected_ancestor(farthest_site, set(hops))
             if router_site != farthest_site:
                 farthest_upstream_sites[site_id]["router_ancestor_site_id"] = router_site
@@ -933,6 +943,12 @@ def _build_site_completion(
         ),
         "farthest_upstream_sites": farthest_upstream_sites,
         "no_upstream_sites": sorted(no_upstream_sites),
+        "no_upstream_data_self_fallback_site_ids": sorted(
+            no_upstream_data_self_fallback_site_ids
+        ),
+        "no_upstream_non_data_excluded_site_ids": sorted(
+            no_upstream_non_data_excluded_site_ids
+        ),
         "upstream_site_hops": reach_by_site,
         "intermediate_site_chains": intermediate_site_chains,
         "intermediate_site_chains_by_target": intermediate_site_chains_by_target,
@@ -1123,6 +1139,8 @@ def _build_topology_highlight_sites(
             })
             item["source_sites"].append(source_site)
             item["hops_by_source_site"][source_site] = selected.get("hop")
+            if selected.get("self_fallback"):
+                item.setdefault("self_fallback_source_sites", []).append(source_site)
             if selected.get("router_promoted"):
                 item["router_promoted"] = True
                 item.setdefault("router_ancestor_site_ids", [])
@@ -1133,6 +1151,10 @@ def _build_topology_highlight_sites(
         for site_id in sorted(farthest_by_target):
             item = farthest_by_target[site_id]
             item["source_sites"] = sorted(set(item["source_sites"]))
+            if item.get("self_fallback_source_sites"):
+                item["self_fallback_source_sites"] = sorted(
+                    set(item["self_fallback_source_sites"])
+                )
             if item.get("router_ancestor_site_ids"):
                 item["router_ancestor_site_ids"] = sorted({
                     site_id for site_id in item["router_ancestor_site_ids"] if site_id
@@ -1880,6 +1902,12 @@ def complete_group_topology(
         ],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
         "no_upstream_sites": completion["no_upstream_sites"],
+        "no_upstream_data_self_fallback_site_ids": completion[
+            "no_upstream_data_self_fallback_site_ids"
+        ],
+        "no_upstream_non_data_excluded_site_ids": completion[
+            "no_upstream_non_data_excluded_site_ids"
+        ],
         "upstream_site_hops": completion["upstream_site_hops"],
         "intermediate_site_chains": completion["intermediate_site_chains"],
         "intermediate_site_chains_by_target": completion["intermediate_site_chains_by_target"],

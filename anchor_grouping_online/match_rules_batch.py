@@ -138,9 +138,10 @@ class BatchFaultGroupMatcher:
     event_cache 作为匹配证据（边匹配仍受 associate_time 约束）。调用结束
     把外置归属/计数与本批结果同步进内部会话（自动去重），但 old_agg
     历史事件仅本次有效，持久引擎只喂本批告警。适合调用方自行保管状态的
-    无状态服务部署。累积输出到 old_agg 时：full_output=True 按 agg_id
-    整体替换该汇聚组；False 须按原始组 ID 合并、告警编码 ID 去重（直接
-    extend 会重复累积、内存膨胀，内部仍去重、结果正确）。
+    无状态服务部署。把新结构输出累积到旧格式 old_agg 时，先读取每个输出
+    value 的 group_members：is_alive=False 时删除对应历史组；存活组在
+    full_output=True 时按 agg_id 用 group_members 整体替换，False 时按原始
+    组 ID 合并并按告警编码 ID 去重（直接 extend 会重复累积、内存膨胀）。
 
     输出口径：存活组只返回本批发生变化（新汇聚组／新成员组／组内新告警）
     的组，纯重发不返回；外置状态中所有告警都早于 history_horizon_ts 的组
@@ -905,7 +906,7 @@ class BatchFaultGroupMatcher:
             if matching_alarm["is_clear"]:
                 raise ValueError(
                     "old_agg 只允许包含有效发生告警，不允许清除告警"
-            )
+                )
             alarm_id = matching_alarm["alarm_id"]
             ts = matching_alarm["ts"]
             alarm_is_alive = history_horizon_ts is None or ts >= history_horizon_ts
