@@ -135,50 +135,53 @@ def stream_zip_alarms(filepath, show_progress=False, file_index=None, total_file
                 return
 
             for member in members:
-                prefix = (
-                    f"[{file_index}/{total_files}] "
-                    if file_index is not None and total_files is not None
-                    else ""
+                yield from _stream_zip_member(
+                    zip_file, member, filepath, show_progress,
+                    file_index, total_files,
                 )
-                label = (
-                    f"{prefix}读取压缩文件 "
-                    f"{os.path.basename(filepath)}::{member.filename}"
-                )
-                progress = (
-                    _build_member_progress(label, member.file_size)
-                    if show_progress
-                    else None
-                )
-                with zip_file.open(member, "r") as raw:
-                    try:
-                        encoding = (
-                            "utf-8-sig"
-                            if _get_alarm_file_type(member.filename) == "csv"
-                            else "utf-8"
-                        )
-                        text_stream = io.TextIOWrapper(raw, encoding=encoding, newline="")
-                        try:
-                            if _get_alarm_file_type(member.filename) == "csv":
-                                yield from _stream_csv_from_text(
-                                    text_stream,
-                                    progress=progress,
-                                    progress_getter=raw.tell,
-                                )
-                            else:
-                                yield from _stream_jsonl_from_text(
-                                    text_stream,
-                                    progress=progress,
-                                    progress_getter=raw.tell,
-                                )
-                        finally:
-                            text_stream.detach()
-                    finally:
-                        if progress is not None:
-                            progress.close()
     except FileNotFoundError:
         print(f"❌ 找不到文件: {filepath}")
     except zipfile.BadZipFile:
         print(f"❌ 非法 zip 文件: {filepath}")
+
+
+def _stream_zip_member(
+    zip_file, member, filepath, show_progress, file_index, total_files
+):
+    """流式读取压缩包内的单个告警文件（CSV/JSONL）。"""
+    prefix = (
+        f"[{file_index}/{total_files}] "
+        if file_index is not None and total_files is not None
+        else ""
+    )
+    label = (
+        f"{prefix}读取压缩文件 "
+        f"{os.path.basename(filepath)}::{member.filename}"
+    )
+    progress = (
+        _build_member_progress(label, member.file_size)
+        if show_progress
+        else None
+    )
+    with zip_file.open(member, "r") as raw:
+        try:
+            is_csv = _get_alarm_file_type(member.filename) == "csv"
+            encoding = "utf-8-sig" if is_csv else "utf-8"
+            text_stream = io.TextIOWrapper(raw, encoding=encoding, newline="")
+            try:
+                stream_from_text = (
+                    _stream_csv_from_text if is_csv else _stream_jsonl_from_text
+                )
+                yield from stream_from_text(
+                    text_stream,
+                    progress=progress,
+                    progress_getter=raw.tell,
+                )
+            finally:
+                text_stream.detach()
+        finally:
+            if progress is not None:
+                progress.close()
 
 
 def stream_alarm_file(filepath, show_progress=False, file_index=None, total_files=None):

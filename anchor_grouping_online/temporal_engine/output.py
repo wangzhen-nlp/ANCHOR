@@ -149,16 +149,39 @@ class TemporalGraphEngineOutputMixin:
         if len(role_mapping) <= 1:
             return match_result
 
+        remove_by_role, owner_by_removed_role_site = (
+            self._collect_output_site_role_removals(match_result, role_mapping)
+        )
+        if not remove_by_role:
+            return match_result
+
+        filtered_role_mapping = self._filter_role_nodes(role_mapping, remove_by_role)
+        filtered_inferred_roots = self._filter_role_nodes(
+            match_result["inferred_roots"], remove_by_role
+        )
+        filtered_symptoms = self._reassign_removed_symptoms(
+            match_result["symptoms"], remove_by_role,
+            owner_by_removed_role_site, filtered_role_mapping,
+        )
+        return {
+            **match_result,
+            "role_mapping": filtered_role_mapping,
+            "inferred_roots": filtered_inferred_roots,
+            "symptoms": filtered_symptoms,
+        }
+
+    def _collect_output_site_role_removals(self, match_result, role_mapping):
+        """按互斥 role 组挑选站点归属，返回 (待移除站点, 被移除者的归属 role)。"""
+        remove_by_role = collections.defaultdict(set)
+        owner_by_removed_role_site = {}
         exclusive_role_groups = self._get_exclusive_site_role_groups_for_output(
             match_result,
             list(role_mapping.keys()),
         )
         if not exclusive_role_groups:
-            return match_result
+            return remove_by_role, owner_by_removed_role_site
 
         role_order = {role: idx for idx, role in enumerate(role_mapping.keys())}
-        remove_by_role = collections.defaultdict(set)
-        owner_by_removed_role_site = {}
         for exclusive_roles in exclusive_role_groups:
             site_to_roles = collections.defaultdict(list)
             for role in exclusive_roles:
@@ -173,30 +196,28 @@ class TemporalGraphEngineOutputMixin:
                     if role != owner_role:
                         remove_by_role[role].add(site)
                         owner_by_removed_role_site[(role, site)] = owner_role
+        return remove_by_role, owner_by_removed_role_site
 
-        if not remove_by_role:
-            return match_result
-
-        filtered_role_mapping = {}
-        for role, nodes in role_mapping.items():
+    @staticmethod
+    def _filter_role_nodes(mapping, remove_by_role):
+        """移除各 role 中被裁掉的站点，裁空的 role 整个删除。"""
+        filtered = {}
+        for role, nodes in mapping.items():
             filtered_nodes = [
                 node for node in nodes
                 if node not in remove_by_role.get(role, set())
             ]
             if filtered_nodes:
-                filtered_role_mapping[role] = filtered_nodes
+                filtered[role] = filtered_nodes
+        return filtered
 
-        filtered_inferred_roots = {}
-        for role, nodes in match_result["inferred_roots"].items():
-            filtered_nodes = [
-                node for node in nodes
-                if node not in remove_by_role.get(role, set())
-            ]
-            if filtered_nodes:
-                filtered_inferred_roots[role] = filtered_nodes
-
+    @staticmethod
+    def _reassign_removed_symptoms(
+        symptoms, remove_by_role, owner_by_removed_role_site, filtered_role_mapping
+    ):
+        """被裁站点的症状改挂归属 role；归属 role 不含该站点时丢弃症状。"""
         filtered_symptoms = []
-        for symptom in match_result["symptoms"]:
+        for symptom in symptoms:
             role = symptom.get("matched_role")
             node = symptom.get("node")
             if role in remove_by_role and node in remove_by_role.get(role, set()):
@@ -215,13 +236,7 @@ class TemporalGraphEngineOutputMixin:
                 else:
                     continue
             filtered_symptoms.append(symptom)
-
-        return {
-            **match_result,
-            "role_mapping": filtered_role_mapping,
-            "inferred_roots": filtered_inferred_roots,
-            "symptoms": filtered_symptoms,
-        }
+        return filtered_symptoms
 
     @staticmethod
     def _get_optional_only_roles(rule):
@@ -294,21 +309,9 @@ class TemporalGraphEngineOutputMixin:
         if len(exclusive_roles) <= 1:
             return inst
 
-        role_order = {role: idx for idx, role in enumerate(roles.keys())}
-        remove_by_role = collections.defaultdict(set)
-        site_to_roles = collections.defaultdict(list)
-        for role in exclusive_roles:
-            for site in roles[role]["nodes"]:
-                site_to_roles[site].append(role)
-
-        for site, site_roles in site_to_roles.items():
-            if len(site_roles) <= 1:
-                continue
-            owner_role = self._choose_site_owner_role(inst, site, site_roles, role_order)
-            for role in site_roles:
-                if role != owner_role:
-                    remove_by_role[role].add(site)
-
+        remove_by_role = self._collect_instance_site_role_removals(
+            inst, roles, exclusive_roles
+        )
         if not remove_by_role:
             return inst
 
@@ -333,6 +336,24 @@ class TemporalGraphEngineOutputMixin:
 
         new_inst["roles"] = new_roles
         return new_inst
+
+    def _collect_instance_site_role_removals(self, inst, roles, exclusive_roles):
+        """同一站点命中多个互斥 role 时选归属 role，其余 role 移除该站点。"""
+        role_order = {role: idx for idx, role in enumerate(roles.keys())}
+        remove_by_role = collections.defaultdict(set)
+        site_to_roles = collections.defaultdict(list)
+        for role in exclusive_roles:
+            for site in roles[role]["nodes"]:
+                site_to_roles[site].append(role)
+
+        for site, site_roles in site_to_roles.items():
+            if len(site_roles) <= 1:
+                continue
+            owner_role = self._choose_site_owner_role(inst, site, site_roles, role_order)
+            for role in site_roles:
+                if role != owner_role:
+                    remove_by_role[role].add(site)
+        return remove_by_role
 
     @staticmethod
     def _keep_symmetric_pair_candidate(curr_role, tgt_role, edge, curr_phys, cand_phys):

@@ -261,6 +261,21 @@ def merge_match_batch(matches):
             for match in matches
         ]
 
+    match_primary_keys = [get_match_alarm_keys(match) for match in matches]
+    groups, group_indexes = _group_matches_by_shared_eid(matches, match_primary_keys)
+
+    merged_matches = []
+    for root_idx, component_matches in groups.items():
+        indexes = group_indexes[root_idx]
+        if len(component_matches) == 1 and not match_primary_keys[indexes[0]]:
+            merged_matches.append(matches[indexes[0]])
+            continue
+        merged_matches.append(merge_match_component(component_matches))
+    return merged_matches
+
+
+def _group_matches_by_shared_eid(matches, match_primary_keys):
+    """按共享告警 eid 用并查集把 match 划分连通分组。"""
     parent = list(range(len(matches)))
 
     def find(idx):
@@ -269,15 +284,6 @@ def merge_match_batch(matches):
             idx = parent[idx]
         return idx
 
-    def union(left, right):
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-            return True
-        return False
-
-    match_primary_keys = [get_match_alarm_keys(match) for match in matches]
     eid_to_match_indexes = collections.defaultdict(list)
     for idx, alarm_keys in enumerate(match_primary_keys):
         if not alarm_keys:
@@ -288,9 +294,11 @@ def merge_match_batch(matches):
     for indexes in eid_to_match_indexes.values():
         if len(indexes) < 2:
             continue
-        head = indexes[0]
+        head_root = find(indexes[0])
         for idx in indexes[1:]:
-            union(head, idx)
+            idx_root = find(idx)
+            if idx_root != head_root:
+                parent[idx_root] = head_root
 
     groups = collections.defaultdict(list)
     group_indexes = collections.defaultdict(list)
@@ -298,15 +306,7 @@ def merge_match_batch(matches):
         root_idx = find(idx)
         groups[root_idx].append(match)
         group_indexes[root_idx].append(idx)
-
-    merged_matches = []
-    for root_idx, component_matches in groups.items():
-        indexes = group_indexes[root_idx]
-        if len(component_matches) == 1 and not match_primary_keys[indexes[0]]:
-            merged_matches.append(matches[indexes[0]])
-            continue
-        merged_matches.append(merge_match_component(component_matches))
-    return merged_matches
+    return groups, group_indexes
 
 
 def clone_instance_with_updates(inst, curr_role, surviving_curr_phys, tgt_role, tgt_nodes):

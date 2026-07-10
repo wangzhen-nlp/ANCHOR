@@ -114,34 +114,45 @@ def _load_window_aggregates(input_path, ne_to_site):
             window_end = record.get("window_end")
 
             for raw_agg_id, member_entries in agg_alarm_groups.items():
-                agg_id = _normalize_text(raw_agg_id)
-                if not agg_id:
-                    raise ValueError(f"第 {line_number} 行存在空的二次汇聚组 ID")
-                if not isinstance(member_entries, list):
-                    raise ValueError(
-                        f"第 {line_number} 行汇聚组 {agg_id!r} 成员必须是列表"
-                    )
-
-                state = aggregates.setdefault(agg_id, _new_aggregate_state(agg_id))
-                state["occurrence_count"] += 1
-                window_key = (
-                    window_start,
-                    window_end,
-                    line_number if window_start is None and window_end is None else None,
-                )
-                state["windows"].add(window_key)
-                state["first_window_start"] = _update_min(
-                    state["first_window_start"], window_start
-                )
-                state["last_window_end"] = _update_max(
-                    state["last_window_end"], window_end
-                )
-
-                _merge_member_entries_into_state(
-                    state, member_entries, agg_id, line_number, ne_to_site
+                _merge_window_aggregate(
+                    aggregates, raw_agg_id, member_entries,
+                    window_start, window_end, line_number, ne_to_site,
                 )
 
     return aggregates, window_record_count
+
+
+def _merge_window_aggregate(
+    aggregates, raw_agg_id, member_entries, window_start, window_end,
+    line_number, ne_to_site,
+):
+    """把一行窗口记录中的单个汇聚组并入跨窗口状态。"""
+    agg_id = _normalize_text(raw_agg_id)
+    if not agg_id:
+        raise ValueError(f"第 {line_number} 行存在空的二次汇聚组 ID")
+    if not isinstance(member_entries, list):
+        raise ValueError(
+            f"第 {line_number} 行汇聚组 {agg_id!r} 成员必须是列表"
+        )
+
+    state = aggregates.setdefault(agg_id, _new_aggregate_state(agg_id))
+    state["occurrence_count"] += 1
+    window_key = (
+        window_start,
+        window_end,
+        line_number if window_start is None and window_end is None else None,
+    )
+    state["windows"].add(window_key)
+    state["first_window_start"] = _update_min(
+        state["first_window_start"], window_start
+    )
+    state["last_window_end"] = _update_max(
+        state["last_window_end"], window_end
+    )
+
+    _merge_member_entries_into_state(
+        state, member_entries, agg_id, line_number, ne_to_site
+    )
 
 
 def _merge_member_entries_into_state(
@@ -168,43 +179,51 @@ def _merge_member_entries_into_state(
             )
 
             for generated_alarm in generated_alarms:
-                if not isinstance(generated_alarm, dict):
-                    raise ValueError(
-                        f"第 {line_number} 行原始组 {group_id!r} "
-                        "包含非对象告警"
-                    )
-                matching_alarm = to_matching_alarm(
-                    generated_alarm, ne_to_site
+                _merge_group_alarm(
+                    state, group_state, group_id, generated_alarm,
+                    line_number, ne_to_site,
                 )
-                if matching_alarm["is_clear"]:
-                    raise ValueError(
-                        f"第 {line_number} 行原始组 {group_id!r} "
-                        "包含清除告警"
-                    )
-                alarm_id = matching_alarm["alarm_id"]
-                existing_owner = state["alarm_group_by_id"].get(alarm_id)
-                if existing_owner is not None and existing_owner != group_id:
-                    raise ValueError(
-                        f"第 {line_number} 行告警 {alarm_id!r} 同时属于"
-                        f" {existing_owner!r} 和 {group_id!r}"
-                    )
-                state["alarm_group_by_id"][alarm_id] = group_id
 
-                existing_alarm = group_state["alarms"].get(alarm_id)
-                if existing_alarm is not None:
-                    if (
-                        _matching_alarm_signature(existing_alarm["matching"])
-                        != _matching_alarm_signature(matching_alarm)
-                    ):
-                        raise ValueError(
-                            f"第 {line_number} 行告警 {alarm_id!r} "
-                            "跨窗口内容不一致"
-                        )
-                    continue
-                group_state["alarms"][alarm_id] = {
-                    "generated": dict(generated_alarm),
-                    "matching": matching_alarm,
-                }
+
+def _merge_group_alarm(
+    state, group_state, group_id, generated_alarm, line_number, ne_to_site
+):
+    """按告警编码 ID 去重并校验跨窗口一致性后，把告警并入组状态。"""
+    if not isinstance(generated_alarm, dict):
+        raise ValueError(
+            f"第 {line_number} 行原始组 {group_id!r} "
+            "包含非对象告警"
+        )
+    matching_alarm = to_matching_alarm(generated_alarm, ne_to_site)
+    if matching_alarm["is_clear"]:
+        raise ValueError(
+            f"第 {line_number} 行原始组 {group_id!r} "
+            "包含清除告警"
+        )
+    alarm_id = matching_alarm["alarm_id"]
+    existing_owner = state["alarm_group_by_id"].get(alarm_id)
+    if existing_owner is not None and existing_owner != group_id:
+        raise ValueError(
+            f"第 {line_number} 行告警 {alarm_id!r} 同时属于"
+            f" {existing_owner!r} 和 {group_id!r}"
+        )
+    state["alarm_group_by_id"][alarm_id] = group_id
+
+    existing_alarm = group_state["alarms"].get(alarm_id)
+    if existing_alarm is not None:
+        if (
+            _matching_alarm_signature(existing_alarm["matching"])
+            != _matching_alarm_signature(matching_alarm)
+        ):
+            raise ValueError(
+                f"第 {line_number} 行告警 {alarm_id!r} "
+                "跨窗口内容不一致"
+            )
+        return
+    group_state["alarms"][alarm_id] = {
+        "generated": dict(generated_alarm),
+        "matching": matching_alarm,
+    }
 
 
 def _build_site_placeholder_ne_id(site_id):
@@ -267,85 +286,125 @@ def _collect_visualization_entries(state, agg_id, ne_graph, site_graph):
     raw_group_summaries = []
 
     for group_id, group_state in state["groups"].items():
-        group_site_ids = set()
-        group_ne_ids = set()
-        group_timestamps = []
-        alarm_items = sorted(
-            group_state["alarms"].values(),
-            key=lambda item: (
-                item["matching"]["ts"],
-                item["matching"]["alarm_id"],
-            ),
+        summary, group_site_ids, group_ne_ids = _collect_group_entries(
+            group_id, group_state, agg_id, ne_graph, site_graph,
+            symptoms, ne_info,
         )
-        for alarm_item in alarm_items:
-            generated_alarm = alarm_item["generated"]
-            matching_alarm = alarm_item["matching"]
-            alarm_id = matching_alarm["alarm_id"]
-            event_id, occurrence_uuid = _split_composed_alarm_id(alarm_id)
-            site_id = matching_alarm["site_id"]
-            ne_id = _resolve_ne_id(matching_alarm)
-            ts = matching_alarm["ts"]
-            group_timestamps.append(ts)
-            if site_id:
-                group_site_ids.add(site_id)
-                all_site_ids.add(site_id)
-            if ne_id:
-                group_ne_ids.add(ne_id)
-                all_ne_ids.add(ne_id)
-
-            ne_meta = ne_graph.get(ne_id, {}) if ne_id else {}
-            domain = _normalize_text(ne_meta.get("domain", "")).upper()
-            symptom = {
-                "node": site_id,
-                "alarm": matching_alarm["alarm_title"],
-                "ts": ts,
-                "eid": alarm_id,
-                "alarm_id": alarm_id,
-                "event_id": event_id,
-                "occurrence_uuid": occurrence_uuid,
-                "alarm_source": matching_alarm["alarm_source"] or ne_id,
-                "domain": domain,
-                "matched_role": "secondary_aggregate_member",
-                "工单号": "",
-                "故障组ID": group_id,
-                "来源故障组UUID": f"alarm-{group_id}",
-                "告警清除时间": "",
-                "extendedattr": matching_alarm.get("extendedattr", ""),
-            }
-            symptoms.append(symptom)
-
-            if ne_id:
-                if ne_id not in ne_info:
-                    ne_info[ne_id] = _build_ne_meta(
-                        ne_id, site_id, agg_id, ne_graph, site_graph
-                    )
-                ne_info[ne_id]["alarm"].append({
-                    "alarm_id": alarm_id,
-                    "event_id": event_id,
-                    "occurrence_uuid": occurrence_uuid,
-                    "alarm_type": matching_alarm["alarm_title"],
-                    "alarm_time": _format_ts(ts),
-                    "alarm_clear_time": "",
-                    "domain": domain,
-                    "site_id": site_id,
-                    "site_name": ne_info[ne_id]["site_name"],
-                    "matched_role": "secondary_aggregate_member",
-                    "工单号": "",
-                    "故障组ID": group_id,
-                    "来源故障组UUID": f"alarm-{group_id}",
-                    "extendedattr": matching_alarm.get("extendedattr", ""),
-                    "ts": ts,
-                })
-
-        raw_group_summaries.append({
-            "group_id": group_id,
-            "alarm_count": len(alarm_items),
-            "site_list": sorted(group_site_ids),
-            "ne_list": sorted(group_ne_ids),
-            "first_alarm_ts": min(group_timestamps) if group_timestamps else None,
-            "last_alarm_ts": max(group_timestamps) if group_timestamps else None,
-        })
+        raw_group_summaries.append(summary)
+        all_site_ids.update(group_site_ids)
+        all_ne_ids.update(group_ne_ids)
     return symptoms, ne_info, all_site_ids, all_ne_ids, raw_group_summaries
+
+
+def _collect_group_entries(
+    group_id, group_state, agg_id, ne_graph, site_graph, symptoms, ne_info
+):
+    """收集单个原始组的症状/网元条目，返回 (组摘要, 站点集合, 网元集合)。"""
+    group_site_ids = set()
+    group_ne_ids = set()
+    group_timestamps = []
+    alarm_items = sorted(
+        group_state["alarms"].values(),
+        key=lambda item: (
+            item["matching"]["ts"],
+            item["matching"]["alarm_id"],
+        ),
+    )
+    for alarm_item in alarm_items:
+        site_id, ne_id, ts = _collect_alarm_entry(
+            alarm_item, group_id, agg_id, ne_graph, site_graph,
+            symptoms, ne_info,
+        )
+        group_timestamps.append(ts)
+        if site_id:
+            group_site_ids.add(site_id)
+        if ne_id:
+            group_ne_ids.add(ne_id)
+
+    summary = {
+        "group_id": group_id,
+        "alarm_count": len(alarm_items),
+        "site_list": sorted(group_site_ids),
+        "ne_list": sorted(group_ne_ids),
+        "first_alarm_ts": min(group_timestamps) if group_timestamps else None,
+        "last_alarm_ts": max(group_timestamps) if group_timestamps else None,
+    }
+    return summary, group_site_ids, group_ne_ids
+
+
+def _collect_alarm_entry(
+    alarm_item, group_id, agg_id, ne_graph, site_graph, symptoms, ne_info
+):
+    """为单条告警生成 symptom 与网元告警条目，返回 (site_id, ne_id, ts)。"""
+    matching_alarm = alarm_item["matching"]
+    alarm_id = matching_alarm["alarm_id"]
+    event_id, occurrence_uuid = _split_composed_alarm_id(alarm_id)
+    site_id = matching_alarm["site_id"]
+    ne_id = _resolve_ne_id(matching_alarm)
+    ts = matching_alarm["ts"]
+    ne_meta = ne_graph.get(ne_id, {}) if ne_id else {}
+    domain = _normalize_text(ne_meta.get("domain", "")).upper()
+    symptoms.append(_build_symptom_entry(
+        matching_alarm, alarm_id, event_id, occurrence_uuid,
+        ne_id, domain, group_id,
+    ))
+    if ne_id:
+        if ne_id not in ne_info:
+            ne_info[ne_id] = _build_ne_meta(
+                ne_id, site_id, agg_id, ne_graph, site_graph
+            )
+        ne_info[ne_id]["alarm"].append(_build_ne_alarm_entry(
+            matching_alarm, alarm_id, event_id, occurrence_uuid,
+            site_id, ne_info[ne_id]["site_name"], domain, group_id,
+        ))
+    return site_id, ne_id, ts
+
+
+def _build_symptom_entry(
+    matching_alarm, alarm_id, event_id, occurrence_uuid, ne_id, domain, group_id
+):
+    """构造可视化总览页使用的 symptom 条目。"""
+    return {
+        "node": matching_alarm["site_id"],
+        "alarm": matching_alarm["alarm_title"],
+        "ts": matching_alarm["ts"],
+        "eid": alarm_id,
+        "alarm_id": alarm_id,
+        "event_id": event_id,
+        "occurrence_uuid": occurrence_uuid,
+        "alarm_source": matching_alarm["alarm_source"] or ne_id,
+        "domain": domain,
+        "matched_role": "secondary_aggregate_member",
+        "工单号": "",
+        "故障组ID": group_id,
+        "来源故障组UUID": f"alarm-{group_id}",
+        "告警清除时间": "",
+        "extendedattr": matching_alarm.get("extendedattr", ""),
+    }
+
+
+def _build_ne_alarm_entry(
+    matching_alarm, alarm_id, event_id, occurrence_uuid,
+    site_id, site_name, domain, group_id,
+):
+    """构造传播页网元条目下的告警明细。"""
+    return {
+        "alarm_id": alarm_id,
+        "event_id": event_id,
+        "occurrence_uuid": occurrence_uuid,
+        "alarm_type": matching_alarm["alarm_title"],
+        "alarm_time": _format_ts(matching_alarm["ts"]),
+        "alarm_clear_time": "",
+        "domain": domain,
+        "site_id": site_id,
+        "site_name": site_name,
+        "matched_role": "secondary_aggregate_member",
+        "工单号": "",
+        "故障组ID": group_id,
+        "来源故障组UUID": f"alarm-{group_id}",
+        "extendedattr": matching_alarm.get("extendedattr", ""),
+        "ts": matching_alarm["ts"],
+    }
 
 
 def _build_visualization_record(state, ne_graph, site_graph):
@@ -392,16 +451,23 @@ def _build_visualization_record(state, ne_graph, site_graph):
         "group_anchor_time": _format_ts(anchor_ts),
         "group_last_ts": last_alarm_ts,
         "group_last_time": _format_ts(last_alarm_ts),
-        "secondary_aggregation": {
-            "aggregate_id": agg_id,
-            "raw_group_count": len(raw_group_summaries),
-            "alarm_count": len(symptoms),
-            "window_count": len(state["windows"]),
-            "aggregate_occurrence_count": state["occurrence_count"],
-            "first_window_start": state["first_window_start"],
-            "last_window_end": state["last_window_end"],
-            "raw_fault_groups": raw_group_summaries,
-        },
+        "secondary_aggregation": _build_secondary_aggregation_meta(
+            state, raw_group_summaries, len(symptoms)
+        ),
+    }
+
+
+def _build_secondary_aggregation_meta(state, raw_group_summaries, alarm_count):
+    """构造记录中的二次汇聚统计元信息。"""
+    return {
+        "aggregate_id": state["agg_id"],
+        "raw_group_count": len(raw_group_summaries),
+        "alarm_count": alarm_count,
+        "window_count": len(state["windows"]),
+        "aggregate_occurrence_count": state["occurrence_count"],
+        "first_window_start": state["first_window_start"],
+        "last_window_end": state["last_window_end"],
+        "raw_fault_groups": raw_group_summaries,
     }
 
 
@@ -416,19 +482,7 @@ def build_visualization_jsonl(
     if input_resolved == output_resolved:
         raise ValueError("输入文件和输出文件不能是同一路径")
 
-    print(f"加载可视化拓扑资源: {resource_buffer}", flush=True)
-    resources = load_resource_buffer(
-        resource_buffer,
-        wanted_types=("ne_graph", "site_graph"),
-    )
-    ne_graph = resources["ne_graph"]
-    site_graph = resources["site_graph"]
-    # 告警不携带站点字段：解析时用 告警源 在网元拓扑中反查站点。
-    ne_to_site = {
-        ne_id: str(ne_info.get("site_id", "")).strip()
-        for ne_id, ne_info in ne_graph.items()
-        if str(ne_info.get("site_id", "")).strip()
-    }
+    ne_graph, site_graph, ne_to_site = _load_visualization_topology(resource_buffer)
 
     print(f"读取滑窗二次汇聚输出: {input_path}", flush=True)
     aggregates, window_record_count = _load_window_aggregates(
@@ -445,20 +499,9 @@ def build_visualization_jsonl(
             state["agg_id"],
         ),
     )
-    raw_group_count = 0
-    alarm_count = 0
-    with open(output_path, "w", encoding="utf-8") as output_file:
-        for state in aggregate_states:
-            visual_record = _build_visualization_record(
-                state, ne_graph, site_graph
-            )
-            raw_group_count += visual_record["secondary_aggregation"][
-                "raw_group_count"
-            ]
-            alarm_count += visual_record["secondary_aggregation"]["alarm_count"]
-            output_file.write(
-                json.dumps(visual_record, ensure_ascii=False) + "\n"
-            )
+    raw_group_count, alarm_count = _write_visualization_records(
+        output_path, aggregate_states, ne_graph, site_graph
+    )
 
     stats = {
         "window_record_count": window_record_count,
@@ -475,6 +518,43 @@ def build_visualization_jsonl(
         flush=True,
     )
     return stats
+
+
+def _load_visualization_topology(resource_buffer):
+    """加载 NE/站点拓扑，并构造 告警源 -> 站点 的反查映射。"""
+    print(f"加载可视化拓扑资源: {resource_buffer}", flush=True)
+    resources = load_resource_buffer(
+        resource_buffer,
+        wanted_types=("ne_graph", "site_graph"),
+    )
+    ne_graph = resources["ne_graph"]
+    site_graph = resources["site_graph"]
+    # 告警不携带站点字段：解析时用 告警源 在网元拓扑中反查站点。
+    ne_to_site = {
+        ne_id: str(ne_info.get("site_id", "")).strip()
+        for ne_id, ne_info in ne_graph.items()
+        if str(ne_info.get("site_id", "")).strip()
+    }
+    return ne_graph, site_graph, ne_to_site
+
+
+def _write_visualization_records(output_path, aggregate_states, ne_graph, site_graph):
+    """逐汇聚组写出可视化记录，返回 (原始组总数, 告警总数)。"""
+    raw_group_count = 0
+    alarm_count = 0
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        for state in aggregate_states:
+            visual_record = _build_visualization_record(
+                state, ne_graph, site_graph
+            )
+            raw_group_count += visual_record["secondary_aggregation"][
+                "raw_group_count"
+            ]
+            alarm_count += visual_record["secondary_aggregation"]["alarm_count"]
+            output_file.write(
+                json.dumps(visual_record, ensure_ascii=False) + "\n"
+            )
+    return raw_group_count, alarm_count
 
 
 def main():

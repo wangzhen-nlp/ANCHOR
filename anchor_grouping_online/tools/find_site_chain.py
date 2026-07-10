@@ -306,7 +306,12 @@ def print_summary(result, max_print):
     print(f"站点是否存在于输入图: {'是' if meta['site_present'] else '否'}")
     print(f"邻接来源: {meta['adjacency_source']}")
     print("第一跳约束: 必须走显式下游边")
-    print(f"后续遍历模式: {'只走显式有向边' if meta['directed_only'] else '按 downstream_map/双向边可双向传播'}")
+    traversal_mode = (
+        "只走显式有向边"
+        if meta["directed_only"]
+        else "按 downstream_map/双向边可双向传播"
+    )
+    print(f"后续遍历模式: {traversal_mode}")
     print(f"图内站点数: {meta['site_count']}")
     print(f"直接下游数: {meta['direct_child_count']}")
     print(f"全部下游站点数: {meta['downstream_count']}")

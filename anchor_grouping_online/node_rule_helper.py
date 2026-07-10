@@ -98,83 +98,98 @@ class NodeRuleHelper:
         """
         if not self.matches_node_structure(physical_node_domain, node_config):
             return False, []
-
         node_type = node_config.get("type", "primitive")
-
         if node_type == "primitive":
-            expected = self.resolve_expected_alarms(physical_node_domain, node_config)
-            if expected is None:
-                return False, []
-            events_in_win = self.events_in_window(
-                physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule
+            return self._validate_primitive_node(
+                physical_node, physical_node_domain, node_config, reference_ts,
+                edge_window, exclude_consumed_trigger_rule,
+                allowed_alarm_source_nes,
             )
-            if allowed_alarm_source_nes is not None:
-                events_in_win = [
-                    e for e in events_in_win
-                    if e.get("alarm_source") in allowed_alarm_source_nes
-                ]
-
-            required_alarms = expected.get("required_alarms")
-            forbidden_alarms = expected.get("forbidden_alarms")
-            optional_alarms = expected.get("optional_alarms")
-            required_source_domains = expected.get("required_alarm_source_domains")
-            if forbidden_alarms is not None:
-                if any(e["alarm"] in forbidden_alarms for e in events_in_win):
-                    return False, []
-
-            collected_events = []
-            if required_alarms is not None:
-                valid = self.filter_events_by_alarm_and_source(
-                    events_in_win,
-                    required_alarms,
-                    required_source_domains,
-                )
-                if not valid:
-                    return False, []
-                collected_events.extend(valid)
-
-            if optional_alarms is not None:
-                collected_events.extend(
-                    self.filter_events_by_alarm_and_source(
-                        events_in_win,
-                        optional_alarms,
-                    )
-                )
-
-            if collected_events:
-                deduped_events = []
-                seen_event_ids = set()
-                for event in collected_events:
-                    event_id = str(event["eid"])
-                    if event_id in seen_event_ids:
-                        continue
-                    seen_event_ids.add(event_id)
-                    deduped_events.append(event)
-                return True, deduped_events
-
-            if optional_alarms is not None or forbidden_alarms is not None:
-                return True, []
-            return False, []
-
         if node_type == "compound":
-            patterns = node_config.get("patterns", [])
-            matched_patterns = 0
-            collected_events = []
-
-            for pattern in patterns:
-                is_valid, events = self.validate_node(
-                    physical_node,
-                    physical_node_domain,
-                    pattern,
-                    reference_ts,
-                    edge_window,
-                    exclude_consumed_trigger_rule,
-                    allowed_alarm_source_nes=allowed_alarm_source_nes,
-                )
-                if is_valid:
-                    matched_patterns += 1
-                    collected_events.extend(events)
-
-            return matched_patterns > 0, collected_events
-
+            return self._validate_compound_node(
+                physical_node, physical_node_domain, node_config, reference_ts,
+                edge_window, exclude_consumed_trigger_rule,
+                allowed_alarm_source_nes,
+            )
         return False, []
+
+    def _validate_primitive_node(
+        self, physical_node, physical_node_domain, node_config, reference_ts,
+        edge_window, exclude_consumed_trigger_rule, allowed_alarm_source_nes,
+    ):
+        """primitive 节点：按 expected_alarms 的必含/禁止/可选告警校验。"""
+        expected = self.resolve_expected_alarms(physical_node_domain, node_config)
+        if expected is None:
+            return False, []
+        events_in_win = self.events_in_window(
+            physical_node, reference_ts, edge_window, exclude_consumed_trigger_rule
+        )
+        if allowed_alarm_source_nes is not None:
+            events_in_win = [
+                e for e in events_in_win
+                if e.get("alarm_source") in allowed_alarm_source_nes
+            ]
+        required_alarms = expected.get("required_alarms")
+        forbidden_alarms = expected.get("forbidden_alarms")
+        optional_alarms = expected.get("optional_alarms")
+        required_source_domains = expected.get("required_alarm_source_domains")
+        if forbidden_alarms is not None:
+            if any(e["alarm"] in forbidden_alarms for e in events_in_win):
+                return False, []
+        collected_events = []
+        if required_alarms is not None:
+            valid = self.filter_events_by_alarm_and_source(
+                events_in_win,
+                required_alarms,
+                required_source_domains,
+            )
+            if not valid:
+                return False, []
+            collected_events.extend(valid)
+        if optional_alarms is not None:
+            collected_events.extend(
+                self.filter_events_by_alarm_and_source(
+                    events_in_win,
+                    optional_alarms,
+                )
+            )
+        if collected_events:
+            return True, self._dedupe_events(collected_events)
+        if optional_alarms is not None or forbidden_alarms is not None:
+            return True, []
+        return False, []
+
+    @staticmethod
+    def _dedupe_events(events):
+        """按告警发生 eid 去重，保留首次出现顺序。"""
+        deduped_events = []
+        seen_event_ids = set()
+        for event in events:
+            event_id = str(event["eid"])
+            if event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(event_id)
+            deduped_events.append(event)
+        return deduped_events
+
+    def _validate_compound_node(
+        self, physical_node, physical_node_domain, node_config, reference_ts,
+        edge_window, exclude_consumed_trigger_rule, allowed_alarm_source_nes,
+    ):
+        """compound 节点：任一 pattern 命中即通过，事件取命中 pattern 的并集。"""
+        matched_patterns = 0
+        collected_events = []
+        for pattern in node_config.get("patterns", []):
+            is_valid, events = self.validate_node(
+                physical_node,
+                physical_node_domain,
+                pattern,
+                reference_ts,
+                edge_window,
+                exclude_consumed_trigger_rule,
+                allowed_alarm_source_nes=allowed_alarm_source_nes,
+            )
+            if is_valid:
+                matched_patterns += 1
+                collected_events.extend(events)
+        return matched_patterns > 0, collected_events

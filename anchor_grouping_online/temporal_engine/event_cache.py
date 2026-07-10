@@ -78,11 +78,7 @@ class TemporalGraphEngineEventCacheMixin:
         return removed_trigger_seqs
 
     def _prune_node_alarm_history_before(
-        self,
-        node,
-        alarm_type,
-        alarm_source,
-        cutoff_by_rule,
+        self, node, alarm_type, alarm_source, cutoff_by_rule
     ):
         events = self.event_cache.get(node)
         if not events:
@@ -105,27 +101,34 @@ class TemporalGraphEngineEventCacheMixin:
             if not matched_rules:
                 updated_events.append(event)
                 continue
-
-            updated_event = event
-            if self._batch_event_by_alarm_id is None:
-                # 隔离模式使用复制替换语义；持久批处理必须原地
-                # 更新，确保 eid 索引继续指向缓存中的同一个事件对象。
-                updated_event = dict(event)
-            updated_event["consumed_trigger_rules"] = frozenset(
-                set(event.get("consumed_trigger_rules", ())) | matched_rules
-            )
-            updated_events.append(updated_event)
-            event_key = (
-                event.get("ts"),
-                event.get("eid"),
-                event.get("alarm"),
-                str(event.get("alarm_source", "") or ""),
-            )
-            for rule_name in matched_rules:
-                removed_event_keys_by_rule[rule_name].add(event_key)
+            updated_events.append(self._consume_matching_event(
+                event, matched_rules, removed_event_keys_by_rule
+            ))
 
         self.event_cache[node] = updated_events
         return self._remove_trigger_events_by_rule_event_keys(
             node,
             removed_event_keys_by_rule,
         )
+
+    def _consume_matching_event(
+        self, event, matched_rules, removed_event_keys_by_rule
+    ):
+        """给事件打上消费标记，并登记待删除的 trigger 事件键。"""
+        updated_event = event
+        if self._batch_event_by_alarm_id is None:
+            # 隔离模式使用复制替换语义；持久批处理必须原地
+            # 更新，确保 eid 索引继续指向缓存中的同一个事件对象。
+            updated_event = dict(event)
+        updated_event["consumed_trigger_rules"] = frozenset(
+            set(event.get("consumed_trigger_rules", ())) | matched_rules
+        )
+        event_key = (
+            event.get("ts"),
+            event.get("eid"),
+            event.get("alarm"),
+            str(event.get("alarm_source", "") or ""),
+        )
+        for rule_name in matched_rules:
+            removed_event_keys_by_rule[rule_name].add(event_key)
+        return updated_event

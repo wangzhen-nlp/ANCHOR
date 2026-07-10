@@ -11,8 +11,10 @@ def normalize_site_chain_hops(hops_map):
             continue
         try:
             hop = int(hop_value)
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"站点 {related_site_id!r} 的 hop 值无效: {hop_value!r}"
+            ) from exc
         if hop > 0:
             normalized[related_site_id] = hop
     return normalized

@@ -60,12 +60,9 @@ def run_variant(ne_graph, constraint_on, misconnection_on):
     args.cross_domain_priority_constraint = constraint_on
     args.transmission_misconnection_filter = misconnection_on
 
-    misconnection_pairs = set()
-    misconnection_stats = {}
-    if misconnection_on:
-        misconnection_pairs, misconnection_stats = (
-            build_transmission_misconnection_pairs(ne_graph)
-        )
+    misconnection_pairs, misconnection_stats = _build_misconnections(
+        ne_graph, misconnection_on
+    )
     inputs = build_site_pair_inputs(
         ne_graph,
         collect_cross_domain=constraint_on,
@@ -90,6 +87,22 @@ def run_variant(ne_graph, constraint_on, misconnection_on):
         compact_output=False,
         constraints=constraints,
     )
+    return _build_variant_result(
+        pair_outputs, constraints, constraint_stats,
+        misconnection_stats, smoothing_stats,
+    )
+
+
+def _build_misconnections(ne_graph, enabled):
+    if not enabled:
+        return set(), {}
+    return build_transmission_misconnection_pairs(ne_graph)
+
+
+def _build_variant_result(
+    pair_outputs, constraints, constraint_stats,
+    misconnection_stats, smoothing_stats,
+):
     return {
         "pair_orders": pair_outputs["pair_orders"],
         "counts": {
@@ -150,17 +163,27 @@ def attribute_flips(base_orders, variant_orders, sample_limit):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="方向翻转归因诊断")
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--resource-buffer", help="resource_buffer.jsonl 路径（读取其中 ne_graph 行）")
-    source.add_argument("--ne-graph", help="ne_graph.json 路径")
-    parser.add_argument("--sample", type=int, default=5, help="每类翻转打印的样例站点对数，默认 5")
-    args = parser.parse_args()
-
+    args = _parse_args()
     print("加载 ne_graph...")
     ne_graph = load_ne_graph(args.resource_buffer, args.ne_graph)
     print(f"  NE 数: {len(ne_graph)}")
+    results = _run_variants(ne_graph)
+    _print_flip_comparisons(results, args.sample)
 
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="方向翻转归因诊断")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--resource-buffer",
+        help="resource_buffer.jsonl 路径（读取其中 ne_graph 行）",
+    )
+    source.add_argument("--ne-graph", help="ne_graph.json 路径")
+    parser.add_argument("--sample", type=int, default=5, help="每类翻转打印的样例站点对数，默认 5")
+    return parser.parse_args()
+
+
+def _run_variants(ne_graph):
     variants = [
         ("baseline(全关)", False, False),
         ("constraint(仅约束)", True, False),
@@ -171,48 +194,62 @@ def main():
     for name, constraint_on, misconnection_on in variants:
         print(f"\n运行 {name} ...")
         results[name] = run_variant(ne_graph, constraint_on, misconnection_on)
-        counts = results[name]["counts"]
-        print(
-            f"  有向 {counts['directed']} / 双向 {counts['bidirectional']} | "
-            f"环强制 {counts['ring_forced']} 环入口 {counts['ring_entry']} "
-            f"环解除边 {counts['ring_released_pairs']}"
-            f"(块 {counts['ring_released_components']}) | "
-            f"约束强制 {counts['constraint_forced']}"
-        )
-        if results[name]["constraint_count"]:
-            print(
-                f"  约束数 {results[name]['constraint_count']} "
-                f"(tie {results[name]['constraint_stats'].get('tie_pair_count')}, "
-                f"消圈 {results[name]['constraint_stats'].get('cycle_dropped_pair_count')}, "
-                f"势场未满足 {results[name]['smoothing_stats'].get('unsatisfied_constraint_count')})"
-            )
-        if results[name]["misconnection_stats"]:
-            print(f"  误连接剔除对数 {results[name]['misconnection_stats'].get('misconnection_pair_count')}")
+        _print_variant_result(results[name])
+    return results
 
+
+def _print_variant_result(result):
+    counts = result["counts"]
+    print(
+        f"  有向 {counts['directed']} / 双向 {counts['bidirectional']} | "
+        f"环强制 {counts['ring_forced']} 环入口 {counts['ring_entry']} "
+        f"环解除边 {counts['ring_released_pairs']}"
+        f"(块 {counts['ring_released_components']}) | "
+        f"约束强制 {counts['constraint_forced']}"
+    )
+    if result["constraint_count"]:
+        constraint_stats = result["constraint_stats"]
+        smoothing_stats = result["smoothing_stats"]
+        print(
+            f"  约束数 {result['constraint_count']} "
+            f"(tie {constraint_stats.get('tie_pair_count')}, "
+            f"消圈 {constraint_stats.get('cycle_dropped_pair_count')}, "
+            f"势场未满足 {smoothing_stats.get('unsatisfied_constraint_count')})"
+        )
+    if result["misconnection_stats"]:
+        count = result["misconnection_stats"].get("misconnection_pair_count")
+        print(f"  误连接剔除对数 {count}")
+
+
+def _print_flip_comparisons(results, sample_limit):
     base_orders = results["baseline(全关)"]["pair_orders"]
     print(f"\n基线站点对总数: {len(base_orders)}")
-
     for name in ("constraint(仅约束)", "misconnection(仅误连接)", "both(全开)"):
         categories, removed = attribute_flips(
-            base_orders, results[name]["pair_orders"], args.sample
+            base_orders, results[name]["pair_orders"], sample_limit
         )
         total_flips = sum(bucket["count"] for bucket in categories.values())
-        print(f"\n===== {name} vs 基线：双向->有向 翻转 {total_flips} 对，剔除消失 {removed} 对 =====")
-        for category in (
-            "constraint_forced",
-            "ring_force_lost",
-            "gap_first_directed",
-            "voting_directed",
-        ):
-            bucket = categories.get(category)
-            if not bucket:
-                continue
-            print(
-                f"  {category}: {bucket['count']} 对"
-                f"（其中非桥变桥 {bucket['bridge_flip_count']}）"
-            )
-            for key in bucket["samples"]:
-                print(f"    样例: {key}")
+        print(
+            f"\n===== {name} vs 基线：双向->有向 "
+            f"翻转 {total_flips} 对，剔除消失 {removed} 对 ====="
+        )
+        _print_flip_categories(categories)
+
+
+def _print_flip_categories(categories):
+    for category in (
+        "constraint_forced", "ring_force_lost",
+        "gap_first_directed", "voting_directed",
+    ):
+        bucket = categories.get(category)
+        if not bucket:
+            continue
+        print(
+            f"  {category}: {bucket['count']} 对"
+            f"（其中非桥变桥 {bucket['bridge_flip_count']}）"
+        )
+        for key in bucket["samples"]:
+            print(f"    样例: {key}")
 
 
 if __name__ == "__main__":

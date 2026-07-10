@@ -99,37 +99,48 @@ def load_valid_alarms(
         if end_ts is not None and first_occurrence_ts > end_ts:
             continue
 
-        occurrence_uuid = alarm_content_uuid(alarm)
-        append_alarm_event(
-            valid_alarms,
-            alarm,
-            site_id,
-            alarm_title,
-            first_occurrence_str,
-            occurrence_uuid,
-            is_clear=False
-        )
         normal_alarm_count += 1
-
-        clear_time_str = str(alarm.get("告警清除时间", "")).strip()
-        if clear_time_str:
-            effective_clear_time_str = apply_clear_delay(
-                first_occurrence_str,
-                clear_time_str,
-                clear_delay_sec,
-            )
-            append_alarm_event(
-                valid_alarms,
-                alarm,
-                site_id,
-                alarm_title,
-                effective_clear_time_str,
-                occurrence_uuid,
-                is_clear=True
-            )
+        if _append_occurrence_events(
+            valid_alarms, alarm, site_id, alarm_title,
+            first_occurrence_str, clear_delay_sec,
+        ):
             clear_alarm_count += 1
 
     return processed_count, valid_alarms, normal_alarm_count, clear_alarm_count
+
+
+def _append_occurrence_events(
+    valid_alarms, alarm, site_id, alarm_title, first_occurrence_str, clear_delay_sec
+):
+    """追加上报事件与（若有清除时间）延迟后的清除事件，返回是否含清除。"""
+    occurrence_uuid = alarm_content_uuid(alarm)
+    append_alarm_event(
+        valid_alarms,
+        alarm,
+        site_id,
+        alarm_title,
+        first_occurrence_str,
+        occurrence_uuid,
+        is_clear=False
+    )
+    clear_time_str = str(alarm.get("告警清除时间", "")).strip()
+    if not clear_time_str:
+        return False
+    effective_clear_time_str = apply_clear_delay(
+        first_occurrence_str,
+        clear_time_str,
+        clear_delay_sec,
+    )
+    append_alarm_event(
+        valid_alarms,
+        alarm,
+        site_id,
+        alarm_title,
+        effective_clear_time_str,
+        occurrence_uuid,
+        is_clear=True
+    )
+    return True
 
 
 def trim_trailing_clear_alarms(valid_alarms):

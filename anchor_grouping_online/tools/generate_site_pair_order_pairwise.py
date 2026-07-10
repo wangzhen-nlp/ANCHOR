@@ -73,31 +73,8 @@ def build_site_pair_inputs(
     collect_cross_domain=False,
     transmission_misconnection_pairs=None,
 ):
-    site_domain_counts = defaultdict(Counter)
-    site_neighbors = defaultdict(set)
-    site_external_edge_count = Counter()
-    site_data_edge_count = Counter()
-    site_transmission_edge_count = Counter()
-    pair_edge_count = Counter()
-    pair_site_domain_counts = defaultdict(lambda: defaultdict(Counter))
-    # 跨类型连边证据：{pair_key: {site_priority, direction_votes, link_count}}。
-    # 收集口径为全部跨 domain 连边（含被拓扑过滤的），只用于方向约束，不进拓扑。
-    cross_domain_pair_evidence = defaultdict(
-        lambda: {"site_priority": {}, "direction_votes": Counter(), "link_count": 0}
-    )
-    all_sites = set()
-
-    with ProgressReporter(len(ne_graph), "pairwise: 聚合站点设备", show_progress) as progress:
-        for ne_info in ne_graph.values():
-            progress.update()
-            if not isinstance(ne_info, dict):
-                continue
-            site_id = _get_site_id(ne_info)
-            if not site_id:
-                continue
-            all_sites.add(site_id)
-            site_domain_counts[site_id][normalize_domain(ne_info.get("domain", ""))] += 1
-
+    inputs = _new_site_pair_inputs()
+    _collect_site_domains(ne_graph, inputs, show_progress)
     with ProgressReporter(0, "pairwise: 扫描跨站链路", show_progress) as progress:
         for link in iter_unique_cross_site_links(
             ne_graph,
@@ -105,85 +82,104 @@ def build_site_pair_inputs(
             transmission_misconnection_pairs=transmission_misconnection_pairs,
         ):
             progress.update()
-            left_site = link["source_site"]
-            right_site = link["target_site"]
-            pair_key = tuple(sorted((left_site, right_site)))
-            left_domain = link["source_domain"]
-            right_domain = link["target_domain"]
-
-            if collect_cross_domain and left_domain != right_domain:
-                left_priority = cross_domain_priority(left_domain)
-                right_priority = cross_domain_priority(right_domain)
-                left_site_priority = _site_cross_domain_priority(
-                    left_site, site_domain_counts
-                )
-                right_site_priority = _site_cross_domain_priority(
-                    right_site, site_domain_counts
-                )
-                endpoint_winner = (
-                    left_site if left_priority > right_priority else right_site
-                )
-                site_winner = (
-                    left_site
-                    if left_site_priority > right_site_priority
-                    else right_site
-                )
-                # 只有两端设备优先级都已知且不同，并且站点自身最高优先级支持
-                # 同一方向时，才构成跨 domain 方向证据。
-                if left_priority and right_priority and left_priority != right_priority:
-                    if (
-                        left_site_priority
-                        and right_site_priority
-                        and left_site_priority != right_site_priority
-                        and endpoint_winner == site_winner
-                    ):
-                        evidence = cross_domain_pair_evidence[pair_key]
-                        evidence["link_count"] += 1
-                        site_priority = evidence["site_priority"]
-                        if left_site_priority > site_priority.get(left_site, 0):
-                            site_priority[left_site] = left_site_priority
-                        if right_site_priority > site_priority.get(right_site, 0):
-                            site_priority[right_site] = right_site_priority
-                        evidence["direction_votes"][site_winner] += 1
-
-            # 被拓扑过滤的跨 domain 连边只贡献约束证据，不参与任何拓扑聚合
+            if collect_cross_domain:
+                _record_cross_domain_evidence(link, inputs)
             if not link.get("included_in_topology", True):
                 continue
-
-            site_neighbors[left_site].add(right_site)
-            site_neighbors[right_site].add(left_site)
-            pair_edge_count[pair_key] += 1
-
-            pair_site_domain_counts[pair_key][left_site][left_domain] += 1
-            pair_site_domain_counts[pair_key][right_site][right_domain] += 1
-
-            site_external_edge_count[left_site] += 1
-            site_external_edge_count[right_site] += 1
-            if left_domain == "Data":
-                site_data_edge_count[left_site] += 1
-            elif left_domain == "Transmission":
-                site_transmission_edge_count[left_site] += 1
-            if right_domain == "Data":
-                site_data_edge_count[right_site] += 1
-            elif right_domain == "Transmission":
-                site_transmission_edge_count[right_site] += 1
-
-    with ProgressReporter(len(all_sites), "pairwise: 初始化孤立站点邻接", show_progress) as progress:
-        for site_id in all_sites:
+            _record_topology_link(link, inputs)
+    label = "pairwise: 初始化孤立站点邻接"
+    with ProgressReporter(len(inputs["all_sites"]), label, show_progress) as progress:
+        for site_id in inputs["all_sites"]:
             progress.update()
-            site_neighbors[site_id]
+            inputs["site_neighbors"][site_id]
+    return inputs
 
-    return {
-        "all_sites": all_sites,
-        "site_domain_counts": site_domain_counts,
-        "site_neighbors": site_neighbors,
-        "site_external_edge_count": site_external_edge_count,
-        "site_data_edge_count": site_data_edge_count,
-        "site_transmission_edge_count": site_transmission_edge_count,
-        "pair_edge_count": pair_edge_count,
-        "pair_site_domain_counts": pair_site_domain_counts,
-        "cross_domain_pair_evidence": cross_domain_pair_evidence,
+
+def _new_site_pair_inputs():
+    evidence_factory = lambda: {
+        "site_priority": {}, "direction_votes": Counter(), "link_count": 0,
     }
+    return {
+        "all_sites": set(),
+        "site_domain_counts": defaultdict(Counter),
+        "site_neighbors": defaultdict(set),
+        "site_external_edge_count": Counter(),
+        "site_data_edge_count": Counter(),
+        "site_transmission_edge_count": Counter(),
+        "pair_edge_count": Counter(),
+        "pair_site_domain_counts": defaultdict(lambda: defaultdict(Counter)),
+        "cross_domain_pair_evidence": defaultdict(evidence_factory),
+    }
+
+
+def _collect_site_domains(ne_graph, inputs, show_progress):
+    label = "pairwise: 聚合站点设备"
+    with ProgressReporter(len(ne_graph), label, show_progress) as progress:
+        for ne_info in ne_graph.values():
+            progress.update()
+            if not isinstance(ne_info, dict):
+                continue
+            site_id = _get_site_id(ne_info)
+            if not site_id:
+                continue
+            inputs["all_sites"].add(site_id)
+            domain = normalize_domain(ne_info.get("domain", ""))
+            inputs["site_domain_counts"][site_id][domain] += 1
+
+
+def _record_cross_domain_evidence(link, inputs):
+    left_site = link["source_site"]
+    right_site = link["target_site"]
+    left_priority = cross_domain_priority(link["source_domain"])
+    right_priority = cross_domain_priority(link["target_domain"])
+    if not left_priority or not right_priority or left_priority == right_priority:
+        return
+    domain_counts = inputs["site_domain_counts"]
+    left_site_priority = _site_cross_domain_priority(left_site, domain_counts)
+    right_site_priority = _site_cross_domain_priority(right_site, domain_counts)
+    if not left_site_priority or not right_site_priority:
+        return
+    if left_site_priority == right_site_priority:
+        return
+    endpoint_winner = left_site if left_priority > right_priority else right_site
+    site_winner = left_site if left_site_priority > right_site_priority else right_site
+    if endpoint_winner != site_winner:
+        return
+    pair_key = tuple(sorted((left_site, right_site)))
+    evidence = inputs["cross_domain_pair_evidence"][pair_key]
+    evidence["link_count"] += 1
+    evidence["site_priority"][left_site] = max(
+        left_site_priority, evidence["site_priority"].get(left_site, 0)
+    )
+    evidence["site_priority"][right_site] = max(
+        right_site_priority, evidence["site_priority"].get(right_site, 0)
+    )
+    evidence["direction_votes"][site_winner] += 1
+
+
+def _record_topology_link(link, inputs):
+    left_site = link["source_site"]
+    right_site = link["target_site"]
+    left_domain = link["source_domain"]
+    right_domain = link["target_domain"]
+    pair_key = tuple(sorted((left_site, right_site)))
+    inputs["site_neighbors"][left_site].add(right_site)
+    inputs["site_neighbors"][right_site].add(left_site)
+    inputs["pair_edge_count"][pair_key] += 1
+    pair_counts = inputs["pair_site_domain_counts"][pair_key]
+    pair_counts[left_site][left_domain] += 1
+    pair_counts[right_site][right_domain] += 1
+    inputs["site_external_edge_count"][left_site] += 1
+    inputs["site_external_edge_count"][right_site] += 1
+    _increment_domain_edge_count(inputs, left_site, left_domain)
+    _increment_domain_edge_count(inputs, right_site, right_domain)
+
+
+def _increment_domain_edge_count(inputs, site_id, domain):
+    if domain == "Data":
+        inputs["site_data_edge_count"][site_id] += 1
+    elif domain == "Transmission":
+        inputs["site_transmission_edge_count"][site_id] += 1
 
 
 def _find_directed_cycle(constraint_adjacency):
@@ -329,7 +325,7 @@ def find_bridge_pairs(all_sites, site_neighbors, show_progress=False):
     bridges = set()
     current_time = 0
 
-    # 不排序：桥集是图不变量，DFS 根/邻居顺序不改变返回的桥边集合（is_bridge 因此稳定）
+    # 桥集是图不变量，DFS 根/邻居顺序不影响 is_bridge。
     with ProgressReporter(len(all_sites), "pairwise: 识别桥边", show_progress) as progress:
         for start_site in all_sites:
             if start_site in discovery_time:
@@ -379,7 +375,10 @@ def build_pairwise_graph_metrics(inputs, show_progress=False):
     )
     pair_graph_metrics = {}
 
-    with ProgressReporter(len(inputs["pair_edge_count"]), "pairwise: 计算站点对图指标", show_progress) as progress:
+    label = "pairwise: 计算站点对图指标"
+    with ProgressReporter(
+        len(inputs["pair_edge_count"]), label, show_progress
+    ) as progress:
         for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
             progress.update()
             pair_key = tuple(sorted((left_site, right_site)))
@@ -496,116 +495,109 @@ def smooth_level_scores(
     constraint_gap=1.0,
     show_progress=False,
 ):
-    """对站点 level_score 做标签传播平滑，得到全局一致的层级场。
-
-    - anchor 站点被钉住（保持原始 level_score），充当稳定参照系；
-    - 其余站点按 new = alpha * 自身原始分 + (1-alpha) * 邻居均值 迭代，直到收敛。
-    - 传入 constraints（跨类型方向约束）时，每轮迭代后做一次软投影：对每条约束
-      upstream->downstream 保证 level(up) >= level(down) + constraint_gap，不足则
-      抬升上行侧/压低下行侧各半（锚点侧不动）。抬压量随平滑扩散到邻居，让约束
-      周边站点的层级顺势重排。收尾再用“只抬升上行侧”的单调投影补齐链式约束
-      （A->B->C 需逐级传导）。
-
-    注意自锚项用的是**原始 level_score**（固定值，软 Dirichlet 约束），而非当前迭代值；
-    否则不动点退化为纯调和场，非 anchor 站点会全部塌缩到最近 anchor，抹掉层级落差。
-
-    复杂度 O(max_iter * (E + C))，纯线性迭代，无路径枚举/优化器。
-
-    Returns:
-        (scores, stats)；stats 含 unsatisfied_constraint_count——收尾后仍不满足的
-        约束数，仅在两端都被锚点钉死等无法调整的情形下非零。
-    """
-    base_level = {site_id: metrics["level_score"] for site_id, metrics in site_metrics.items()}
+    """对站点层级分做带锚点和方向约束的标签传播平滑。"""
+    base_level = {
+        site_id: metrics["level_score"]
+        for site_id, metrics in site_metrics.items()
+    }
     scores = dict(base_level)
     anchors = set(anchor_sites)
-
-    constraint_pairs = []
-    if constraints:
-        for pair_key in sorted(constraints):
-            constraint = constraints[pair_key]
-            upstream_site = constraint["upstream_site"]
-            downstream_site = constraint["downstream_site"]
-            if upstream_site in scores and downstream_site in scores:
-                constraint_pairs.append((upstream_site, downstream_site))
-
-    def _project_constraints(target_scores):
-        """软投影：缺口两侧各补一半；锚点侧不动，双锚点无法调整则跳过。"""
-        for upstream_site, downstream_site in constraint_pairs:
-            deficit = (
-                target_scores[downstream_site] + constraint_gap
-                - target_scores[upstream_site]
-            )
-            if deficit <= 0.0:
-                continue
-            upstream_pinned = upstream_site in anchors
-            downstream_pinned = downstream_site in anchors
-            if upstream_pinned and downstream_pinned:
-                continue
-            if upstream_pinned:
-                target_scores[downstream_site] -= deficit
-            elif downstream_pinned:
-                target_scores[upstream_site] += deficit
-            else:
-                half = deficit / 2.0
-                target_scores[upstream_site] += half
-                target_scores[downstream_site] -= half
-
+    constraint_pairs = _collect_constraint_pairs(constraints, scores)
     if constraint_pairs:
-        _project_constraints(scores)
+        _project_level_constraints(scores, constraint_pairs, anchors, constraint_gap)
+    scores = _run_level_smoothing(
+        scores, base_level, site_neighbors, anchors, constraint_pairs,
+        constraint_gap, alpha, max_iter, tol, show_progress,
+    )
+    unsatisfied = _finalize_constraint_scores(
+        scores, constraint_pairs, anchors, constraint_gap
+    )
+    return scores, {"unsatisfied_constraint_count": unsatisfied}
 
-    # 预先算好每个非 anchor 站点的有效邻居列表，避免每轮重复过滤/成员判断
-    pending = {}
-    for site_id in scores:
-        if site_id in anchors:
+
+def _collect_constraint_pairs(constraints, scores):
+    pairs = []
+    for pair_key in sorted(constraints or {}):
+        constraint = constraints[pair_key]
+        upstream = constraint["upstream_site"]
+        downstream = constraint["downstream_site"]
+        if upstream in scores and downstream in scores:
+            pairs.append((upstream, downstream))
+    return pairs
+
+
+def _project_level_constraints(scores, constraint_pairs, anchors, gap):
+    """软投影方向约束：可调节的两侧均分缺口。"""
+    for upstream, downstream in constraint_pairs:
+        deficit = scores[downstream] + gap - scores[upstream]
+        if deficit <= 0.0:
             continue
-        neighbors = [n for n in site_neighbors.get(site_id, ()) if n in scores]
-        if neighbors:
-            pending[site_id] = neighbors
+        upstream_pinned = upstream in anchors
+        downstream_pinned = downstream in anchors
+        if upstream_pinned and downstream_pinned:
+            continue
+        if upstream_pinned:
+            scores[downstream] -= deficit
+        elif downstream_pinned:
+            scores[upstream] += deficit
+        else:
+            half = deficit / 2.0
+            scores[upstream] += half
+            scores[downstream] -= half
 
-    with ProgressReporter(max_iter, "pairwise: 平滑层级分", show_progress) as progress:
+
+def _run_level_smoothing(
+    scores, base_level, site_neighbors, anchors, constraint_pairs,
+    gap, alpha, max_iter, tol, show_progress,
+):
+    pending = {
+        site_id: [n for n in site_neighbors.get(site_id, ()) if n in scores]
+        for site_id in scores
+        if site_id not in anchors
+    }
+    pending = {site: neighbors for site, neighbors in pending.items() if neighbors}
+    label = "pairwise: 平滑层级分"
+    with ProgressReporter(max_iter, label, show_progress) as progress:
         for _ in range(max_iter):
             progress.update()
             new_scores = dict(scores)
             max_delta = 0.0
             for site_id, neighbors in pending.items():
                 neighbor_avg = sum(scores[n] for n in neighbors) / len(neighbors)
-                value = alpha * base_level[site_id] + (1.0 - alpha) * neighbor_avg
+                value = alpha * base_level[site_id]
+                value += (1.0 - alpha) * neighbor_avg
                 new_scores[site_id] = value
                 max_delta = max(max_delta, abs(value - scores[site_id]))
-            if constraint_pairs:
-                _project_constraints(new_scores)
+            _project_level_constraints(
+                new_scores, constraint_pairs, anchors, gap
+            )
             scores = new_scores
             if max_delta < tol:
                 break
+    return scores
 
-    unsatisfied_constraint_count = 0
-    if constraint_pairs:
-        # 收尾单调投影：优先抬升上行侧（上行被锚点钉住则压低下行侧），
-        # 反复扫描直至稳定，保证链式约束在最终场上逐级满足。
-        for _ in range(min(len(constraint_pairs), 200) + 1):
-            changed = False
-            for upstream_site, downstream_site in constraint_pairs:
-                deficit = (
-                    scores[downstream_site] + constraint_gap - scores[upstream_site]
-                )
-                if deficit <= 1e-9:
-                    continue
-                if upstream_site not in anchors:
-                    scores[upstream_site] += deficit
-                elif downstream_site not in anchors:
-                    scores[downstream_site] -= deficit
-                else:
-                    continue
-                changed = True
-            if not changed:
-                break
-        unsatisfied_constraint_count = sum(
-            1
-            for upstream_site, downstream_site in constraint_pairs
-            if scores[upstream_site] < scores[downstream_site] + constraint_gap - 1e-6
-        )
 
-    return scores, {"unsatisfied_constraint_count": unsatisfied_constraint_count}
+def _finalize_constraint_scores(scores, pairs, anchors, gap):
+    """用单调投影传导链式约束，并返回未满足数。"""
+    for _ in range(min(len(pairs), 200) + 1):
+        changed = False
+        for upstream, downstream in pairs:
+            deficit = scores[downstream] + gap - scores[upstream]
+            if deficit <= 1e-9:
+                continue
+            if upstream not in anchors:
+                scores[upstream] += deficit
+            elif downstream not in anchors:
+                scores[downstream] -= deficit
+            else:
+                continue
+            changed = True
+        if not changed:
+            break
+    return sum(
+        1 for upstream, downstream in pairs
+        if scores[upstream] < scores[downstream] + gap - 1e-6
+    )
 
 
 def build_pairwise_site_metrics(inputs, args, show_progress=False, constraints=None):
@@ -621,7 +613,8 @@ def build_pairwise_site_metrics(inputs, args, show_progress=False, constraints=N
 
     site_metrics = {}
     component_summaries = []
-    with ProgressReporter(len(components), "pairwise: 计算分量层级指标", show_progress) as progress:
+    label = "pairwise: 计算分量层级指标"
+    with ProgressReporter(len(components), label, show_progress) as progress:
         for component_index, component_sites in enumerate(components):
             progress.update()
             anchors = select_component_anchors(component_sites, inputs, base_scores, args)
@@ -630,40 +623,33 @@ def build_pairwise_site_metrics(inputs, args, show_progress=False, constraints=N
                 anchors,
                 inputs["site_neighbors"],
             )
-            component_summaries.append(
-                {
-                    "component_id": component_index,
-                    "site_count": len(component_sites),
-                    "anchor_sites": anchors,
-                }
+            component_summaries.append({
+                "component_id": component_index,
+                "site_count": len(component_sites),
+                "anchor_sites": anchors,
+            })
+            _add_component_site_metrics(
+                site_metrics, component_sites, component_index,
+                distance_map, base_scores, inputs, args,
             )
 
-            for site_id in component_sites:
-                core_distance = distance_map.get(site_id)
-                level_score = base_scores[site_id]
-                if core_distance is not None:
-                    level_score -= args.core_distance_penalty * core_distance
-                site_metrics[site_id] = {
-                    "component_id": component_index,
-                    "domain_counts": dict(inputs["site_domain_counts"].get(site_id, {})),
-                    "neighbor_count": len(inputs["site_neighbors"].get(site_id, ())),
-                    "external_edge_count": int(
-                        inputs["site_external_edge_count"].get(site_id, 0)
-                    ),
-                    "data_edge_count": int(inputs["site_data_edge_count"].get(site_id, 0)),
-                    "transmission_edge_count": int(
-                        inputs["site_transmission_edge_count"].get(site_id, 0)
-                    ),
-                    "base_core_score": round(base_scores[site_id], 6),
-                    "core_distance": core_distance,
-                    "level_score": round(level_score, 6),
-                }
+    smoothing_stats = _smooth_site_metrics(
+        site_metrics, component_summaries, inputs, args,
+        constraints, show_progress,
+    )
+    return site_metrics, component_summaries, smoothing_stats
 
-    # 标签传播平滑：得到全局一致的层级场，供 gap-first 定向与严格环入口排序使用
-    anchor_sites = set()
-    for summary in component_summaries:
-        anchor_sites.update(summary["anchor_sites"])
-    smoothed, smoothing_stats = smooth_level_scores(
+
+def _smooth_site_metrics(
+    site_metrics, component_summaries, inputs, args,
+    constraints, show_progress,
+):
+    anchor_sites = {
+        site_id
+        for summary in component_summaries
+        for site_id in summary["anchor_sites"]
+    }
+    smoothed, stats = smooth_level_scores(
         site_metrics,
         inputs["site_neighbors"],
         anchor_sites,
@@ -676,8 +662,37 @@ def build_pairwise_site_metrics(inputs, args, show_progress=False, constraints=N
     )
     for site_id, metrics in site_metrics.items():
         metrics["level_score_smoothed"] = round(smoothed[site_id], 6)
+    return stats
 
-    return site_metrics, component_summaries, smoothing_stats
+
+def _add_component_site_metrics(
+    site_metrics, component_sites, component_index,
+    distance_map, base_scores, inputs, args,
+):
+    for site_id in component_sites:
+        core_distance = distance_map.get(site_id)
+        level_score = base_scores[site_id]
+        if core_distance is not None:
+            level_score -= args.core_distance_penalty * core_distance
+        site_metrics[site_id] = {
+            "component_id": component_index,
+            "domain_counts": dict(
+                inputs["site_domain_counts"].get(site_id, {})
+            ),
+            "neighbor_count": len(inputs["site_neighbors"].get(site_id, ())),
+            "external_edge_count": int(
+                inputs["site_external_edge_count"].get(site_id, 0)
+            ),
+            "data_edge_count": int(
+                inputs["site_data_edge_count"].get(site_id, 0)
+            ),
+            "transmission_edge_count": int(
+                inputs["site_transmission_edge_count"].get(site_id, 0)
+            ),
+            "base_core_score": round(base_scores[site_id], 6),
+            "core_distance": core_distance,
+            "level_score": round(level_score, 6),
+        }
 
 
 def _add_direction_evidence(score_container, winner, loser, feature, amount, detail):
@@ -765,7 +780,7 @@ def _vote_score_gaps(score_container, left_site, right_site, left_metrics, right
                 right_site,
                 "level_score",
                 amount,
-                f"{left_site} 层级分更高 ({left_metrics['level_score']:.3f} > {right_metrics['level_score']:.3f})",
+                _format_metric_gap(left_site, "层级分", left_metrics, right_metrics, "level_score"),
             )
         else:
             _add_direction_evidence(
@@ -774,7 +789,7 @@ def _vote_score_gaps(score_container, left_site, right_site, left_metrics, right
                 left_site,
                 "level_score",
                 amount,
-                f"{right_site} 层级分更高 ({right_metrics['level_score']:.3f} > {left_metrics['level_score']:.3f})",
+                _format_metric_gap(right_site, "层级分", right_metrics, left_metrics, "level_score"),
             )
 
     base_score_gap = left_metrics["base_core_score"] - right_metrics["base_core_score"]
@@ -802,11 +817,16 @@ def _vote_score_gaps(score_container, left_site, right_site, left_metrics, right
             )
 
 
+def _format_metric_gap(winner, label, winner_metrics, loser_metrics, field):
+    return (
+        f"{winner} {label}更高 "
+        f"({winner_metrics[field]:.3f} > {loser_metrics[field]:.3f})"
+    )
+
+
 def _vote_data_domains(
-    score_container, left_site, right_site, left_metrics, right_metrics,
-    pair_domain_counts, args,
-):
-    """特征投票：Data 设备存在性与站点对连接中的 Data 暴露量。"""
+    score_container, left_site, right_site, left_metrics, right_metrics, pair_domain_counts, args):
+    """特征投票：Data 存在性与站点对的 Data 暴露量。"""
     left_has_data = left_metrics["domain_counts"].get("Data", 0) > 0
     right_has_data = right_metrics["domain_counts"].get("Data", 0) > 0
     if left_has_data != right_has_data:
@@ -850,7 +870,8 @@ def _vote_data_domains(
                 left_site,
                 "pair_data_exposure",
                 amount,
-                f"{right_site} 在该站点对连接中出现更多 Data 设备 ({right_pair_data} > {left_pair_data})",
+                f"{right_site} 在该站点对连接中出现更多 Data 设备 "
+                f"({right_pair_data} > {left_pair_data})",
             )
 
 
@@ -866,7 +887,9 @@ def _vote_topology_shape(score_container, left_site, right_site, left_metrics, r
                 right_site,
                 "neighbor_count",
                 amount,
-                f"{left_site} 的邻接站点更多 ({left_metrics['neighbor_count']} > {right_metrics['neighbor_count']})",
+                f"{left_site} 的邻接站点更多 "
+                f"({left_metrics['neighbor_count']} > "
+                f"{right_metrics['neighbor_count']})",
             )
         else:
             _add_direction_evidence(
@@ -875,7 +898,9 @@ def _vote_topology_shape(score_container, left_site, right_site, left_metrics, r
                 left_site,
                 "neighbor_count",
                 amount,
-                f"{right_site} 的邻接站点更多 ({right_metrics['neighbor_count']} > {left_metrics['neighbor_count']})",
+                f"{right_site} 的邻接站点更多 "
+                f"({right_metrics['neighbor_count']} > "
+                f"{left_metrics['neighbor_count']})",
             )
 
     left_is_leaf = left_metrics["neighbor_count"] <= args.leaf_neighbor_threshold
@@ -927,7 +952,10 @@ def _effective_direction_margin(graph_metrics, args):
             {
                 "feature": "shared_neighbors",
                 "amount": round(shared_neighbor_bonus, 6),
-                "detail": f"两端共享 {graph_metrics['shared_neighbor_count']} 个邻居站点，局部多路径更明显",
+                "detail": (
+                    f"两端共享 {graph_metrics['shared_neighbor_count']} "
+                    "个邻居站点，局部多路径更明显"
+                ),
             }
         )
     return effective_margin, uncertainty_reasons
@@ -938,34 +966,13 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
     right_metrics = site_metrics[right_site]
     pair_key = tuple(sorted((left_site, right_site)))
     pair_domain_counts = inputs["pair_site_domain_counts"].get(pair_key, {})
-    graph_metrics = pair_graph_metrics.get(
-        pair_key,
-        {
-            "is_bridge": False,
-            "has_alternative_path": True,
-            "shared_neighbor_count": 0,
-            "shared_neighbors": [],
-        },
+    graph_metrics = pair_graph_metrics.get(pair_key, _default_graph_metrics())
+    gap_result = _build_global_gap_if_decisive(
+        left_site, right_site, left_metrics, right_metrics,
+        graph_metrics, args,
     )
-
-    # 全局层级场清晰时直接按层级差定向，跳过局部 7 特征投票。
-    # 短路阈值与投票的 effective_margin 一样对非桥边/共享邻居更保守：层级差不够大时
-    # 不短路，交回投票，由其保守 margin 把不确定的环路/多路径边判成双向。
-    left_level = left_metrics.get("level_score_smoothed", left_metrics["level_score"])
-    right_level = right_metrics.get("level_score_smoothed", right_metrics["level_score"])
-    gap = left_level - right_level
-    effective_threshold = args.global_gap_threshold
-    if not graph_metrics["is_bridge"]:
-        effective_threshold += args.global_gap_nonbridge_bonus
-    effective_threshold += (
-        min(graph_metrics["shared_neighbor_count"], args.max_shared_neighbor_bonus_count)
-        * args.global_gap_shared_neighbor_bonus
-    )
-    if gap != 0.0 and abs(gap) >= effective_threshold:
-        return build_global_gap_result(
-            left_site, right_site, left_level, right_level, gap,
-            effective_threshold, graph_metrics, args,
-        )
+    if gap_result is not None:
+        return gap_result
 
     score_container = {
         left_site: {"score": 0.0, "breakdown": []},
@@ -985,19 +992,65 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
     score_gap = left_score - right_score
     effective_margin, uncertainty_reasons = _effective_direction_margin(graph_metrics, args)
 
-    if abs(score_gap) < effective_margin:
-        relation = "<->"
-        preferred_source = None
-        preferred_target = None
-    elif score_gap > 0:
-        relation = "->"
-        preferred_source = left_site
-        preferred_target = right_site
-    else:
-        relation = "->"
-        preferred_source = right_site
-        preferred_target = left_site
+    direction = _select_pair_direction(
+        left_site, right_site, score_gap, effective_margin
+    )
+    return _build_voted_pair_result(
+        left_site, right_site, pair_key, inputs, graph_metrics,
+        score_container, left_score, right_score, score_gap,
+        effective_margin, uncertainty_reasons, direction, args,
+    )
 
+
+def _default_graph_metrics():
+    return {
+        "is_bridge": False,
+        "has_alternative_path": True,
+        "shared_neighbor_count": 0,
+        "shared_neighbors": [],
+    }
+
+
+def _build_global_gap_if_decisive(
+    left_site, right_site, left_metrics, right_metrics, graph_metrics, args,
+):
+    left_level = left_metrics.get(
+        "level_score_smoothed", left_metrics["level_score"]
+    )
+    right_level = right_metrics.get(
+        "level_score_smoothed", right_metrics["level_score"]
+    )
+    gap = left_level - right_level
+    threshold = args.global_gap_threshold
+    if not graph_metrics["is_bridge"]:
+        threshold += args.global_gap_nonbridge_bonus
+    shared_count = min(
+        graph_metrics["shared_neighbor_count"],
+        args.max_shared_neighbor_bonus_count,
+    )
+    threshold += shared_count * args.global_gap_shared_neighbor_bonus
+    if gap == 0.0 or abs(gap) < threshold:
+        return None
+    return build_global_gap_result(
+        left_site, right_site, left_level, right_level, gap,
+        threshold, graph_metrics, args,
+    )
+
+
+def _select_pair_direction(left_site, right_site, score_gap, margin):
+    if abs(score_gap) < margin:
+        return "<->", None, None
+    if score_gap > 0:
+        return "->", left_site, right_site
+    return "->", right_site, left_site
+
+
+def _build_voted_pair_result(
+    left_site, right_site, pair_key, inputs, graph_metrics,
+    scores, left_score, right_score, score_gap, margin,
+    uncertainty_reasons, direction, args,
+):
+    relation, preferred_source, preferred_target = direction
     return {
         "site_a": left_site,
         "site_b": right_site,
@@ -1007,7 +1060,7 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
         "score_a_to_b": round(left_score, 6),
         "score_b_to_a": round(right_score, 6),
         "score_gap": round(score_gap, 6),
-        "decision_margin": effective_margin,
+        "decision_margin": margin,
         "base_direction_margin": args.direction_margin,
         "pair_edge_count": int(inputs["pair_edge_count"].get(pair_key, 0)),
         "is_bridge": graph_metrics["is_bridge"],
@@ -1015,8 +1068,8 @@ def evaluate_pair_direction(left_site, right_site, site_metrics, inputs, pair_gr
         "shared_neighbor_count": graph_metrics["shared_neighbor_count"],
         "shared_neighbors": graph_metrics["shared_neighbors"],
         "uncertainty_adjustments": uncertainty_reasons,
-        "score_breakdown_a_to_b": score_container[left_site]["breakdown"],
-        "score_breakdown_b_to_a": score_container[right_site]["breakdown"],
+        "score_breakdown_a_to_b": scores[left_site]["breakdown"],
+        "score_breakdown_b_to_a": scores[right_site]["breakdown"],
     }
 
 
@@ -1061,23 +1114,10 @@ def build_pairwise_orders(
     site_metrics,
     pair_graph_metrics,
     args,
-    show_progress=False,
-    compact_output=False,
-    constraints=None,
+    show_progress=False, compact_output=False, constraints=None,
 ):
-    pair_orders = {}
-    compact_edges = [] if compact_output else None
-    downstream_map = defaultdict(set)
-    before_directed_pair_count = 0
-    before_bidirectional_pair_count = 0
-    directed_pair_count = 0
-    bidirectional_pair_count = 0
-    strict_ring_context = {"pair_context": {}, "components": []}
-    strict_ring_forced_pair_count = 0
-    strict_ring_entry_direction_pair_count = 0
-    strict_ring_changed_pair_count = 0
-
-    strict_ring_context = build_strict_ring_context(
+    state = _new_pair_order_state(compact_output)
+    ring_context = build_strict_ring_context(
         inputs["pair_edge_count"].keys(),
         [
             pair_key
@@ -1092,119 +1132,153 @@ def build_pairwise_orders(
             for site_id, metrics in site_metrics.items()
         },
     )
-    strict_ring_pair_context = strict_ring_context["pair_context"]
-
-    # 环块解除（constraint_ring_release，默认关闭）：约束两端同环块时解除该块的
-    # 严格环覆盖。默认不启用——环块会把共边环与双归下游一并融合进来，
-    # “约束所在的环”在共边网状结构上没有唯一定义，解除范围无法正确圈定；
-    # 约束仍通过直连对硬覆盖与势场投影生效。
     constraints = constraints or {}
-    constraint_ring_release = bool(getattr(args, "constraint_ring_release", False))
-    # 直连约束对硬覆盖开关：关闭后约束不再改写任何边的判向（观察/评估模式）
-    constraint_hard_override = bool(getattr(args, "constraint_hard_override", True))
-    constraint_forced_pair_count = 0
-    constraint_changed_pair_count = 0
-    strict_ring_released_pair_count = 0
-    released_component_ids = set()
-    if constraints and constraint_ring_release:
-        site_component_ids = {}
-        for component in strict_ring_context["components"]:
-            for component_site in component["sites"]:
-                site_component_ids[component_site] = component["component_id"]
-        for constraint in constraints.values():
-            upstream_component_id = site_component_ids.get(constraint["upstream_site"])
-            if upstream_component_id is None:
-                continue
-            if upstream_component_id == site_component_ids.get(
-                constraint["downstream_site"]
-            ):
-                released_component_ids.add(upstream_component_id)
-        for component in strict_ring_context["components"]:
-            if component["component_id"] in released_component_ids:
-                component["released_by_constraint"] = True
-    if released_component_ids:
-        retained_pair_context = {}
-        for ring_pair_key, ring_context in strict_ring_pair_context.items():
-            if ring_context["component_id"] in released_component_ids:
-                strict_ring_released_pair_count += 1
-            else:
-                retained_pair_context[ring_pair_key] = ring_context
-        strict_ring_pair_context = retained_pair_context
-
-    with ProgressReporter(len(inputs["pair_edge_count"]), "pairwise: 判断站点对方向", show_progress) as progress:
+    ring_pair_context, released_ids, released_pair_count = (
+        _release_constraint_ring_components(
+            ring_context, constraints,
+            bool(getattr(args, "constraint_ring_release", False)),
+        )
+    )
+    state["strict_ring_released_pair_count"] = released_pair_count
+    hard_override = bool(getattr(args, "constraint_hard_override", True))
+    label = "pairwise: 判断站点对方向"
+    with ProgressReporter(len(inputs["pair_edge_count"]), label, show_progress) as progress:
         for left_site, right_site in sorted(inputs["pair_edge_count"].keys()):
             progress.update()
             pair_key = tuple(sorted((left_site, right_site)))
-            pair_result = evaluate_pair_direction(
-                left_site,
-                right_site,
-                site_metrics,
-                inputs,
-                pair_graph_metrics,
-                args,
+            pair_result = _evaluate_pair_order(
+                left_site, right_site, pair_key, site_metrics, inputs,
+                pair_graph_metrics, args, ring_pair_context,
+                constraints, hard_override, state,
             )
-            if pair_result.get("relation") == "<->":
-                before_bidirectional_pair_count += 1
-            else:
-                before_directed_pair_count += 1
-            ring_pair_context = strict_ring_pair_context.get(pair_key)
-            pair_result, strict_ring_changed = apply_strict_ring_pairwise_override(
-                pair_result,
-                ring_pair_context,
+            _record_pair_order(
+                state, left_site, right_site, pair_result, compact_output
             )
-            if ring_pair_context:
-                if ring_pair_context.get("force_bidirectional"):
-                    strict_ring_forced_pair_count += 1
-                elif ring_pair_context.get("force_entry_direction"):
-                    strict_ring_entry_direction_pair_count += 1
-                if strict_ring_changed:
-                    strict_ring_changed_pair_count += 1
-            constraint_info = constraints.get(pair_key)
-            if constraint_info is not None and constraint_hard_override:
-                pair_result, constraint_changed = apply_cross_domain_constraint_override(
-                    pair_result,
-                    constraint_info,
-                )
-                constraint_forced_pair_count += 1
-                if constraint_changed:
-                    constraint_changed_pair_count += 1
-            if compact_output:
-                compact_edges.append(compact_pairwise_prediction(pair_result))
-            else:
-                pair_orders[f"{left_site}||{right_site}"] = pair_result
+    return _build_pair_order_output(
+        state, ring_context, released_ids, compact_output
+    )
 
-            relation = pair_result["relation"]
-            if relation == "<->":
-                bidirectional_pair_count += 1
-                downstream_map[left_site].add(right_site)
-                downstream_map[right_site].add(left_site)
-            else:
-                directed_pair_count += 1
-                downstream_map[pair_result["preferred_source"]].add(
-                    pair_result["preferred_target"]
-                )
 
+def _new_pair_order_state(compact_output):
+    return {
+        "pair_orders": {},
+        "compact_edges": [] if compact_output else None,
+        "downstream_map": defaultdict(set),
+        "before_directed_pair_count": 0,
+        "before_bidirectional_pair_count": 0,
+        "directed_pair_count": 0,
+        "bidirectional_pair_count": 0,
+        "strict_ring_forced_pair_count": 0,
+        "strict_ring_entry_direction_pair_count": 0,
+        "strict_ring_changed_pair_count": 0,
+        "strict_ring_released_pair_count": 0,
+        "constraint_forced_pair_count": 0,
+        "constraint_changed_pair_count": 0,
+    }
+
+
+def _release_constraint_ring_components(ring_context, constraints, enabled):
+    pair_context = ring_context["pair_context"]
+    if not constraints or not enabled:
+        return pair_context, set(), 0
+    site_components = {
+        site_id: component["component_id"]
+        for component in ring_context["components"]
+        for site_id in component["sites"]
+    }
+    released_ids = set()
+    for constraint in constraints.values():
+        upstream_id = site_components.get(constraint["upstream_site"])
+        downstream_id = site_components.get(constraint["downstream_site"])
+        if upstream_id is not None and upstream_id == downstream_id:
+            released_ids.add(upstream_id)
+    for component in ring_context["components"]:
+        if component["component_id"] in released_ids:
+            component["released_by_constraint"] = True
+    retained = {
+        pair_key: context
+        for pair_key, context in pair_context.items()
+        if context["component_id"] not in released_ids
+    }
+    return retained, released_ids, len(pair_context) - len(retained)
+
+
+def _evaluate_pair_order(
+    left_site, right_site, pair_key, site_metrics, inputs,
+    pair_graph_metrics, args, ring_pair_context,
+    constraints, hard_override, state,
+):
+    result = evaluate_pair_direction(
+        left_site, right_site, site_metrics, inputs, pair_graph_metrics, args
+    )
+    before_key = (
+        "before_bidirectional_pair_count"
+        if result.get("relation") == "<->"
+        else "before_directed_pair_count"
+    )
+    state[before_key] += 1
+    ring_info = ring_pair_context.get(pair_key)
+    result, ring_changed = apply_strict_ring_pairwise_override(result, ring_info)
+    if ring_info:
+        if ring_info.get("force_bidirectional"):
+            state["strict_ring_forced_pair_count"] += 1
+        elif ring_info.get("force_entry_direction"):
+            state["strict_ring_entry_direction_pair_count"] += 1
+        if ring_changed:
+            state["strict_ring_changed_pair_count"] += 1
+    constraint = constraints.get(pair_key)
+    if constraint is not None and hard_override:
+        result, changed = apply_cross_domain_constraint_override(result, constraint)
+        state["constraint_forced_pair_count"] += 1
+        if changed:
+            state["constraint_changed_pair_count"] += 1
+    return result
+
+
+def _record_pair_order(state, left_site, right_site, result, compact_output):
+    if compact_output:
+        state["compact_edges"].append(compact_pairwise_prediction(result))
+    else:
+        state["pair_orders"][f"{left_site}||{right_site}"] = result
+    if result["relation"] == "<->":
+        state["bidirectional_pair_count"] += 1
+        state["downstream_map"][left_site].add(right_site)
+        state["downstream_map"][right_site].add(left_site)
+    else:
+        state["directed_pair_count"] += 1
+        state["downstream_map"][result["preferred_source"]].add(
+            result["preferred_target"]
+        )
+
+
+def _build_pair_order_output(state, ring_context, released_ids, compact_output):
     output = {
-        "pair_orders": pair_orders,
+        "pair_orders": state["pair_orders"],
         "downstream_map": {
             site_id: sorted(neighbors)
-            for site_id, neighbors in sorted(downstream_map.items())
+            for site_id, neighbors in sorted(state["downstream_map"].items())
         },
-        "before_directed_pair_count": before_directed_pair_count,
-        "before_bidirectional_pair_count": before_bidirectional_pair_count,
-        "directed_pair_count": directed_pair_count,
-        "bidirectional_pair_count": bidirectional_pair_count,
-        "strict_ring_components": strict_ring_context["components"],
-        "strict_ring_forced_pair_count": strict_ring_forced_pair_count,
-        "strict_ring_entry_direction_pair_count": strict_ring_entry_direction_pair_count,
-        "strict_ring_changed_pair_count": strict_ring_changed_pair_count,
-        "strict_ring_released_component_count": len(released_component_ids),
-        "strict_ring_released_pair_count": strict_ring_released_pair_count,
-        "cross_domain_constraint_forced_pair_count": constraint_forced_pair_count,
-        "cross_domain_constraint_changed_pair_count": constraint_changed_pair_count,
+        "before_directed_pair_count": state["before_directed_pair_count"],
+        "before_bidirectional_pair_count": state["before_bidirectional_pair_count"],
+        "directed_pair_count": state["directed_pair_count"],
+        "bidirectional_pair_count": state["bidirectional_pair_count"],
+        "strict_ring_components": ring_context["components"],
+        "strict_ring_forced_pair_count": state["strict_ring_forced_pair_count"],
+        "strict_ring_entry_direction_pair_count": (
+            state["strict_ring_entry_direction_pair_count"]
+        ),
+        "strict_ring_changed_pair_count": state["strict_ring_changed_pair_count"],
+        "strict_ring_released_component_count": len(released_ids),
+        "strict_ring_released_pair_count": state["strict_ring_released_pair_count"],
+        "cross_domain_constraint_forced_pair_count": (
+            state["constraint_forced_pair_count"]
+        ),
+        "cross_domain_constraint_changed_pair_count": (
+            state["constraint_changed_pair_count"]
+        ),
     }
     if compact_output:
-        output["compact_edges"] = compact_edges
+        output["compact_edges"] = state["compact_edges"]
     return output
 
 
@@ -1236,34 +1310,42 @@ def build_pairwise_meta(args, inputs, component_summaries, pair_outputs, bridge_
 
 
 def build_pairwise_prediction(ne_graph, args, show_progress=False):
-    """在内存中跑完整 pairwise 流程，返回 compact 输出（meta / edges / downstream_map）。
+    """在内存中运行 pairwise 流程并返回 compact 预测。"""
+    context = _prepare_pairwise_prediction(ne_graph, args, show_progress)
+    pair_outputs = build_pairwise_orders(
+        context["inputs"],
+        context["site_metrics"],
+        context["pair_graph_metrics"],
+        args,
+        show_progress=show_progress,
+        compact_output=True,
+        constraints=context["constraints"],
+    )
+    meta = build_pairwise_meta(
+        args, context["inputs"], context["component_summaries"],
+        pair_outputs, context["bridge_pair_count"],
+        context["pair_graph_metrics"],
+    )
+    _update_pairwise_prediction_meta(meta, context, pair_outputs, args)
+    return _build_pairwise_prediction_result(meta, context, pair_outputs)
 
-    与 main 的非 full-output 路径产物一致，可直接作为下游 site_chains 的 prediction 输入，
-    省去落盘再读盘。
 
-    args.cross_domain_priority_constraint 开启时，跨类型连边（如 Data-Ran）在
-    连边端点优先级与站点自身优先级方向一致时产生硬方向约束：注入层级平滑
-    （周边站点顺势重排）、解除含约束端点的严格环块、并对有拓扑直连边的约束对
-    强制判向；约束集随结果的 cross_domain_constraints 字段导出，供 site_chains
-    侧校验。
-    """
-    constraint_enabled = bool(getattr(args, "cross_domain_priority_constraint", False))
-
-    # 预处理：疑似误连接的站点对（Data 站点 <-> Trans+Ran 站点之间只有传输连边、
-    # 无 Data-Ran 佐证），其传输类连边从拓扑/约束/裁剪口径整体剔除
+def _prepare_pairwise_prediction(ne_graph, args, show_progress):
+    constraint_enabled = bool(getattr(
+        args, "cross_domain_priority_constraint", False))
     misconnection_enabled = bool(
         getattr(args, "transmission_misconnection_filter", False)
     )
     misconnection_pairs = set()
-    misconnection_stats = {"candidate_pair_count": 0, "misconnection_pair_count": 0}
+    misconnection_stats = {
+        "candidate_pair_count": 0, "misconnection_pair_count": 0,
+    }
     if misconnection_enabled:
         misconnection_pairs, misconnection_stats = (
             build_transmission_misconnection_pairs(ne_graph)
         )
-
     inputs = build_site_pair_inputs(
-        ne_graph,
-        show_progress=show_progress,
+        ne_graph, show_progress=show_progress,
         collect_cross_domain=constraint_enabled,
         transmission_misconnection_pairs=misconnection_pairs,
     )
@@ -1271,73 +1353,106 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
     constraint_stats = {"tie_pair_count": 0, "cycle_dropped_pair_count": 0}
     if constraint_enabled:
         constraints, constraint_stats = build_cross_domain_constraints(
-            inputs["cross_domain_pair_evidence"],
-            inputs["pair_edge_count"],
+            inputs["cross_domain_pair_evidence"], inputs["pair_edge_count"]
         )
-    pair_graph_metrics = build_pairwise_graph_metrics(inputs, show_progress=show_progress)
-    bridge_pair_count = sum(
-        1 for graph_metrics in pair_graph_metrics.values() if graph_metrics["is_bridge"]
+    graph_metrics = build_pairwise_graph_metrics(
+        inputs, show_progress=show_progress
     )
-    # 势场投影开关：关闭后约束不再注入层级平滑（多跳约束将失去全部判向影响）
-    constraint_level_projection = bool(
-        getattr(args, "constraint_level_projection", True)
+    projection = bool(getattr(args, "constraint_level_projection", True))
+    site_metrics, summaries, smoothing_stats = build_pairwise_site_metrics(
+        inputs, args, show_progress=show_progress,
+        constraints=constraints if projection else None,
     )
-    site_metrics, component_summaries, smoothing_stats = build_pairwise_site_metrics(
-        inputs,
-        args,
-        show_progress=show_progress,
-        constraints=constraints if constraint_level_projection else None,
-    )
-    pair_outputs = build_pairwise_orders(
-        inputs,
-        site_metrics,
-        pair_graph_metrics,
-        args,
-        show_progress=show_progress,
-        compact_output=True,
-        constraints=constraints,
-    )
-    meta = build_pairwise_meta(
-        args, inputs, component_summaries, pair_outputs, bridge_pair_count, pair_graph_metrics
-    )
+    return {
+        "constraint_enabled": constraint_enabled,
+        "misconnection_enabled": misconnection_enabled,
+        "misconnection_pairs": misconnection_pairs,
+        "misconnection_stats": misconnection_stats,
+        "inputs": inputs, "constraints": constraints,
+        "constraint_stats": constraint_stats,
+        "pair_graph_metrics": graph_metrics,
+        "bridge_pair_count": sum(
+            1 for item in graph_metrics.values() if item["is_bridge"]
+        ),
+        "constraint_level_projection": projection,
+        "site_metrics": site_metrics,
+        "component_summaries": summaries,
+        "smoothing_stats": smoothing_stats,
+    }
+
+
+def _update_pairwise_prediction_meta(meta, context, pair_outputs, args):
+    constraint_enabled = context["constraint_enabled"]
+    misconnection_enabled = context["misconnection_enabled"]
     meta["cross_domain_priority_constraint"] = constraint_enabled
     meta["transmission_misconnection_filter"] = misconnection_enabled
     if misconnection_enabled:
+        stats = context["misconnection_stats"]
         meta["transmission_misconnection_candidate_pair_count"] = (
-            misconnection_stats["candidate_pair_count"]
+            stats["candidate_pair_count"]
         )
         meta["transmission_misconnection_pair_count"] = (
-            misconnection_stats["misconnection_pair_count"]
+            stats["misconnection_pair_count"]
         )
-    if constraint_enabled:
-        direct_pair_count = sum(
-            1 for constraint in constraints.values() if constraint["has_topology_edge"]
-        )
-        meta.update({
-            "cross_domain_constraint_hard_override": bool(
-                getattr(args, "constraint_hard_override", True)
-            ),
-            "cross_domain_constraint_level_projection": constraint_level_projection,
-            "cross_domain_constraint_ring_release": bool(
-                getattr(args, "constraint_ring_release", False)
-            ),
-            "cross_domain_constraint_pair_count": len(constraints),
-            "cross_domain_constraint_direct_pair_count": direct_pair_count,
-            "cross_domain_constraint_multi_hop_pair_count": len(constraints) - direct_pair_count,
-            "cross_domain_constraint_tie_pair_count": constraint_stats["tie_pair_count"],
-            "cross_domain_constraint_cycle_dropped_pair_count": constraint_stats["cycle_dropped_pair_count"],
-            "cross_domain_constraint_level_unsatisfied_count": smoothing_stats["unsatisfied_constraint_count"],
-            "cross_domain_constraint_forced_pair_count": pair_outputs["cross_domain_constraint_forced_pair_count"],
-            "cross_domain_constraint_changed_pair_count": pair_outputs["cross_domain_constraint_changed_pair_count"],
-            "strict_ring_released_component_count": pair_outputs["strict_ring_released_component_count"],
-            "strict_ring_released_pair_count": pair_outputs["strict_ring_released_pair_count"],
-        })
+    if not constraint_enabled:
+        return
+    constraints = context["constraints"]
+    direct_count = sum(
+        1 for item in constraints.values() if item["has_topology_edge"]
+    )
+    meta.update(_constraint_meta_fields(
+        args, context, pair_outputs, direct_count
+    ))
+
+
+def _constraint_meta_fields(args, context, pair_outputs, direct_count):
+    constraints = context["constraints"]
+    return {
+        "cross_domain_constraint_hard_override": bool(
+            getattr(args, "constraint_hard_override", True)
+        ),
+        "cross_domain_constraint_level_projection": (
+            context["constraint_level_projection"]
+        ),
+        "cross_domain_constraint_ring_release": bool(
+            getattr(args, "constraint_ring_release", False)
+        ),
+        "cross_domain_constraint_pair_count": len(constraints),
+        "cross_domain_constraint_direct_pair_count": direct_count,
+        "cross_domain_constraint_multi_hop_pair_count": (
+            len(constraints) - direct_count
+        ),
+        "cross_domain_constraint_tie_pair_count": (
+            context["constraint_stats"]["tie_pair_count"]
+        ),
+        "cross_domain_constraint_cycle_dropped_pair_count": (
+            context["constraint_stats"]["cycle_dropped_pair_count"]
+        ),
+        "cross_domain_constraint_level_unsatisfied_count": (
+            context["smoothing_stats"]["unsatisfied_constraint_count"]
+        ),
+        "cross_domain_constraint_forced_pair_count": (
+            pair_outputs["cross_domain_constraint_forced_pair_count"]
+        ),
+        "cross_domain_constraint_changed_pair_count": (
+            pair_outputs["cross_domain_constraint_changed_pair_count"]
+        ),
+        "strict_ring_released_component_count": (
+            pair_outputs["strict_ring_released_component_count"]
+        ),
+        "strict_ring_released_pair_count": (
+            pair_outputs["strict_ring_released_pair_count"]
+        ),
+    }
+
+
+def _build_pairwise_prediction_result(meta, context, pair_outputs):
     result = {
         "meta": meta,
         "edges": pair_outputs["compact_edges"],
         "downstream_map": pair_outputs["downstream_map"],
     }
-    if constraint_enabled:
+    if context["constraint_enabled"]:
         result["cross_domain_constraints"] = [
             {
                 "upstream_site": constraint["upstream_site"],
@@ -1346,11 +1461,11 @@ def build_pairwise_prediction(ne_graph, args, show_progress=False):
                 "total_cross_link_count": constraint["total_cross_link_count"],
                 "has_topology_edge": constraint["has_topology_edge"],
             }
-            for _, constraint in sorted(constraints.items())
+            for _, constraint in sorted(context["constraints"].items())
         ]
-    if misconnection_enabled:
-        # 随产物导出，供 site_chains 的 restrict 裁剪按同一口径剔除误连接
+    if context["misconnection_enabled"]:
         result["transmission_misconnection_pairs"] = [
-            list(pair_key) for pair_key in sorted(misconnection_pairs)
+            list(pair_key)
+            for pair_key in sorted(context["misconnection_pairs"])
         ]
     return result

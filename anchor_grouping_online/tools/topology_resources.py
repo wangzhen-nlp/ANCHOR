@@ -1,3 +1,21 @@
+"""拓扑工具共享的资源路径与默认输入位置。"""
+
+__all__ = [
+    "RESOURCE_DIR",
+    "RESOURCE_DIR_NAME",
+    "resource_path",
+    "resource_display",
+    "SYS_LINK_DIR",
+    "SYS_NE_DIR",
+    "SYS_SITE_DIR",
+    "RESOURCE_BUFFER_JSONL",
+    "NE_FILE",
+    "SITE_FILE",
+    "NE_NE_FILE",
+    "PORT_PORT_FILE",
+    "NE_PORT_FILE",
+]
+
 from pathlib import Path
 
 
@@ -25,20 +43,3 @@ SITE_FILE = resource_path("site.csv")
 NE_NE_FILE = resource_path("ne_ne.csv")
 PORT_PORT_FILE = resource_path("port_port.csv")
 NE_PORT_FILE = resource_path("ne_port.csv")
-
-
-__all__ = [
-    "RESOURCE_DIR",
-    "RESOURCE_DIR_NAME",
-    "resource_path",
-    "resource_display",
-    "SYS_LINK_DIR",
-    "SYS_NE_DIR",
-    "SYS_SITE_DIR",
-    "RESOURCE_BUFFER_JSONL",
-    "NE_FILE",
-    "SITE_FILE",
-    "NE_NE_FILE",
-    "PORT_PORT_FILE",
-    "NE_PORT_FILE",
-]

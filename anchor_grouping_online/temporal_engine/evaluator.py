@@ -85,17 +85,8 @@ class TemporalGraphEngineEvaluatorMixin:
         return list(candidate_hops)
 
     def _validate_candidate_nodes_for_edge(
-        self,
-        candidates,
-        tgt_role,
-        tgt_cfg,
-        ref_ts,
-        edge,
-        rule_name,
-        trigger_role,
-        helper,
-        validation_cache,
-        allowed_alarm_source_nes=None,
+        self, candidates, tgt_role, tgt_cfg, ref_ts, edge, rule_name,
+        trigger_role, helper, validation_cache, allowed_alarm_source_nes=None,
     ):
         curr_valid_targets = {}
         window_cache_key = edge["win"]
@@ -106,26 +97,10 @@ class TemporalGraphEngineEvaluatorMixin:
 
         for cand_phys in candidates:
             exclude_consumed_trigger_rule = rule_name if tgt_role == trigger_role else None
-            if exclude_consumed_trigger_rule is None:
-                cache_key = (
-                    "candidate_node_shared",
-                    id(tgt_cfg),
-                    cand_phys,
-                    ref_ts,
-                    window_cache_key,
-                    ne_filter_key,
-                )
-            else:
-                cache_key = (
-                    "candidate_node",
-                    rule_name,
-                    tgt_role,
-                    id(tgt_cfg),
-                    cand_phys,
-                    ref_ts,
-                    window_cache_key,
-                    ne_filter_key,
-                )
+            cache_key = self._candidate_validation_cache_key(
+                rule_name, tgt_role, tgt_cfg, cand_phys, ref_ts,
+                window_cache_key, ne_filter_key, exclude_consumed_trigger_rule,
+            )
             if cache_key in validation_cache:
                 is_valid, events = validation_cache[cache_key]
             else:
@@ -145,6 +120,22 @@ class TemporalGraphEngineEvaluatorMixin:
                 curr_valid_targets[cand_phys] = events
 
         return curr_valid_targets
+
+    @staticmethod
+    def _candidate_validation_cache_key(
+        rule_name, tgt_role, tgt_cfg, cand_phys, ref_ts,
+        window_cache_key, ne_filter_key, exclude_consumed_trigger_rule,
+    ):
+        """候选校验缓存键；无 trigger 排除维度时跨规则共享。"""
+        if exclude_consumed_trigger_rule is None:
+            return (
+                "candidate_node_shared", id(tgt_cfg), cand_phys, ref_ts,
+                window_cache_key, ne_filter_key,
+            )
+        return (
+            "candidate_node", rule_name, tgt_role, id(tgt_cfg), cand_phys,
+            ref_ts, window_cache_key, ne_filter_key,
+        )
 
     def _get_required_link_alarm_set_for_role(self, phys_node, role_cfg, helper):
         expected = helper.resolve_expected_alarms(
@@ -252,21 +243,9 @@ class TemporalGraphEngineEvaluatorMixin:
 
 
     def _evaluate_edge_source_node(
-        self,
-        curr_phys,
-        curr_events,
-        curr_role,
-        tgt_role,
-        tgt_cfg,
-        curr_cfg,
-        edge,
-        rule_name,
-        trigger_role,
-        trigger_ts,
-        helper,
-        validation_cache,
-        traversal_cache,
-        allowed_alarm_source_nes=None,
+        self, curr_phys, curr_events, curr_role, tgt_role, tgt_cfg, curr_cfg,
+        edge, rule_name, trigger_role, trigger_ts, helper,
+        validation_cache, traversal_cache, allowed_alarm_source_nes=None,
     ):
         ref_ts = curr_events[0]["ts"] if curr_events else trigger_ts
         candidates = self._collect_edge_candidates(
@@ -279,15 +258,8 @@ class TemporalGraphEngineEvaluatorMixin:
             rule_name=rule_name,
         )
         curr_valid_targets = self._validate_candidate_nodes_for_edge(
-            candidates,
-            tgt_role,
-            tgt_cfg,
-            ref_ts,
-            edge,
-            rule_name,
-            trigger_role,
-            helper,
-            validation_cache,
+            candidates, tgt_role, tgt_cfg, ref_ts, edge, rule_name,
+            trigger_role, helper, validation_cache,
             allowed_alarm_source_nes=allowed_alarm_source_nes,
         )
 
@@ -325,19 +297,9 @@ class TemporalGraphEngineEvaluatorMixin:
         )
 
     def _collect_instance_edge_targets(
-        self,
-        inst,
-        curr_role,
-        tgt_role,
-        edge,
-        tgt_cfg,
-        rule_name,
-        trigger_role,
-        trigger_ts,
-        helper,
-        nodes_cfg,
-        validation_cache,
-        traversal_cache,
+        self, inst, curr_role, tgt_role, edge, tgt_cfg, rule_name,
+        trigger_role, trigger_ts, helper, nodes_cfg,
+        validation_cache, traversal_cache,
     ):
         valid_targets = {}
         surviving_curr_phys = {}
@@ -352,46 +314,48 @@ class TemporalGraphEngineEvaluatorMixin:
 
         for curr_phys, curr_events in inst["roles"][curr_role]["nodes"].items():
             curr_valid_targets, source_events_by_target = self._evaluate_edge_source_node(
-                curr_phys,
-                curr_events,
-                curr_role,
-                tgt_role,
-                tgt_cfg,
-                curr_cfg,
-                edge,
-                rule_name,
-                trigger_role,
-                trigger_ts,
-                helper,
-                validation_cache,
-                traversal_cache,
+                curr_phys, curr_events, curr_role, tgt_role, tgt_cfg, curr_cfg,
+                edge, rule_name, trigger_role, trigger_ts, helper,
+                validation_cache, traversal_cache,
                 allowed_alarm_source_nes=allowed_alarm_source_nes,
             )
             if not curr_valid_targets:
                 continue
 
-            combined_curr_events = []
-            seen_curr_event_ids = set()
-            for target_phys in curr_valid_targets:
-                for event in source_events_by_target.get(target_phys, curr_events):
-                    event_id = get_symptom_alarm_identity(event) or (
-                        event.get("node"),
-                        event.get("ts"),
-                        event.get("alarm"),
-                        event.get("alarm_source"),
-                    )
-                    if event_id in seen_curr_event_ids:
-                        continue
-                    seen_curr_event_ids.add(event_id)
-                    combined_curr_events.append(event)
-                curr_events_by_target[(curr_phys, target_phys)] = source_events_by_target.get(target_phys, curr_events)
-
+            combined_curr_events = self._combine_source_events(
+                curr_phys, curr_events, curr_valid_targets,
+                source_events_by_target, curr_events_by_target,
+            )
             surviving_curr_phys[curr_phys] = combined_curr_events or curr_events
             curr_support_targets[curr_phys] = set(curr_valid_targets)
             for key, value in curr_valid_targets.items():
                 valid_targets[key] = value
 
         return valid_targets, surviving_curr_phys, curr_support_targets, curr_events_by_target
+
+    @staticmethod
+    def _combine_source_events(
+        curr_phys, curr_events, curr_valid_targets,
+        source_events_by_target, curr_events_by_target,
+    ):
+        """按事件身份合并各 target 的 source 事件，并登记 (curr, tgt) 明细。"""
+        combined_curr_events = []
+        seen_curr_event_ids = set()
+        for target_phys in curr_valid_targets:
+            events = source_events_by_target.get(target_phys, curr_events)
+            for event in events:
+                event_id = get_symptom_alarm_identity(event) or (
+                    event.get("node"),
+                    event.get("ts"),
+                    event.get("alarm"),
+                    event.get("alarm_source"),
+                )
+                if event_id in seen_curr_event_ids:
+                    continue
+                seen_curr_event_ids.add(event_id)
+                combined_curr_events.append(event)
+            curr_events_by_target[(curr_phys, target_phys)] = events
+        return combined_curr_events
 
     def _materialize_edge_advanced_instances(
         self,
@@ -437,18 +401,8 @@ class TemporalGraphEngineEvaluatorMixin:
         return [stabilized_inst] if stabilized_inst is not None else []
 
     def _advance_instance_across_edge(
-        self,
-        inst,
-        curr_role,
-        tgt_role,
-        edge,
-        nodes_cfg,
-        rule_name,
-        trigger_role,
-        trigger_ts,
-        helper,
-        validation_cache,
-        traversal_cache,
+        self, inst, curr_role, tgt_role, edge, nodes_cfg, rule_name,
+        trigger_role, trigger_ts, helper, validation_cache, traversal_cache,
     ):
         inst_roles = inst["roles"]
 
@@ -461,18 +415,9 @@ class TemporalGraphEngineEvaluatorMixin:
         tgt_cfg = nodes_cfg[tgt_role]
         valid_targets, surviving_curr_phys, curr_support_targets, curr_events_by_target = (
             self._collect_instance_edge_targets(
-                inst,
-                curr_role,
-                tgt_role,
-                edge,
-                tgt_cfg,
-                rule_name,
-                trigger_role,
-                trigger_ts,
-                helper,
-                nodes_cfg,
-                validation_cache,
-                traversal_cache,
+                inst, curr_role, tgt_role, edge, tgt_cfg, rule_name,
+                trigger_role, trigger_ts, helper, nodes_cfg,
+                validation_cache, traversal_cache,
             )
         )
 
@@ -498,59 +443,16 @@ class TemporalGraphEngineEvaluatorMixin:
         )
 
     def _fork_primitive_target_instances(
-        self,
-        inst,
-        curr_role,
-        tgt_role,
-        surviving_curr_phys,
-        valid_targets,
-        curr_support_targets,
-        nodes_cfg,
-        curr_events_by_target=None,
+        self, inst, curr_role, tgt_role, surviving_curr_phys, valid_targets,
+        curr_support_targets, nodes_cfg, curr_events_by_target=None,
     ):
         next_instances = []
         curr_events_by_target = curr_events_by_target or {}
-
-        # 旧实现对每个 target 都完整扫描一次 surviving_curr_phys，并再次扫描
-        # curr_support_targets 来构造依赖，复杂度接近 O(targets * current_nodes)。
-        # 这里先反转一次支撑关系，后续只访问真正支撑该 target 的 current nodes。
-        # 外层按 surviving_curr_phys 的原顺序构建 list，保持实例内容及迭代顺序不变。
-        single_curr_item = None
-        supporting_curr_nodes_by_target = None
-        if len(surviving_curr_phys) == 1:
-            # 这是从 trigger 首次向外分叉时最常见的形态。直接做集合成员判断，
-            # 避免为了单个 current node 构建 target -> nodes 反向字典。
-            single_curr_item = next(iter(surviving_curr_phys.items()))
-            single_curr_node, _single_curr_events = single_curr_item
-            single_curr_supported_targets = curr_support_targets.get(
-                single_curr_node,
-                (),
-            )
-        else:
-            supporting_curr_nodes_by_target = {
-                target_node: []
-                for target_node in valid_targets
-            }
-            for curr_node in surviving_curr_phys:
-                for target_node in curr_support_targets.get(curr_node, ()):
-                    supporting_curr_nodes = supporting_curr_nodes_by_target.get(
-                        target_node
-                    )
-                    if supporting_curr_nodes is not None:
-                        supporting_curr_nodes.append(curr_node)
-
+        supporting_nodes_for = self._build_target_support_index(
+            surviving_curr_phys, curr_support_targets, valid_targets
+        )
         for target_node, target_events in valid_targets.items():
-            if single_curr_item is not None:
-                supporting_curr_nodes = (
-                    (single_curr_item[0],)
-                    if target_node in single_curr_supported_targets
-                    else ()
-                )
-            else:
-                supporting_curr_nodes = supporting_curr_nodes_by_target.get(
-                    target_node,
-                    (),
-                )
+            supporting_curr_nodes = supporting_nodes_for(target_node)
             target_surviving_curr_phys = {
                 curr_node: curr_events_by_target.get(
                     (curr_node, target_node),
@@ -578,6 +480,38 @@ class TemporalGraphEngineEvaluatorMixin:
             if stabilized_inst is not None:
                 next_instances.append(stabilized_inst)
         return next_instances
+
+    @staticmethod
+    def _build_target_support_index(
+        surviving_curr_phys, curr_support_targets, valid_targets
+    ):
+        """反转支撑关系，返回 target_node -> 支撑它的 current nodes 的查询函数。
+
+        旧实现对每个 target 都完整扫描一次 surviving_curr_phys，并再次扫描
+        curr_support_targets 来构造依赖，复杂度接近 O(targets * current_nodes)。
+        这里先反转一次支撑关系，后续只访问真正支撑该 target 的 current nodes；
+        按 surviving_curr_phys 的原顺序构建 list，保持实例内容及迭代顺序不变。
+        单 current node（trigger 首次向外分叉的最常见形态）时直接做集合成员
+        判断，避免为单个 current node 构建反向字典。
+        """
+        if len(surviving_curr_phys) == 1:
+            single_curr_node = next(iter(surviving_curr_phys))
+            supported_targets = curr_support_targets.get(single_curr_node, ())
+            return lambda target_node: (
+                (single_curr_node,) if target_node in supported_targets else ()
+            )
+        supporting_curr_nodes_by_target = {
+            target_node: []
+            for target_node in valid_targets
+        }
+        for curr_node in surviving_curr_phys:
+            for target_node in curr_support_targets.get(curr_node, ()):
+                supporting_curr_nodes = supporting_curr_nodes_by_target.get(
+                    target_node
+                )
+                if supporting_curr_nodes is not None:
+                    supporting_curr_nodes.append(curr_node)
+        return lambda target_node: supporting_curr_nodes_by_target.get(target_node, ())
 
     def _advance_instances_across_edge(
         self,
@@ -711,13 +645,8 @@ class TemporalGraphEngineEvaluatorMixin:
         root_roles = plan["root_roles"]
         caches = eval_caches or self._create_eval_caches()
         is_trigger_valid, trigger_events = self._validate_trigger_node_for_rule(
-            rule_name,
-            nodes_cfg,
-            trigger_role,
-            trigger_node,
-            trigger_ts,
-            helper,
-            caches["validation_cache"],
+            rule_name, nodes_cfg, trigger_role, trigger_node, trigger_ts,
+            helper, caches["validation_cache"],
         )
         if not is_trigger_valid:
             return []
@@ -731,27 +660,13 @@ class TemporalGraphEngineEvaluatorMixin:
 
         for curr_role, tgt_role, edge in edges_to_explore:
             instances = self._advance_instances_across_edge(
-                instances,
-                curr_role,
-                tgt_role,
-                edge,
-                nodes_cfg,
-                rule_name,
-                trigger_role,
-                trigger_ts,
-                helper,
-                caches,
+                instances, curr_role, tgt_role, edge, nodes_cfg,
+                rule_name, trigger_role, trigger_ts, helper, caches,
             )
             if instances:
                 continue
             return []
 
-        results = self._build_match_results_from_instances(
-            instances,
-            rule_name,
-            rule,
-            nodes_cfg,
-            root_roles,
-            trigger_ts,
+        return self._build_match_results_from_instances(
+            instances, rule_name, rule, nodes_cfg, root_roles, trigger_ts,
         )
-        return results

@@ -80,6 +80,14 @@ def _resource_buffer_pairwise_args():
     return SimpleNamespace(
         ne_graph="<resource_buffer: ne_graph>",
         output="<resource_buffer: site_pair_order_pairwise>",
+        **_resource_buffer_pairwise_scoring_args(),
+        **_resource_buffer_pairwise_constraint_args(),
+    )
+
+
+def _resource_buffer_pairwise_scoring_args():
+    """pairwise 判向的打分、阈值与平滑参数。"""
+    return dict(
         direction_margin=2.5,
         core_distance_penalty=2.0,
         non_bridge_margin_bonus=2.0,
@@ -115,6 +123,12 @@ def _resource_buffer_pairwise_args():
         global_gap_threshold=1.0,
         global_gap_nonbridge_bonus=2.0,
         global_gap_shared_neighbor_bonus=0.5,
+    )
+
+
+def _resource_buffer_pairwise_constraint_args():
+    """pairwise 判向的跨类型方向约束、后处理与输出开关。"""
+    return dict(
         # 跨类型连边方向约束（Data > Transmission > Ran 优先级高者为上行）：
         # 注入层级平滑、解除含约束端点的严格环块、强制直连对判向
         cross_domain_priority_constraint=True,
@@ -390,7 +404,9 @@ def iter_ne_port_link_online(input_path: str = NE_PORT_FILE):
 # 基础数据加载（去重取最新）
 # --------------------------------------------------------------------------- #
 def load_ne_info(records, report_duplicates: bool = False) -> dict:
-    """从记录生成器加载 NE 信息；同 vid 冲突时按出现顺序后者直接覆盖前者，不做字段合并。
+    """从记录生成器加载 NE 信息。
+
+    同 vid 冲突时按出现顺序后者覆盖前者，不做字段合并。
 
     records 为逐条产出规范化 NE 记录（dict）的可迭代对象，可由 iter_ne_csv_records 从当前
     SYS_NE CSV 构造，也可替换成其它数据源；期望字段见 iter_ne_csv_records（NE ID 为 vid）。
@@ -410,7 +426,7 @@ def load_ne_info(records, report_duplicates: bool = False) -> dict:
         vid = sys.intern(vid)
         if duplicates is not None and vid in result:
             duplicates[vid] += 1
-        # 低基数/高重复字段做 intern：同值只留一份对象，大幅压缩百万级记录的重复占用。
+        # 低基数/高重复字段做 intern，压缩大量记录的重复占用。
         # name 为高基数（设备名各异），不 intern 以免污染 intern 表。
         result[vid] = {
             'domain': sys.intern((row.get('domain') or '').strip()),
@@ -427,10 +443,12 @@ def load_ne_info(records, report_duplicates: bool = False) -> dict:
 
 
 def load_site_info(records, report_duplicates: bool = False) -> dict:
-    """从记录生成器加载站点信息；同 site_id 冲突时按出现顺序后者直接替换前者，不做字段合并。
+    """从记录生成器加载站点信息。
 
-    records 为逐条产出规范化站点记录（dict）的可迭代对象，可由 iter_site_csv_records 从当前
-    SYS_SITE CSV 构造，也可替换成其它数据源；期望字段见 iter_site_csv_records（站点 ID 为 vid）。
+    同 site_id 冲突时按出现顺序后者替换前者，不合并字段。
+
+    records 为逐条产出规范化站点记录（dict）的可迭代对象，
+    期望字段见 iter_site_csv_records（站点 ID 为 vid）。
 
     Returns:
         {site_id: {site_name, longitude, latitude, is_hub}}
@@ -518,7 +536,6 @@ def build_graphs_from_relations(ne_ne_links, port_port_links, ne_port_links, ne_
     """
     site_links = defaultdict(lambda: defaultdict(dict))
     ne_links = defaultdict(lambda: defaultdict(dict))
-    peer_index = {}
 
     stats = {
         'ne_link_count': 0,
@@ -529,6 +546,21 @@ def build_graphs_from_relations(ne_ne_links, port_port_links, ne_port_links, ne_
         'port_mapped_count': 0,
     }
 
+    _ingest_ne_ne_links(ne_ne_links, ne_info, site_links, ne_links, stats)
+
+    port_to_ne = {}
+    for record in ne_port_links:
+        ne_vid = record.get('src_vid') or ''
+        port_vid = record.get('dst_vid') or ''
+        if ne_vid and port_vid:
+            port_to_ne[port_vid] = sys.intern(ne_vid)
+
+    peer_index = _build_peer_index(port_port_links, port_to_ne, stats)
+    return site_links, ne_links, peer_index, stats
+
+
+def _ingest_ne_ne_links(ne_ne_links, ne_info, site_links, ne_links, stats):
+    """消费 NE-NE 关系：登记 NE 邻接图与（可映射时的）站点邻接图。"""
     for record in ne_ne_links:
         src_ne = record.get('src_vid') or ''
         dst_ne = record.get('dst_vid') or ''
@@ -550,13 +582,10 @@ def build_graphs_from_relations(ne_ne_links, port_port_links, ne_port_links, ne_
             stats['site_mapped_count'] += 1
             _add_bidirectional_edge(site_links, src_site, dst_site, link_type)
 
-    port_to_ne = {}
-    for record in ne_port_links:
-        ne_vid = record.get('src_vid') or ''
-        port_vid = record.get('dst_vid') or ''
-        if ne_vid and port_vid:
-            port_to_ne[port_vid] = sys.intern(ne_vid)
 
+def _build_peer_index(port_port_links, port_to_ne, stats):
+    """消费端口-端口关系，构建双向端口对端索引。"""
+    peer_index = {}
     for record in port_port_links:
         src_port_vid = record.get('src_vid') or ''
         dst_port_vid = record.get('dst_vid') or ''
@@ -578,8 +607,7 @@ def build_graphs_from_relations(ne_ne_links, port_port_links, ne_port_links, ne_
             ne_native_id=src_ne,
             port_vid=src_port_vid,
         )
-
-    return site_links, ne_links, peer_index, stats
+    return peer_index
 
 
 def assemble_site_graph(site_info: dict, site_links: dict) -> dict:
@@ -707,13 +735,7 @@ def _write_resource_line(output_file, resource_type: str, data) -> None:
 
 def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_records,
                           ne_port_records, output_path, report_duplicates: bool = False):
-    """消费资源记录生成器，产出单个资源缓冲文件（JSONL）。
-
-    ne_records / site_records / ne_ne_records / port_port_records / ne_port_records
-    均为逐条产出规范化记录（dict）的可迭代对象，是本工具与“数据从哪来”之间的
-    唯一耦合点。默认由当前 CSV 构造，后续可整体替换成 DB / 接口等其它数据源。
-    消费端假定这些记录中的 vid / linkLayer 已归一化。
-    """
+    """消费规范化资源记录生成器，产出 JSONL 资源缓冲文件。"""
     # 1) NE 读取一次，得到完整 NE 信息（其中含 site_id）
     print("加载NE信息...")
     ne_info = load_ne_info(ne_records, report_duplicates)
@@ -733,36 +755,64 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
     )
     print(f"  站点图: 处理 {stats['site_link_count']} 条链路，成功映射 {stats['site_mapped_count']} 条")
     print(f"  NE图:   处理 {stats['ne_link_count']} 条链路，成功映射 {stats['ne_mapped_count']} 条")
-    print(f"  端口对端: 处理 {stats['port_link_count']} 条链路，成功映射 {stats['port_mapped_count']} 条")
+    print(
+        f"  端口对端: 处理 {stats['port_link_count']} 条链路，"
+        f"成功映射 {stats['port_mapped_count']} 条"
+    )
 
-    # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出
-    site_graph = assemble_site_graph(site_info, site_links)
-    ne_graph = assemble_ne_graph(ne_info, site_info, ne_links)
-    site_device_counts = build_site_device_counts(ne_graph)
+    # 4) 组装为单个缓冲对象，用字段区分不同内容后一次性写出。
+    #    保存汇总值后释放组装输入；ne_info/ne_graph 共享内层 NE dict，
+    #    但外层 dict 可回收。
+    resources = {
+        'site_graph': assemble_site_graph(site_info, site_links),
+        'ne_graph': assemble_ne_graph(ne_info, site_info, ne_links),
+        'link_peer_index': peer_index,
+    }
+    resources['site_device_counts'] = build_site_device_counts(resources['ne_graph'])
+    summary_counts = _collect_buffer_summary_counts(
+        resources['site_graph'], resources['ne_graph'],
+        peer_index, resources['site_device_counts'],
+    )
+    del site_links, ne_links, ne_info, site_info, peer_index
 
-    # 保存汇总值后释放组装输入；ne_info/ne_graph 共享内层 NE dict，但外层 dict 可回收。
-    site_graph_count = len(site_graph)
-    site_neighbor_total = sum(len(v['link']) for v in site_graph.values())
-    site_neighbor_max = max((len(v['link']) for v in site_graph.values()), default=0)
-    ne_graph_count = len(ne_graph)
-    ne_with_site_count = sum(1 for ne in ne_graph.values() if ne.get('site_id'))
-    peer_index_count = len(peer_index)
-    site_device_count = len(site_device_counts)
-    del site_links, ne_links, ne_info, site_info
+    site_chains = _write_resource_buffer_file(output_path, resources)
+    _print_resource_buffer_summary(output_path, summary_counts, site_chains)
 
-    # 逐资源写 JSONL（每行一个 {"resource_type", "data"}）：site_chains 只依赖 ne_graph，
-    # 先写并释放其余大资源，避免 pairwise/site_chains 的临时结构与之叠加成峰值。
+
+def _collect_buffer_summary_counts(site_graph, ne_graph, peer_index, site_device_counts):
+    """在释放组装输入前保存汇总统计值。"""
+    return {
+        'site_graph_count': len(site_graph),
+        'site_neighbor_total': sum(len(v['link']) for v in site_graph.values()),
+        'site_neighbor_max': max(
+            (len(v['link']) for v in site_graph.values()), default=0
+        ),
+        'ne_graph_count': len(ne_graph),
+        'ne_with_site_count': sum(
+            1 for ne in ne_graph.values() if ne.get('site_id')
+        ),
+        'peer_index_count': len(peer_index),
+        'site_device_count': len(site_device_counts),
+    }
+
+
+def _write_resource_buffer_file(output_path, resources):
+    """逐资源写 JSONL（每行一个 {"resource_type", "data"}），返回 site_chains。
+
+    site_chains 只依赖 ne_graph：先写并（通过 pop）释放其余大资源，避免
+    pairwise/site_chains 的临时结构与之叠加成峰值。调用方须在调用前删除
+    自己持有的资源引用。
+    """
     with open(output_path, 'w', encoding='utf-8') as f:
-        _write_resource_line(f, 'site_graph', site_graph)
-        del site_graph
+        _write_resource_line(f, 'site_graph', resources.pop('site_graph'))
 
+        ne_graph = resources.pop('ne_graph')
         _write_resource_line(f, 'ne_graph', ne_graph)
 
-        _write_resource_line(f, 'link_peer_index', peer_index)
-        del peer_index
-
-        _write_resource_line(f, 'site_device_counts', site_device_counts)
-        del site_device_counts
+        _write_resource_line(f, 'link_peer_index', resources.pop('link_peer_index'))
+        _write_resource_line(
+            f, 'site_device_counts', resources.pop('site_device_counts')
+        )
 
         # ne_graph 已写盘；site_chains 仅读 site_id/domain/link。删除字段不会让 Python dict
         # 的哈希表缩容，因此逐节点重建小字典，真正释放 name/经纬度等值及空槽容量。
@@ -777,31 +827,41 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
         print("\n生成站点链路(site_chains)...")
         site_chains = build_site_chains_field(ne_graph)
         _write_resource_line(f, 'site_chains', site_chains)
+    return site_chains
 
-    # 汇总
+
+def _print_resource_buffer_summary(output_path, counts, site_chains):
+    """打印各资源的汇总统计。"""
     print(f"\n生成文件: {output_path}")
 
-    print(f"  [site_graph] 站点数: {site_graph_count}")
-    if site_graph_count:
-        print(f"    平均邻居站点数: {site_neighbor_total/site_graph_count:.1f}")
-        print(f"    最大邻居站点数: {site_neighbor_max}")
-
-    print(f"  [ne_graph] NE数: {ne_graph_count}")
-    if ne_graph_count:
+    print(f"  [site_graph] 站点数: {counts['site_graph_count']}")
+    if counts['site_graph_count']:
         print(
-            f"    有站点信息的NE: {ne_with_site_count} "
-            f"({ne_with_site_count/ne_graph_count*100:.1f}%)"
+            f"    平均邻居站点数: "
+            f"{counts['site_neighbor_total']/counts['site_graph_count']:.1f}"
+        )
+        print(f"    最大邻居站点数: {counts['site_neighbor_max']}")
+
+    print(f"  [ne_graph] NE数: {counts['ne_graph_count']}")
+    if counts['ne_graph_count']:
+        print(
+            f"    有站点信息的NE: {counts['ne_with_site_count']} "
+            f"({counts['ne_with_site_count']/counts['ne_graph_count']*100:.1f}%)"
         )
 
-    print(f"  [link_peer_index] 对端索引记录数: {peer_index_count}")
+    print(f"  [link_peer_index] 对端索引记录数: {counts['peer_index_count']}")
 
-    print(f"  [site_device_counts] 站点画像数: {site_device_count}")
+    print(f"  [site_device_counts] 站点画像数: {counts['site_device_count']}")
 
     site_chains_meta = site_chains.get('meta', {})
     print(f"  [site_chains] 站点数: {site_chains_meta.get('site_count', len(site_chains.get('sites', {})))}")
     print(f"    下游可达关系数: {site_chains_meta.get('total_downstream_relations', 0)}")
     print(f"    双向直接边数: {site_chains_meta.get('total_bidirectional_edges', 0)}")
+    _print_site_chains_details(site_chains_meta)
 
+
+def _print_site_chains_details(site_chains_meta):
+    """打印 site_chains 后处理与约束校验统计。"""
     completion_stats = site_chains_meta.get('data_upstream_chain_completion') or {}
     if completion_stats:
         print(
@@ -816,39 +876,55 @@ def build_resource_buffer(ne_records, site_records, ne_ne_records, port_port_rec
             f"    误连接剔除站点对数: "
             f"{site_chains_meta['transmission_misconnection_pair_count']}"
         )
+    _print_constraint_check_summary(site_chains_meta)
 
-    constraint_check_stats = (
-        site_chains_meta.get('cross_domain_constraint_check') or {}
-    ).get('stats') or {}
-    if constraint_check_stats:
-        print(
-            f"    跨类型约束: {constraint_check_stats.get('constraint_count', 0)} 条 "
-            f"(直连满足 {constraint_check_stats.get('satisfied_direct_count', 0)}, "
-            f"多跳满足 {constraint_check_stats.get('satisfied_multi_hop_count', 0)}, "
-            f"不可达 {constraint_check_stats.get('unreachable_count', 0)})"
-        )
-        print(
-            f"    约束违例: 反向 {constraint_check_stats.get('reverse_violation_count', 0)}, "
-            f"平行 {constraint_check_stats.get('bidirectional_violation_count', 0)}"
-        )
-        reverse_violations = [
-            violation
-            for violation in (
-                site_chains_meta.get('cross_domain_constraint_check') or {}
-            ).get('violations', [])
-            if violation.get('type') == 'reverse'
-        ]
-        if reverse_violations:
-            print("    反向违例明细:")
-            for violation in reverse_violations:
-                print(
-                    f"      {violation.get('upstream_site')} -> "
-                    f"{violation.get('downstream_site')} "
-                    f"(最终反向 hop={violation.get('hop')})"
-                )
+
+def _print_constraint_check_summary(site_chains_meta):
+    """打印跨类型方向约束校验统计与反向违例明细。"""
+    constraint_check = site_chains_meta.get('cross_domain_constraint_check') or {}
+    constraint_check_stats = constraint_check.get('stats') or {}
+    if not constraint_check_stats:
+        return
+    print(
+        f"    跨类型约束: {constraint_check_stats.get('constraint_count', 0)} 条 "
+        f"(直连满足 {constraint_check_stats.get('satisfied_direct_count', 0)}, "
+        f"多跳满足 {constraint_check_stats.get('satisfied_multi_hop_count', 0)}, "
+        f"不可达 {constraint_check_stats.get('unreachable_count', 0)})"
+    )
+    print(
+        f"    约束违例: 反向 {constraint_check_stats.get('reverse_violation_count', 0)}, "
+        f"平行 {constraint_check_stats.get('bidirectional_violation_count', 0)}"
+    )
+    reverse_violations = [
+        violation
+        for violation in constraint_check.get('violations', [])
+        if violation.get('type') == 'reverse'
+    ]
+    if reverse_violations:
+        print("    反向违例明细:")
+        for violation in reverse_violations:
+            print(
+                f"      {violation.get('upstream_site')} -> "
+                f"{violation.get('downstream_site')} "
+                f"(最终反向 hop={violation.get('hop')})"
+            )
 
 
 def main():
+    args = _parse_args()
+    # 要换数据源，只需改为产出同结构 dict 的生成器。
+    build_resource_buffer(
+        ne_records=iter_ne_csv_records(args.ne_dir),
+        site_records=iter_site_csv_records(args.site_dir),
+        ne_ne_records=iter_ne_ne_link(args.link_input),
+        port_port_records=iter_port_port(args.link_input),
+        ne_port_records=iter_ne_port_link(args.link_input),
+        output_path=args.output,
+        report_duplicates=args.report_duplicates,
+    )
+
+
+def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "一次性生成单个资源缓冲文件（site_graph / ne_graph / "
@@ -877,26 +953,17 @@ def main():
         "--output",
         "-o",
         default=DEFAULT_BUFFER_OUTPUT,
-        help=f"输出缓冲文件（JSONL，每行一个 {{resource_type,data}} 资源），默认: {resource_display('resource_buffer.jsonl')}",
+        help=(
+            "输出缓冲文件（JSONL，每行一个 {resource_type,data} 资源），"
+            f"默认: {resource_display('resource_buffer.jsonl')}"
+        ),
     )
     parser.add_argument(
         "--report-duplicates",
         action="store_true",
         help="打印 NE/站点/链路 中重复 ID 的明细（默认仅汇总，不打印明细）",
     )
-    args = parser.parse_args()
-
-    # 唯一耦合点：从当前 CSV 构造资源记录生成器。要换数据源，只需在这里换成
-    # 产出同结构 dict 记录的生成器，build_resource_buffer 无需改动。
-    build_resource_buffer(
-        ne_records=iter_ne_csv_records(args.ne_dir),
-        site_records=iter_site_csv_records(args.site_dir),
-        ne_ne_records=iter_ne_ne_link(args.link_input),
-        port_port_records=iter_port_port(args.link_input),
-        ne_port_records=iter_ne_port_link(args.link_input),
-        output_path=args.output,
-        report_duplicates=args.report_duplicates,
-    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

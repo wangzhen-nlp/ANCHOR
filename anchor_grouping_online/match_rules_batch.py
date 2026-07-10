@@ -117,6 +117,24 @@ class BatchFaultGroupMatcher:
     成员」：传入 old_agg 时合并其既有成员输出完整成员（组内按告警编码
     ID 去重）；未传 old_agg 时不跨批持久保存历史全量，退回本批增量成员，
     此时与默认口径等价。
+
+    外置状态模式（old_agg_alarm_groups）：传入既有二次汇聚故障组（格式
+    与输出一致）时，以它为跨窗口上下文重建临时会话后再汇聚本批，可关联
+    其中的告警/原始组/汇聚组 ID；其归属与计数完整保留、不过期，但告警
+    只有位于「本批最早告警时间 - max_group_time」之后才写入临时
+    event_cache 作为匹配证据（边匹配仍受 associate_time 约束）。调用结束
+    把外置归属/计数与本批结果同步进内部会话（自动去重），但 old_agg
+    历史事件仅本次有效，持久引擎只喂本批告警。适合调用方自行保管状态的
+    无状态服务部署。累积输出到 old_agg 时：full_output=True 按 agg_id
+    整体替换该汇聚组；False 须按原始组 ID 合并、告警编码 ID 去重（直接
+    extend 会重复累积、内存膨胀，内部仍去重、结果正确）。
+
+    输出口径：只返回本批发生变化（新汇聚组／新成员组／组内新告警）的
+    汇聚组，纯重发不返回，整批无变化返回空字典。key 为稳定的汇聚故障组
+    ID（UUID，同一场故障后续沿用）；value 为原始组条目列表，每条为
+    {原始组id: [告警, ...]}（按告警编码 ID 去重）。只输出累计至少含 2 个
+    原始故障组的汇聚组；未汇聚且未附着的单成员组不分配 ID、不建立候选
+    状态。
     """
 
     def __init__(
@@ -169,40 +187,12 @@ class BatchFaultGroupMatcher:
 
         拿全量告警按 ANCHOR 规则聚合故障组，再通过并查集把原始组汇聚到
         一起——两告警被聚进同一故障组，则各自所属原始组汇聚为一组；未形成
-        关联且无法附着的单成员组不输出。各模式语义见类 docstring。
-
-        输入参数
-            alarm_groups     Dict[str, List]  必选
-                待二次汇聚的故障组集合 {故障组id: [告警, ...]}，告警为
-                告警生成器输出的字典（见模块 docstring）。
-            associate_time   int              必选
-                关联告警的时间窗（分钟），即匹配阶段的规则边时间窗。
-            max_group_time   int              必选
-                汇聚后故障组允许的最大时间窗（分钟），即组保留时长。
-            max_group_member int              必选
-                汇聚故障组允许包含的最大原始故障组个数。附着会超限时放弃
-                附着；本批内部分量超限时按成员时间顺序切分，单个原始组
-                永远不会被拆开。
-            old_agg_alarm_groups Dict[str, List[Dict[str, List]]] 可选
-                既有二次汇聚故障组（格式与输出一致）。提供时以它为跨窗口
-                上下文重建临时会话后再汇聚本批，可关联其中的告警/原始组/
-                汇聚组 ID；其归属与计数完整保留、不过期，但告警只有位于
-                「本批最早告警时间 - max_group_time」之后才写入临时
-                event_cache 作为匹配证据（边匹配仍受 associate_time 约束）。
-                调用结束把外置归属/计数与本批结果同步进内部会话（自动
-                去重），但 old_agg 历史事件仅本次有效，持久引擎只喂本批
-                告警。适合调用方自行保管状态的无状态服务部署。累积输出到
-                old_agg 时：full_output=True 按 agg_id 整体替换该汇聚组；
-                False 须按原始组 ID 合并、告警编码 ID 去重（直接 extend
-                会重复累积、内存膨胀，内部仍去重、结果正确）。
-        输出参数
-            agg_alarm_groups Dict[str, List[Dict[str, List]]]
-                只返回本批发生变化（新汇聚组／新成员组／组内新告警）的
-                汇聚组，纯重发不返回，整批无变化返回空字典。key 为稳定的
-                汇聚故障组 ID（UUID，同一场故障后续沿用）；value 为原始组
-                条目列表，每条为 {原始组id: [告警, ...]}（按告警编码 ID
-                去重）。只输出累计至少含 2 个原始故障组的汇聚组；未汇聚
-                且未附着的单成员组不分配 ID、不建立候选状态。
+        关联且无法附着的单成员组不输出。alarm_groups 为待二次汇聚的故障组
+        集合 {故障组id: [告警, ...]}（告警字段见模块 docstring）；
+        associate_time / max_group_time 为关联时间窗与组保留时长（分钟）；
+        max_group_member 为汇聚组最大原始组个数（超限时放弃附着或按成员
+        时间顺序切分，单个原始组不拆开）；old_agg_alarm_groups 为既有二次
+        汇聚故障组（外置状态模式）。输出口径与各模式语义详见类 docstring。
         """
         max_member_count = int(max_group_member)
         # 调用内共享的告警转换缓存：各阶段复用同一份 to_matching_alarm 结果。
@@ -217,16 +207,8 @@ class BatchFaultGroupMatcher:
         batch = self._register_batch_input(
             session, engine, alarm_groups, matching_cache, ne_to_site
         )
-        # 2. 批开始的历史回收：统一视界 = 本批最早告警时间 − max_group_time。
-        #    外置状态模式跳过：old_agg 归属永久保留，其匹配证据已按视界过滤。
-        if (
-            batch.batch_min_ts is not None
-            and old_agg_alarm_groups is None
-            and not self.batch_isolated
-        ):
-            for node in list(engine.event_cache.keys()):
-                engine._prune_expired_raw_events_in_place(node, batch.batch_min_ts)
-            _prune_session_history(session, batch.batch_min_ts - session["max_stay_sec"])
+        # 2. 批开始的历史回收（外置状态模式跳过）。
+        self._prune_batch_horizon(session, batch, old_agg_alarm_groups)
         # 3. 喂流 + 收割，再把匹配组转成组间连边与历史汇聚组关联。
         output_matches = self._collect_batch_matches(
             engine, batch, matching_cache, ne_to_site
@@ -236,6 +218,32 @@ class BatchFaultGroupMatcher:
         batch_member_entries_by_agg, changed_agg_ids = self._assign_components(
             session, alarm_groups, batch, links, max_member_count
         )
+        # 5~6. 构建增量、同步外置状态并生成对外输出。
+        return self._finalize_batch(
+            session, batch, alarm_groups, associate_time, max_group_time,
+            old_agg_alarm_groups, batch_member_entries_by_agg, changed_agg_ids,
+            matching_cache, ne_to_site,
+        )
+
+    def _prune_batch_horizon(self, session, batch, old_agg_alarm_groups):
+        """批开始的历史回收：统一视界 = 本批最早告警时间 − max_group_time。
+
+        外置状态模式跳过：old_agg 归属永久保留，其匹配证据已按视界过滤。
+        """
+        if (
+            batch.batch_min_ts is None
+            or old_agg_alarm_groups is not None
+            or self.batch_isolated
+        ):
+            return
+        _prune_session_horizon(session, batch.batch_min_ts)
+
+    def _finalize_batch(
+        self, session, batch, alarm_groups, associate_time, max_group_time,
+        old_agg_alarm_groups, batch_member_entries_by_agg, changed_agg_ids,
+        matching_cache, ne_to_site,
+    ):
+        """构建本批增量、同步外置状态并生成对外输出。"""
         need_full_increment = (
             old_agg_alarm_groups is not None and not self.batch_isolated
         )
@@ -273,18 +281,10 @@ class BatchFaultGroupMatcher:
         证据；转换结果写入 matching_cache 供后续登记/喂流复用。归属注册表
         仍完整导入。
         """
-        external_history_horizon_ts = None
-        if old_agg_alarm_groups is not None:
-            external_batch_min_ts = None
-            for group_alarms in alarm_groups.values():
-                for generated_alarm in group_alarms or ():
-                    ts = _matching_alarm(generated_alarm, matching_cache, ne_to_site)["ts"]
-                    if external_batch_min_ts is None or ts < external_batch_min_ts:
-                        external_batch_min_ts = ts
-            if external_batch_min_ts is not None:
-                external_history_horizon_ts = (
-                    external_batch_min_ts - float(max_group_time) * 60.0
-                )
+        external_history_horizon_ts = self._external_history_horizon(
+            alarm_groups, max_group_time, old_agg_alarm_groups,
+            matching_cache, ne_to_site,
+        )
         if self.batch_isolated:
             # 隔离模式所有状态仅在本次调用内存活，不保留上一批会话，
             # 避免与本批 old_agg 临时会话叠加占用内存。
@@ -310,6 +310,28 @@ class BatchFaultGroupMatcher:
             return self._new_session(associate_time, max_group_time)
         return self._ensure_session(associate_time, max_group_time)
 
+    @staticmethod
+    def _external_history_horizon(
+        alarm_groups, max_group_time, old_agg_alarm_groups,
+        matching_cache, ne_to_site,
+    ):
+        """外置状态模式的历史证据时间下界：本批最早告警时间 - max_group_time。
+
+        非外置模式返回 None。O(batch) 的预计算；转换结果写入
+        matching_cache 供后续登记/喂流复用。
+        """
+        if old_agg_alarm_groups is None:
+            return None
+        batch_min_ts = None
+        for group_alarms in alarm_groups.values():
+            for generated_alarm in group_alarms or ():
+                ts = _matching_alarm(generated_alarm, matching_cache, ne_to_site)["ts"]
+                if batch_min_ts is None or ts < batch_min_ts:
+                    batch_min_ts = ts
+        if batch_min_ts is None:
+            return None
+        return batch_min_ts - float(max_group_time) * 60.0
+
     def _register_batch_input(
         self, session, engine, alarm_groups, matching_cache, ne_to_site
     ):
@@ -333,51 +355,70 @@ class BatchFaultGroupMatcher:
         )
         batch_alarm_ids = set()
         for group_id, group_alarms in alarm_groups.items():
-            alarm_ids = set()
-            kept_alarms = []
-            min_ts = None
-            group_last_ts = None
-            for generated_alarm in group_alarms or ():
-                matching_alarm = _matching_alarm(generated_alarm, matching_cache, ne_to_site)
-                alarm_id = matching_alarm["alarm_id"]
-                ts = matching_alarm["ts"]
-                first_in_batch = alarm_id not in batch_alarm_ids
-                batch_alarm_ids.add(alarm_id)
-                if first_in_batch:
-                    batch.current_generated_alarms.append(generated_alarm)
-                if batch.batch_min_ts is None or ts < batch.batch_min_ts:
-                    batch.batch_min_ts = ts
-                min_ts = ts if min_ts is None else min(min_ts, ts)
-                if alarm_id not in alarm_ids:
-                    kept_alarms.append(generated_alarm)
-                alarm_ids.add(alarm_id)
-                owner_group_ids = batch.local_alarm_owners.setdefault(alarm_id, [])
-                if group_id not in owner_group_ids:
-                    owner_group_ids.append(group_id)
-                alarm_entry = session["alarm_registry"].get(alarm_id)
-                alarm_was_registered = alarm_entry is not None
-                if alarm_entry is None:
-                    alarm_entry = _register_alarm(session, alarm_id, ts, None)
-                registered_ts = alarm_entry[0]
-                if group_last_ts is None or registered_ts > group_last_ts:
-                    group_last_ts = registered_ts
-                if not batch.use_batch_upsert:
-                    if first_in_batch and (
-                        not alarm_was_registered or matching_alarm["is_clear"]
-                    ):
-                        batch.new_generated_alarms.append(generated_alarm)
-                    elif first_in_batch:
-                        batch.overlapping_generated_alarms.append(generated_alarm)
-            batch.local_group_alarm_ids[group_id] = alarm_ids
-            batch.local_group_alarms[group_id] = kept_alarms
-            batch.local_group_min_ts[group_id] = min_ts
-            # 组注册表：刷新最近告警时间（归属在分量分配阶段写入）。
-            group_entry = session["group_registry"].get(group_id)
-            if group_entry is None:
-                _register_group(session, group_id, group_last_ts, None)
-            else:
-                _touch_group(session, group_id, group_last_ts)
+            self._register_batch_group(
+                session, batch, batch_alarm_ids, group_id, group_alarms,
+                matching_cache, ne_to_site,
+            )
         return batch
+
+    def _register_batch_group(
+        self, session, batch, batch_alarm_ids, group_id, group_alarms,
+        matching_cache, ne_to_site,
+    ):
+        """登记单个原始组的本批告警，并刷新组注册表的最近告警时间。"""
+        alarm_ids = set()
+        kept_alarms = []
+        min_ts = None
+        group_last_ts = None
+        for generated_alarm in group_alarms or ():
+            matching_alarm = _matching_alarm(generated_alarm, matching_cache, ne_to_site)
+            alarm_id = matching_alarm["alarm_id"]
+            ts = matching_alarm["ts"]
+            first_in_batch = alarm_id not in batch_alarm_ids
+            batch_alarm_ids.add(alarm_id)
+            if first_in_batch:
+                batch.current_generated_alarms.append(generated_alarm)
+            if batch.batch_min_ts is None or ts < batch.batch_min_ts:
+                batch.batch_min_ts = ts
+            min_ts = ts if min_ts is None else min(min_ts, ts)
+            if alarm_id not in alarm_ids:
+                kept_alarms.append(generated_alarm)
+            alarm_ids.add(alarm_id)
+            owner_group_ids = batch.local_alarm_owners.setdefault(alarm_id, [])
+            if group_id not in owner_group_ids:
+                owner_group_ids.append(group_id)
+            alarm_entry = session["alarm_registry"].get(alarm_id)
+            alarm_was_registered = alarm_entry is not None
+            if alarm_entry is None:
+                alarm_entry = _register_alarm(session, alarm_id, ts, None)
+            registered_ts = alarm_entry[0]
+            if group_last_ts is None or registered_ts > group_last_ts:
+                group_last_ts = registered_ts
+            self._classify_trigger_eligibility(
+                batch, generated_alarm, first_in_batch, alarm_was_registered,
+                matching_alarm["is_clear"],
+            )
+        batch.local_group_alarm_ids[group_id] = alarm_ids
+        batch.local_group_alarms[group_id] = kept_alarms
+        batch.local_group_min_ts[group_id] = min_ts
+        # 组注册表：刷新最近告警时间（归属在分量分配阶段写入）。
+        group_entry = session["group_registry"].get(group_id)
+        if group_entry is None:
+            _register_group(session, group_id, group_last_ts, None)
+        else:
+            _touch_group(session, group_id, group_last_ts)
+
+    @staticmethod
+    def _classify_trigger_eligibility(
+        batch, generated_alarm, first_in_batch, alarm_was_registered, is_clear
+    ):
+        """非 upsert 引擎按「新告警/重叠告警」划分本批 trigger 资格。"""
+        if batch.use_batch_upsert or not first_in_batch:
+            return
+        if not alarm_was_registered or is_clear:
+            batch.new_generated_alarms.append(generated_alarm)
+        else:
+            batch.overlapping_generated_alarms.append(generated_alarm)
 
     def _collect_batch_matches(self, engine, batch, matching_cache, ne_to_site):
         """增量喂流 + 逐 trigger 收割 + 批内/历史合并与输出可见性过滤。"""
@@ -481,11 +522,7 @@ class BatchFaultGroupMatcher:
         新 ID。返回 (本批各汇聚组成员条目, 本批发生变化的汇聚组 ID 集合)。
         """
         local_union, linked_agg_ids_by_group, current_group_edges = links
-
-        def member_order_key(group_id):
-            min_ts = batch.local_group_min_ts.get(group_id)
-            return (min_ts is None, min_ts if min_ts is not None else 0.0, str(group_id))
-
+        member_order_key = _batch_member_order_key(batch)
         # changed_agg_ids 记录本批真正变化的汇聚组：新增原始组成员，或已有
         # 成员组内新增告警；新建汇聚组必然带来新成员，天然纳入。
         batch_member_entries_by_agg = {}
@@ -494,68 +531,90 @@ class BatchFaultGroupMatcher:
         for members in components:
             members.sort(key=member_order_key)
         components.sort(key=lambda members: member_order_key(members[0]))
-
         for members in components:
-            linked_agg_ids = []
-            for group_id in members:
-                for agg_id in linked_agg_ids_by_group[group_id]:
-                    if agg_id in session["agg_registry"] and agg_id not in linked_agg_ids:
-                        linked_agg_ids.append(agg_id)
+            self._assign_component(
+                session, batch, members, linked_agg_ids_by_group,
+                current_group_edges, max_member_count,
+                batch_member_entries_by_agg, changed_agg_ids,
+            )
+        return batch_member_entries_by_agg, changed_agg_ids
 
-            # 已有归属一旦落定就不改挂；其余成员仅在能附着到既有汇聚组或
-            # 与至少一个其他成员形成新汇聚时才分配 ID。
-            unassigned_members = []
-            for group_id in members:
-                existing_agg_id = session["group_registry"][group_id][1]
-                if existing_agg_id in session["agg_registry"]:
-                    self._assign_members_to_agg(
-                        session, existing_agg_id, [group_id], batch,
-                        batch_member_entries_by_agg, changed_agg_ids,
-                    )
-                else:
-                    _set_group_owner(session, group_id, None)
-                    unassigned_members.append(group_id)
-            if not unassigned_members:
-                continue
-
-            # 新成员同时关联多个历史汇聚组时，只选一个能整体容纳本子分量
-            # 的目标，既有汇聚组之间不合并。
-            eligible_targets = [
-                agg_id for agg_id in linked_agg_ids
-                if session["agg_registry"][agg_id][0] + len(unassigned_members)
-                <= max_member_count
-            ]
-            if eligible_targets:
-                eligible_targets.sort(
-                    key=lambda a: (-session["agg_registry"][a][2], str(a))
-                )
+    def _assign_component(
+        self, session, batch, members, linked_agg_ids_by_group,
+        current_group_edges, max_member_count,
+        batch_member_entries_by_agg, changed_agg_ids,
+    ):
+        """单个连通分量的归属分配：沿用既有归属 → 附着历史组 → 新建。"""
+        linked_agg_ids = []
+        for group_id in members:
+            for agg_id in linked_agg_ids_by_group[group_id]:
+                if agg_id in session["agg_registry"] and agg_id not in linked_agg_ids:
+                    linked_agg_ids.append(agg_id)
+        # 已有归属一旦落定就不改挂；其余成员仅在能附着到既有汇聚组或
+        # 与至少一个其他成员形成新汇聚时才分配 ID。
+        unassigned_members = []
+        for group_id in members:
+            existing_agg_id = session["group_registry"][group_id][1]
+            if existing_agg_id in session["agg_registry"]:
                 self._assign_members_to_agg(
-                    session, eligible_targets[0], unassigned_members, batch,
+                    session, existing_agg_id, [group_id], batch,
                     batch_member_entries_by_agg, changed_agg_ids,
                 )
-                continue
+            else:
+                _set_group_owner(session, group_id, None)
+                unassigned_members.append(group_id)
+        if not unassigned_members:
+            return
+        # 新成员同时关联多个历史汇聚组时，只选一个能整体容纳本子分量
+        # 的目标，既有汇聚组之间不合并。
+        eligible_targets = [
+            agg_id for agg_id in linked_agg_ids
+            if session["agg_registry"][agg_id][0] + len(unassigned_members)
+            <= max_member_count
+        ]
+        if eligible_targets:
+            eligible_targets.sort(
+                key=lambda a: (-session["agg_registry"][a][2], str(a))
+            )
+            self._assign_members_to_agg(
+                session, eligible_targets[0], unassigned_members, batch,
+                batch_member_entries_by_agg, changed_agg_ids,
+            )
+            return
+        self._assign_split_components(
+            session, batch, unassigned_members, current_group_edges,
+            max_member_count, batch_member_entries_by_agg, changed_agg_ids,
+        )
 
-            # 无历史目标可容纳：只保留未归属成员彼此间的直接匹配边重算
-            # 连通子图。仅通过已落定成员传递连通的新组自然拆开。
-            unassigned_set = set(unassigned_members)
-            sub_union = _GroupUnionFind()
-            for group_id in unassigned_members:
-                sub_union.add(group_id)
-            for edge_group_ids in current_group_edges:
-                sub_union.union_all([g for g in edge_group_ids if g in unassigned_set])
-            sub_components = sub_union.components(unassigned_members)
-            for sub_members in sub_components:
-                sub_members.sort(key=member_order_key)
-            sub_components.sort(key=lambda sub: member_order_key(sub[0]))
-            for sub_members in sub_components:
-                for pack_members in _split_members_by_cap(sub_members, max_member_count):
-                    if len(pack_members) < 2:
-                        continue
-                    self._assign_members_to_agg(
-                        session, _new_agg_group(session), pack_members, batch,
-                        batch_member_entries_by_agg, changed_agg_ids,
-                    )
-        return batch_member_entries_by_agg, changed_agg_ids
+    def _assign_split_components(
+        self, session, batch, unassigned_members, current_group_edges,
+        max_member_count, batch_member_entries_by_agg, changed_agg_ids,
+    ):
+        """无历史目标可容纳时的新建分配。
+
+        只保留未归属成员彼此间的直接匹配边重算连通子图（仅通过已落定
+        成员传递连通的新组自然拆开），按上限切分后为 >=2 成员的包分配
+        全新汇聚组 ID。
+        """
+        member_order_key = _batch_member_order_key(batch)
+        unassigned_set = set(unassigned_members)
+        sub_union = _GroupUnionFind()
+        for group_id in unassigned_members:
+            sub_union.add(group_id)
+        for edge_group_ids in current_group_edges:
+            sub_union.union_all([g for g in edge_group_ids if g in unassigned_set])
+        sub_components = sub_union.components(unassigned_members)
+        for sub_members in sub_components:
+            sub_members.sort(key=member_order_key)
+        sub_components.sort(key=lambda sub: member_order_key(sub[0]))
+        for sub_members in sub_components:
+            for pack_members in _split_members_by_cap(sub_members, max_member_count):
+                if len(pack_members) < 2:
+                    continue
+                self._assign_members_to_agg(
+                    session, _new_agg_group(session), pack_members, batch,
+                    batch_member_entries_by_agg, changed_agg_ids,
+                )
 
     def _assign_members_to_agg(
         self, session, agg_id, member_group_ids, batch,
@@ -682,25 +741,18 @@ class BatchFaultGroupMatcher:
         return agg_alarm_groups
 
     def _merge_increment_into_session(
-        self,
-        agg_output,
-        associate_time,
-        max_group_time,
-        batch_min_ts,
-        raw_alarm_groups=None,
-        imported_agg_counts=None,
-        matching_cache=None,
+        self, agg_output, associate_time, max_group_time, batch_min_ts,
+        raw_alarm_groups=None, imported_agg_counts=None, matching_cache=None,
     ):
         """把外置归属快照、本批增量及本批原始告警并入内部会话。
 
         按增量合并：汇聚组条目缺失才创建；新原始组才计数；本批告警统一
-        幂等写入内部引擎。既有原始组的归属发生变化视为外置状态冲突，
-        直接报错。raw_alarm_groups 只补齐原始组/告警缓存；未汇聚成员的
-        归属保持 None，不创建单成员二次汇聚组。外置历史告警只登记归属，
-        不写入持久引擎；持久 event_cache 和 trigger 只接收本批原始告警。
-        合并后对内部会话执行与内部调用相同的视界清理——纯外置使用形态
-        （每批都传 old_agg）下这是内部状态唯一的过期出口，否则只进不出、
-        无界增长。
+        幂等写入内部引擎；既有归属发生变化视为外置状态冲突，直接报错。
+        raw_alarm_groups 只补齐原始组/告警缓存；未汇聚成员的归属保持
+        None，不创建单成员二次汇聚组。外置历史告警只登记归属，不写入
+        持久引擎；持久 event_cache 和 trigger 只接收本批原始告警。合并后
+        执行与内部调用相同的视界清理——纯外置使用形态（每批都传 old_agg）
+        下这是内部状态唯一的过期出口，否则只进不出、无界增长。
         """
         session = self._ensure_session(associate_time, max_group_time)
         ne_to_site = self.static_context.ne_to_site
@@ -709,55 +761,21 @@ class BatchFaultGroupMatcher:
             current_matching_alarms_by_id,
             current_generated_alarms_by_id,
         ) = _index_current_alarms(raw_alarm_groups, matching_cache, ne_to_site)
-
-        def resolve_matching_alarm(generated_alarm):
-            if isinstance(generated_alarm, dict):
-                raw_alarm_id = generated_alarm.get("vid")
-                if isinstance(raw_alarm_id, str):
-                    current_alarm = current_matching_alarms_by_id.get(
-                        raw_alarm_id.strip()
-                    )
-                    if current_alarm is not None:
-                        return current_alarm
-            return _matching_alarm(generated_alarm, matching_cache, ne_to_site)
-
+        resolve_matching_alarm = _make_matching_alarm_resolver(
+            current_matching_alarms_by_id, matching_cache, ne_to_site
+        )
         imported_group_ids, imported_alarm_ids = _validate_external_increment(
             session, agg_output, resolve_matching_alarm,
             need_id_sets=imported_agg_counts is None,
         )
         _import_external_entries(session, agg_output, resolve_matching_alarm)
-
         # 本批未进入可见汇聚输出的原始告警也要保留，确保外置调用后切换到
         # 内部模式时，时序引擎拥有与连续内部模式一致的事件历史。
-        for group_id, alarm_records in current_alarm_records_by_group.items():
-            group_entry = session["group_registry"].get(group_id)
-            if group_entry is None:
-                group_entry = _register_group(session, group_id, None, None)
-            current_group_last_ts = group_entry[0]
-            for generated_alarm, matching_alarm in alarm_records:
-                alarm_id = matching_alarm["alarm_id"]
-                ts = matching_alarm["ts"]
-                if alarm_id not in session["alarm_registry"]:
-                    _register_alarm(session, alarm_id, ts, None)
-                if current_group_last_ts is None or ts > current_group_last_ts:
-                    current_group_last_ts = ts
-            _touch_group(session, group_id, current_group_last_ts)
-
-        if imported_agg_counts is None:
-            imported_agg_counts = {
-                agg_id: (
-                    len(imported_group_ids[agg_id]),
-                    len(imported_alarm_ids[agg_id]),
-                )
-                for agg_id in agg_output
-            }
-        # 直接覆盖临时会话已按唯一 ID 算好的计数，保证重复导入幂等，也
-        # 避免 O(|group_registry| + |alarm_registry|) 的内部全表扫描。
-        for agg_id in agg_output:
-            agg_entry = session["agg_registry"].get(agg_id)
-            if agg_entry is not None:
-                agg_entry[0], agg_entry[2] = imported_agg_counts[agg_id]
-
+        _register_current_batch_groups(session, current_alarm_records_by_group)
+        _overwrite_agg_counts(
+            session, agg_output, imported_agg_counts,
+            imported_group_ids, imported_alarm_ids,
+        )
         if current_generated_alarms_by_id:
             self._feed_engine(
                 session["engine"],
@@ -769,12 +787,7 @@ class BatchFaultGroupMatcher:
             )
         # 视界清理：本批告警均不早于 batch_min_ts，只会清掉更早的历史。
         if batch_min_ts is not None:
-            engine = session["engine"]
-            for node in list(engine.event_cache.keys()):
-                engine._prune_expired_raw_events_in_place(node, batch_min_ts)
-            _prune_session_history(
-                session, batch_min_ts - session["max_stay_sec"]
-            )
+            _prune_session_horizon(session, batch_min_ts)
 
     def _rebuild_session_from_agg(
         self, old_agg_alarm_groups, associate_time, max_group_time,
@@ -794,61 +807,66 @@ class BatchFaultGroupMatcher:
         """
         session = self._new_session(associate_time, max_group_time)
         ne_to_site = self.static_context.ne_to_site
-        for raw_agg_id, member_entries in old_agg_alarm_groups.items():
-            agg_id = raw_agg_id
+        for agg_id, member_entries in old_agg_alarm_groups.items():
             agg_entry = _ensure_agg(session, agg_id)
             agg_last_ts = None
             for member_entry in member_entries or ():
                 for group_id, group_alarms in member_entry.items():
-                    group_entry = session["group_registry"].get(group_id)
-                    if group_entry is None:
-                        group_entry = _register_group(
-                            session, group_id, None, agg_id
-                        )
-                        agg_entry[0] += 1
-                    elif group_entry[1] != agg_id:
-                        raise ValueError(
-                            f"外置历史冲突：原始故障组 {group_id!r} 同时归属"
-                            f" {group_entry[1]!r} 和 {agg_id!r}"
-                        )
-                    group_last_ts = None
-                    for generated_alarm in group_alarms or ():
-                        matching_alarm = _matching_alarm(
-                            generated_alarm, matching_cache, ne_to_site
-                        )
-                        if matching_alarm["is_clear"]:
-                            raise ValueError(
-                                "old_agg 只允许包含有效发生告警，不允许清除告警"
-                            )
-                        alarm_id = matching_alarm["alarm_id"]
-                        ts = matching_alarm["ts"]
-                        alarm_entry = session["alarm_registry"].get(alarm_id)
-                        if alarm_entry is None:
-                            _register_alarm(session, alarm_id, ts, agg_id)
-                            if (
-                                history_horizon_ts is None
-                                or ts >= history_horizon_ts
-                            ):
-                                self._process_matching_alarm(
-                                    session["engine"],
-                                    matching_alarm,
-                                    index_trigger=False,
-                                )
-                            agg_entry[2] += 1
-                        elif alarm_entry[1] != agg_id:
-                            raise ValueError(
-                                f"外置历史冲突：告警 {alarm_id!r} 同时归属"
-                                f" {alarm_entry[1]!r} 和 {agg_id!r}"
-                            )
-                        if agg_last_ts is None or ts > agg_last_ts:
-                            agg_last_ts = ts
-                        if group_last_ts is None or ts > group_last_ts:
-                            group_last_ts = ts
-                    if group_last_ts is not None:
-                        _touch_group(session, group_id, group_last_ts)
+                    group_last_ts = self._rebuild_group_entry(
+                        session, agg_id, agg_entry, group_id, group_alarms,
+                        matching_cache, ne_to_site, history_horizon_ts,
+                    )
+                    if group_last_ts is not None and (
+                        agg_last_ts is None or group_last_ts > agg_last_ts
+                    ):
+                        agg_last_ts = group_last_ts
             if agg_last_ts is not None:
                 _touch_agg(session, agg_id, agg_last_ts)
         return session
+
+    def _rebuild_group_entry(
+        self, session, agg_id, agg_entry, group_id, group_alarms,
+        matching_cache, ne_to_site, history_horizon_ts,
+    ):
+        """导入外置汇聚组的单个成员条目，返回该条目的最晚告警时间。"""
+        group_entry = session["group_registry"].get(group_id)
+        if group_entry is None:
+            _register_group(session, group_id, None, agg_id)
+            agg_entry[0] += 1
+        elif group_entry[1] != agg_id:
+            raise ValueError(
+                f"外置历史冲突：原始故障组 {group_id!r} 同时归属"
+                f" {group_entry[1]!r} 和 {agg_id!r}"
+            )
+        group_last_ts = None
+        for generated_alarm in group_alarms or ():
+            matching_alarm = _matching_alarm(
+                generated_alarm, matching_cache, ne_to_site
+            )
+            if matching_alarm["is_clear"]:
+                raise ValueError(
+                    "old_agg 只允许包含有效发生告警，不允许清除告警"
+                )
+            alarm_id = matching_alarm["alarm_id"]
+            ts = matching_alarm["ts"]
+            alarm_entry = session["alarm_registry"].get(alarm_id)
+            if alarm_entry is None:
+                _register_alarm(session, alarm_id, ts, agg_id)
+                if history_horizon_ts is None or ts >= history_horizon_ts:
+                    self._process_matching_alarm(
+                        session["engine"], matching_alarm, index_trigger=False
+                    )
+                agg_entry[2] += 1
+            elif alarm_entry[1] != agg_id:
+                raise ValueError(
+                    f"外置历史冲突：告警 {alarm_id!r} 同时归属"
+                    f" {alarm_entry[1]!r} 和 {agg_id!r}"
+                )
+            if group_last_ts is None or ts > group_last_ts:
+                group_last_ts = ts
+        if group_last_ts is not None:
+            _touch_group(session, group_id, group_last_ts)
+        return group_last_ts
 
     def _ensure_session(self, associate_time, max_group_time):
         """惰性创建并持有内部会话；时间参数变化时原地更新会话。"""
@@ -931,40 +949,16 @@ class BatchFaultGroupMatcher:
             (generated_alarms, True),
             (trigger_only_alarms or (), False),
         )
-        if not sort_events and preconverted_events:
-            if matching_cache is None:
-                raise ValueError("preconverted_events 需要 matching_cache")
-            # 调用方已在修改引擎前完成全批转换；此处只按
-            # 原有顺序惰性读取，不改变异常原子性。
-            matching_events = (
-                (matching_cache[id(alarm)], cache_event)
-                for alarms, cache_event in event_batches
-                for alarm in alarms
-            )
-        else:
-            matching_events = [
-                (_matching_alarm(alarm, matching_cache, ne_to_site), cache_event)
-                for alarms, cache_event in event_batches
-                for alarm in alarms
-            ]
-            if sort_events:
-                matching_events.sort(key=lambda item: item[0]["ts"])
+        matching_events = BatchFaultGroupMatcher._collect_feed_events(
+            event_batches, sort_events, preconverted_events,
+            matching_cache, ne_to_site,
+        )
         trigger_candidates = []
         for alarm, cache_event in matching_events:
             if upsert_events:
-                alarm_payload = None
-                if alarm.get("extendedattr"):
-                    alarm_payload = {"extendedattr": alarm["extendedattr"]}
-                trigger_candidates.extend(engine.process_batch_event(
-                    node=alarm["site_id"],
-                    alarm_source=alarm["alarm_source"],
-                    alarm_type=alarm["alarm_title"],
-                    ts=alarm["ts"],
-                    alarm_id=alarm["alarm_id"],
-                    alarm_payload=alarm_payload,
-                    is_clear=alarm["is_clear"],
-                    index_trigger=index_trigger,
-                ))
+                BatchFaultGroupMatcher._upsert_matching_alarm(
+                    engine, alarm, index_trigger, trigger_candidates
+                )
             else:
                 BatchFaultGroupMatcher._process_matching_alarm(
                     engine,
@@ -974,6 +968,47 @@ class BatchFaultGroupMatcher:
                     trigger_candidates=trigger_candidates,
                 )
         return trigger_candidates
+
+    @staticmethod
+    def _collect_feed_events(
+        event_batches, sort_events, preconverted_events, matching_cache, ne_to_site
+    ):
+        """构造 (转换后告警, 是否缓存) 事件序列，需要时按 ts 预排序。"""
+        if not sort_events and preconverted_events:
+            if matching_cache is None:
+                raise ValueError("preconverted_events 需要 matching_cache")
+            # 调用方已在修改引擎前完成全批转换；此处只按
+            # 原有顺序惰性读取，不改变异常原子性。
+            return (
+                (matching_cache[id(alarm)], cache_event)
+                for alarms, cache_event in event_batches
+                for alarm in alarms
+            )
+        matching_events = [
+            (_matching_alarm(alarm, matching_cache, ne_to_site), cache_event)
+            for alarms, cache_event in event_batches
+            for alarm in alarms
+        ]
+        if sort_events:
+            matching_events.sort(key=lambda item: item[0]["ts"])
+        return matching_events
+
+    @staticmethod
+    def _upsert_matching_alarm(engine, alarm, index_trigger, trigger_candidates):
+        """按 eid 幂等覆盖写入持久引擎，累积本批 trigger 候选。"""
+        alarm_payload = None
+        if alarm.get("extendedattr"):
+            alarm_payload = {"extendedattr": alarm["extendedattr"]}
+        trigger_candidates.extend(engine.process_batch_event(
+            node=alarm["site_id"],
+            alarm_source=alarm["alarm_source"],
+            alarm_type=alarm["alarm_title"],
+            ts=alarm["ts"],
+            alarm_id=alarm["alarm_id"],
+            alarm_payload=alarm_payload,
+            is_clear=alarm["is_clear"],
+            index_trigger=index_trigger,
+        ))
 
     @staticmethod
     def _process_matching_alarm(
@@ -1037,27 +1072,18 @@ class BatchFaultGroupMatcher:
     ):
         """按 trigger 告警 ts 从早到晚逐个触发故障组汇聚，返回原始 match 列表。
 
-        按首触发时间升序处理，因此消费回收的 cutoff 只会清理不晚于本组
-        症状时间的历史，不影响更晚的独立故障。
-        每次汇聚成功后立即调用引擎既有的 _prune_consumed_alarm_history：
-        被故障组消费的 trigger 告警会从 trigger_event_index 中删除；
-        后续 trigger 若已被消费，会被直接跳过，不再重复汇聚。
-
-        trigger_candidates 是喂流阶段直接返回的本批候选三元组
-        (ts, seq, trigger_key)，无需再扫描 trigger_event_index 筛本批序号。
-        不在本批输入中的历史事件不会发起 trigger；本批 trigger 评估时仍可
-        引用 event_cache 中的历史告警作为症状证据。
+        升序处理保证消费回收的 cutoff 只清理不晚于本组症状时间的历史，
+        不影响更晚的独立故障；每次汇聚成功后立即调用
+        _prune_consumed_alarm_history，被消费的 trigger 直接跳过、不再
+        重复汇聚。trigger_candidates 是喂流阶段直接返回的本批候选三元组
+        (ts, seq, trigger_key)；不在本批输入中的历史事件不发起 trigger，
+        但历史告警仍可作为症状证据参与评估。
         """
-        # aggregate_alarm_groups 传入的是 _feed_engine 刚创建的
-        # 独占列表，可原地排序；其他直接调用默认仍复制，
-        # 不修改调用方容器。
-        if not owns_trigger_candidates or not isinstance(trigger_candidates, list):
-            trigger_candidates = list(trigger_candidates)
-        # 非隔离模式喂流前已按 ts 排序，同时 trigger seq
-        # 单调递增，候选已按 (ts, seq) 有序；隔离模式仍
-        # 在此排序，保证无序输入的收割语义。
-        if not trigger_candidates_sorted:
-            trigger_candidates.sort()
+        trigger_candidates = BatchFaultGroupMatcher._prepare_trigger_candidates(
+            trigger_candidates,
+            owns_trigger_candidates,
+            trigger_candidates_sorted,
+        )
         consumed_trigger_seqs = set()
 
         raw_matches = []
@@ -1082,6 +1108,19 @@ class BatchFaultGroupMatcher:
             removed_trigger_seqs = engine._prune_consumed_alarm_history(results)
             consumed_trigger_seqs.update(removed_trigger_seqs)
         return raw_matches
+
+    @staticmethod
+    def _prepare_trigger_candidates(
+        trigger_candidates,
+        owns_trigger_candidates,
+        trigger_candidates_sorted,
+    ):
+        """必要时复制并排序 trigger 候选，避免修改调用方容器。"""
+        if not owns_trigger_candidates or not isinstance(trigger_candidates, list):
+            trigger_candidates = list(trigger_candidates)
+        if not trigger_candidates_sorted:
+            trigger_candidates.sort()
+        return trigger_candidates
 
     @staticmethod
     def _merge_batch_and_finalize(engine, raw_matches):
@@ -1221,6 +1260,70 @@ def _merge_member_entries(
                     generated_alarm, matching_cache, ne_to_site
                 )["alarm_id"]
                 alarms_by_id.setdefault(alarm_id, generated_alarm)
+
+
+def _prune_session_horizon(session, batch_min_ts):
+    """视界清理：清除 batch_min_ts 之前的引擎事件与过期会话状态。"""
+    engine = session["engine"]
+    for node in list(engine.event_cache.keys()):
+        engine._prune_expired_raw_events_in_place(node, batch_min_ts)
+    _prune_session_history(session, batch_min_ts - session["max_stay_sec"])
+
+
+def _make_matching_alarm_resolver(
+    current_matching_alarms_by_id, matching_cache, ne_to_site
+):
+    """优先复用本批已转换告警的解析器：外置条目与本批重叠时避免重复转换。"""
+    def resolve_matching_alarm(generated_alarm):
+        if isinstance(generated_alarm, dict):
+            raw_alarm_id = generated_alarm.get("vid")
+            if isinstance(raw_alarm_id, str):
+                current_alarm = current_matching_alarms_by_id.get(
+                    raw_alarm_id.strip()
+                )
+                if current_alarm is not None:
+                    return current_alarm
+        return _matching_alarm(generated_alarm, matching_cache, ne_to_site)
+    return resolve_matching_alarm
+
+
+def _register_current_batch_groups(session, current_alarm_records_by_group):
+    """登记本批原始组/告警（归属保持 None），并刷新组的最近告警时间。"""
+    for group_id, alarm_records in current_alarm_records_by_group.items():
+        group_entry = session["group_registry"].get(group_id)
+        if group_entry is None:
+            group_entry = _register_group(session, group_id, None, None)
+        current_group_last_ts = group_entry[0]
+        for generated_alarm, matching_alarm in alarm_records:
+            alarm_id = matching_alarm["alarm_id"]
+            ts = matching_alarm["ts"]
+            if alarm_id not in session["alarm_registry"]:
+                _register_alarm(session, alarm_id, ts, None)
+            if current_group_last_ts is None or ts > current_group_last_ts:
+                current_group_last_ts = ts
+        _touch_group(session, group_id, current_group_last_ts)
+
+
+def _overwrite_agg_counts(
+    session, agg_output, imported_agg_counts, imported_group_ids, imported_alarm_ids
+):
+    """用唯一 ID 计数覆盖汇聚组画像，保证重复导入幂等。
+
+    直接覆盖临时会话已按唯一 ID 算好的计数，避免
+    O(|group_registry| + |alarm_registry|) 的内部全表扫描。
+    """
+    if imported_agg_counts is None:
+        imported_agg_counts = {
+            agg_id: (
+                len(imported_group_ids[agg_id]),
+                len(imported_alarm_ids[agg_id]),
+            )
+            for agg_id in agg_output
+        }
+    for agg_id in agg_output:
+        agg_entry = session["agg_registry"].get(agg_id)
+        if agg_entry is not None:
+            agg_entry[0], agg_entry[2] = imported_agg_counts[agg_id]
 
 
 def _prune_session_history(session, horizon_ts):
@@ -1431,6 +1534,14 @@ def _attach_alarms_to_agg(session, agg_id, alarm_ids):
         _touch_agg(session, agg_id, latest_ts)
 
 
+def _batch_member_order_key(batch):
+    """成员组排序键：按本批最早告警时间升序，缺失时间的组排最后。"""
+    def member_order_key(group_id):
+        min_ts = batch.local_group_min_ts.get(group_id)
+        return (min_ts is None, min_ts if min_ts is not None else 0.0, str(group_id))
+    return member_order_key
+
+
 def _split_members_by_cap(members, max_member_count):
     """把分量成员按原始组个数上限切分，返回成员列表的列表。
 
@@ -1509,27 +1620,33 @@ def _validate_external_increment(
                         f"会话中已归属 {group_entry[1]!r}，新增量却归属"
                         f" {agg_id!r}"
                     )
-                for generated_alarm in group_alarms:
-                    matching_alarm = resolve_matching_alarm(generated_alarm)
-                    if imported_alarm_ids is not None:
-                        imported_alarm_ids[agg_id].add(
-                            matching_alarm["alarm_id"]
-                        )
-                    alarm_entry = session["alarm_registry"].get(
-                        matching_alarm["alarm_id"]
-                    )
-                    if (
-                        alarm_entry is not None
-                        and alarm_entry[1] is not None
-                        and alarm_entry[1] != agg_id
-                    ):
-                        raise ValueError(
-                            f"外置增量冲突：告警 "
-                            f"{matching_alarm['alarm_id']!r} 在内部会话中"
-                            f"已归属 {alarm_entry[1]!r}，新增量却归属"
-                            f" {agg_id!r}"
-                        )
+                _validate_external_alarm_owners(
+                    session, agg_id, group_alarms,
+                    resolve_matching_alarm, imported_alarm_ids,
+                )
     return imported_group_ids, imported_alarm_ids
+
+
+def _validate_external_alarm_owners(
+    session, agg_id, group_alarms, resolve_matching_alarm, imported_alarm_ids
+):
+    """校验条目内各告警在内部会话中的既有归属与 agg_id 一致。"""
+    for generated_alarm in group_alarms:
+        matching_alarm = resolve_matching_alarm(generated_alarm)
+        if imported_alarm_ids is not None:
+            imported_alarm_ids[agg_id].add(matching_alarm["alarm_id"])
+        alarm_entry = session["alarm_registry"].get(matching_alarm["alarm_id"])
+        if (
+            alarm_entry is not None
+            and alarm_entry[1] is not None
+            and alarm_entry[1] != agg_id
+        ):
+            raise ValueError(
+                f"外置增量冲突：告警 "
+                f"{matching_alarm['alarm_id']!r} 在内部会话中"
+                f"已归属 {alarm_entry[1]!r}，新增量却归属"
+                f" {agg_id!r}"
+            )
 
 
 def _import_external_entries(session, agg_output, resolve_matching_alarm):

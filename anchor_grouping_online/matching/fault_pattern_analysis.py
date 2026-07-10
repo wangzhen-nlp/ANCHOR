@@ -17,7 +17,8 @@ _EMPTY_NEIGHBORS = frozenset()
 # 求精确最长简单链。该问题本身仍是指数级；双 BFS 近似在带环分量上偏差严重
 # （哈密顿覆盖几乎 100% 漏判），会把环型模式误判成 unknown。
 #
-# 因此这里把阈值做成可配，且 >N 的分量直接返回空链——经 classify_component 的覆盖校验落为
+# 因此这里把阈值做成可配，且 >N 的分量直接返回空链。
+# 经 classify_component 的覆盖校验落为
 # unknown -> 该故障组被丢弃，而不是给出错误的近似链。
 # 默认 18；复杂分量仍需按数据规模权衡精确搜索成本与召回。
 LONGEST_PATH_EXACT_MAX_SITES = 18
@@ -286,32 +287,11 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
     upstream_candidates_by_site = {}
     seeded_unmanaged_sites = set()
 
-    def push_next_candidate(unmanaged_site):
-        site_candidates = upstream_candidates_by_site[unmanaged_site]
-        while site_candidates:
-            distance, parent_site = heapq.heappop(site_candidates)
-            if parent_site not in remaining:
-                continue
-            heapq.heappush(
-                candidates,
-                (distance, unmanaged_site, parent_site),
-            )
-            return
-
     def seed_candidates(unmanaged_site):
-        if unmanaged_site in seeded_unmanaged_sites or unmanaged_site not in remaining:
-            return
-        seeded_unmanaged_sites.add(unmanaged_site)
-        site_candidates = [
-            (distance, upstream_site)
-            for upstream_site, distance in relation_index.iter_upstream_distances_in(
-                unmanaged_site,
-                remaining,
-            )
-        ]
-        heapq.heapify(site_candidates)
-        upstream_candidates_by_site[unmanaged_site] = site_candidates
-        push_next_candidate(unmanaged_site)
+        _seed_upstream_candidates(
+            unmanaged_site, remaining, relation_index,
+            candidates, upstream_candidates_by_site, seeded_unmanaged_sites,
+        )
 
     for unmanaged_site in unmanaged_sites:
         seed_candidates(unmanaged_site)
@@ -321,7 +301,9 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
         if unmanaged_site not in remaining:
             continue
         if parent_site not in remaining:
-            push_next_candidate(unmanaged_site)
+            _push_next_upstream_candidate(
+                unmanaged_site, remaining, candidates, upstream_candidates_by_site
+            )
             continue
 
         remaining.remove(unmanaged_site)
@@ -333,6 +315,44 @@ def absorb_unmanaged_downstream_sites(site_ids, initial_unmanaged_sites, relatio
         if not parent_was_unmanaged:
             seed_candidates(parent_site)
     return remaining, unmanaged_sites & remaining, absorbed_by
+
+
+def _push_next_upstream_candidate(
+    unmanaged_site, remaining, candidates, upstream_candidates_by_site
+):
+    """把该站点局部堆中下一个仍然存活的上游候选推入全局堆。"""
+    site_candidates = upstream_candidates_by_site[unmanaged_site]
+    while site_candidates:
+        distance, parent_site = heapq.heappop(site_candidates)
+        if parent_site not in remaining:
+            continue
+        heapq.heappush(
+            candidates,
+            (distance, unmanaged_site, parent_site),
+        )
+        return
+
+
+def _seed_upstream_candidates(
+    unmanaged_site, remaining, relation_index,
+    candidates, upstream_candidates_by_site, seeded_unmanaged_sites,
+):
+    """为首次成为 unmanaged 的站点建立局部上游候选堆并推入全局最优。"""
+    if unmanaged_site in seeded_unmanaged_sites or unmanaged_site not in remaining:
+        return
+    seeded_unmanaged_sites.add(unmanaged_site)
+    site_candidates = [
+        (distance, upstream_site)
+        for upstream_site, distance in relation_index.iter_upstream_distances_in(
+            unmanaged_site,
+            remaining,
+        )
+    ]
+    heapq.heapify(site_candidates)
+    upstream_candidates_by_site[unmanaged_site] = site_candidates
+    _push_next_upstream_candidate(
+        unmanaged_site, remaining, candidates, upstream_candidates_by_site
+    )
 
 
 def iter_connected_components(nodes, relation_index):
@@ -520,6 +540,13 @@ def _exact_longest_path(component, adjacency):
         best_length(index, 1 << index)
         for index in range(len(nodes))
     ]
+    return _reconstruct_longest_path(
+        nodes, adjacency_indexes, best_length, start_lengths
+    )
+
+
+def _reconstruct_longest_path(nodes, adjacency_indexes, best_length, start_lengths):
+    """按记忆化的 best_length 结果回溯重建一条最长简单链。"""
     remaining_length = max(start_lengths)
     current_index = next(
         index

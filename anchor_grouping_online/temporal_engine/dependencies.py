@@ -56,34 +56,9 @@ class TemporalGraphEngineDependencyMixin:
             changed = False
 
             for (src_role, dst_role), dep in dependencies.items():
-                src_state = stabilized_roles.get(src_role)
-                dst_state = stabilized_roles.get(dst_role)
-                if src_state is None or dst_state is None:
-                    continue
-
-                live_src_nodes = src_state["nodes"]
-                live_dst_nodes = dst_state["nodes"]
-                live_dst_set = set(live_dst_nodes)
-                live_src_set = set(live_src_nodes)
-
-                kept_src_nodes = {
-                    src_node: live_src_nodes[src_node]
-                    for src_node in live_src_nodes
-                    if dep.get("src_to_dst", {}).get(src_node, set()) & live_dst_set
-                }
-                if len(kept_src_nodes) != len(live_src_nodes):
-                    src_state["nodes"] = kept_src_nodes
-                    live_src_nodes = kept_src_nodes
-                    live_src_set = set(kept_src_nodes)
-                    changed = True
-
-                kept_dst_nodes = {
-                    dst_node: live_dst_nodes[dst_node]
-                    for dst_node in live_dst_nodes
-                    if dep.get("dst_to_src", {}).get(dst_node, set()) & live_src_set
-                }
-                if len(kept_dst_nodes) != len(live_dst_nodes):
-                    dst_state["nodes"] = kept_dst_nodes
+                if self._prune_dependency_nodes(
+                    stabilized_roles, src_role, dst_role, dep
+                ):
                     changed = True
 
             for role, role_state in stabilized_roles.items():
@@ -92,3 +67,37 @@ class TemporalGraphEngineDependencyMixin:
 
             if not changed:
                 return stabilized_inst
+
+    @staticmethod
+    def _prune_dependency_nodes(stabilized_roles, src_role, dst_role, dep):
+        """按单条边依赖双向裁剪失去支撑的节点，返回是否有变化。"""
+        src_state = stabilized_roles.get(src_role)
+        dst_state = stabilized_roles.get(dst_role)
+        if src_state is None or dst_state is None:
+            return False
+
+        changed = False
+        live_src_nodes = src_state["nodes"]
+        live_dst_nodes = dst_state["nodes"]
+        live_dst_set = set(live_dst_nodes)
+
+        kept_src_nodes = {
+            src_node: live_src_nodes[src_node]
+            for src_node in live_src_nodes
+            if dep.get("src_to_dst", {}).get(src_node, set()) & live_dst_set
+        }
+        if len(kept_src_nodes) != len(live_src_nodes):
+            src_state["nodes"] = kept_src_nodes
+            live_src_nodes = kept_src_nodes
+            changed = True
+
+        live_src_set = set(live_src_nodes)
+        kept_dst_nodes = {
+            dst_node: live_dst_nodes[dst_node]
+            for dst_node in live_dst_nodes
+            if dep.get("dst_to_src", {}).get(dst_node, set()) & live_src_set
+        }
+        if len(kept_dst_nodes) != len(live_dst_nodes):
+            dst_state["nodes"] = kept_dst_nodes
+            changed = True
+        return changed

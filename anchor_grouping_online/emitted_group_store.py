@@ -20,7 +20,7 @@ _SYMPTOM_LIST_FIELDS = (
 
 
 def _shallow_copy_symptom(symptom):
-    """与 dict(symptom) 等价但额外复制已知 list 字段；不递归 list 元素（都是 immutable str）。"""
+    """复制 symptom 及其已知 list 字段，不递归复制字符串元素。"""
     copied = dict(symptom)
     for field in _SYMPTOM_LIST_FIELDS:
         value = copied.get(field)
@@ -84,18 +84,8 @@ class EmittedGroupStore:
         return qualified
 
     def _merge_with_related_by_eid(self, match_result):
-        related_groups = []
         current_alarm_keys = self._get_alarm_keys(match_result["symptoms"])
-
-        related_indexes = sorted({
-            idx
-            for alarm_key in current_alarm_keys
-            for idx in self.eid_to_group_indexes.get(alarm_key, set())
-            if 0 <= idx < len(self.groups) and self.groups[idx] is not None
-        })
-        for idx in related_indexes:
-            related_groups.append((idx, self.groups[idx]))
-
+        related_groups = self._find_related_groups(current_alarm_keys)
         if not related_groups:
             return match_result, set(), True
 
@@ -107,56 +97,58 @@ class EmittedGroupStore:
             "symptoms": list(match_result["symptoms"]),
             "_expire_ts_hint": match_result["_expire_ts_hint"],
         }
-
         symptom_map = {}
         for symptom in merged["symptoms"]:
-            alarm_key = self._get_alarm_key(symptom)
-            existing_symptom = symptom_map.get(alarm_key)
-            if existing_symptom is None:
-                symptom_map[alarm_key] = symptom
-            else:
-                symptom_map[alarm_key] = merge_symptom_role_metadata(
-                    existing_symptom,
-                    symptom,
-                )
+            self._merge_symptom_into_map(symptom_map, symptom)
 
         merged_group_indexes = set()
         fully_containing_history_exists = False
         for idx, item in related_groups:
             merged_group_indexes.add(idx)
-            previous_match = item["match"]
-            previous_alarm_keys = item["alarm_keys"]
-            if current_alarm_keys.issubset(previous_alarm_keys):
+            if current_alarm_keys.issubset(item["alarm_keys"]):
                 fully_containing_history_exists = True
-            previous_merged_rules = previous_match["merged_rules"]
-            merged["merged_rules"] = sorted(
-                set(merged["merged_rules"])
-                | {rule for rule in previous_merged_rules if rule}
-            )
-            for role, nodes in previous_match["inferred_roots"].items():
-                role_key = _role_key_for_merged_source(previous_match, role)
-                _add_nodes_to_role_mapping(merged["inferred_roots"], role_key, nodes)
-
-            for role, nodes in previous_match["role_mapping"].items():
-                role_key = _role_key_for_merged_source(previous_match, role)
-                _add_nodes_to_role_mapping(merged["role_mapping"], role_key, nodes)
-
-            for symptom in previous_match["symptoms"]:
-                alarm_key = self._get_alarm_key(symptom)
-                existing_symptom = symptom_map.get(alarm_key)
-                if existing_symptom is None:
-                    symptom_map[alarm_key] = symptom
-                else:
-                    # 同一发生同时出现在当前组与历史组：保留当前轮的 symptom 为主，
-                    # 但合并历史组的 role/规则归属，避免丢失某一侧的命中信息。
-                    symptom_map[alarm_key] = merge_symptom_role_metadata(existing_symptom, symptom)
-
+            self._absorb_history_match(merged, symptom_map, item["match"])
         merged["symptoms"] = list(symptom_map.values())
+        return merged, merged_group_indexes, not fully_containing_history_exists
 
-        if fully_containing_history_exists:
-            return merged, merged_group_indexes, False
+    def _find_related_groups(self, current_alarm_keys):
+        """按 eid 索引找出与当前组共享告警的存活历史组，按索引升序。"""
+        related_indexes = sorted({
+            idx
+            for alarm_key in current_alarm_keys
+            for idx in self.eid_to_group_indexes.get(alarm_key, set())
+            if 0 <= idx < len(self.groups) and self.groups[idx] is not None
+        })
+        return [(idx, self.groups[idx]) for idx in related_indexes]
 
-        return merged, merged_group_indexes, True
+    def _merge_symptom_into_map(self, symptom_map, symptom):
+        """同一发生只保留一条 symptom，重复时合并 role/规则归属。
+
+        同一发生同时出现在当前组与历史组：保留当前轮的 symptom 为主，
+        但合并历史组的 role/规则归属，避免丢失某一侧的命中信息。
+        """
+        alarm_key = self._get_alarm_key(symptom)
+        existing_symptom = symptom_map.get(alarm_key)
+        if existing_symptom is None:
+            symptom_map[alarm_key] = symptom
+        else:
+            symptom_map[alarm_key] = merge_symptom_role_metadata(
+                existing_symptom,
+                symptom,
+            )
+
+    def _absorb_history_match(self, merged, symptom_map, previous_match):
+        """把单个历史组的规则、role 映射与 symptom 并入 merged。"""
+        merged["merged_rules"] = sorted(
+            set(merged["merged_rules"])
+            | {rule for rule in previous_match["merged_rules"] if rule}
+        )
+        for field in _MATCH_TOP_DICT_OF_LIST_FIELDS:
+            for role, nodes in previous_match[field].items():
+                role_key = _role_key_for_merged_source(previous_match, role)
+                _add_nodes_to_role_mapping(merged[field], role_key, nodes)
+        for symptom in previous_match["symptoms"]:
+            self._merge_symptom_into_map(symptom_map, symptom)
 
     def replace_and_store(self, merged_group_indexes, match_result):
         """删除被吸收的历史组，并把当前组作为新的历史版本落库。"""

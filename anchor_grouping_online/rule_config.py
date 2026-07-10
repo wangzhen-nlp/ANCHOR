@@ -210,7 +210,10 @@ data_no_offline_adjacent_optional_offline_rule = {
 
 data_offline_adjacent_offline_rule = {
   "pattern_name": "data_offline_adjacent_offline_context",
-  "description": "本路由Data offline，双向相邻路由Data offline，本路由/相邻路由下挂offline可有可无",
+  "description": (
+    "本路由Data offline，双向相邻路由Data offline，"
+    "本路由/相邻路由下挂offline可有可无"
+  ),
   "trigger_role": "offline_current_parent_data_node",
   "exclusive_site_roles": [
     "offline_current_parent_data_node",

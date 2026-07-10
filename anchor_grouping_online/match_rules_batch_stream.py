@@ -123,41 +123,54 @@ def _settle_window(
         max_group_member=max_group_member,
     )
     aggregation_elapsed_seconds = time.perf_counter() - aggregation_started_at
+    record = _build_window_record(
+        start, window_sec, alarm_groups, len(buffer),
+        agg_alarm_groups, aggregation_elapsed_seconds,
+    )
+    output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # 每个窗口结果立即落盘，方便运行期间通过 tail -f
+    # 查看完整中间结果，不必等到文件关闭。
+    output_file.flush()
+    _print_window_summary(record, window_index, emitted_row_number)
+    return True
+
+
+def _build_window_record(
+    start, window_sec, alarm_groups, input_alarm_count, agg_alarm_groups, elapsed
+):
+    """组装单窗口的输出记录。"""
     merged_input_group_count = sum(
         len(member_entries)
         for member_entries in agg_alarm_groups.values()
     )
-    record = {
+    return {
         "window_start": start,
         "window_end": start + window_sec,
         "window_start_time": _format_ts(start),
         "window_end_time": _format_ts(start + window_sec),
         "input_group_count": len(alarm_groups),
-        "input_alarm_count": len(buffer),
+        "input_alarm_count": input_alarm_count,
         "agg_group_count": len(agg_alarm_groups),
         "merged_input_group_count": merged_input_group_count,
-        "aggregation_elapsed_seconds": round(
-            aggregation_elapsed_seconds, 6
-        ),
+        "aggregation_elapsed_seconds": round(elapsed, 6),
         "agg_alarm_groups": agg_alarm_groups,
     }
-    output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-    # 每个窗口结果立即落盘，方便运行期间通过 tail -f
-    # 查看完整中间结果，不必等到文件关闭。
-    output_file.flush()
+
+
+def _print_window_summary(record, window_index, emitted_row_number):
+    """打印单窗口结算摘要。"""
     print(
         f"  [窗口 {window_index}] "
         f"{record['window_start_time']} ~ {record['window_end_time']}："
         f"{record['input_alarm_count']} 条告警 / "
         f"{record['input_group_count']} 个原始组 -> "
         f"{record['agg_group_count']} 个汇聚组，"
-        f"其中合并原始组 {merged_input_group_count} 个，"
-        f"汇聚耗时 {aggregation_elapsed_seconds:.3f} 秒"
+        f"其中合并原始组 {record['merged_input_group_count']} 个，"
+        f"汇聚耗时 {record['aggregation_elapsed_seconds']:.3f} 秒"
         f"（已写入第 "
         f"{emitted_row_number} 行）",
         flush=True,
     )
-    return True
 
 
 def run_sliding_window_aggregation(
@@ -193,8 +206,32 @@ def run_sliding_window_aggregation(
     )
 
     alarm_stream, skip_stats = _iter_window_alarms(alarms_path)
-    # 缓冲近似保有当前窗口的告警。对输入顺序不做假设：乱序只影响告警
-    # 被切进哪一批，聚合判定由 matcher 按告警自身时间完成，与顺序无关。
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        window_count, emitted_window_count = _run_window_loop(
+            alarm_stream, matcher, output_file, window_sec, step_sec,
+            associate_time, max_group_time, max_group_member,
+        )
+    return {
+        "window_count": window_count,
+        "emitted_window_count": emitted_window_count,
+        "clear_skipped": skip_stats["clear_skipped"],
+        "ungrouped_skipped": skip_stats["ungrouped_skipped"],
+    }
+
+
+def _drain_buffer_before(buffer, window_start):
+    """丢弃缓冲中已滑出窗口左界的告警。"""
+    while buffer and buffer[0][0] < window_start:
+        buffer.popleft()
+
+
+def _run_window_loop(
+    alarm_stream, matcher, output_file, window_sec, step_sec,
+    associate_time, max_group_time, max_group_member,
+):
+    """滑动窗口主循环，返回 (结算窗口数, 非空输出窗口数)。缓冲近似保有
+    当前窗口的告警；对输入顺序不做假设——乱序只影响告警被切进哪一批，
+    聚合判定由 matcher 按告警自身时间完成，与顺序无关。"""
     buffer = deque()
     window_start = None
     window_count = 0
@@ -203,50 +240,39 @@ def run_sliding_window_aggregation(
     def _align_to_step(ts):
         return math.floor(ts / step_sec) * step_sec
 
-    with open(output_path, "w", encoding="utf-8") as output_file:
+    def settle_window(start):
+        nonlocal window_count, emitted_window_count
+        window_count += 1
+        if _settle_window(
+            buffer, matcher, output_file, start, window_sec,
+            associate_time, max_group_time, max_group_member,
+            window_count, emitted_window_count + 1,
+        ):
+            emitted_window_count += 1
 
-        def settle_window(start):
-            nonlocal window_count, emitted_window_count
-            window_count += 1
-            if _settle_window(
-                buffer, matcher, output_file, start, window_sec,
-                associate_time, max_group_time, max_group_member,
-                window_count, emitted_window_count + 1,
-            ):
-                emitted_window_count += 1
-
-        for ts, group_id, generated_alarm in alarm_stream:
-            if window_start is None:
-                window_start = _align_to_step(ts)
-            # 新告警越过当前窗口右界：依次结算已完整的窗口并滑动。
-            while ts >= window_start + window_sec:
-                settle_window(window_start)
-                window_start += step_sec
-                while buffer and buffer[0][0] < window_start:
-                    buffer.popleft()
-                if not buffer and ts >= window_start + window_sec:
-                    # 空档期跳到第一个能覆盖到该告警的窗口起点
-                    # （align(ts - window) + step），中间被跳过的窗口在
-                    # 理想网格中必然为空，不影响滑动语义。
-                    window_start = max(
-                        window_start,
-                        _align_to_step(ts - window_sec) + step_sec,
-                    )
-            buffer.append((ts, group_id, generated_alarm))
-
-        # 流结束后把缓冲内剩余告警覆盖到的窗口全部结算完。
-        while buffer:
+    for ts, group_id, generated_alarm in alarm_stream:
+        if window_start is None:
+            window_start = _align_to_step(ts)
+        # 新告警越过当前窗口右界：依次结算已完整的窗口并滑动。
+        while ts >= window_start + window_sec:
             settle_window(window_start)
             window_start += step_sec
-            while buffer and buffer[0][0] < window_start:
-                buffer.popleft()
-
-    return {
-        "window_count": window_count,
-        "emitted_window_count": emitted_window_count,
-        "clear_skipped": skip_stats["clear_skipped"],
-        "ungrouped_skipped": skip_stats["ungrouped_skipped"],
-    }
+            _drain_buffer_before(buffer, window_start)
+            if not buffer and ts >= window_start + window_sec:
+                # 空档期跳到第一个能覆盖到该告警的窗口起点
+                # （align(ts - window) + step），中间被跳过的窗口在
+                # 理想网格中必然为空，不影响滑动语义。
+                window_start = max(
+                    window_start,
+                    _align_to_step(ts - window_sec) + step_sec,
+                )
+        buffer.append((ts, group_id, generated_alarm))
+    # 流结束后把缓冲内剩余告警覆盖到的窗口全部结算完。
+    while buffer:
+        settle_window(window_start)
+        window_start += step_sec
+        _drain_buffer_before(buffer, window_start)
+    return window_count, emitted_window_count
 
 
 def main():

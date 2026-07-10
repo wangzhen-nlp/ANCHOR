@@ -83,73 +83,8 @@ def build_transmission_misconnection_pairs(ne_graph):
     认为这些 Transmission 相关连边是误连接。命中站点对之间的传输类连边应从
     拓扑推断、方向约束与裁剪口径中一并剔除（由消费端按返回集合过滤）。
     """
-    site_domains = defaultdict(set)
-    for ne_info in ne_graph.values():
-        if not isinstance(ne_info, dict):
-            continue
-        site_id = _get_site_id(ne_info)
-        if not site_id:
-            continue
-        site_domains[site_id].add(normalize_domain(ne_info.get("domain", "")))
-
-    def _matches(data_side_domains, ran_side_domains):
-        return (
-            "Data" in data_side_domains
-            and "Data" not in ran_side_domains
-            and "Ran" in ran_side_domains
-            and any(is_transmission_domain(d) for d in ran_side_domains)
-        )
-
-    def _pair_precondition(site_a, site_b):
-        domains_a = site_domains.get(site_a, ())
-        domains_b = site_domains.get(site_b, ())
-        return _matches(domains_a, domains_b) or _matches(domains_b, domains_a)
-
-    # 原始连边遍历（不做 domain 过滤——误连接判定要看全部连边），按 NE 对去重
-    candidate_flags = {}
-    seen_ne_pairs = set()
-    for source_ne, source_info in ne_graph.items():
-        if not isinstance(source_info, dict):
-            continue
-        source_site = _get_site_id(source_info)
-        if not source_site:
-            continue
-        source_domain = normalize_domain(source_info.get("domain", ""))
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
-            continue
-        for target_ne in raw_links:
-            target_info = ne_graph.get(target_ne)
-            if not isinstance(target_info, dict):
-                continue
-            target_site = _get_site_id(target_info)
-            if not target_site or target_site == source_site:
-                continue
-            ne_key = (
-                (source_ne, target_ne)
-                if source_ne <= target_ne
-                else (target_ne, source_ne)
-            )
-            if ne_key in seen_ne_pairs:
-                continue
-            seen_ne_pairs.add(ne_key)
-
-            pair_key = tuple(sorted((source_site, target_site)))
-            flags = candidate_flags.get(pair_key)
-            if flags is None:
-                if not _pair_precondition(source_site, target_site):
-                    candidate_flags[pair_key] = False
-                    continue
-                flags = {"has_transmission_link": False, "has_data_ran_link": False}
-                candidate_flags[pair_key] = flags
-            elif flags is False:
-                continue
-
-            target_domain = normalize_domain(target_info.get("domain", ""))
-            if is_transmission_domain(source_domain) or is_transmission_domain(target_domain):
-                flags["has_transmission_link"] = True
-            if {source_domain, target_domain} == {"Data", "Ran"}:
-                flags["has_data_ran_link"] = True
+    site_domains = _collect_site_domains(ne_graph)
+    candidate_flags = _scan_misconnection_candidate_flags(ne_graph, site_domains)
 
     misconnection_pairs = {
         pair_key
@@ -163,6 +98,97 @@ def build_transmission_misconnection_pairs(ne_graph):
         "misconnection_pair_count": len(misconnection_pairs),
     }
     return misconnection_pairs, stats
+
+
+def _collect_site_domains(ne_graph):
+    """站点 -> 站内设备的归一化 domain 集合。"""
+    site_domains = defaultdict(set)
+    for ne_info in ne_graph.values():
+        if not isinstance(ne_info, dict):
+            continue
+        site_id = _get_site_id(ne_info)
+        if not site_id:
+            continue
+        site_domains[site_id].add(normalize_domain(ne_info.get("domain", "")))
+    return site_domains
+
+
+def _misconnection_precondition(site_domains, site_a, site_b):
+    """一端含 Data、另一端 Trans+Ran 无 Data 时才是误连接候选站点对。"""
+    def _matches(data_side_domains, ran_side_domains):
+        return (
+            "Data" in data_side_domains
+            and "Data" not in ran_side_domains
+            and "Ran" in ran_side_domains
+            and any(is_transmission_domain(d) for d in ran_side_domains)
+        )
+
+    domains_a = site_domains.get(site_a, ())
+    domains_b = site_domains.get(site_b, ())
+    return _matches(domains_a, domains_b) or _matches(domains_b, domains_a)
+
+
+def _scan_misconnection_candidate_flags(ne_graph, site_domains):
+    """原始连边遍历（不做 domain 过滤——误连接判定要看全部连边），按 NE 对去重。
+
+    返回 {pair_key: False（非候选）或 {"has_transmission_link", "has_data_ran_link"}}。
+    """
+    candidate_flags = {}
+    seen_ne_pairs = set()
+    for source_ne, source_info in ne_graph.items():
+        if not isinstance(source_info, dict):
+            continue
+        source_site = _get_site_id(source_info)
+        if not source_site:
+            continue
+        source_domain = normalize_domain(source_info.get("domain", ""))
+        raw_links = source_info.get("link", {})
+        if not isinstance(raw_links, dict):
+            continue
+        for target_ne in raw_links:
+            _flag_misconnection_edge(
+                ne_graph, site_domains, candidate_flags, seen_ne_pairs,
+                source_ne, source_site, source_domain, target_ne,
+            )
+    return candidate_flags
+
+
+def _flag_misconnection_edge(
+    ne_graph, site_domains, candidate_flags, seen_ne_pairs,
+    source_ne, source_site, source_domain, target_ne,
+):
+    """按单条 NE 边更新候选站点对的传输连边/Data-Ran 佐证标记。"""
+    target_info = ne_graph.get(target_ne)
+    if not isinstance(target_info, dict):
+        return
+    target_site = _get_site_id(target_info)
+    if not target_site or target_site == source_site:
+        return
+    ne_key = (
+        (source_ne, target_ne)
+        if source_ne <= target_ne
+        else (target_ne, source_ne)
+    )
+    if ne_key in seen_ne_pairs:
+        return
+    seen_ne_pairs.add(ne_key)
+
+    pair_key = tuple(sorted((source_site, target_site)))
+    flags = candidate_flags.get(pair_key)
+    if flags is None:
+        if not _misconnection_precondition(site_domains, source_site, target_site):
+            candidate_flags[pair_key] = False
+            return
+        flags = {"has_transmission_link": False, "has_data_ran_link": False}
+        candidate_flags[pair_key] = flags
+    elif flags is False:
+        return
+
+    target_domain = normalize_domain(target_info.get("domain", ""))
+    if is_transmission_domain(source_domain) or is_transmission_domain(target_domain):
+        flags["has_transmission_link"] = True
+    if {source_domain, target_domain} == {"Data", "Ran"}:
+        flags["has_data_ran_link"] = True
 
 
 def classify_device_role(domain: str) -> str:
@@ -253,21 +279,17 @@ def should_include_cross_site_link(
         else is_wireless_only_site(target_site, site_role_counts)
     )
 
-    if (
+    source_allowed = (
         source_wireless_only
         and source_role == "wireless"
         and target_role in allowed_peer_roles
-    ):
-        return True
-
-    if (
+    )
+    target_allowed = (
         target_wireless_only
         and target_role == "wireless"
         and source_role in allowed_peer_roles
-    ):
-        return True
-
-    return False
+    )
+    return source_allowed or target_allowed
 
 
 def iter_unique_cross_site_links(
@@ -291,78 +313,105 @@ def iter_unique_cross_site_links(
     任一端为传输类 domain 的连边被视为误连接，直接跳过（拓扑与约束证据均不产出）。
     """
     seen = None if assume_symmetric else set()
-    site_role_counts = (
-        None
-        if wireless_only_sites is not None
-        else build_site_role_counts(ne_graph)
-    )
+    site_role_counts = None
+    if wireless_only_sites is None:
+        site_role_counts = build_site_role_counts(ne_graph)
 
     for source_ne, source_info in ne_graph.items():
         source_site = _get_site_id(source_info)
         if not source_site:
             continue
 
-        source_domain = normalize_domain(source_info.get("domain", ""))
-        raw_links = source_info.get("link", {})
-        if not isinstance(raw_links, dict):
+        yield from _iter_source_cross_site_links(
+            ne_graph, source_ne, source_info, source_site,
+            site_role_counts, include_filtered_cross_domain,
+            transmission_misconnection_pairs, assume_symmetric, seen,
+        )
+
+
+def _iter_source_cross_site_links(
+    ne_graph, source_ne, source_info, source_site, site_role_counts,
+    include_filtered, misconnection_pairs, assume_symmetric, seen,
+):
+    """遍历单个 NE 的合法跨站链路。"""
+    source_domain = normalize_domain(source_info.get("domain", ""))
+    raw_links = source_info.get("link", {})
+    if not isinstance(raw_links, dict):
+        return
+    for target_ne, link_meta in raw_links.items():
+        target_info = ne_graph.get(target_ne)
+        if not isinstance(target_info, dict):
             continue
-
-        for target_ne, link_meta in raw_links.items():
-            target_info = ne_graph.get(target_ne)
-            if not isinstance(target_info, dict):
-                continue
-
-            target_site = _get_site_id(target_info)
-            if not target_site or target_site == source_site:
-                continue
-
-            target_domain = normalize_domain(target_info.get("domain", ""))
-            if transmission_misconnection_pairs and (
-                is_transmission_domain(source_domain)
-                or is_transmission_domain(target_domain)
+        target_site = _get_site_id(target_info)
+        if not target_site or target_site == source_site:
+            continue
+        target_domain = normalize_domain(target_info.get("domain", ""))
+        if _is_misconnection(
+            source_site, target_site, source_domain, target_domain,
+            misconnection_pairs,
+        ):
+            continue
+        included = should_include_cross_site_link(
+            source_site, source_domain, target_site, target_domain,
+            site_role_counts,
+        )
+        if not included and not include_filtered:
+            continue
+        link_types = _get_link_types(link_meta)
+        for link_type in link_types:
+            if _is_duplicate_link(
+                source_ne, target_ne, link_type, assume_symmetric, seen
             ):
-                misconnection_key = (
-                    (source_site, target_site)
-                    if source_site <= target_site
-                    else (target_site, source_site)
-                )
-                if misconnection_key in transmission_misconnection_pairs:
-                    continue
-            included_in_topology = should_include_cross_site_link(
-                source_site,
-                source_domain,
-                target_site,
-                target_domain,
-                site_role_counts,
-            )
-            if not included_in_topology and not include_filtered_cross_domain:
                 continue
-
-            link_types = (
-                sorted(link_meta.keys())
-                if isinstance(link_meta, dict) and link_meta
-                else ["__unknown__"]
+            yield _build_cross_site_link(
+                source_ne, target_ne, source_site, target_site,
+                source_domain, target_domain, link_type, included,
             )
 
-            for link_type in link_types:
-                if assume_symmetric:
-                    if source_ne > target_ne:
-                        continue
-                else:
-                    key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                yield {
-                    "source_ne": source_ne,
-                    "target_ne": target_ne,
-                    "source_site": source_site,
-                    "target_site": target_site,
-                    "source_domain": source_domain,
-                    "target_domain": target_domain,
-                    "link_type": str(link_type),
-                    "included_in_topology": included_in_topology,
-                }
+
+def _is_misconnection(
+    source_site, target_site, source_domain, target_domain, pairs,
+):
+    if not pairs:
+        return False
+    if not (
+        is_transmission_domain(source_domain)
+        or is_transmission_domain(target_domain)
+    ):
+        return False
+    return tuple(sorted((source_site, target_site))) in pairs
+
+
+def _get_link_types(link_meta):
+    if isinstance(link_meta, dict) and link_meta:
+        return sorted(link_meta)
+    return ["__unknown__"]
+
+
+def _is_duplicate_link(source_ne, target_ne, link_type, assume_symmetric, seen):
+    if assume_symmetric:
+        return source_ne > target_ne
+    key = tuple(sorted((source_ne, target_ne))) + (str(link_type),)
+    if key in seen:
+        return True
+    seen.add(key)
+    return False
+
+
+def _build_cross_site_link(
+    source_ne, target_ne, source_site, target_site,
+    source_domain, target_domain, link_type, included,
+):
+    return {
+        "source_ne": source_ne,
+        "target_ne": target_ne,
+        "source_site": source_site,
+        "target_site": target_site,
+        "source_domain": source_domain,
+        "target_domain": target_domain,
+        "link_type": str(link_type),
+        "included_in_topology": included,
+    }
 
 
 def _collect_ring_component(start_site, non_bridge_neighbors, visited):
@@ -441,21 +490,9 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
     分数最低的出入口站点视为更靠端侧的 exit。
     """
     site_scores = site_scores or {}
-    normalized_bridge_pairs = {
-        tuple(sorted(pair))
-        for pair in bridge_pairs
-    }
-    non_bridge_neighbors = defaultdict(set)
-    bridge_neighbors = defaultdict(set)
-
-    for left_site, right_site in edge_keys:
-        pair_key = tuple(sorted((left_site, right_site)))
-        if pair_key in normalized_bridge_pairs:
-            bridge_neighbors[left_site].add(right_site)
-            bridge_neighbors[right_site].add(left_site)
-        else:
-            non_bridge_neighbors[left_site].add(right_site)
-            non_bridge_neighbors[right_site].add(left_site)
+    non_bridge_neighbors, bridge_neighbors = _build_ring_neighbor_maps(
+        edge_keys, bridge_pairs
+    )
 
     visited = set()
     pair_context = {}
@@ -469,20 +506,9 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
             start_site, non_bridge_neighbors, visited
         )
         component_set = set(component_sites)
-        internal_pairs = []
-        entry_exit_sites = set()
-
-        for site_id in component_set:
-            for neighbor_site in bridge_neighbors.get(site_id, ()):
-                if neighbor_site not in component_set:
-                    entry_exit_sites.add(site_id)
-
-            for neighbor_site in non_bridge_neighbors.get(site_id, ()):
-                if neighbor_site not in component_set:
-                    continue
-                internal_pairs.append(tuple(sorted((site_id, neighbor_site))))
-
-        internal_pairs = sorted(set(internal_pairs))
+        internal_pairs, entry_exit_sites = _describe_ring_component(
+            component_set, non_bridge_neighbors, bridge_neighbors
+        )
         if not internal_pairs:
             continue
 
@@ -492,31 +518,59 @@ def build_strict_ring_context(edge_keys, bridge_pairs, site_scores=None):
             component_set, internal_pairs, entry_exit_sites,
             site_scores, component_id,
         )
-        start_site = summary["start_site"]
-        entry_site = summary["entry_site"]
-        exit_site = summary["exit_site"]
         component_summaries.append(summary)
-
-        for pair_key in internal_pairs:
-            entry_related = entry_site is not None and entry_site in pair_key
-            force_bidirectional = (
-                entry_site is None
-                or entry_site not in pair_key
-            )
-            pair_context[pair_key] = {
-                "component_id": component_id,
-                "start_site": start_site,
-                "entry_exit_sites": entry_exit_sites,
-                "entry_site": entry_site,
-                "exit_site": exit_site,
-                "force_entry_direction": entry_related,
-                "force_bidirectional": force_bidirectional,
-            }
+        _add_ring_pair_context(pair_context, internal_pairs, summary)
 
     return {
         "pair_context": pair_context,
         "components": component_summaries,
     }
+
+
+def _build_ring_neighbor_maps(edge_keys, bridge_pairs):
+    normalized_bridges = {tuple(sorted(pair)) for pair in bridge_pairs}
+    non_bridge_neighbors = defaultdict(set)
+    bridge_neighbors = defaultdict(set)
+    for left_site, right_site in edge_keys:
+        pair_key = tuple(sorted((left_site, right_site)))
+        target = (
+            bridge_neighbors
+            if pair_key in normalized_bridges
+            else non_bridge_neighbors
+        )
+        target[left_site].add(right_site)
+        target[right_site].add(left_site)
+    return non_bridge_neighbors, bridge_neighbors
+
+
+def _describe_ring_component(
+    component_set, non_bridge_neighbors, bridge_neighbors,
+):
+    internal_pairs = set()
+    entry_exit_sites = set()
+    for site_id in component_set:
+        external = set(bridge_neighbors.get(site_id, ())) - component_set
+        if external:
+            entry_exit_sites.add(site_id)
+        for neighbor_site in non_bridge_neighbors.get(site_id, ()):
+            if neighbor_site in component_set:
+                internal_pairs.add(tuple(sorted((site_id, neighbor_site))))
+    return sorted(internal_pairs), sorted(entry_exit_sites)
+
+
+def _add_ring_pair_context(pair_context, internal_pairs, summary):
+    entry_site = summary["entry_site"]
+    for pair_key in internal_pairs:
+        entry_related = entry_site is not None and entry_site in pair_key
+        pair_context[pair_key] = {
+            "component_id": summary["component_id"],
+            "start_site": summary["start_site"],
+            "entry_exit_sites": summary["entry_exit_sites"],
+            "entry_site": entry_site,
+            "exit_site": summary["exit_site"],
+            "force_entry_direction": entry_related,
+            "force_bidirectional": not entry_related,
+        }
 
 
 def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
@@ -525,56 +579,62 @@ def apply_strict_ring_pairwise_override(pair_result, ring_pair_context):
         return pair_result, False
 
     if ring_pair_context.get("force_entry_direction"):
-        entry_site = ring_pair_context.get("entry_site")
-        site_a = pair_result.get("site_a")
-        site_b = pair_result.get("site_b")
-        if entry_site not in {site_a, site_b}:
-            return pair_result, False
-
-        other_site = site_b if entry_site == site_a else site_a
-        updated = dict(pair_result)
-        updated["original_relation"] = pair_result.get("relation")
-        updated["original_preferred_source"] = pair_result.get("preferred_source")
-        updated["original_preferred_target"] = pair_result.get("preferred_target")
-        updated["relation"] = "->"
-        updated["preferred_source"] = entry_site
-        updated["preferred_target"] = other_site
-        updated["strict_ring_entry_direction"] = True
-        updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
-        updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
-        updated["strict_ring_entry_site"] = entry_site
-        updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
-        updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
-        updated["uncertainty_adjustments"] = list(
-            updated.get("uncertainty_adjustments", [])
-        ) + [{
-            "feature": "strict_ring_entry_direction",
-            "amount": 0.0,
-            "detail": "严格环模式：入口相关连接强制为入口指向环内站点",
-        }]
-        changed = (
-            pair_result.get("relation") != "->"
-            or pair_result.get("preferred_source") != entry_site
-            or pair_result.get("preferred_target") != other_site
-        )
-        return updated, changed
+        return _apply_ring_entry_override(pair_result, ring_pair_context)
 
     if not ring_pair_context.get("force_bidirectional"):
         return pair_result, False
 
+    return _apply_ring_bidirectional_override(pair_result, ring_pair_context)
+
+
+def _copy_ring_override_fields(pair_result, ring_context):
     updated = dict(pair_result)
     updated["original_relation"] = pair_result.get("relation")
     updated["original_preferred_source"] = pair_result.get("preferred_source")
     updated["original_preferred_target"] = pair_result.get("preferred_target")
+    updated["strict_ring_component_id"] = ring_context.get("component_id")
+    updated["strict_ring_start_site"] = ring_context.get("start_site")
+    updated["strict_ring_entry_site"] = ring_context.get("entry_site")
+    updated["strict_ring_exit_site"] = ring_context.get("exit_site")
+    updated["strict_ring_entry_exit_sites"] = ring_context.get(
+        "entry_exit_sites", []
+    )
+    return updated
+
+
+def _apply_ring_entry_override(pair_result, ring_context):
+    entry_site = ring_context.get("entry_site")
+    site_a = pair_result.get("site_a")
+    site_b = pair_result.get("site_b")
+    if entry_site not in {site_a, site_b}:
+        return pair_result, False
+    other_site = site_b if entry_site == site_a else site_a
+    updated = _copy_ring_override_fields(pair_result, ring_context)
+    updated["relation"] = "->"
+    updated["preferred_source"] = entry_site
+    updated["preferred_target"] = other_site
+    updated["strict_ring_entry_direction"] = True
+    updated["uncertainty_adjustments"] = list(
+        updated.get("uncertainty_adjustments", [])
+    ) + [{
+        "feature": "strict_ring_entry_direction",
+        "amount": 0.0,
+        "detail": "严格环模式：入口相关连接强制为入口指向环内站点",
+    }]
+    changed = (
+        pair_result.get("relation") != "->"
+        or pair_result.get("preferred_source") != entry_site
+        or pair_result.get("preferred_target") != other_site
+    )
+    return updated, changed
+
+
+def _apply_ring_bidirectional_override(pair_result, ring_context):
+    updated = _copy_ring_override_fields(pair_result, ring_context)
     updated["relation"] = "<->"
     updated["preferred_source"] = None
     updated["preferred_target"] = None
     updated["strict_ring_bidirectional"] = True
-    updated["strict_ring_component_id"] = ring_pair_context.get("component_id")
-    updated["strict_ring_start_site"] = ring_pair_context.get("start_site")
-    updated["strict_ring_entry_site"] = ring_pair_context.get("entry_site")
-    updated["strict_ring_exit_site"] = ring_pair_context.get("exit_site")
-    updated["strict_ring_entry_exit_sites"] = ring_pair_context.get("entry_exit_sites", [])
     updated["uncertainty_adjustments"] = list(
         updated.get("uncertainty_adjustments", [])
     ) + [{
