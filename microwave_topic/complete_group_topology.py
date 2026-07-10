@@ -10,7 +10,7 @@ import math
 import re
 import sys
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -915,7 +915,7 @@ def _build_site_completion(
 
 
 def _build_ran_data_upstream_highlight_sites(
-    no_upstream_site_ids,
+    source_site_ids,
     site_has_data,
     site_links,
     directed_edge_types,
@@ -923,7 +923,7 @@ def _build_ran_data_upstream_highlight_sites(
 ):
     site_has_data = set(site_has_data or ())
     data_neighbors_by_site = {}
-    for site_id in no_upstream_site_ids:
+    for site_id in source_site_ids:
         site_id = _normalize_text(site_id)
         if not site_id or site_id in site_has_data:
             continue
@@ -938,27 +938,28 @@ def _build_ran_data_upstream_highlight_sites(
     if len(data_neighbors_by_site) < 2:
         return []
 
-    # 只有经 site_chains（upstream/downstream/bidirectional，可经其他站点中转）
-    # 与另一个满足条件站点连通的，才参与补标；孤立的不算。
+    # 至少两个经 site_chains 连通的候选源站必须共同连接到同一个 Data 站点；
+    # 各自连接不同 Data 站点或只有一个源站连接到该 Data 站点时不补标。
     site_chain_components = site_chain_components or {}
-    component_counts = Counter(
-        site_chain_components[site_id]
-        for site_id in data_neighbors_by_site
-        if site_id in site_chain_components
-    )
-    marks_by_site = {}
-    for site_id in sorted(data_neighbors_by_site):
+    sources_by_component_and_data_site = defaultdict(set)
+    for site_id, data_neighbor_sites in data_neighbors_by_site.items():
         component = site_chain_components.get(site_id)
-        if component is None or component_counts[component] < 2:
+        if component is None:
             continue
-        for peer_site in data_neighbors_by_site[site_id]:
-            mark = marks_by_site.setdefault(peer_site, {
-                "site_id": peer_site,
-                "role": "ran_data_upstream_site",
-                "label": "Ran-Data 相邻 Data 站点",
-                "source_sites": [],
-            })
-            mark["source_sites"].append(site_id)
+        for peer_site in data_neighbor_sites:
+            sources_by_component_and_data_site[(component, peer_site)].add(site_id)
+
+    marks_by_site = {}
+    for (_component, peer_site), source_sites in sorted(sources_by_component_and_data_site.items()):
+        if len(source_sites) < 2:
+            continue
+        mark = marks_by_site.setdefault(peer_site, {
+            "site_id": peer_site,
+            "role": "ran_data_upstream_site",
+            "label": "Ran-Data 相邻 Data 站点",
+            "source_sites": [],
+        })
+        mark["source_sites"].extend(source_sites)
     result = []
     for peer_site in sorted(marks_by_site):
         mark = marks_by_site[peer_site]
@@ -1043,14 +1044,27 @@ def _build_topology_highlight_sites(
                 site_id for site_id in item["router_ancestor_site_ids"] if site_id
             })
         result.append(item)
-    # 无上游站点本身不打标，只用于触发 Ran-Data 相邻 Data 站点补标。
-    no_upstream_site_ids = [
+    # 非 Data 告警源站只要完整 upstream 闭包中不存在 Data 站点，就可用于触发
+    # Ran-Data 相邻 Data 站点补标；允许其 upstream 中存在其他非 Data 站点。
+    normalized_data_site_ids = {
         _normalize_text(site_id)
-        for site_id in completion.get("no_upstream_sites") or []
+        for site_id in site_has_data or ()
         if _normalize_text(site_id)
-    ]
+    }
+    source_site_ids = []
+    for site_id, upstream_hops in (completion.get("upstream_site_hops") or {}).items():
+        site_id = _normalize_text(site_id)
+        if not site_id or site_id in normalized_data_site_ids:
+            continue
+        upstream_site_ids = {
+            _normalize_text(upstream_site_id)
+            for upstream_site_id in (upstream_hops or {})
+            if _normalize_text(upstream_site_id) and _normalize_text(upstream_site_id) != site_id
+        }
+        if upstream_site_ids.isdisjoint(normalized_data_site_ids):
+            source_site_ids.append(site_id)
     result.extend(_build_ran_data_upstream_highlight_sites(
-        no_upstream_site_ids,
+        source_site_ids,
         site_has_data,
         site_links,
         directed_edge_types,
