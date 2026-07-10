@@ -10,7 +10,7 @@ import math
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -204,8 +204,55 @@ def _load_site_chain_index(site_chains_path):
             site_chain_index[site_id] = {
                 "upstream_site_hops": normalize_site_chain_hops(raw_info.get("upstream_site_hops")),
                 "downstream_site_hops": normalize_site_chain_hops(raw_info.get("downstream_site_hops")),
+                "bidirectional_sites": _normalize_site_id_set(raw_info.get("bidirectional_sites")),
             }
     return site_chain_index, restrict_relation
+
+
+def _normalize_site_id_set(site_ids):
+    return {
+        _normalize_text(site_id)
+        for site_id in (site_ids or [])
+        if _normalize_text(site_id)
+    }
+
+
+def _build_site_chain_component_index(site_chain_index):
+    """site_chains 无向连通分量索引：upstream/downstream/bidirectional 关系都视为无向边。
+
+    与故障组无关，入口处预构建一次复用；返回 站点ID -> 分量代表站点ID。
+    """
+    parent = {}
+
+    def _find(site_id):
+        root = site_id
+        while parent[root] != root:
+            root = parent[root]
+        while parent[site_id] != root:
+            parent[site_id], site_id = root, parent[site_id]
+        return root
+
+    def _union(site_a, site_b):
+        parent.setdefault(site_a, site_a)
+        parent.setdefault(site_b, site_b)
+        root_a, root_b = _find(site_a), _find(site_b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for site_id, info in (site_chain_index or {}).items():
+        if not site_id or not isinstance(info, dict):
+            continue
+        parent.setdefault(site_id, site_id)
+        neighbor_sites = (
+            set(info.get("upstream_site_hops") or ())
+            | set(info.get("downstream_site_hops") or ())
+            | set(info.get("bidirectional_sites") or ())
+        )
+        for neighbor_site in neighbor_sites:
+            if neighbor_site and neighbor_site != site_id:
+                _union(site_id, neighbor_site)
+
+    return {site_id: _find(site_id) for site_id in parent}
 
 
 def _site_context(site_id, site_graph_data, ne_info):
@@ -867,7 +914,66 @@ def _build_site_completion(
     }
 
 
-def _build_topology_highlight_sites(completion):
+def _build_ran_data_upstream_highlight_sites(
+    no_upstream_site_ids,
+    site_has_data,
+    site_links,
+    directed_edge_types,
+    site_chain_components,
+):
+    site_has_data = set(site_has_data or ())
+    data_neighbors_by_site = {}
+    for site_id in no_upstream_site_ids:
+        site_id = _normalize_text(site_id)
+        if not site_id or site_id in site_has_data:
+            continue
+        data_neighbor_sites = [
+            peer_site
+            for peer_site in sorted((site_links or {}).get(site_id, ()))
+            if peer_site in site_has_data
+            and ("Ran", "Data") in (directed_edge_types or {}).get((site_id, peer_site), set())
+        ]
+        if data_neighbor_sites:
+            data_neighbors_by_site[site_id] = data_neighbor_sites
+    if len(data_neighbors_by_site) < 2:
+        return []
+
+    # 只有经 site_chains（upstream/downstream/bidirectional，可经其他站点中转）
+    # 与另一个满足条件站点连通的，才参与补标；孤立的不算。
+    site_chain_components = site_chain_components or {}
+    component_counts = Counter(
+        site_chain_components[site_id]
+        for site_id in data_neighbors_by_site
+        if site_id in site_chain_components
+    )
+    marks_by_site = {}
+    for site_id in sorted(data_neighbors_by_site):
+        component = site_chain_components.get(site_id)
+        if component is None or component_counts[component] < 2:
+            continue
+        for peer_site in data_neighbors_by_site[site_id]:
+            mark = marks_by_site.setdefault(peer_site, {
+                "site_id": peer_site,
+                "role": "ran_data_upstream_site",
+                "label": "Ran-Data 相邻 Data 站点",
+                "source_sites": [],
+            })
+            mark["source_sites"].append(site_id)
+    result = []
+    for peer_site in sorted(marks_by_site):
+        mark = marks_by_site[peer_site]
+        mark["source_sites"] = sorted(set(mark["source_sites"]))
+        result.append(mark)
+    return result
+
+
+def _build_topology_highlight_sites(
+    completion,
+    site_has_data,
+    site_links,
+    directed_edge_types,
+    site_chain_components,
+):
     common_upstream_sites = list(completion.get("common_upstream_sites") or [])
     common_upstream_site = completion.get("common_upstream_site")
     if common_upstream_site and common_upstream_site not in common_upstream_sites:
@@ -937,43 +1043,36 @@ def _build_topology_highlight_sites(completion):
                 site_id for site_id in item["router_ancestor_site_ids"] if site_id
             })
         result.append(item)
-    for site_id in completion.get("no_upstream_sites") or []:
-        site_id = _normalize_text(site_id)
-        if not site_id:
-            continue
-        result.append({
-            "site_id": site_id,
-            "role": "no_upstream_site",
-            "label": "无可用 upstream 站点",
-        })
+    # 无上游站点本身不打标，只用于触发 Ran-Data 相邻 Data 站点补标。
+    no_upstream_site_ids = [
+        _normalize_text(site_id)
+        for site_id in completion.get("no_upstream_sites") or []
+        if _normalize_text(site_id)
+    ]
+    result.extend(_build_ran_data_upstream_highlight_sites(
+        no_upstream_site_ids,
+        site_has_data,
+        site_links,
+        directed_edge_types,
+        site_chain_components,
+    ))
     return result
 
 
-def _filter_non_offline_alarm_site_highlight_sites(highlight_sites, non_offline_alarm_site_ids):
-    non_offline_alarm_site_ids = {
-        _normalize_text(site_id) for site_id in (non_offline_alarm_site_ids or []) if _normalize_text(site_id)
-    }
+def _filter_hub_highlight_sites(highlight_sites, site_graph_data, site_has_data):
+    # 只保留 hub 站点或含 Data 设备的站点。
+    site_has_data = set(site_has_data or ())
     kept = []
     removed_site_ids = []
     for item in highlight_sites or []:
         if not isinstance(item, dict):
             continue
         site_id = _normalize_text(item.get("site_id", ""))
-        if site_id and site_id in non_offline_alarm_site_ids:
-            removed_site_ids.append(site_id)
-            continue
-        kept.append(item)
-    return kept, sorted(set(removed_site_ids))
-
-
-def _filter_hub_highlight_sites(highlight_sites, site_graph_data):
-    kept = []
-    removed_site_ids = []
-    for item in highlight_sites or []:
-        if not isinstance(item, dict):
-            continue
-        site_id = _normalize_text(item.get("site_id", ""))
-        if site_id and not _site_is_hub(site_id, site_graph_data):
+        if (
+            site_id
+            and site_id not in site_has_data
+            and not _site_is_hub(site_id, site_graph_data)
+        ):
             removed_site_ids.append(site_id)
             continue
         kept.append(item)
@@ -1121,9 +1220,136 @@ def _postprocess_data_linked_ancestor_sites(highlight_sites, site_has_data, site
     ], sorted(removed_site_ids), sorted(shared_data_removed_site_ids)
 
 
+def _stringify_like_js(value):
+    # 对齐标注工具 JS 的字符串化：整数值的 float 不带小数点。
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _alarm_root_cause_key(alarm, index):
+    """与 ne_propagation_labeling.html 的 getAlarmRootCauseKey 保持一致。"""
+    alarm_id = alarm.get("alarm_id") or alarm.get("eid")
+    if alarm_id:
+        return "id:" + _stringify_like_js(alarm_id)
+    alarm_type = alarm.get("alarm_type") or alarm.get("title") or ""
+    ticket = alarm.get("工单号") or ""
+    ts = alarm.get("ts") or alarm.get("alarm_time") or ""
+    return (
+        "k:" + _stringify_like_js(alarm_type)
+        + "|" + _stringify_like_js(ticket)
+        + "|" + _stringify_like_js(ts)
+        + "|#" + str(index)
+    )
+
+
+def _pick_site_root_cause(site_id, ne_ids, ne_info, ne_graph_data, site_chain_index):
+    """按规则为标记站点挑根因：最早非断站告警 > 最早断站告警 > 下游连接最多的 Transmission 设备。"""
+    non_offline_records = []
+    offline_records = []
+    for ne_id in ne_ids:
+        entry = ne_info.get(ne_id) or {}
+        for index, alarm in enumerate(entry.get("alarm") or []):
+            if not isinstance(alarm, dict):
+                continue
+            ts = _first_record_timestamp(alarm, OFFLINE_START_TIME_FIELDS)
+            # 无时间戳的告警排在有时间戳的之后；ne_id/下标兜底保证结果稳定。
+            sort_key = (ts is None, ts if ts is not None else 0.0, ne_id, index)
+            record = (sort_key, ne_id, index, alarm)
+            if _record_has_offline_alarm(alarm):
+                offline_records.append(record)
+            else:
+                non_offline_records.append(record)
+    for records, kind in (
+        (non_offline_records, "non_offline_alarm"),
+        (offline_records, "offline_alarm"),
+    ):
+        if records:
+            _sort_key, ne_id, index, alarm = min(records)
+            return ne_id, kind, _alarm_root_cause_key(alarm, index)
+
+    # 无告警：标和下游站点（site_chains）连接最多的 Transmission 设备，平局取 ne_id 最小的。
+    downstream_sites = set(
+        (site_chain_index.get(site_id) or {}).get("downstream_site_hops") or ()
+    )
+    best = None
+    for ne_id in sorted(ne_ids):
+        if _device_role(ne_info.get(ne_id) or {}) != "Microwave":
+            continue
+        raw_info = ne_graph_data.get(ne_id, {}) if isinstance(ne_graph_data, dict) else {}
+        links = raw_info.get("link", {}) if isinstance(raw_info, dict) else {}
+        connected_downstream_sites = set()
+        for peer_ne in links or ():
+            peer_site = _site_of_ne(peer_ne, ne_graph_data)
+            if peer_site and peer_site in downstream_sites:
+                connected_downstream_sites.add(peer_site)
+        if best is None or len(connected_downstream_sites) > best[0]:
+            best = (len(connected_downstream_sites), ne_id)
+    if best is not None:
+        return best[1], "transmission_device", None
+    return None
+
+
+def _annotate_root_cause_for_highlight_sites(
+    group,
+    highlight_sites,
+    ne_info,
+    ne_graph_data,
+    site_chain_index,
+):
+    """为最终标记候选站点预填根因标注；输入已有人工标注时不覆盖。"""
+    existing = group.get("root_cause_annotations")
+    if isinstance(existing, dict) and existing:
+        return []
+
+    ne_ids_by_site = defaultdict(list)
+    for ne_id, entry in ne_info.items():
+        if isinstance(entry, dict):
+            entry_site_id = _normalize_text(entry.get("site_id", ""))
+            if entry_site_id:
+                ne_ids_by_site[entry_site_id].append(ne_id)
+
+    annotations = {}
+    summary = []
+    for item in highlight_sites or []:
+        if not isinstance(item, dict):
+            continue
+        site_id = _normalize_text(item.get("site_id", ""))
+        if not site_id:
+            continue
+        picked = _pick_site_root_cause(
+            site_id,
+            ne_ids_by_site.get(site_id) or [],
+            ne_info,
+            ne_graph_data,
+            site_chain_index,
+        )
+        if not picked:
+            continue
+        ne_id, kind, alarm_key = picked
+        annotation = annotations.setdefault(ne_id, {"device": False, "alarms": {}})
+        if alarm_key:
+            annotation["alarms"][alarm_key] = True
+        else:
+            annotation["device"] = True
+        summary.append({
+            "site_id": site_id,
+            "ne_id": ne_id,
+            "kind": kind,
+            "alarm_key": alarm_key,
+        })
+    if annotations:
+        group["root_cause_annotations"] = annotations
+    return summary
+
+
 def _ancestor_highlight_count(completion):
     highlight_sites = completion.get("highlight_sites") or []
-    ancestor_roles = {"common_upstream_site", "farthest_upstream_site", "no_upstream_site"}
+    ancestor_roles = {
+        "common_upstream_site",
+        "farthest_upstream_site",
+        "ran_data_upstream_site",
+    }
     ancestor_site_ids = {
         _normalize_text(item.get("site_id", ""))
         for item in highlight_sites
@@ -1135,7 +1361,11 @@ def _ancestor_highlight_count(completion):
 def _blocked_ancestor_site_ids(completion):
     blocked_site_ids = {_normalize_text(site_id) for site_id in BLOCKED_ANCESTOR_SITE_IDS}
     ancestor_site_ids = set()
-    ancestor_roles = {"common_upstream_site", "farthest_upstream_site", "no_upstream_site"}
+    ancestor_roles = {
+        "common_upstream_site",
+        "farthest_upstream_site",
+        "ran_data_upstream_site",
+    }
     for item in completion.get("highlight_sites") or []:
         if not isinstance(item, dict) or item.get("role") not in ancestor_roles:
             continue
@@ -1313,6 +1543,7 @@ def complete_group_topology(
     site_has_ran=None,
     site_links=None,
     directed_edge_types=None,
+    site_chain_components=None,
 ):
     group = copy.deepcopy(group)
     group_id = group.get("uuid") or group.get("故障组ID") or group.get("match_info", {}).get("uuid", "")
@@ -1330,6 +1561,8 @@ def complete_group_topology(
     non_offline_alarm_sites = sorted(set(alarm_sites) - set(offline_alarm_sites))
     if site_has_data is None or site_has_ran is None or site_links is None or directed_edge_types is None:
         site_has_data, site_has_ran, site_links, directed_edge_types = _build_site_data_and_link_index(ne_graph_data)
+    if site_chain_components is None:
+        site_chain_components = _build_site_chain_component_index(site_chain_index)
     completion = _build_site_completion(
         offline_alarm_sites,
         site_chain_index,
@@ -1341,17 +1574,17 @@ def complete_group_topology(
     # 上游祖先仍只由断站/Offline 告警站点推断，但只要站点上存在任意告警，
     # 就应把该站点纳入设备展开范围，补齐站内没有告警的设备。
     selected_sites = set(completion["selected_sites"]) | set(alarm_sites)
-    topology_highlight_sites = _build_topology_highlight_sites(completion)
-    (
-        topology_highlight_sites,
-        non_offline_alarm_site_filtered_ancestor_site_ids,
-    ) = _filter_non_offline_alarm_site_highlight_sites(
-        topology_highlight_sites,
-        non_offline_alarm_sites,
+    topology_highlight_sites = _build_topology_highlight_sites(
+        completion,
+        site_has_data,
+        site_links,
+        directed_edge_types,
+        site_chain_components,
     )
     topology_highlight_sites, hub_filtered_ancestor_site_ids = _filter_hub_highlight_sites(
         topology_highlight_sites,
         site_graph_data,
+        site_has_data,
     )
     (
         topology_highlight_sites,
@@ -1378,6 +1611,13 @@ def complete_group_topology(
     ) = _filter_to_single_data_ancestor_highlight_site(
         topology_highlight_sites,
         site_has_data,
+    )
+    # Ran-Data 补出的 Data 站点不在 completion 的 selected_sites 里，
+    # 只把过滤后仍保留的补进输出拓扑。
+    selected_sites.update(
+        item["site_id"]
+        for item in topology_highlight_sites
+        if item.get("role") == "ran_data_upstream_site" and item.get("site_id")
     )
     topology_highlight_site_ids = sorted(
         item["site_id"]
@@ -1416,6 +1656,13 @@ def complete_group_topology(
     }
 
     group["ne_info"] = ne_info
+    auto_root_cause_annotations = _annotate_root_cause_for_highlight_sites(
+        group,
+        topology_highlight_sites,
+        ne_info,
+        ne_graph_data,
+        site_chain_index,
+    )
     group["group_info"] = {
         group_id: {
             "ne_list": sorted(included_ne_ids),
@@ -1429,7 +1676,13 @@ def complete_group_topology(
     match_info = group.get("match_info") if isinstance(group.get("match_info"), dict) else {}
     if isinstance(match_info.get("role_mapping"), dict):
         existing_role_mapping.update(copy.deepcopy(match_info["role_mapping"]))
-    for derived_role in ("context_site", "common_upstream_site", "farthest_upstream_site", "no_upstream_site"):
+    for derived_role in (
+        "context_site",
+        "common_upstream_site",
+        "farthest_upstream_site",
+        "no_upstream_site",
+        "ran_data_upstream_site",
+    ):
         existing_role_mapping.pop(derived_role, None)
     alarm_site_set = set(alarm_sites)
     existing_role_mapping["associated_site"] = sorted(alarm_site_set)
@@ -1446,17 +1699,17 @@ def complete_group_topology(
         for item in topology_highlight_sites
         if item.get("role") == "farthest_upstream_site"
     ]
-    no_upstream_sites = [
+    ran_data_upstream_sites = [
         item["site_id"]
         for item in topology_highlight_sites
-        if item.get("role") == "no_upstream_site"
+        if item.get("role") == "ran_data_upstream_site"
     ]
     if common_upstream_sites:
         existing_role_mapping["common_upstream_site"] = sorted(common_upstream_sites)
     if farthest_upstream_sites:
         existing_role_mapping["farthest_upstream_site"] = sorted(farthest_upstream_sites)
-    if no_upstream_sites:
-        existing_role_mapping["no_upstream_site"] = sorted(no_upstream_sites)
+    if ran_data_upstream_sites:
+        existing_role_mapping["ran_data_upstream_site"] = sorted(ran_data_upstream_sites)
     group["role_mapping"] = existing_role_mapping
 
     match_info = copy.deepcopy(match_info)
@@ -1487,7 +1740,6 @@ def complete_group_topology(
         "intermediate_site_chains_by_target": completion["intermediate_site_chains_by_target"],
         "data_ancestor_promotions": completion["data_ancestor_promotions"],
         "data_ancestor_missing_site_ids": completion["data_ancestor_missing_site_ids"],
-        "non_offline_alarm_site_filtered_ancestor_site_ids": non_offline_alarm_site_filtered_ancestor_site_ids,
         "hub_filtered_ancestor_site_ids": hub_filtered_ancestor_site_ids,
         "ran_without_data_link_filtered_ancestor_site_ids": ran_without_data_link_filtered_ancestor_site_ids,
         "data_link_pruned_ancestor_site_ids": data_link_pruned_ancestor_site_ids,
@@ -1495,6 +1747,7 @@ def complete_group_topology(
         "single_data_ancestor_pruned_site_ids": single_data_ancestor_pruned_site_ids,
         "highlight_site_ids": topology_highlight_site_ids,
         "highlight_sites": topology_highlight_sites,
+        "auto_root_cause_annotations": auto_root_cause_annotations,
         "site_level_connected": bool(completion["common_upstream_site"]) or len(offline_alarm_sites) <= 1,
         "offline_site_max_duration_seconds": _serialize_offline_durations(offline_site_max_durations),
         "offline_duration_filter": _offline_duration_filter_summary(offline_site_max_durations),
@@ -1540,6 +1793,7 @@ def complete_groups(
     upstream_adjacency = (
         _build_weighted_upstream_adjacency(site_chain_index) if restrict_relation else None
     )
+    site_chain_components = _build_site_chain_component_index(site_chain_index)
 
     stats = {
         "input_group_count": 0,
@@ -1587,6 +1841,7 @@ def complete_groups(
                     site_has_ran,
                     site_links,
                     directed_edge_types,
+                    site_chain_components,
                 )
                 completion = completed.get("topology_completion", {})
                 if completion.get("common_upstream_site"):

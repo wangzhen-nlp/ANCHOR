@@ -17,8 +17,10 @@ from fault_grouping.site_topology import build_site_to_ne_ids, normalize_site_ch
 from microwave_topic.complete_group_topology import (
     _blocked_ancestor_site_ids,
     _build_group_progress,
+    _build_site_chain_component_index,
     _build_site_data_and_link_index,
     _build_weighted_upstream_adjacency,
+    _normalize_site_id_set,
     _check_group_alarm_topology,
     _detect_restrict_relation,
     _group_uuid,
@@ -47,6 +49,9 @@ def _load_site_chain_index_from_data(site_chains_data):
                 ),
                 "downstream_site_hops": normalize_site_chain_hops(
                     raw_info.get("downstream_site_hops")
+                ),
+                "bidirectional_sites": _normalize_site_id_set(
+                    raw_info.get("bidirectional_sites")
                 ),
             }
     return site_chain_index, restrict_relation
@@ -89,6 +94,7 @@ def complete_groups_from_resource_buffer(
     upstream_adjacency = (
         _build_weighted_upstream_adjacency(site_chain_index) if restrict_relation else None
     )
+    site_chain_components = _build_site_chain_component_index(site_chain_index)
 
     stats = {
         "input_group_count": 0,
@@ -136,6 +142,7 @@ def complete_groups_from_resource_buffer(
                     site_has_ran,
                     site_links,
                     directed_edge_types,
+                    site_chain_components,
                 )
                 completion = completed.get("topology_completion", {})
                 if completion.get("common_upstream_site"):
