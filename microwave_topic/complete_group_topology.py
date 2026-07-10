@@ -867,6 +867,19 @@ def _build_site_completion(
         else:
             selected_sites.add(target_site)
 
+    # 无 upstream 源站的处理独立于公共 upstream/逐站回退分支：Data 站点补入自身，
+    # 非 Data 站点只记录排除原因。这样其他源站找到公共 upstream 时也不会漏掉该 Data 源站。
+    for site_id in no_upstream_sites:
+        if site_id in data_site_ids:
+            farthest_upstream_sites[site_id] = {
+                "site_id": site_id,
+                "hop": 0,
+                "self_fallback": True,
+            }
+            _append_unique(no_upstream_data_self_fallback_site_ids, site_id)
+        else:
+            _append_unique(no_upstream_non_data_excluded_site_ids, site_id)
+
     if common_candidates:
         def _common_rank(candidate):
             return (
@@ -897,29 +910,19 @@ def _build_site_completion(
             else {}
         )
     else:
-        for site_id in alarm_sites:
-            # 有 upstream 时选择最远 upstream；没有 upstream 时，只有包含 Data 设备的
-            # 源站才允许回退到自身（hop=0），非 Data 源站不加入回退结果。
+        for site_id in common_upstream_source_sites:
+            # 这里只处理有 upstream 的源站；无 upstream 源站已在上方独立处理。
             hops = {
                 upstream_site: hop
                 for upstream_site, hop in reach_by_site[site_id].items()
                 if upstream_site != site_id
             }
-            if not hops and site_id not in data_site_ids:
-                _append_unique(no_upstream_sites, site_id)
-                _append_unique(no_upstream_non_data_excluded_site_ids, site_id)
-                continue
-            if not hops:
-                hops = {site_id: 0}
-                _append_unique(no_upstream_data_self_fallback_site_ids, site_id)
             max_hop = max(hops.values())
             farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
             farthest_upstream_sites[site_id] = {
                 "site_id": farthest_site,
                 "hop": max_hop,
             }
-            if farthest_site == site_id:
-                farthest_upstream_sites[site_id]["self_fallback"] = True
             router_site = _promote_selected_ancestor(farthest_site, set(hops))
             if router_site != farthest_site:
                 farthest_upstream_sites[site_id]["router_ancestor_site_id"] = router_site
@@ -1077,6 +1080,48 @@ def _build_ran_data_upstream_highlight_sites(
     return result
 
 
+def _build_farthest_upstream_highlight_sites(completion):
+    farthest_by_target = {}
+    for source_site, selected in (completion.get("farthest_upstream_sites") or {}).items():
+        if not isinstance(selected, dict):
+            continue
+        target_site = _normalize_text(selected.get("site_id", ""))
+        if not target_site:
+            continue
+        item = farthest_by_target.setdefault(target_site, {
+            "site_id": target_site,
+            "role": "farthest_upstream_site",
+            "label": "最远 upstream 站点",
+            "source_sites": [],
+            "hops_by_source_site": {},
+        })
+        item["source_sites"].append(source_site)
+        item["hops_by_source_site"][source_site] = selected.get("hop")
+        if selected.get("self_fallback"):
+            item.setdefault("self_fallback_source_sites", []).append(source_site)
+        if selected.get("router_promoted"):
+            item["router_promoted"] = True
+            item.setdefault("router_ancestor_site_ids", [])
+            item["router_ancestor_site_ids"].append(
+                _normalize_text(selected.get("router_ancestor_site_id", ""))
+            )
+
+    result = []
+    for site_id in sorted(farthest_by_target):
+        item = farthest_by_target[site_id]
+        item["source_sites"] = sorted(set(item["source_sites"]))
+        if item.get("self_fallback_source_sites"):
+            item["self_fallback_source_sites"] = sorted(
+                set(item["self_fallback_source_sites"])
+            )
+        if item.get("router_ancestor_site_ids"):
+            item["router_ancestor_site_ids"] = sorted({
+                site_id for site_id in item["router_ancestor_site_ids"] if site_id
+            })
+        result.append(item)
+    return result
+
+
 def _build_topology_highlight_sites(
     completion,
     site_has_data,
@@ -1123,44 +1168,19 @@ def _build_topology_highlight_sites(
                 )
             result.append(item)
 
-    else:
-        farthest_by_target = {}
-        for source_site, selected in (completion.get("farthest_upstream_sites") or {}).items():
-            if not isinstance(selected, dict):
-                continue
-            target_site = _normalize_text(selected.get("site_id", ""))
-            if not target_site:
-                continue
-            item = farthest_by_target.setdefault(target_site, {
-                "site_id": target_site,
-                "role": "farthest_upstream_site",
-                "label": "最远 upstream 站点",
-                "source_sites": [],
-                "hops_by_source_site": {},
-            })
-            item["source_sites"].append(source_site)
-            item["hops_by_source_site"][source_site] = selected.get("hop")
-            if selected.get("self_fallback"):
-                item.setdefault("self_fallback_source_sites", []).append(source_site)
-            if selected.get("router_promoted"):
-                item["router_promoted"] = True
-                item.setdefault("router_ancestor_site_ids", [])
-                item["router_ancestor_site_ids"].append(
-                    _normalize_text(selected.get("router_ancestor_site_id", ""))
-                )
-
-        for site_id in sorted(farthest_by_target):
-            item = farthest_by_target[site_id]
-            item["source_sites"] = sorted(set(item["source_sites"]))
-            if item.get("self_fallback_source_sites"):
-                item["self_fallback_source_sites"] = sorted(
-                    set(item["self_fallback_source_sites"])
-                )
-            if item.get("router_ancestor_site_ids"):
-                item["router_ancestor_site_ids"] = sorted({
-                    site_id for site_id in item["router_ancestor_site_ids"] if site_id
-                })
+    for item in _build_farthest_upstream_highlight_sites(completion):
+        existing = next(
+            (candidate for candidate in result if candidate.get("site_id") == item.get("site_id")),
+            None,
+        )
+        if existing is None:
             result.append(item)
+            continue
+        if item.get("self_fallback_source_sites"):
+            existing["self_fallback_source_sites"] = sorted(set(
+                (existing.get("self_fallback_source_sites") or [])
+                + item["self_fallback_source_sites"]
+            ))
     # 非 Data 告警源站只要完整 upstream 闭包中不存在 Data 站点，就可用于触发
     # Ran-Data 相邻 Data 站点补标；允许其 upstream 中存在其他非 Data 站点。
     normalized_data_site_ids = {
