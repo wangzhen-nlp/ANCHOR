@@ -460,6 +460,24 @@ def _append_unique(values, value):
         values.append(value)
 
 
+def _missing_coordinate_ne_ids(group):
+    """返回经度或纬度缺失的输出设备 ID；数值 0 是有效坐标。"""
+    ne_info = group.get("ne_info") if isinstance(group, dict) else None
+    if not isinstance(ne_info, dict):
+        return []
+
+    def _is_blank(value):
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    return sorted(
+        ne_id
+        for ne_id, entry in ne_info.items()
+        if not isinstance(entry, dict)
+        or _is_blank(entry.get("longitude"))
+        or _is_blank(entry.get("latitude"))
+    )
+
+
 def _check_group_alarm_topology(group, ne_graph_data, site_graph_data):
     result = {
         "checked_alarm_count": 0,
@@ -794,8 +812,19 @@ def _build_site_completion(
             reach_by_site[site_id] = _closure_upstream_hops(site_id, site_chain_index)
             parents_by_site[site_id] = None
 
-    common_candidates = None
+    # 完全没有 upstream 的源站不参与公共 upstream 求交，避免孤立站点把其余
+    # 有 upstream 源站本可得到的公共候选交集拉成空集。
+    common_upstream_source_sites = []
+    no_upstream_sites = []
     for site_id in alarm_sites:
+        actual_upstream_sites = set(reach_by_site[site_id]) - {site_id}
+        if actual_upstream_sites:
+            common_upstream_source_sites.append(site_id)
+        else:
+            no_upstream_sites.append(site_id)
+
+    common_candidates = None
+    for site_id in common_upstream_source_sites:
         candidates = set(reach_by_site[site_id]) - excluded_ancestor_site_ids
         common_candidates = candidates if common_candidates is None else common_candidates & candidates
     common_candidates = common_candidates or set()
@@ -805,7 +834,6 @@ def _build_site_completion(
     common_upstream_hops = {}
     common_upstream_hops_by_site = {}
     farthest_upstream_sites = {}
-    no_upstream_sites = []
     intermediate_site_chains = {}
     intermediate_site_chains_by_target = {}
     data_ancestor_promotions = []
@@ -843,8 +871,8 @@ def _build_site_completion(
     if common_candidates:
         def _common_rank(candidate):
             return (
-                sum(reach_by_site[site_id][candidate] for site_id in alarm_sites),
-                max(reach_by_site[site_id][candidate] for site_id in alarm_sites),
+                sum(reach_by_site[site_id][candidate] for site_id in common_upstream_source_sites),
+                max(reach_by_site[site_id][candidate] for site_id in common_upstream_source_sites),
             )
 
         best_common_rank = min(_common_rank(candidate) for candidate in common_candidates)
@@ -856,10 +884,10 @@ def _build_site_completion(
                 common_upstream_sites.append(lowest_common_site)
                 common_upstream_hops_by_site[lowest_common_site] = {
                     site_id: reach_by_site[site_id][lowest_common_site]
-                    for site_id in alarm_sites
+                    for site_id in common_upstream_source_sites
                 }
             router_site = _promote_selected_ancestor(lowest_common_site, common_candidates)
-            for site_id in alarm_sites:
+            for site_id in common_upstream_source_sites:
                 _select_path(site_id, lowest_common_site)
                 if router_site != lowest_common_site and router_site in reach_by_site[site_id]:
                     _select_path(site_id, router_site)
@@ -877,7 +905,7 @@ def _build_site_completion(
                 if upstream_site != site_id and upstream_site not in excluded_ancestor_site_ids
             }
             if not hops:
-                no_upstream_sites.append(site_id)
+                _append_unique(no_upstream_sites, site_id)
                 continue
             max_hop = max(hops.values())
             farthest_site = min(candidate for candidate, hop in hops.items() if hop == max_hop)
@@ -903,6 +931,10 @@ def _build_site_completion(
         "common_upstream_sites": common_upstream_sites,
         "common_upstream_hops": common_upstream_hops,
         "common_upstream_hops_by_site": common_upstream_hops_by_site,
+        "common_upstream_source_site_ids": common_upstream_source_sites,
+        "common_upstream_excluded_no_upstream_site_ids": sorted(
+            set(alarm_sites) - set(common_upstream_source_sites)
+        ),
         "farthest_upstream_sites": farthest_upstream_sites,
         "no_upstream_sites": sorted(no_upstream_sites),
         "upstream_site_hops": reach_by_site,
@@ -1847,6 +1879,10 @@ def complete_group_topology(
         "common_upstream_sites": completion["common_upstream_sites"],
         "common_upstream_hops": completion["common_upstream_hops"],
         "common_upstream_hops_by_site": completion["common_upstream_hops_by_site"],
+        "common_upstream_source_site_ids": completion["common_upstream_source_site_ids"],
+        "common_upstream_excluded_no_upstream_site_ids": completion[
+            "common_upstream_excluded_no_upstream_site_ids"
+        ],
         "farthest_upstream_sites": completion["farthest_upstream_sites"],
         "no_upstream_sites": completion["no_upstream_sites"],
         "upstream_site_hops": completion["upstream_site_hops"],
@@ -1920,6 +1956,8 @@ def complete_groups(
         "skipped_by_ancestor_output_group_count": 0,
         "skipped_by_offline_duration_filter_group_count": 0,
         "skipped_by_blocked_ancestor_site_group_count": 0,
+        "skipped_by_missing_device_coordinates_group_count": 0,
+        "missing_device_coordinates_count": 0,
         "skipped_by_missing_alarm_topology_group_count": 0,
         "missing_alarm_source_group_count": 0,
         "missing_ne_graph_group_count": 0,
@@ -1995,6 +2033,13 @@ def complete_groups(
                         stats["missing_ne_site_group_count"] += 1
                     if alarm_topology_check["missing_site_graph_ids"]:
                         stats["missing_site_graph_group_count"] += 1
+                    progress.update(stats)
+                    continue
+                # 仅在最终写出前检查坐标；拓扑计算和其他筛选逻辑不依赖经纬度。
+                missing_coordinate_ne_ids = _missing_coordinate_ne_ids(completed)
+                if missing_coordinate_ne_ids:
+                    stats["skipped_by_missing_device_coordinates_group_count"] += 1
+                    stats["missing_device_coordinates_count"] += len(missing_coordinate_ne_ids)
                     progress.update(stats)
                     continue
                 stats["added_site_count"] += len(completion.get("added_site_ids", []))

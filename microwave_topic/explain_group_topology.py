@@ -241,6 +241,21 @@ def _append_upstream_reasoning(lines, completion, site_names):
             f"{_format_hops(source_hops, source_site, site_names)}"
         )
 
+    if "common_upstream_source_site_ids" in completion:
+        common_source_site_ids = _as_list(completion.get("common_upstream_source_site_ids"))
+        excluded_no_upstream_site_ids = _as_list(
+            completion.get("common_upstream_excluded_no_upstream_site_ids")
+        )
+        lines.append(
+            "参与公共 upstream 求交的有 upstream 源站: "
+            + _site_list(common_source_site_ids, site_names)
+        )
+        if excluded_no_upstream_site_ids:
+            lines.append(
+                "因完全没有 upstream 而不参与求交的源站: "
+                + _site_list(excluded_no_upstream_site_ids, site_names)
+            )
+
     common_sites = _as_list(completion.get("common_upstream_sites"))
     common_site = _text(completion.get("common_upstream_site"))
     if common_site and common_site not in common_sites:
@@ -571,7 +586,12 @@ def _append_consistency_checks(lines, group, completion, site_names):
     if highlight_ids != recorded_highlight_ids:
         warnings.append("highlight_site_ids 与 highlight_sites 中的站点不一致")
 
-    source_sites = [_text(site_id) for site_id in _as_list(completion.get("ancestor_source_site_ids"))]
+    common_source_field = (
+        "common_upstream_source_site_ids"
+        if "common_upstream_source_site_ids" in completion
+        else "ancestor_source_site_ids"
+    )
+    source_sites = [_text(site_id) for site_id in _as_list(completion.get(common_source_field))]
     excluded_sites = set(map(_text, _as_list(completion.get("non_offline_alarm_site_ids")))) - {""}
     upstream_hops = completion.get("upstream_site_hops") or {}
     common_candidates = None

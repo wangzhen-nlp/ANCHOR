@@ -25,6 +25,7 @@ from microwave_topic.complete_group_topology import (
     _detect_restrict_relation,
     _group_uuid,
     _iter_jsonl,
+    _missing_coordinate_ne_ids,
     _safe_filename,
     _ancestor_highlight_count,
     _should_output_by_ancestor_count,
@@ -106,6 +107,8 @@ def complete_groups_from_resource_buffer(
         "skipped_by_ancestor_output_group_count": 0,
         "skipped_by_offline_duration_filter_group_count": 0,
         "skipped_by_blocked_ancestor_site_group_count": 0,
+        "skipped_by_missing_device_coordinates_group_count": 0,
+        "missing_device_coordinates_count": 0,
         "skipped_by_missing_alarm_topology_group_count": 0,
         "missing_alarm_source_group_count": 0,
         "missing_ne_graph_group_count": 0,
@@ -186,6 +189,14 @@ def complete_groups_from_resource_buffer(
                         stats["missing_ne_site_group_count"] += 1
                     if alarm_topology_check["missing_site_graph_ids"]:
                         stats["missing_site_graph_group_count"] += 1
+                    progress.update(stats)
+                    continue
+
+                # 仅在最终写出前检查坐标；拓扑计算和其他筛选逻辑不依赖经纬度。
+                missing_coordinate_ne_ids = _missing_coordinate_ne_ids(completed)
+                if missing_coordinate_ne_ids:
+                    stats["skipped_by_missing_device_coordinates_group_count"] += 1
+                    stats["missing_device_coordinates_count"] += len(missing_coordinate_ne_ids)
                     progress.update(stats)
                     continue
 
