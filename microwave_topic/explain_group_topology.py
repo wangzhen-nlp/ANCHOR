@@ -45,7 +45,6 @@ ROOT_CAUSE_REASONS = {
 }
 
 RAN_DATA_STATUS_REASONS = {
-    "skipped_common_upstream": "已找到最低公共 upstream，因此没有执行 Ran-Data 补标",
     "produced": "已找到至少两个同组件源站共同连接的 Data 站点",
     "insufficient_eligible_source_sites": "排除 Data 源站和存在 Data upstream 的源站后，候选源站少于两个",
     "insufficient_sources_with_ran_data_neighbor": "候选源站不少于两个，但具有 Ran->Data 直连邻站的源站少于两个",

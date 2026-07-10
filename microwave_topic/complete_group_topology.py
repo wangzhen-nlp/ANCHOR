@@ -1044,23 +1044,14 @@ def _build_topology_highlight_sites(
     common_upstream_site = completion.get("common_upstream_site")
     if common_upstream_site and common_upstream_site not in common_upstream_sites:
         common_upstream_sites.insert(0, common_upstream_site)
+    result = []
     if common_upstream_sites:
-        if isinstance(ran_data_diagnostics, dict):
-            ran_data_diagnostics.update({
-                "status": "skipped_common_upstream",
-                "source_evaluations": [],
-                "eligible_source_site_ids": [],
-                "sources_with_ran_data_neighbor_site_ids": [],
-                "shared_data_site_evaluations": [],
-                "generated_highlight_site_ids": [],
-            })
         promotions_by_source = defaultdict(list)
         for promotion in completion.get("data_ancestor_promotions") or []:
             if isinstance(promotion, dict) and promotion.get("from_site_id"):
                 promotions_by_source[promotion.get("from_site_id")].append(promotion)
         hops_by_target = completion.get("common_upstream_hops_by_site") or {}
         missing_data_ancestor_site_ids = set(completion.get("data_ancestor_missing_site_ids") or [])
-        result = []
         for site_id in common_upstream_sites:
             item = {
                 "site_id": site_id,
@@ -1086,38 +1077,39 @@ def _build_topology_highlight_sites(
                     if promotion.get("upstream_hop") is not None
                 )
             result.append(item)
-        return result
 
-    farthest_by_target = {}
-    for source_site, selected in (completion.get("farthest_upstream_sites") or {}).items():
-        if not isinstance(selected, dict):
-            continue
-        target_site = _normalize_text(selected.get("site_id", ""))
-        if not target_site:
-            continue
-        item = farthest_by_target.setdefault(target_site, {
-            "site_id": target_site,
-            "role": "farthest_upstream_site",
-            "label": "最远 upstream 站点",
-            "source_sites": [],
-            "hops_by_source_site": {},
-        })
-        item["source_sites"].append(source_site)
-        item["hops_by_source_site"][source_site] = selected.get("hop")
-        if selected.get("router_promoted"):
-            item["router_promoted"] = True
-            item.setdefault("router_ancestor_site_ids", [])
-            item["router_ancestor_site_ids"].append(_normalize_text(selected.get("router_ancestor_site_id", "")))
-
-    result = []
-    for site_id in sorted(farthest_by_target):
-        item = farthest_by_target[site_id]
-        item["source_sites"] = sorted(set(item["source_sites"]))
-        if item.get("router_ancestor_site_ids"):
-            item["router_ancestor_site_ids"] = sorted({
-                site_id for site_id in item["router_ancestor_site_ids"] if site_id
+    else:
+        farthest_by_target = {}
+        for source_site, selected in (completion.get("farthest_upstream_sites") or {}).items():
+            if not isinstance(selected, dict):
+                continue
+            target_site = _normalize_text(selected.get("site_id", ""))
+            if not target_site:
+                continue
+            item = farthest_by_target.setdefault(target_site, {
+                "site_id": target_site,
+                "role": "farthest_upstream_site",
+                "label": "最远 upstream 站点",
+                "source_sites": [],
+                "hops_by_source_site": {},
             })
-        result.append(item)
+            item["source_sites"].append(source_site)
+            item["hops_by_source_site"][source_site] = selected.get("hop")
+            if selected.get("router_promoted"):
+                item["router_promoted"] = True
+                item.setdefault("router_ancestor_site_ids", [])
+                item["router_ancestor_site_ids"].append(
+                    _normalize_text(selected.get("router_ancestor_site_id", ""))
+                )
+
+        for site_id in sorted(farthest_by_target):
+            item = farthest_by_target[site_id]
+            item["source_sites"] = sorted(set(item["source_sites"]))
+            if item.get("router_ancestor_site_ids"):
+                item["router_ancestor_site_ids"] = sorted({
+                    site_id for site_id in item["router_ancestor_site_ids"] if site_id
+                })
+            result.append(item)
     # 非 Data 告警源站只要完整 upstream 闭包中不存在 Data 站点，就可用于触发
     # Ran-Data 相邻 Data 站点补标；允许其 upstream 中存在其他非 Data 站点。
     normalized_data_site_ids = {
