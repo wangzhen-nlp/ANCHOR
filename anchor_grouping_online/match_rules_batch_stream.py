@@ -25,16 +25,16 @@ from argparse import ArgumentParser
 from collections import deque
 from datetime import datetime
 
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 from anchor_grouping_online.alarm_events.generator import generate_alarm
 from anchor_grouping_online.alarm_events.io import is_clear_alarm
 from anchor_grouping_online.alarm_events.sorted_cache import iter_sorted_alarm_cache_items
 from anchor_grouping_online.match_rules_batch import BatchFaultGroupMatcher
 from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
+
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
 
 
 def _build_arg_parser():

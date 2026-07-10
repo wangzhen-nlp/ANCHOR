@@ -239,9 +239,18 @@ def _append_upstream_reasoning(lines, completion, site_names):
 
     for source_site in source_site_ids:
         source_hops = upstream_hops.get(source_site, {}) if isinstance(upstream_hops, dict) else {}
+        upstream_text = _format_hops(source_hops, source_site, site_names)
+        if source_site in _as_list(
+            completion.get("no_upstream_data_self_fallback_site_ids")
+        ):
+            upstream_text = "无 upstream（站内包含 Data，逐站回退可选择源站自身）"
+        elif source_site in _as_list(
+            completion.get("no_upstream_non_data_excluded_site_ids")
+        ):
+            upstream_text = "无 upstream（站内不含 Data，不加入逐站回退结果）"
         lines.append(
             f"- {_site_label(source_site, site_names)}: "
-            f"{_format_hops(source_hops, source_site, site_names)}"
+            f"{upstream_text}"
         )
 
     if "common_upstream_source_site_ids" in completion:

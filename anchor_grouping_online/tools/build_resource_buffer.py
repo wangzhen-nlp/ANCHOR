@@ -30,11 +30,6 @@ from dataclasses import asdict, dataclass
 from collections import defaultdict
 from types import SimpleNamespace
 
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 from anchor_grouping_online.peer_index_keys import make_key
 from anchor_grouping_online.tools.progress_utils import ProgressBar
 from anchor_grouping_online.tools.topology_resources import (
@@ -54,6 +49,11 @@ from anchor_grouping_online.tools.generate_site_chains import (
     verify_cross_domain_constraints,
 )
 from anchor_grouping_online.tools.generate_site_pair_order_pairwise import build_pairwise_prediction
+
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
 
 # 单文件缓冲产物的默认输出路径（JSONL：每行一个资源）
 DEFAULT_BUFFER_OUTPUT = RESOURCE_BUFFER_JSONL

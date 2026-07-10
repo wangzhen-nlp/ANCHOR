@@ -34,13 +34,13 @@ import time
 from argparse import ArgumentParser
 from datetime import datetime
 
+from anchor_grouping_online.alarm_events.sorted_cache import write_sorted_alarm_cache
+from anchor_grouping_online.alarm_events.generator import port_vid_from_extendedattr
+
 if __package__ in (None, ""):
     from _script_env import ensure_package_parent
 
     ensure_package_parent()
-
-from anchor_grouping_online.alarm_events.sorted_cache import write_sorted_alarm_cache
-from anchor_grouping_online.alarm_events.generator import port_vid_from_extendedattr
 
 
 SITE_PLACEHOLDER_PREFIX = "SITE::"

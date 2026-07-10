@@ -24,14 +24,14 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from anchor_grouping_online.alarm_events.generator import to_matching_alarm
+from anchor_grouping_online.resource_buffer import load_resource_buffer
+from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
+
 if __package__ in (None, ""):
     from _script_env import ensure_package_parent
 
     ensure_package_parent()
-
-from anchor_grouping_online.alarm_events.generator import to_matching_alarm
-from anchor_grouping_online.resource_buffer import load_resource_buffer
-from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
 
 
 SECONDARY_AGGREGATION_RULE = "secondary_aggregation_rule"

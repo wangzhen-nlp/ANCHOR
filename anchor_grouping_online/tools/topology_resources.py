@@ -1,5 +1,8 @@
 """拓扑工具共享的资源路径与默认输入位置。"""
 
+from pathlib import Path
+
+
 __all__ = [
     "RESOURCE_DIR",
     "RESOURCE_DIR_NAME",
@@ -15,8 +18,6 @@ __all__ = [
     "PORT_PORT_FILE",
     "NE_PORT_FILE",
 ]
-
-from pathlib import Path
 
 
 # 资源目录：本工具目录的上一级目录下的 resources（anchor_grouping_online/resources）

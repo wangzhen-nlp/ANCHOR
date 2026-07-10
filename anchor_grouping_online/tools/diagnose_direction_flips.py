@@ -22,11 +22,6 @@
 import argparse
 import json
 
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 from anchor_grouping_online.tools.build_resource_buffer import (
     _resource_buffer_pairwise_args,
 )
@@ -40,6 +35,11 @@ from anchor_grouping_online.tools.generate_site_pair_order_pairwise import (
 from anchor_grouping_online.tools.site_pair_order_common import (
     build_transmission_misconnection_pairs,
 )
+
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
 
 
 def load_ne_graph(resource_buffer_path=None, ne_graph_path=None):
