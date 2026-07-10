@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -92,6 +93,53 @@ def _alarm_title(alarm):
         if value:
             return value
     return "未命名告警"
+
+
+def _text_has_token(text, token):
+    if len(token) <= 2:
+        return re.search(rf"(?<![A-Z0-9]){token}(?![A-Z0-9])", text) is not None
+    return token in text
+
+
+def _device_role(entry):
+    domain = _text(entry.get("domain") if isinstance(entry, dict) else "").upper()
+    if any(_text_has_token(domain, token) for token in ("DATA", "IP", "ROUTER", "METRO")):
+        return "Data"
+    if any(
+        _text_has_token(domain, token)
+        for token in ("MICROWAVE", "MW", "RTN", "TRANSMISSION", "DWDM", "OTN", "OPTICAL", "WDM")
+    ):
+        return "Microwave"
+    if any(_text_has_token(domain, token) for token in ("RAN", "WIRELESS", "NODEB", "BTS", "LTE")):
+        return "Ran"
+    return "Other"
+
+
+def _site_role_index(ne_info):
+    roles_by_site = {}
+    for entry in (ne_info or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        site_id = _text(entry.get("site_id"))
+        if site_id:
+            roles_by_site.setdefault(site_id, set()).add(_device_role(entry))
+    return roles_by_site
+
+
+def _has_ran_data_link(source_site, data_site, ne_info):
+    source_site = _text(source_site)
+    data_site = _text(data_site)
+    for entry in (ne_info or {}).values():
+        if not isinstance(entry, dict) or _text(entry.get("site_id")) != source_site:
+            continue
+        if _device_role(entry) != "Ran":
+            continue
+        links = entry.get("link") if isinstance(entry.get("link"), dict) else {}
+        for peer_ne_id in links:
+            peer_entry = ne_info.get(peer_ne_id) if isinstance(ne_info.get(peer_ne_id), dict) else {}
+            if _text(peer_entry.get("site_id")) == data_site and _device_role(peer_entry) == "Data":
+                return True
+    return False
 
 
 def _load_single_group(input_path):
@@ -278,6 +326,60 @@ def _append_data_reasoning(lines, completion, site_names):
             )
 
 
+def _append_shared_data_neighbors(lines, group, completion, site_names):
+    highlights = [
+        item
+        for item in _as_list(completion.get("highlight_sites"))
+        if isinstance(item, dict) and item.get("role") == "ran_data_upstream_site"
+    ]
+    if not highlights:
+        return
+
+    _append_section(lines, "无 Data upstream -> 公共 Data 邻站")
+    ne_info = group.get("ne_info") if isinstance(group.get("ne_info"), dict) else {}
+    roles_by_site = _site_role_index(ne_info)
+    data_site_ids = {
+        site_id for site_id, roles in roles_by_site.items() if "Data" in roles
+    }
+    upstream_hops = completion.get("upstream_site_hops") or {}
+
+    for item in highlights:
+        data_site = _text(item.get("site_id"))
+        source_sites = sorted({_text(site_id) for site_id in _as_list(item.get("source_sites")) if _text(site_id)})
+        data_status = "已从 ne_info 确认为 Data 站点" if data_site in data_site_ids else "ne_info 中未识别到 Data 设备"
+        lines.append(f"公共 Data 站点: {_site_label(data_site, site_names)}（{data_status}）")
+        lines.append(f"共同连接源站 ({len(source_sites)}): {_site_list(source_sites, site_names)}")
+        for source_site in source_sites:
+            source_hops = upstream_hops.get(source_site, {}) if isinstance(upstream_hops, dict) else {}
+            upstream_site_ids = {
+                _text(site_id)
+                for site_id in source_hops
+                if _text(site_id) and _text(site_id) != source_site
+            }
+            data_upstream_site_ids = sorted(upstream_site_ids & data_site_ids)
+            unknown_upstream_site_ids = sorted(upstream_site_ids - set(roles_by_site))
+            lines.append(f"- 源站 {_site_label(source_site, site_names)}")
+            lines.append(f"  upstream: {_format_hops(source_hops, source_site, site_names)}")
+            if data_upstream_site_ids:
+                lines.append(
+                    "  Data upstream 检查: 不符合，发现 "
+                    + _site_list(data_upstream_site_ids, site_names)
+                )
+            elif unknown_upstream_site_ids:
+                lines.append(
+                    "  Data upstream 检查: 文件内可见 upstream 未发现 Data；"
+                    "以下站点缺少设备信息，无法完整确认: "
+                    + _site_list(unknown_upstream_site_ids, site_names)
+                )
+            else:
+                lines.append("  Data upstream 检查: 通过，所有可见 upstream 站点均为非 Data")
+            lines.append(
+                "  Ran->Data 直连检查: "
+                + ("通过" if _has_ran_data_link(source_site, data_site, ne_info) else "未能从 per-file 的设备链路中复核")
+            )
+        lines.append("站点链路组件检查: per-file 未保存组件编号，只能看到算法记录的最终通过结果。")
+
+
 def _append_filters(lines, completion, site_names):
     _append_section(lines, "候选过滤")
     found = False
@@ -459,6 +561,7 @@ def explain_group(group, input_path=None, all_ne=False):
     _append_summary(lines, group, completion, site_names)
     _append_upstream_reasoning(lines, completion, site_names)
     _append_data_reasoning(lines, completion, site_names)
+    _append_shared_data_neighbors(lines, group, completion, site_names)
     _append_filters(lines, completion, site_names)
     _append_offline_duration(lines, completion, site_names)
     _append_root_causes(lines, group, completion, site_names)
