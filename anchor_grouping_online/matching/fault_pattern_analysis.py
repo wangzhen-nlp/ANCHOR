@@ -697,6 +697,6 @@ def has_recognized_fault_pattern(prepared_case, relation_index):
             router_device_sites=router_device_sites,
             absorbed_by=absorbed_by,
         )
-        if pattern not in {"unknown", "ip_ring_others"}:
+        if pattern not in {"unknown"}:
             return True
     return False
