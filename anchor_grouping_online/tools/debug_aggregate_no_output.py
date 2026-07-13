@@ -63,7 +63,12 @@ from anchor_grouping_online.match_rules_batch import (
 from anchor_grouping_online.matching.fault_pattern_analysis import (
     MAX_ANALYSIS_SITES,
     classify_component,
+    classify_ip_ring_chain,
     extract_offline_sites,
+    has_absorbed_site_for_final,
+    has_two_bidirectional_or_upstream_neighbors,
+    iter_connected_components,
+    longest_path_in_component,
     prepare_case_record,
 )
 from anchor_grouping_online.temporal_engine.utils import (
@@ -492,6 +497,90 @@ def _diagnose_zero_triggers(engine, converted_rows):
               f"@{conv['site_id'] or '-'}: {reason}")
 
 
+def _explain_component_classification(component_sites, prepared, relation_index):
+    """逐分支复述 classify_component 的判定过程，返回解释文本行。
+
+    与 matching/fault_pattern_analysis.classify_component 的分支一一对应，
+    只加解释不改判定；那边逻辑变化时这里需要同步。
+    """
+    lines = []
+    component_sites = set(component_sites)
+    router_sites = set(prepared.router_device_sites or ())
+    unmanaged = set(prepared.active_unmanaged_sites) & component_sites
+    absorbed_by = prepared.absorbed_by or {}
+    lines.append(f"分量断站(吸收后仍 active 的 offline 站点): {sorted(unmanaged)}")
+    non_router = sorted(component_sites - router_sites)
+    if non_router:
+        lines.append(f"-> unknown: 分量含 {len(non_router)} 个无路由设备的站点 "
+                     f"{non_router[:8]}（这些站点在 ne_graph 中没有路由域设备）")
+        return lines
+    if len(unmanaged) == 1:
+        candidate = next(iter(unmanaged))
+        neighbors = sorted(relation_index.non_downstream_neighbors(candidate))
+        lines.append(f"唯一断站 {candidate!r} 的非下游邻居 {len(neighbors)} 个: "
+                     f"{neighbors[:6]}")
+        if len(neighbors) == 0:
+            lines.append("-> unknown: 断站没有任何非下游邻居（拓扑上孤立，"
+                         "无法判定链路形态）")
+        elif len(neighbors) == 1:
+            if has_absorbed_site_for_final(candidate, absorbed_by):
+                lines.append("-> ip_chain_single_link（可识别）")
+            else:
+                lines.append("-> unknown: 单链末端断站，但没有任何被吸收的"
+                             "下游断站挂在它下面（absorbed_by 中无该站的"
+                             "下游链），单站孤立断障不作为汇聚证据")
+        else:
+            lines.append("-> ip_chain_multi_link（可识别）")
+        return lines
+    mismatch = sorted(
+        site_id for site_id in unmanaged
+        if not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
+    )
+    lines.append(f"环度数不满足（双向/上游环邻居数 != 2）的断站 "
+                 f"{len(mismatch)} 个: {mismatch[:8]}")
+    if len(mismatch) > 2:
+        lines.append("-> unknown: 超过 2 个断站不满足环度数条件，"
+                     "不可能是环/环段形态")
+        return lines
+    sub_components = list(iter_connected_components(unmanaged, relation_index))
+    if len(sub_components) != 1:
+        lines.append(f"-> unknown: 断站之间不连通，分成 {len(sub_components)} 块: "
+                     f"{[sorted(c)[:5] for c in sub_components[:4]]}")
+        return lines
+    chain = longest_path_in_component(sub_components[0], relation_index)
+    if len(chain) < 2 or set(chain) != set(sub_components[0]):
+        lines.append(f"-> unknown: 断站子图不是一条覆盖全部断站的简单链"
+                     f"（最长链 {chain}），可能是分叉/星形结构或超出精确"
+                     "搜索上限")
+        return lines
+    label = classify_ip_ring_chain(chain, relation_index)
+    lines.append(f"断站链: {chain}")
+    if label not in {"unknown", "ip_ring_others"}:
+        lines.append(f"-> {label}（可识别）")
+        return lines
+    ring_degrees = {
+        site_id: len(relation_index.ring_neighbors(site_id))
+        for site_id in chain
+    }
+    lines.append(f"链上各站点的环邻居数（single 模式要求全部 =2）: {ring_degrees}")
+    endpoint_a, endpoint_b = chain[0], chain[-1]
+    chain_set = set(chain)
+    common_bidir = sorted(
+        (relation_index.bidirectional_neighbor_set(endpoint_a)
+         & relation_index.bidirectional_neighbor_set(endpoint_b)) - chain_set
+    )
+    common_upstream = sorted(
+        (relation_index.direct_upstream_neighbor_set(endpoint_a)
+         & relation_index.direct_upstream_neighbor_set(endpoint_b)) - chain_set
+    )
+    lines.append(f"端点 {endpoint_a!r}/{endpoint_b!r} 的链外共同双向邻居: "
+                 f"{common_bidir}；共同上游: {common_upstream}")
+    lines.append("-> ip_ring_others: 既不满足 single（全链环邻居数=2），"
+                 "也不满足 multi（内部站点环度数OK、端点度数不满足、"
+                 "且两端点有链外共同上游/双向邻居）")
+    return lines
+
+
 def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
     """复算 FaultPatternFilter.analyze_match 的各步骤，指出在哪一步被拒绝。
 
@@ -537,16 +626,20 @@ def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
             for component_sites in list(components)[:5]:
                 print(f"{indent}  - 分量: {sorted(component_sites)}")
             return
-        patterns = [
-            classify_component(
+        patterns = []
+        for component_sites in components:
+            label = classify_component(
                 component_sites,
                 prepared.active_unmanaged_sites,
                 relation_index,
                 router_device_sites=prepared.router_device_sites,
                 absorbed_by=prepared.absorbed_by,
             )
-            for component_sites in components
-        ]
+            patterns.append(label)
+            for line in _explain_component_classification(
+                component_sites, prepared, relation_index
+            ):
+                print(f"{indent}  {line}")
         print(f"{indent}!! 拒绝原因: filter-others 不通过——分量分类结果为 "
               f"{patterns}，只有 unknown/ip_ring_others 之外的模式才可参与"
               "二次汇聚")
