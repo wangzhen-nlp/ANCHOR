@@ -57,6 +57,12 @@ from anchor_grouping_online.match_rules_batch import (
     BatchFaultGroupMatcher,
     _collect_symptom_alarm_ids,
 )
+from anchor_grouping_online.matching.fault_pattern_analysis import (
+    MAX_ANALYSIS_SITES,
+    classify_component,
+    extract_offline_sites,
+    prepare_case_record,
+)
 from anchor_grouping_online.temporal_engine.utils import (
     matches_expected_alarm,
     merge_match_batch,
@@ -106,6 +112,7 @@ class DebugBatchFaultGroupMatcher(BatchFaultGroupMatcher):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.debug = SimpleNamespace(
+            fault_pattern_filter=self.fault_pattern_filter,
             session=None,
             engine=None,
             batch=None,
@@ -415,6 +422,68 @@ def _diagnose_zero_triggers(engine, converted_rows):
               f"@{conv['site_id'] or '-'}: {reason}")
 
 
+def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
+    """复算 FaultPatternFilter.analyze_match 的各步骤，指出在哪一步被拒绝。
+
+    与 analyze_match 的差异仅在 component_limit=None（枚举全部投影分量，
+    便于展示），不影响判定结论。依赖过滤器内部字段，仅用于诊断展示。
+    """
+    if fault_pattern_filter is None:
+        print(f"{indent}(未启用故障模式过滤器，无法复算)")
+        return
+    try:
+        site_ids = fault_pattern_filter._extract_match_sites(match)
+        ne_to_site = fault_pattern_filter._ne_to_site
+        relation_index = fault_pattern_filter._relation_index
+        offline_sites = sorted(
+            extract_offline_sites(match, ne_to_site) & set(site_ids)
+        )
+        print(f"{indent}症状站点 {len(site_ids)} 个: {site_ids[:10]}"
+              + ("..." if len(site_ids) > 10 else "")
+              + f"；其中 offline 站点: {offline_sites[:10]}")
+        if len(site_ids) > MAX_ANALYSIS_SITES:
+            print(f"{indent}!! 拒绝原因: 站点数超过分析上限 "
+                  f"MAX_ANALYSIS_SITES={MAX_ANALYSIS_SITES}")
+            return
+        prepared = prepare_case_record(
+            match,
+            relation_index,
+            ne_to_site,
+            fault_pattern_filter._site_has_router_device,
+            site_ids=site_ids,
+            component_limit=None,
+        )
+        if prepared.router_device_sites:
+            print(f"{indent}路由设备站点: "
+                  f"{sorted(prepared.router_device_sites)[:10]}")
+        if prepared.absorbed_by:
+            shown = dict(list(prepared.absorbed_by.items())[:5])
+            print(f"{indent}被吸收的无管理下游站点(站点->吸收者): {shown}")
+        components = prepared.projected_components
+        if len(components) != 1:
+            print(f"{indent}!! 拒绝原因: one-component-only 不通过——"
+                  f"站点在拓扑投影上形成 {len(components)} 个连通分量"
+                  "（各分量之间无站点链邻接关系）:")
+            for component_sites in list(components)[:5]:
+                print(f"{indent}  - 分量: {sorted(component_sites)}")
+            return
+        patterns = [
+            classify_component(
+                component_sites,
+                prepared.active_unmanaged_sites,
+                relation_index,
+                router_device_sites=prepared.router_device_sites,
+                absorbed_by=prepared.absorbed_by,
+            )
+            for component_sites in components
+        ]
+        print(f"{indent}!! 拒绝原因: filter-others 不通过——分量分类结果为 "
+              f"{patterns}，只有 unknown/ip_ring_others 之外的模式才可参与"
+              "二次汇聚")
+    except Exception as exc:  # noqa: BLE001 诊断复算失败不影响主流程
+        print(f"{indent}(复算故障模式过滤细节失败: {exc})")
+
+
 def _print_match_symptoms(match, indent="      ", limit=12):
     """打印单个 match 的症状明细：告警名 / alarm_source / 站点 / 角色 / 时间。"""
     symptoms = list(match.get("symptoms", ()) or ())
@@ -503,8 +572,12 @@ def report_matches(debug, converted_rows, show_matches):
           f"{after_rule_filter} -> {len(debug.eligible_matches)} 个")
     for match in debug.dropped_by_pattern_filter[:5]:
         print(f"  - 丢弃: merged_rules={match.get('merged_rules')} "
-              f"症状 {len(match.get('symptoms', ()))} 条"
-              "（filter-others / one-component-only 未通过）")
+              f"症状 {len(match.get('symptoms', ()))} 条:")
+        _print_match_symptoms(match, indent="    ", limit=8)
+        _diagnose_pattern_filter_drop(debug.fault_pattern_filter, match)
+    if len(debug.dropped_by_pattern_filter) > 5:
+        print(f"  ... 被故障模式过滤丢弃的 match 共 "
+              f"{len(debug.dropped_by_pattern_filter)} 个，仅展开前 5 个")
     if not debug.eligible_matches:
         print("  !! 全部被故障模式过滤吃掉")
         return
