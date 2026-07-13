@@ -8,13 +8,12 @@ import json
 from collections import defaultdict, deque
 from pathlib import Path
 
-from anchor_grouping_online.tools.topology_resources import resource_display, resource_path
-
 if __package__ in (None, ""):
     from _script_env import ensure_package_parent
 
     ensure_package_parent()
 
+from anchor_grouping_online.tools.topology_resources import resource_display, resource_path
 
 DEFAULT_PREDICTION_CANDIDATES = [
     "site_pair_order_global_path_optimized_ring.json",

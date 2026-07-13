@@ -8,6 +8,11 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
+
 from anchor_grouping_online.tools.find_site_chain import (
     DEFAULT_PREDICTION_CANDIDATES,
     add_adjacency_edge,
@@ -22,12 +27,6 @@ from anchor_grouping_online.tools.site_pair_order_common import (
     normalize_domain,
 )
 from anchor_grouping_online.tools.topology_resources import resource_display, resource_path
-
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 
 def build_bidirectional_neighbors(data):
     """提取直接双向边连接的站点集合。"""

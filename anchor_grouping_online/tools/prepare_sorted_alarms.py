@@ -2,6 +2,11 @@ import os
 import time
 from argparse import ArgumentParser
 
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
+
 from anchor_grouping_online.alarm_types import CRITICAL_ALARMS
 from anchor_grouping_online.alarm_events.io import (
     is_clear_alarm,
@@ -10,12 +15,6 @@ from anchor_grouping_online.alarm_events.io import (
     trim_trailing_clear_alarms,
 )
 from anchor_grouping_online.alarm_events.sorted_cache import write_sorted_alarm_cache
-
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 
 def build_sorted_alarms(
     alarm_input,

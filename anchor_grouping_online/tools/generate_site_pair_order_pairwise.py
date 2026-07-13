@@ -14,6 +14,11 @@
 
 from collections import Counter, defaultdict, deque
 
+if __package__ in (None, ""):
+    from _script_env import ensure_package_parent
+
+    ensure_package_parent()
+
 from anchor_grouping_online.tools.site_pair_order_common import (
     ProgressReporter,
     _get_site_id,
@@ -24,12 +29,6 @@ from anchor_grouping_online.tools.site_pair_order_common import (
     iter_unique_cross_site_links,
     normalize_domain,
 )
-
-if __package__ in (None, ""):
-    from _script_env import ensure_package_parent
-
-    ensure_package_parent()
-
 
 def compact_pairwise_prediction(pair_result):
     """把 pairwise 内部方向结果转换成统一的上下行预测格式。"""

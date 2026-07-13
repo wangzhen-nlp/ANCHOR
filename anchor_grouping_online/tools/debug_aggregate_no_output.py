@@ -67,6 +67,7 @@ from anchor_grouping_online.matching.fault_pattern_analysis import (
     prepare_case_record,
 )
 from anchor_grouping_online.temporal_engine.utils import (
+    get_match_alarm_keys,
     matches_expected_alarm,
     merge_match_batch,
 )
@@ -512,6 +513,61 @@ def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
         print(f"{indent}(复算故障模式过滤细节失败: {exc})")
 
 
+def _report_merge_details(debug):
+    """展示批内合并的分组关系：哪些 raw match 因共享哪些告警被并成一个。
+
+    merge_match_batch 按"共享症状 eid"的并查集分组，每个合并组的症状按
+    eid 去重。这里用同样的 alarm key 反推 raw -> merged 的归属，不改变
+    任何状态。
+    """
+    raw_key_sets = [get_match_alarm_keys(m) for m in debug.raw_matches]
+    any_merged = False
+    for j, merged in enumerate(debug.merged_matches[:10]):
+        merged_key_set = get_match_alarm_keys(merged)
+        member_indexes = [
+            i for i, key_set in enumerate(raw_key_sets)
+            if key_set & merged_key_set
+        ]
+        if len(member_indexes) <= 1:
+            continue
+        any_merged = True
+        raw_symptom_total = sum(
+            len(debug.raw_matches[i].get("symptoms", ()) or ())
+            for i in member_indexes
+        )
+        member_rules = [
+            (i, list(debug.raw_matches[i].get("merged_rules", ())))
+            for i in member_indexes
+        ]
+        print(f"  - merged#{j} 规则组合 {merged.get('merged_rules')}: "
+              f"由 {len(member_indexes)} 个 raw match 合并, "
+              f"症状 {raw_symptom_total} 条按 eid 去重为 "
+              f"{len(merged.get('symptoms', ()) or ())} 条")
+        for i, rules in member_rules[:8]:
+            print(f"      raw match#{i} 规则 {rules}")
+        # 桥接告警：同时出现在 >=2 个 raw match 里、把它们连通的共享症状。
+        eid_counts = {}
+        for i in member_indexes:
+            for alarm_key in raw_key_sets[i]:
+                eid_counts[alarm_key] = eid_counts.get(alarm_key, 0) + 1
+        symptom_by_eid = {
+            str(s.get("eid", "") or "").strip(): s
+            for s in merged.get("symptoms", ()) or ()
+        }
+        bridges = [eid for eid, count in eid_counts.items() if count >= 2]
+        for eid in bridges[:8]:
+            symptom = symptom_by_eid.get(eid, {})
+            print(f"      桥接告警 eid={eid!r}  "
+                  f"告警 {symptom.get('alarm')!r}  "
+                  f"源 {symptom.get('alarm_source')!r}  "
+                  f"（出现在 {eid_counts[eid]} 个 raw match 中）")
+    if len(debug.merged_matches) > 10:
+        print(f"  ... 合并结果共 {len(debug.merged_matches)} 个，仅展开前 10 个")
+    if not any_merged and len(debug.raw_matches) == len(debug.merged_matches):
+        print("  各 raw match 之间无共享症状告警，未发生合并"
+              "（仅做了 match 内部的 eid 去重）")
+
+
 def _describe_external_symptom(debug, alarm_id):
     """解释一个不属于本批输入的症状告警是从哪来的。"""
     entry = None
@@ -586,6 +642,7 @@ def report_matches(debug, converted_rows, show_matches):
     print("=" * 72)
     print(f"[5] 批内合并 merge_match_batch: "
           f"{len(debug.raw_matches)} -> {len(debug.merged_matches)} 个")
+    _report_merge_details(debug)
     print("=" * 72)
     print(f"[6] 历史合并: "
           f"{len(debug.merged_matches)} -> {len(debug.finalized_matches)} 个")
