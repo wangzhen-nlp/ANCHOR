@@ -669,13 +669,8 @@ def classify_component(
 
     # 多断站分量只保留两类 ring 模式：single 要求所有链节点满足
     # “双向或上游邻居数 == 2”，multi 最多允许两个不满足条件的端点。
-    ring_degree_mismatch_count = sum(
-        not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
-        for site_id in component_unmanaged_sites
-    )
-    if ring_degree_mismatch_count > 2:
-        return "unknown"
-
+    # 环度数条件不再作为前置早退，统一交给 classify_ip_ring_chain 判定
+    # （度数不满足的链会落为 ip_ring_others）。
     unmanaged_components = list(
         iter_connected_components(component_unmanaged_sites, relation_index)
     )

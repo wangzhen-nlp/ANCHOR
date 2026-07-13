@@ -537,11 +537,8 @@ def _explain_component_classification(component_sites, prepared, relation_index)
         if not has_two_bidirectional_or_upstream_neighbors(site_id, relation_index)
     )
     lines.append(f"环度数不满足（双向/上游环邻居数 != 2）的断站 "
-                 f"{len(mismatch)} 个: {mismatch[:8]}")
-    if len(mismatch) > 2:
-        lines.append("-> unknown: 超过 2 个断站不满足环度数条件，"
-                     "不可能是环/环段形态")
-        return lines
+                 f"{len(mismatch)} 个: {mismatch[:8]}（仅供参考，"
+                 "不再作为前置早退条件）")
     sub_components = list(iter_connected_components(unmanaged, relation_index))
     if len(sub_components) != 1:
         lines.append(f"-> unknown: 断站之间不连通，分成 {len(sub_components)} 块: "
