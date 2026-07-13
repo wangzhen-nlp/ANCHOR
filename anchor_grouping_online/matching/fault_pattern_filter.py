@@ -84,10 +84,4 @@ class FaultPatternFilter:
         )
         if len(prepared_case.projected_components) != 1:
             return None
-
-        if not has_recognized_fault_pattern(
-            prepared_case,
-            self._relation_index,
-        ):
-            return None
         return True

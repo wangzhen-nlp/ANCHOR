@@ -128,6 +128,7 @@ data_link_adjacent_no_offline_rule = {
 data_link_adjacent_offline_rule = {
   "pattern_name": "data_link_adjacent_offline_context",
   "description": "本路由Data link且无Data offline，邻接路由Data offline，下挂断站可有可无",
+  "output_eligible": True,
   "trigger_role": "data_link_offline_parent_data_node",
   "exclusive_site_roles": [
     "data_link_offline_adjacent_data_node",
@@ -214,6 +215,7 @@ data_offline_adjacent_offline_rule = {
     "本路由Data offline，双向相邻路由Data offline，"
     "本路由/相邻路由下挂offline可有可无"
   ),
+  "output_eligible": True,
   "trigger_role": "offline_current_parent_data_node",
   "exclusive_site_roles": [
     "offline_current_parent_data_node",

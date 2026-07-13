@@ -150,20 +150,61 @@ class DebugBatchFaultGroupMatcher(BatchFaultGroupMatcher):
         return batch
 
     def _record_rule_evaluations(self, engine):
-        """包一层引擎的规则评估入口，记录每次 (站点, 规则) 的评估结果数。"""
+        """包一层引擎的规则评估入口与三个子步骤，记录每次评估的结果数，
+        未命中时定位失败在哪一步：trigger 节点自验证 / 某条边推进 /
+        实例约束（exclusive_site_roles、可选边依赖、result_constraints）。
+        """
         original_evaluate = engine._evaluate_rule
+        original_validate = engine._validate_trigger_node_for_rule
+        original_advance = engine._advance_instances_across_edge
+        original_build = engine._build_match_results_from_instances
+        trace = {"trigger_valid": None, "edges": [], "build": None}
+
+        def recording_validate(rule_name, nodes_cfg, trigger_role,
+                               trigger_node, trigger_ts, helper,
+                               validation_cache):
+            is_valid, trigger_events = original_validate(
+                rule_name, nodes_cfg, trigger_role, trigger_node,
+                trigger_ts, helper, validation_cache,
+            )
+            trace["trigger_valid"] = (is_valid, trigger_role)
+            return is_valid, trigger_events
+
+        def recording_advance(instances, curr_role, tgt_role, edge,
+                              *args, **kwargs):
+            next_instances = original_advance(
+                instances, curr_role, tgt_role, edge, *args, **kwargs
+            )
+            trace["edges"].append(
+                (curr_role, tgt_role, len(instances), len(next_instances),
+                 edge)
+            )
+            return next_instances
+
+        def recording_build(instances, *args, **kwargs):
+            results = original_build(instances, *args, **kwargs)
+            trace["build"] = (len(instances), len(results or ()))
+            return results
 
         def recording_evaluate(rule_name, rule, trigger_node, event_ts,
                                *args, **kwargs):
+            trace["trigger_valid"] = None
+            trace["edges"] = []
+            trace["build"] = None
             results = original_evaluate(
                 rule_name, rule, trigger_node, event_ts, *args, **kwargs
             )
+            reason = None if results else _derive_no_match_reason(trace)
             self.debug.evaluations.append(
-                (trigger_node, rule_name, event_ts, len(results or ()))
+                (trigger_node, rule_name, event_ts, len(results or ()),
+                 reason)
             )
             return results
 
         engine._evaluate_rule = recording_evaluate
+        engine._validate_trigger_node_for_rule = recording_validate
+        engine._advance_instances_across_edge = recording_advance
+        engine._build_match_results_from_instances = recording_build
 
     def _feed_engine(self, engine, generated_alarms, **kwargs):
         candidates = BatchFaultGroupMatcher._feed_engine(
@@ -513,6 +554,36 @@ def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
         print(f"{indent}(复算故障模式过滤细节失败: {exc})")
 
 
+def _derive_no_match_reason(trace):
+    """由评估子步骤 trace 推断单次评估未命中的原因。"""
+    if trace["trigger_valid"] is not None and not trace["trigger_valid"][0]:
+        _is_valid, trigger_role = trace["trigger_valid"]
+        return (f"trigger 节点验证失败: 触发站点自身告警不满足 trigger 角色 "
+                f"{trigger_role} 的节点配置（必需/禁止告警或域要求）")
+    for curr_role, tgt_role, count_in, count_out, edge in trace["edges"]:
+        if count_out == 0:
+            edge_desc = f"方向={edge.get('traverse_dir')}"
+            if edge.get("hops") is not None:
+                edge_desc += f", max_hops={edge.get('hops')}"
+            if edge.get("win") is not None:
+                edge_desc += f", 时间窗={edge.get('win'):.0f}s"
+            if edge.get("optional"):
+                edge_desc += ", optional"
+            if edge.get("dedupe_symmetric_pair"):
+                edge_desc += ", 对称去重(只保留站点字典序小的方向)"
+            return (f"边推进失败: {curr_role} -> {tgt_role} ({edge_desc}) "
+                    f"{count_in} 个实例全部无可行候选"
+                    "（拓扑无相邻/下挂站点，或候选站点告警不满足目标角色"
+                    "节点配置/关联时间窗）")
+    if trace["build"] is not None:
+        count_in, count_out = trace["build"]
+        if count_in and not count_out:
+            return (f"实例约束失败: {count_in} 个候选实例全部被丢弃"
+                    "（exclusive_site_roles 站点归属冲突 / 可选边依赖回收 / "
+                    "result_constraints 不满足）")
+    return "未定位到具体步骤（评估提前返回）"
+
+
 def _report_merge_details(debug):
     """展示批内合并的分组关系：哪些 raw match 因共享哪些告警被并成一个。
 
@@ -615,11 +686,20 @@ def report_matches(debug, converted_rows, show_matches):
           f"（{skipped} 个候选因已被更早的汇聚消费而跳过），"
           f"raw_matches 共 {len(debug.raw_matches)} 个")
     per_rule = {}
-    for _node, rule_name, _ts, n_results in debug.evaluations:
+    for _node, rule_name, _ts, n_results, _reason in debug.evaluations:
         attempts, hits = per_rule.get(rule_name, (0, 0))
         per_rule[rule_name] = (attempts + 1, hits + (1 if n_results else 0))
     for rule_name, (attempts, hits) in sorted(per_rule.items()):
         print(f"  - {rule_name}: 评估 {attempts} 次, 命中 {hits} 次")
+    failed_evaluations = [e for e in debug.evaluations if not e[3]]
+    if failed_evaluations:
+        print("  未命中评估的原因:")
+        for node, rule_name, ts, _n, reason in failed_evaluations[:10]:
+            print(f"  - 站点 {node!r} 规则 {rule_name} ts={_fmt_ts(ts)}:")
+            print(f"      {reason}")
+        if len(failed_evaluations) > 10:
+            print(f"  ... 未命中评估共 {len(failed_evaluations)} 次，"
+                  "仅展开前 10 次")
     if debug.raw_matches:
         print("  命中明细:")
         for i, match in enumerate(debug.raw_matches[:10]):
@@ -629,15 +709,10 @@ def report_matches(debug, converted_rows, show_matches):
             print(f"  ... raw match 共 {len(debug.raw_matches)} 个，"
                   "仅显示前 10 个")
     if not debug.raw_matches:
-        for node, rule_name, ts, _n in debug.evaluations[:10]:
-            print(f"  - 评估无结果: 站点 {node!r} 规则 {rule_name} "
-                  f"ts={_fmt_ts(ts)}")
-        print("  有 trigger 但规则评估为空，常见原因:")
-        print("  - 症状告警不齐：规则要求的相邻/下挂节点告警缺失，"
-              "或对应网元不在拓扑邻接关系里")
-        print("  - associate_time 太小：症状之间 ts 差超过关联窗"
-              f"（当前 {debug.session['associate_window_sec']:.0f}s）")
-        print("  - 症状告警是清除告警或已被本批更早的汇聚消费")
+        print("  有 trigger 但全部评估未命中（各次原因见上）。通用提示: "
+              "边推进失败时注意 associate_time 关联窗"
+              f"（当前 {debug.session['associate_window_sec']:.0f}s）"
+              "是否小于症状间的时间差")
         return
     print("=" * 72)
     print(f"[5] 批内合并 merge_match_batch: "
