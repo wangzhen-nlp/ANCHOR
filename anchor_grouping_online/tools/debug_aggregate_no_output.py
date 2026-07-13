@@ -9,7 +9,10 @@
 用法：
     python -m anchor_grouping_online.tools.debug_aggregate_no_output params.py
     python -m anchor_grouping_online.tools.debug_aggregate_no_output params.json \
-        [--show-alarms] [--show-matches N]
+        [--show-alarms] [--show-matches N] [--no-rule-filter] [--no-pattern-filter]
+
+--no-rule-filter / --no-pattern-filter 是 what-if 开关：分别旁路 [8]/[9]
+两道过滤，用来回答"如果放开这道过滤，这批数据能不能汇聚出结果"。
 
 参数文件字段（JSON 顶层 key / Python 模块同名变量）：
     alarm_groups          必填，{故障组id: [告警, ...]}（告警字段见
@@ -343,6 +346,31 @@ def report_conversion(rows, show_alarms):
           "（仅当共享告警已归属某汇聚组时，各组才沿用该归属）")
     for alarm_id, owners in list(shared_alarms.items())[:5]:
         print(f"  - 共享告警 {alarm_id!r}: 属于组 {sorted(map(str, owners))}")
+    # 同一 vid 携带不同内容 = 编码 ID 冲突：本批只有首次出现的条目会被
+    # 登记并喂入引擎，其余条目被静默忽略（跨批重发则按 eid 幂等覆盖历史）。
+    variants_by_alarm = {}
+    for group_id, _alarm, conv in converted:
+        signature = (conv["alarm_title"], conv["ts"], conv["alarm_source"],
+                     conv["is_clear"])
+        variants_by_alarm.setdefault(conv["alarm_id"], {}).setdefault(
+            signature, []
+        ).append(group_id)
+    conflicts = {
+        alarm_id: variants
+        for alarm_id, variants in variants_by_alarm.items()
+        if len(variants) > 1
+    }
+    if conflicts:
+        print(f"  !! 发现 {len(conflicts)} 个 vid 携带不同内容的告警"
+              "（编码 ID 冲突）——本批只保留首次出现的那条，其余被忽略:")
+        for alarm_id, variants in list(conflicts.items())[:5]:
+            print(f"     vid={alarm_id!r}:")
+            for order, (signature, group_ids) in enumerate(variants.items()):
+                title, ts, source, is_clear = signature
+                kept = "保留" if order == 0 else "忽略"
+                print(f"       [{kept}] {title!r}  源 {source!r}  "
+                      f"ts={_fmt_ts(ts)}  is_clear={is_clear}  "
+                      f"来自组 {sorted(map(str, group_ids))}")
     if ts_values:
         print(f"  批内时间范围: {_fmt_ts(min(ts_values))} ~ {_fmt_ts(max(ts_values))}"
               f"  (跨度 {max(ts_values) - min(ts_values):.1f}s)")
@@ -484,6 +512,21 @@ def _diagnose_pattern_filter_drop(fault_pattern_filter, match, indent="    "):
         print(f"{indent}(复算故障模式过滤细节失败: {exc})")
 
 
+def _describe_external_symptom(debug, alarm_id):
+    """解释一个不属于本批输入的症状告警是从哪来的。"""
+    entry = None
+    if debug.session is not None:
+        entry = debug.session["alarm_registry"].get(alarm_id)
+    if entry is not None:
+        ts, agg_id = entry
+        if agg_id is not None:
+            return (f"非本批: 历史告警, 已归属汇聚组 {agg_id}"
+                    f"（覆盖组将据此挂到该汇聚组）, ts={_fmt_ts(ts)}")
+        return f"非本批: 历史告警(已登记, 无汇聚组归属), ts={_fmt_ts(ts)}"
+    return ("非本批: 仅存在于引擎历史事件缓存的匹配证据"
+            "（未在会话登记，不产生任何组间关联）")
+
+
 def _print_match_symptoms(match, indent="      ", limit=12):
     """打印单个 match 的症状明细：告警名 / alarm_source / 站点 / 角色 / 时间。"""
     symptoms = list(match.get("symptoms", ()) or ())
@@ -605,20 +648,32 @@ def report_linking(debug, alarm_groups):
     if debug.preexisting_alarm_owners:
         print(f"  告警归属连续性沿用: {len(debug.preexisting_alarm_owners)} 条"
               "告警已有汇聚组归属")
-    if debug.eligible_matches and not current_group_edges and not linked_any:
-        print("  !! 有通过过滤的匹配组，但没有形成任何组间关联——"
-              "每个 match 的症状告警都只落在同一个原始组里，或症状告警的 "
-              "eid 不在本批 alarm_groups 的告警 vid 中")
+    if debug.eligible_matches:
+        print("  各匹配组的本批组覆盖明细:")
         for i, match in enumerate(debug.eligible_matches[:5]):
-            symptom_ids = _collect_symptom_alarm_ids(match)
-            owners = sorted({
-                g for aid in symptom_ids
-                for g in debug.batch.local_alarm_owners.get(aid, ())
-            })
-            missing = [aid for aid in symptom_ids
-                       if aid not in debug.batch.local_alarm_owners]
-            print(f"     match#{i}: 覆盖原始组 {owners}"
-                  + (f"，症状不属于本批的告警 {missing}" if missing else ""))
+            covered_groups = []
+            for alarm_id in _collect_symptom_alarm_ids(match):
+                for group_id in debug.batch.local_alarm_owners.get(alarm_id, ()):
+                    if group_id not in covered_groups:
+                        covered_groups.append(group_id)
+            if len(covered_groups) >= 2:
+                print(f"  - match#{i} 覆盖本批原始组 {covered_groups}: 可建组间边")
+                continue
+            print(f"  - match#{i} 覆盖本批原始组 {covered_groups}: "
+                  "!! 不足 2 个组，无法建组间边（仅能通过历史归属挂靠），"
+                  "症状归属逐条分解:")
+            for symptom in list(match.get("symptoms", ()) or ())[:10]:
+                alarm_id = str(symptom.get("eid", "") or "").strip()
+                owner_groups = debug.batch.local_alarm_owners.get(alarm_id)
+                if owner_groups:
+                    source_desc = f"本批组 {list(owner_groups)}"
+                else:
+                    source_desc = _describe_external_symptom(debug, alarm_id)
+                print(f"      eid={alarm_id!r}  告警 {symptom.get('alarm')!r}  "
+                      f"源 {symptom.get('alarm_source')!r} -> {source_desc}")
+        if len(debug.eligible_matches) > 5:
+            print(f"  ... 匹配组共 {len(debug.eligible_matches)} 个，"
+                  "仅展开前 5 个")
     components = local_union.components(alarm_groups)
     multi = [c for c in components if len(c) >= 2]
     print(f"  连通分量: 共 {len(components)} 个，其中 >=2 成员的 {len(multi)} 个")
@@ -687,6 +742,10 @@ def main():
                         help="打印全部告警的转换结果")
     parser.add_argument("--show-matches", type=int, default=0, metavar="N",
                         help="打印前 N 个通过过滤的匹配组明细")
+    parser.add_argument("--no-rule-filter", action="store_true",
+                        help="what-if: 旁路 [8] 可参与二次汇聚规则过滤")
+    parser.add_argument("--no-pattern-filter", action="store_true",
+                        help="what-if: 旁路 [9] 故障模式过滤")
     args = parser.parse_args()
 
     params = load_params(args.params)
@@ -703,6 +762,13 @@ def main():
         batch_isolated=params.get("batch_isolated", False),
         full_output=params.get("full_output", False),
     )
+    if args.no_rule_filter:
+        matcher.output_eligible_rules = None
+        print("** what-if 模式: 已旁路 [8] 可参与二次汇聚规则过滤 **")
+    if args.no_pattern_filter:
+        matcher.fault_pattern_filter = None
+        matcher.debug.fault_pattern_filter = None
+        print("** what-if 模式: 已旁路 [9] 故障模式过滤 **")
     alarm_groups = params["alarm_groups"]
     report_input(alarm_groups, params)
     rows = _convert_all_alarms(alarm_groups, matcher.static_context.ne_to_site)
