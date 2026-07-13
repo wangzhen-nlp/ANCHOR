@@ -415,6 +415,20 @@ def _diagnose_zero_triggers(engine, converted_rows):
               f"@{conv['site_id'] or '-'}: {reason}")
 
 
+def _print_match_symptoms(match, indent="      ", limit=12):
+    """打印单个 match 的症状明细：告警名 / alarm_source / 站点 / 角色 / 时间。"""
+    symptoms = list(match.get("symptoms", ()) or ())
+    for symptom in symptoms[:limit]:
+        print(f"{indent}告警 {symptom.get('alarm')!r}  "
+              f"源 {symptom.get('alarm_source')!r}  "
+              f"站点 {symptom.get('node')!r}  "
+              f"角色 {symptom.get('matched_role')}  "
+              f"ts={_fmt_ts(symptom.get('ts'))}  "
+              f"eid={symptom.get('eid')!r}")
+    if len(symptoms) > limit:
+        print(f"{indent}... 症状共 {len(symptoms)} 条，仅显示前 {limit} 条")
+
+
 def report_matches(debug, converted_rows, show_matches):
     if debug.session is None:
         print("=" * 72)
@@ -438,6 +452,14 @@ def report_matches(debug, converted_rows, show_matches):
         per_rule[rule_name] = (attempts + 1, hits + (1 if n_results else 0))
     for rule_name, (attempts, hits) in sorted(per_rule.items()):
         print(f"  - {rule_name}: 评估 {attempts} 次, 命中 {hits} 次")
+    if debug.raw_matches:
+        print("  命中明细:")
+        for i, match in enumerate(debug.raw_matches[:10]):
+            print(f"  - raw match#{i} 规则 {match.get('merged_rules')}:")
+            _print_match_symptoms(match)
+        if len(debug.raw_matches) > 10:
+            print(f"  ... raw match 共 {len(debug.raw_matches)} 个，"
+                  "仅显示前 10 个")
     if not debug.raw_matches:
         for node, rule_name, ts, _n in debug.evaluations[:10]:
             print(f"  - 评估无结果: 站点 {node!r} 规则 {rule_name} "
@@ -487,10 +509,10 @@ def report_matches(debug, converted_rows, show_matches):
         print("  !! 全部被故障模式过滤吃掉")
         return
     if show_matches:
+        print("  通过全部过滤的匹配组明细:")
         for i, match in enumerate(debug.eligible_matches[:show_matches]):
-            symptom_ids = _collect_symptom_alarm_ids(match)
-            print(f"  match#{i}: rules={match.get('merged_rules')} "
-                  f"症状告警={symptom_ids}")
+            print(f"  - match#{i} 规则 {match.get('merged_rules')}:")
+            _print_match_symptoms(match)
 
 
 def report_linking(debug, alarm_groups):
