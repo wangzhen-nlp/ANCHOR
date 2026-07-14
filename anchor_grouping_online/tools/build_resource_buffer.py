@@ -238,6 +238,20 @@ def _iter_csv_records_with_progress(input_path: str, label: str):
     progress.close()
 
 
+def _iter_csv_records_with_progress_new(input_path: str, label: str):
+    """在 iter_csv_records 之上叠加行级进度显示，逐条产出原始记录。"""
+    progress = ProgressBar(0, label)
+    row_count = 0
+    for row in iter_csv_records(input_path, progress):
+        row_count += 1
+        if row_count % PROGRESS_ROW_STEP == 0:
+            progress.set(row_count)
+        new_row = {'src_vid': row['srcVid'], 'dst_vid': row['dstVid']}
+        yield new_row
+    progress.set(row_count)
+    progress.close()
+
+
 def _normalize_ne_vid_for_generator(value) -> str:
     return str(value or '').strip().upper()
 
@@ -250,7 +264,7 @@ def _normalize_link_layer_for_generator(value) -> str:
     return str(value or '').strip().upper()
 
 
-def iter_ne_csv_records(data_dir: str = SYS_NE_DIR):
+def _iter_ne_csv_records(data_dir: str = SYS_NE_DIR):
     """从当前 SYS_NE CSV 目录构造 NE 记录生成器，供 load_ne_info 消费。
 
     仅产出规范化后的字段（其余原始列被丢弃）：
@@ -268,7 +282,7 @@ def iter_ne_csv_records(data_dir: str = SYS_NE_DIR):
         }
 
 
-def iter_site_csv_records(data_dir: str = SYS_SITE_DIR):
+def _iter_site_csv_records(data_dir: str = SYS_SITE_DIR):
     """从当前 SYS_SITE CSV 目录构造站点记录生成器，供 load_site_info 消费。
 
     仅产出规范化后的字段（其余原始列被丢弃）：
@@ -360,7 +374,7 @@ def iter_ne_port_link(link_input: str = SYS_LINK_DIR):
 # online 版记录生成器：CSV/zip 原始行原样透传，不做任何改动（不筛选列、不归一化、
 # 不构造 VID），假定数据源已直接产出消费端期望的字段与值。
 # --------------------------------------------------------------------------- #
-def iter_ne_records_online(input_path: str = NE_FILE):
+def _iter_ne_csv_records(input_path: str = NE_FILE):
     """从 online CSV 原样透传 NE 记录，供 load_ne_info 消费。
 
     期望列：vid / domain / typeId / networkType / name / vender / siteId
@@ -368,7 +382,7 @@ def iter_ne_records_online(input_path: str = NE_FILE):
     yield from _iter_csv_records_with_progress(input_path, "  读取NE记录")
 
 
-def iter_site_records_online(input_path: str = SITE_FILE):
+def _iter_site_csv_records(input_path: str = SITE_FILE):
     """从 online CSV 原样透传站点记录，供 load_site_info 消费。
 
     期望列：vid / name / longitude / latitude / isHub
@@ -376,28 +390,28 @@ def iter_site_records_online(input_path: str = SITE_FILE):
     yield from _iter_csv_records_with_progress(input_path, "  读取站点记录")
 
 
-def iter_ne_ne_link_online(input_path: str = NE_NE_FILE):
+def _iter_ne_ne_link(input_path: str = NE_NE_FILE):
     """从 online CSV 原样透传 NE-NE 链路记录（src_vid / dst_vid 为两端 NE VID）。
 
     期望列：src_vid / dst_vid / linkLayer
     """
-    yield from _iter_csv_records_with_progress(input_path, "  读取NE-NE链路")
+    yield from _iter_csv_records_with_progress_new(input_path, "  读取NE-NE链路")
 
 
-def iter_port_port_online(input_path: str = PORT_PORT_FILE):
+def _iter_port_port(input_path: str = PORT_PORT_FILE):
     """从 online CSV 原样透传端口-端口链路记录（src_vid / dst_vid 为两端端口 VID）。
 
     期望列：src_vid / dst_vid / linkLayer
     """
-    yield from _iter_csv_records_with_progress(input_path, "  读取端口-端口链路")
+    yield from _iter_csv_records_with_progress_new(input_path, "  读取端口-端口链路")
 
 
-def iter_ne_port_link_online(input_path: str = NE_PORT_FILE):
+def _iter_ne_port_link(input_path: str = NE_PORT_FILE):
     """从 online CSV 原样透传 NE-端口归属关系记录（src_vid 为 NE VID，dst_vid 为端口 VID）。
 
     期望列：src_vid / dst_vid
     """
-    yield from _iter_csv_records_with_progress(input_path, "  读取NE-端口关系")
+    yield from _iter_csv_records_with_progress_new(input_path, "  读取NE-端口关系")
 
 
 # --------------------------------------------------------------------------- #
@@ -914,11 +928,11 @@ def main():
     args = _parse_args()
     # 要换数据源，只需改为产出同结构 dict 的生成器。
     build_resource_buffer(
-        ne_records=iter_ne_csv_records(args.ne_dir),
-        site_records=iter_site_csv_records(args.site_dir),
-        ne_ne_records=iter_ne_ne_link(args.link_input),
-        port_port_records=iter_port_port(args.link_input),
-        ne_port_records=iter_ne_port_link(args.link_input),
+        ne_records=iter_ne_csv_records(),
+        site_records=iter_site_csv_records(),
+        ne_ne_records=iter_ne_ne_link(),
+        port_port_records=iter_port_port(),
+        ne_port_records=iter_ne_port_link(),
         output_path=args.output,
         report_duplicates=args.report_duplicates,
     )
