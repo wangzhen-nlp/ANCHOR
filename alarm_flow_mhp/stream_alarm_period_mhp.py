@@ -27,7 +27,6 @@ import argparse
 import bisect
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-import gzip
 import heapq
 import hashlib
 import json
@@ -62,7 +61,8 @@ from alarm_flow_mhp.feature_spec import (
     RuntimeFeatureScorer,
     RuntimeMuScorer,
     build_node_context,
-    parse_label_entity_at,
+    domain_of,
+    make_entity,
     runtime_ne_at,
     topo_node_of,
 )
@@ -80,7 +80,7 @@ from topology_tools.region_utils import load_ne_graph
 
 EPS = 1e-12
 ASSOCIATION_CACHE_FORMAT = "alarm_flow_mhp.period_association_cache"
-ASSOCIATION_CACHE_VERSION = 1
+ASSOCIATION_CACHE_VERSION = 3
 
 
 @dataclass
@@ -191,23 +191,32 @@ def association_cache_fingerprint(
     }
 
 
-def _open_cache(path, mode):
-    if str(path).lower().endswith(".gz"):
-        return gzip.open(path, mode, encoding="utf-8")
-    return open(path, mode, encoding="utf-8")
-
-
 def load_association_cache(path, expected_fingerprint=None) -> dict:
-    with _open_cache(path, "rt") as stream:
-        payload = json.load(stream)
-    if payload.get("format") != ASSOCIATION_CACHE_FORMAT:
-        raise ValueError(f"unsupported association cache format: {payload.get('format')!r}")
-    if int(payload.get("version", -1)) != ASSOCIATION_CACHE_VERSION:
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            header = json.loads(str(archive["metadata_json"].item()))
+            array_names = (
+                "target_signature_ids",
+                "source_signature_ids",
+                "base_scores",
+                "thresholds",
+                "past_windows",
+                "future_windows",
+                "target_offsets",
+                "source_offsets",
+                "source_order",
+            )
+            arrays = {name: archive[name] for name in array_names}
+    except (KeyError, OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid binary association cache: {exc}") from exc
+    if header.get("format") != ASSOCIATION_CACHE_FORMAT:
+        raise ValueError(f"unsupported association cache format: {header.get('format')!r}")
+    if int(header.get("version", -1)) != ASSOCIATION_CACHE_VERSION:
         raise ValueError(
-            f"unsupported association cache version: {payload.get('version')!r}"
+            f"unsupported association cache version: {header.get('version')!r}"
         )
     if expected_fingerprint is not None:
-        actual = payload.get("fingerprint") or {}
+        actual = header.get("fingerprint") or {}
         if actual != expected_fingerprint:
             changed = sorted(
                 key
@@ -218,7 +227,43 @@ def load_association_cache(path, expected_fingerprint=None) -> dict:
                 "association cache does not match current model/graphs/config; "
                 f"changed={','.join(changed) or 'unknown'}"
             )
-    return payload
+    edge_count = int((header.get("metadata") or {}).get("edge_count", -1))
+    signature_count = int((header.get("metadata") or {}).get("signature_count", -1))
+    edge_arrays = (
+        arrays["target_signature_ids"], arrays["source_signature_ids"],
+        arrays["base_scores"], arrays["thresholds"], arrays["past_windows"],
+        arrays["future_windows"], arrays["source_order"],
+    )
+    if edge_count < 0 or any(len(array) != edge_count for array in edge_arrays):
+        raise ValueError("association-cache edge array lengths do not match metadata")
+    if (
+        signature_count < 0
+        or len(arrays["target_offsets"]) != signature_count + 1
+        or len(arrays["source_offsets"]) != signature_count + 1
+    ):
+        raise ValueError("association-cache CSR offsets do not match signature_count")
+    for name in (
+        "target_signature_ids", "source_signature_ids", "target_offsets",
+        "source_offsets", "source_order",
+    ):
+        if not np.issubdtype(arrays[name].dtype, np.integer):
+            raise ValueError(f"association-cache {name} must use an integer dtype")
+    for name in ("target_offsets", "source_offsets"):
+        offsets = arrays[name]
+        if (
+            int(offsets[0]) != 0
+            or int(offsets[-1]) != edge_count
+            or np.any(offsets[1:] < offsets[:-1])
+        ):
+            raise ValueError(f"association-cache {name} is invalid")
+    if edge_count:
+        if (
+            int(arrays["target_signature_ids"].max()) >= signature_count
+            or int(arrays["source_signature_ids"].max()) >= signature_count
+            or int(arrays["source_order"].max()) >= edge_count
+        ):
+            raise ValueError("association-cache edge index is out of range")
+    return {**header, "arrays": arrays}
 
 
 def write_association_cache(path, payload):
@@ -226,20 +271,24 @@ def write_association_cache(path, payload):
     if parent:
         os.makedirs(parent, exist_ok=True)
     temp_path = f"{path}.tmp"
-    # Preserve gzip behavior for the temporary file as well.
-    if str(path).lower().endswith(".gz"):
-        temp_path += ".gz"
     try:
-        with _open_cache(temp_path, "wt") as stream:
-            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.write("\n")
+        arrays = dict(payload.get("arrays") or {})
+        header = {key: value for key, value in payload.items() if key != "arrays"}
+        with open(temp_path, "wb") as stream:
+            np.savez_compressed(
+                stream,
+                metadata_json=np.asarray(
+                    json.dumps(header, ensure_ascii=False, separators=(",", ":"))
+                ),
+                **arrays,
+            )
         os.replace(temp_path, path)
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PeriodType:
     """Runtime event type: feature entity (normally NE id) + alarm type."""
 
@@ -247,24 +296,79 @@ class PeriodType:
     alarm_type: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PeriodSignature:
     period_type: PeriodType
     initial_state: int
 
 
-def artifact_period_types(artifact):
-    """Known runtime period types reconstructed from the artifact vocabulary."""
+def graph_period_types(artifact, scorer):
+    """Full inductive universe: graph entities × model alarm-type vocabulary."""
+    rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
+    alarm_types = sorted({str(value) for value in (rt.get("at_vocab") or []) if str(value)})
+    if not alarm_types:
+        raise ValueError("feature artifact has an empty training.feature_runtime.at_vocab")
+
     type_fields = tuple(artifact.config.type_fields)
     node_field = artifact.config.topology_node_field
-    result = set()
-    for label in artifact.vocabs.type_vocab.labels:
-        entity, alarm_type = parse_label_entity_at(label, type_fields, node_field)
-        entity = str(entity or "")
-        alarm_type = str(alarm_type or "")
-        if entity and alarm_type:
-            result.add(PeriodType(entity, alarm_type))
-    return sorted(result, key=lambda value: (value.entity, value.alarm_type))
+    uses_domain = DEVICE_DOMAIN_FIELD in type_fields
+    entities = []
+    for node in sorted(str(value) for value in scorer.node_infos):
+        if not uses_domain:
+            entities.append(node)
+            continue
+        if node_field == "site_id":
+            domains = sorted({str(value) for value in scorer.node_domains.get(node, ()) if str(value)})
+        else:
+            domain = str(domain_of(node, scorer.node_infos) or "")
+            domains = [domain] if domain else []
+        entities.extend(make_entity(node, domain) for domain in domains)
+
+    period_types = [
+        PeriodType(entity, alarm_type)
+        for entity in entities
+        for alarm_type in alarm_types
+    ]
+    return period_types, len(entities), len(alarm_types)
+
+
+def build_compact_csr_arrays(
+    target_signature_ids,
+    source_signature_ids,
+    base_scores,
+    thresholds,
+    past_windows,
+    future_windows,
+    signature_count,
+):
+    """Build compact forward/reverse CSR arrays from target-sorted edge rows."""
+    edge_count = len(target_signature_ids)
+    id_dtype = np.uint32 if signature_count <= np.iinfo(np.uint32).max else np.uint64
+    order_dtype = np.uint32 if edge_count <= np.iinfo(np.uint32).max else np.uint64
+    target_ids = np.asarray(target_signature_ids, dtype=id_dtype)
+    source_ids = np.asarray(source_signature_ids, dtype=id_dtype)
+    if edge_count and np.any(target_ids[1:] < target_ids[:-1]):
+        raise ValueError("compact cache edges must be sorted by target signature")
+    target_counts = np.bincount(target_ids.astype(np.int64), minlength=signature_count)
+    source_counts = np.bincount(source_ids.astype(np.int64), minlength=signature_count)
+    target_offsets = np.empty(signature_count + 1, dtype=np.uint64)
+    source_offsets = np.empty(signature_count + 1, dtype=np.uint64)
+    target_offsets[0] = 0
+    source_offsets[0] = 0
+    np.cumsum(target_counts, dtype=np.uint64, out=target_offsets[1:])
+    np.cumsum(source_counts, dtype=np.uint64, out=source_offsets[1:])
+    source_order = np.argsort(source_ids, kind="stable").astype(order_dtype, copy=False)
+    return {
+        "target_signature_ids": target_ids,
+        "source_signature_ids": source_ids,
+        "base_scores": np.asarray(base_scores, dtype=np.float64),
+        "thresholds": np.asarray(thresholds, dtype=np.float64),
+        "past_windows": np.asarray(past_windows, dtype=np.float64),
+        "future_windows": np.asarray(future_windows, dtype=np.float64),
+        "target_offsets": target_offsets,
+        "source_offsets": source_offsets,
+        "source_order": source_order,
+    }
 
 
 @dataclass
@@ -316,15 +420,75 @@ class AlarmPeriod:
         return True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CompiledEdge:
-    target_signature: PeriodSignature
-    source_signature: PeriodSignature
-    alpha: float
     base_score: float
     threshold: float
     past_window_sec: float
     future_window_sec: float
+
+
+class CompactAssociationIndex:
+    """Read-only bidirectional CSR index over precompiled numeric edges."""
+
+    def __init__(self, period_types, arrays):
+        self.period_types = tuple(period_types)
+        self.type_to_id = {value: index for index, value in enumerate(self.period_types)}
+        self.target_signature_ids = np.asarray(arrays["target_signature_ids"])
+        self.source_signature_ids = np.asarray(arrays["source_signature_ids"])
+        self.base_scores = np.asarray(arrays["base_scores"], dtype=np.float64)
+        self.thresholds = np.asarray(arrays["thresholds"], dtype=np.float64)
+        self.past_windows = np.asarray(arrays["past_windows"], dtype=np.float64)
+        self.future_windows = np.asarray(arrays["future_windows"], dtype=np.float64)
+        self.target_offsets = np.asarray(arrays["target_offsets"])
+        self.source_offsets = np.asarray(arrays["source_offsets"])
+        self.source_order = np.asarray(arrays["source_order"])
+        self.memory_bytes = sum(
+            array.nbytes
+            for array in (
+                self.target_signature_ids, self.source_signature_ids,
+                self.base_scores, self.thresholds, self.past_windows,
+                self.future_windows, self.target_offsets, self.source_offsets,
+                self.source_order,
+            )
+        )
+
+    def _signature_id(self, signature):
+        type_id = self.type_to_id.get(signature.period_type)
+        if type_id is None:
+            return None
+        return int(type_id) * 8 + int(signature.initial_state)
+
+    def _signature(self, signature_id):
+        type_id, state = divmod(int(signature_id), 8)
+        return PeriodSignature(self.period_types[type_id], state)
+
+    def _edge(self, index):
+        return CompiledEdge(
+            base_score=float(self.base_scores[index]),
+            threshold=float(self.thresholds[index]),
+            past_window_sec=float(self.past_windows[index]),
+            future_window_sec=float(self.future_windows[index]),
+        )
+
+    def iter_target(self, target):
+        signature_id = self._signature_id(target)
+        if signature_id is None:
+            return
+        start = int(self.target_offsets[signature_id])
+        end = int(self.target_offsets[signature_id + 1])
+        for index in range(start, end):
+            yield self._signature(self.source_signature_ids[index]), self._edge(index)
+
+    def iter_source(self, source):
+        signature_id = self._signature_id(source)
+        if signature_id is None:
+            return
+        start = int(self.source_offsets[signature_id])
+        end = int(self.source_offsets[signature_id + 1])
+        for position in range(start, end):
+            index = int(self.source_order[position])
+            yield self._signature(self.target_signature_ids[index]), self._edge(index)
 
 
 @dataclass
@@ -399,7 +563,13 @@ class CompiledAssociationPlan:
         )
         self.mu_by_at = rt.get("mu_by_alarm_type", {}) or {}
         self.mu_default = float(rt.get("mu_default", 0.0))
+        # ``signatures`` contains only signatures discovered incrementally at
+        # runtime.  Offline coverage is type-level because all eight states are
+        # guaranteed compiled and materializing 8× coverage objects is wasteful.
         self.signatures: set[PeriodSignature] = set()
+        self.covered_period_types: set[PeriodType] = set()
+        self._covered_candidate_index = None
+        self.precompiled_index: Optional[CompactAssociationIndex] = None
         self.edges_by_target: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
         self.edges_by_source: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
         self._mu_cache: dict[PeriodType, float] = {}
@@ -407,6 +577,16 @@ class CompiledAssociationPlan:
         self.pruned_pair_count = 0
         self.preloaded_signature_count = 0
         self.preloaded_edge_count = 0
+
+    def iter_edges_by_target(self, signature):
+        if self.precompiled_index is not None:
+            yield from self.precompiled_index.iter_target(signature)
+        yield from self.edges_by_target.get(signature, {}).items()
+
+    def iter_edges_by_source(self, signature):
+        if self.precompiled_index is not None:
+            yield from self.precompiled_index.iter_source(signature)
+        yield from self.edges_by_source.get(signature, {}).items()
 
     def _mu(self, period_type: PeriodType) -> float:
         cached = self._mu_cache.get(period_type)
@@ -446,20 +626,39 @@ class CompiledAssociationPlan:
         return bool(hops.get(an, {}).get(bn, 0) or hops.get(bn, {}).get(an, 0))
 
     def register_signature(self, signature: PeriodSignature):
-        if signature in self.signatures:
+        if (
+            signature.period_type in self.covered_period_types
+            or signature in self.signatures
+        ):
             return
         existing = list(self.signatures)
         self.signatures.add(signature)
-        for other in existing + [signature]:
+        for other in existing:
             if not self._related(signature, other):
                 continue
             self._compile(signature, other)
             if signature != other:
                 self._compile(other, signature)
+        if self._covered_candidate_index is not None:
+            for other_type in self._candidate_sources(
+                signature.period_type, self._covered_candidate_index
+            ):
+                for state in range(8):
+                    other = PeriodSignature(other_type, state)
+                    self._compile(signature, other)
+                    self._compile(other, signature)
+        self._compile(signature, signature)
 
     def _compile(self, target: PeriodSignature, source: PeriodSignature):
         if source in self.edges_by_target.get(target, {}):
             return
+        edge = self._compute_edge(target, source)
+        if edge is None:
+            return
+        self.edges_by_target[target][source] = edge
+        self.edges_by_source[source][target] = edge
+
+    def _compute_edge(self, target: PeriodSignature, source: PeriodSignature):
         t = target.period_type
         s = source.period_type
         src_marks = np.asarray([_combo_state(source.initial_state)], dtype=np.float64)
@@ -505,31 +704,32 @@ class CompiledAssociationPlan:
                 log_margin / self.late_lambda * self.config.time_scale_sec,
             )
         edge = CompiledEdge(
-            target_signature=target,
-            source_signature=source,
-            alpha=alpha,
             base_score=base_score,
             threshold=threshold,
             past_window_sec=past_window,
             future_window_sec=future_window,
         )
-        self.edges_by_target[target][source] = edge
-        self.edges_by_source[source][target] = edge
         self.compiled_pair_count += 1
+        return edge
 
-    def _candidate_period_type_pairs(self, period_types):
-        """Yield exactly the directed type pairs admitted by ``_related``.
+    def prepare_candidate_period_types(self, period_types, count_pairs=True):
+        """Build a reusable related-type index and return its exact pair count.
 
         The related-scope path indexes entity/node/site/topology reach first, so
         offline compilation does not perform a blind all-signature quadratic
-        scan merely to reject unrelated pairs.
+        scan merely to reject unrelated pairs. Candidate sets are reconstructed
+        per target instead of being retained, because the graph-wide universe
+        can contain millions of directed pairs.
         """
-        period_types = tuple(sorted(set(period_types), key=lambda x: (x.entity, x.alarm_type)))
+        period_types = tuple(sorted(period_types, key=lambda x: (x.entity, x.alarm_type)))
         if self.config.candidate_scope == "global":
-            for target in period_types:
-                for source in period_types:
-                    yield target, source
-            return
+            return {
+                "period_types": period_types,
+                "global": True,
+                "total_pair_count": (
+                    len(period_types) * len(period_types) if count_pairs else None
+                ),
+            }
 
         by_entity = defaultdict(set)
         by_node = defaultdict(set)
@@ -554,64 +754,93 @@ class CompiledAssociationPlan:
                     neighbor_nodes[left].add(right)
                     neighbor_nodes[right].add(left)
 
-        for target in period_types:
-            candidates = set(by_entity[target.entity])
-            node = topo_node_of(target.entity)
-            if node:
-                candidates.update(by_node[node])
-                info = infos.get(node)
-                site = str(getattr(info, "site_id", "") or "")
-                if site:
-                    candidates.update(by_site[site])
-                for neighbor in neighbor_nodes.get(node, ()):
-                    candidates.update(by_node[neighbor])
-            for source in sorted(candidates, key=lambda x: (x.entity, x.alarm_type)):
+        prepared = {
+            "period_types": period_types,
+            "global": False,
+            "by_entity": by_entity,
+            "by_node": by_node,
+            "by_site": by_site,
+            "neighbor_nodes": neighbor_nodes,
+        }
+        total_pair_count = None
+        if count_pairs:
+            total_pair_count = 0
+            for target in period_types:
+                total_pair_count += len(self._candidate_sources(target, prepared))
+        prepared["total_pair_count"] = total_pair_count
+        return prepared
+
+    def _candidate_sources(self, target, prepared):
+        period_types = prepared["period_types"]
+        if prepared["global"]:
+            return period_types
+        by_entity = prepared["by_entity"]
+        by_node = prepared["by_node"]
+        by_site = prepared["by_site"]
+        neighbor_nodes = prepared["neighbor_nodes"]
+        candidates = set(by_entity.get(target.entity, ()))
+        node = topo_node_of(target.entity)
+        if node:
+            candidates.update(by_node.get(node, ()))
+            info = self.scorer.node_infos.get(node)
+            site = str(getattr(info, "site_id", "") or "")
+            if site:
+                candidates.update(by_site.get(site, ()))
+            for neighbor in neighbor_nodes.get(node, ()):
+                candidates.update(by_node.get(neighbor, ()))
+        return tuple(sorted(candidates, key=lambda x: (x.entity, x.alarm_type)))
+
+    def _candidate_period_type_pairs(self, prepared):
+        for target in prepared["period_types"]:
+            for source in self._candidate_sources(target, prepared):
                 yield target, source
 
-    def precompile_period_types(self, period_types, progress=None):
+    def precompile_period_types(
+        self,
+        period_types,
+        progress=None,
+        prepared_candidates=None,
+        edge_sink=None,
+    ):
         """Compile all eight frozen-state signatures for known period types."""
-        period_types = tuple(sorted(set(period_types), key=lambda x: (x.entity, x.alarm_type)))
+        prepared = prepared_candidates or self.prepare_candidate_period_types(period_types)
+        period_types = prepared["period_types"]
         states = tuple(range(8))
-        for period_type in period_types:
-            for state in states:
-                self.signatures.add(PeriodSignature(period_type, state))
+        if edge_sink is None:
+            self.covered_period_types.update(period_types)
+            self._covered_candidate_index = prepared
 
         type_pair_count = 0
-        for target_type, source_type in self._candidate_period_type_pairs(period_types):
+        for target_type in prepared["period_types"]:
+            source_types = self._candidate_sources(target_type, prepared)
             for target_state in states:
                 target = PeriodSignature(target_type, target_state)
-                for source_state in states:
-                    source = PeriodSignature(source_type, source_state)
-                    self._compile(target, source)
-            type_pair_count += 1
+                for source_type in source_types:
+                    for source_state in states:
+                        source = PeriodSignature(source_type, source_state)
+                        if edge_sink is None:
+                            self._compile(target, source)
+                        else:
+                            edge = self._compute_edge(target, source)
+                            if edge is not None:
+                                edge_sink(target, source, edge)
+            type_pair_count += len(source_types)
             if progress is not None:
                 progress(type_pair_count, self.compiled_pair_count, self.pruned_pair_count)
         return type_pair_count
 
-    @staticmethod
-    def _encode_signature(signature):
-        return [
-            signature.period_type.entity,
-            signature.period_type.alarm_type,
-            int(signature.initial_state),
-        ]
-
-    @staticmethod
-    def _decode_signature(row):
-        if not isinstance(row, list) or len(row) != 3:
-            raise ValueError("invalid association-cache signature row")
-        state = int(row[2])
-        if state < 0 or state > 7:
-            raise ValueError(f"invalid association-cache state: {state}")
-        return PeriodSignature(PeriodType(str(row[0]), str(row[1])), state)
-
     def to_cache_payload(self, fingerprint, extra_metadata=None):
-        signatures = sorted(
-            self.signatures,
+        period_types = tuple(
+            sorted(self.covered_period_types, key=lambda x: (x.entity, x.alarm_type))
+        )
+        type_to_id = {value: index for index, value in enumerate(period_types)}
+        targets = sorted(
+            self.edges_by_target,
             key=lambda x: (x.period_type.entity, x.period_type.alarm_type, x.initial_state),
         )
-        edges = []
-        for target in signatures:
+        target_ids, source_ids = [], []
+        base_scores, thresholds, past_windows, future_windows = [], [], [], []
+        for target in targets:
             sources = self.edges_by_target.get(target, {})
             for source, edge in sorted(
                 sources.items(),
@@ -621,74 +850,66 @@ class CompiledAssociationPlan:
                     item[0].initial_state,
                 ),
             ):
-                edges.append(
-                    self._encode_signature(target)
-                    + self._encode_signature(source)
-                    + [
-                        float(edge.alpha),
-                        float(edge.base_score),
-                        float(edge.threshold),
-                        float(edge.past_window_sec),
-                        float(edge.future_window_sec),
-                    ]
-                )
+                target_ids.append(type_to_id[target.period_type] * 8 + target.initial_state)
+                source_ids.append(type_to_id[source.period_type] * 8 + source.initial_state)
+                base_scores.append(edge.base_score)
+                thresholds.append(edge.threshold)
+                past_windows.append(edge.past_window_sec)
+                future_windows.append(edge.future_window_sec)
+        signature_count = len(period_types) * 8
+        arrays = build_compact_csr_arrays(
+            target_ids,
+            source_ids,
+            base_scores,
+            thresholds,
+            past_windows,
+            future_windows,
+            signature_count,
+        )
         return {
             "format": ASSOCIATION_CACHE_FORMAT,
             "version": ASSOCIATION_CACHE_VERSION,
             "fingerprint": dict(fingerprint),
-            "edges": edges,
+            "arrays": arrays,
             "metadata": {
-                "signature_count": len(signatures),
-                "edge_count": len(edges),
+                "type_universe": "graph",
+                "period_type_count": len(period_types),
+                "signature_count": signature_count,
+                "edge_count": len(target_ids),
                 "pruned_pair_count": int(self.pruned_pair_count),
                 **dict(extra_metadata or {}),
             },
         }
 
     def load_cache_payload(self, payload):
-        # Coverage is reconstructed from the fingerprinted model vocabulary;
-        # the persistent payload remains a strictly sparse positive-edge table.
-        signatures = {
-            PeriodSignature(period_type, state)
-            for period_type in artifact_period_types(self.artifact)
-            for state in range(8)
-        }
-        declared_signature_count = int(
-            (payload.get("metadata") or {}).get("signature_count", -1)
+        # Coverage is reconstructed from the fingerprinted graph and model AT
+        # vocabulary; the persistent payload remains positive edges only.
+        metadata = payload.get("metadata") or {}
+        if metadata.get("type_universe") != "graph":
+            raise ValueError("association cache is not a graph-universe cache")
+        period_types, _entity_count, _alarm_type_count = graph_period_types(
+            self.artifact, self.scorer
         )
-        if declared_signature_count != len(signatures):
+        period_types = tuple(period_types)
+        covered = set(period_types)
+        declared_period_type_count = int(metadata.get("period_type_count", -1))
+        declared_signature_count = int(metadata.get("signature_count", -1))
+        if (
+            declared_period_type_count != len(covered)
+            or declared_signature_count != len(covered) * 8
+        ):
             raise ValueError(
-                "association-cache coverage does not match artifact vocabulary: "
-                f"cache={declared_signature_count}, artifact={len(signatures)}"
+                "association-cache coverage does not match graph universe: "
+                f"cache_types={declared_period_type_count}, graph_types={len(covered)}, "
+                f"cache_signatures={declared_signature_count}"
             )
-        loaded_edges = 0
-        for row in payload.get("edges") or []:
-            if not isinstance(row, list) or len(row) != 11:
-                raise ValueError("invalid association-cache edge row")
-            target = self._decode_signature(row[:3])
-            source = self._decode_signature(row[3:6])
-            if target not in signatures or source not in signatures:
-                raise ValueError("association-cache edge references an uncovered signature")
-            values = [float(value) for value in row[6:]]
-            if not all(math.isfinite(value) for value in values):
-                raise ValueError("association-cache edge contains a non-finite value")
-            edge = CompiledEdge(
-                target_signature=target,
-                source_signature=source,
-                alpha=values[0],
-                base_score=values[1],
-                threshold=values[2],
-                past_window_sec=values[3],
-                future_window_sec=values[4],
-            )
-            if source in self.edges_by_target.get(target, {}):
-                raise ValueError("association-cache contains a duplicate edge")
-            self.edges_by_target[target][source] = edge
-            self.edges_by_source[source][target] = edge
-            loaded_edges += 1
-        self.signatures.update(signatures)
-        self.preloaded_signature_count += len(signatures)
-        self.preloaded_edge_count += loaded_edges
+        self.covered_period_types.update(covered)
+        self._covered_candidate_index = self.prepare_candidate_period_types(
+            covered, count_pairs=False
+        )
+        self.precompiled_index = CompactAssociationIndex(period_types, payload["arrays"])
+        self.preloaded_signature_count += len(covered) * 8
+        self.preloaded_edge_count += int(metadata["edge_count"])
 
 
 class AlarmPeriodMHPAssigner:
@@ -933,7 +1154,7 @@ class AlarmPeriodMHPAssigner:
         sig = period.signature
 
         # Current period acts as target; only its newly mature times are probed.
-        for source_sig, edge in self.plan.edges_by_target.get(sig, {}).items():
+        for source_sig, edge in self.plan.iter_edges_by_target(sig):
             for source_pid in tuple(self.period_ids_by_signature.get(source_sig, ())):
                 if source_pid == period.period_id:
                     continue
@@ -946,7 +1167,7 @@ class AlarmPeriodMHPAssigner:
 
         # Current period acts as source; reverse index catches relationships to
         # older target periods without rescanning every historical occurrence.
-        for target_sig, edge in self.plan.edges_by_source.get(sig, {}).items():
+        for target_sig, edge in self.plan.iter_edges_by_source(sig):
             for target_pid in tuple(self.period_ids_by_signature.get(target_sig, ())):
                 if target_pid == period.period_id:
                     continue
@@ -1389,6 +1610,11 @@ class AlarmPeriodMHPAssigner:
             ),
             "preloaded_signature_count": self.plan.preloaded_signature_count,
             "preloaded_edge_count": self.plan.preloaded_edge_count,
+            "preloaded_array_bytes": (
+                self.plan.precompiled_index.memory_bytes
+                if self.plan.precompiled_index is not None
+                else 0
+            ),
             "active_group_count": len(self.groups),
             "closed_group_count": len(self.closed_groups),
         }
@@ -1470,7 +1696,7 @@ def _build_parser():
         "--association-cache",
         default="",
         help=(
-            "Optional offline sparse association cache (.json or .json.gz). "
+            "Optional version-3 compact binary association cache (.npz). "
             "Known signatures are loaded from it; unseen online devices are "
             "compiled incrementally in memory only."
         ),
@@ -1610,10 +1836,13 @@ def main():
             parser.error(f"cannot load --association-cache: {exc}")
         if not args.quiet:
             cache_md = association_cache.get("metadata") or {}
+            array_mib = sum(
+                array.nbytes for array in association_cache.get("arrays", {}).values()
+            ) / (1024 * 1024)
             print(
                 f"[period] association cache loaded: "
                 f"signatures={cache_md.get('signature_count', 0)}, "
-                f"edges={cache_md.get('edge_count', 0)}",
+                f"edges={cache_md.get('edge_count', 0)}, arrays={array_mib:.1f}MiB",
                 flush=True,
             )
 
