@@ -1,0 +1,1697 @@
+#!/usr/bin/env python3
+"""AlarmPeriod-oriented online inference for feature-mode alarm-flow MHP.
+
+This is intentionally a separate engine from ``stream_alarm_mhp.py``.  The
+legacy/fast engines assign one parent to every alarm occurrence; this engine
+uses an AlarmPeriod as the matching and grouping unit:
+
+* repeated ``(feature entity, alarm type)`` raises share one open period;
+* a period freezes the dynamic source/target state seen before its first raise;
+* matching waits for a fixed event-time aggregation lag and then harvests only
+  occurrences added since the previous harvest;
+* static feature amplitude, relation prior, immigrant threshold, and reachable
+  past/future horizons can be loaded from an offline sparse cache; signatures
+  absent from that cache are compiled once and retained in memory;
+* the temporal score uses the closest valid occurrence pair between periods;
+* a period has one primary fault group.  Cross-group evidence creates a merge
+  proposal; it never launches an eager BFS/DFS over the historical graph.
+
+The result is a match-rules-style execution plan driven by MHP parameters.  It
+is a new grouping semantics, not a bit-for-bit replacement for the branching
+parent inference engines.
+"""
+
+from __future__ import annotations
+
+import argparse
+import bisect
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+import gzip
+import heapq
+import hashlib
+import json
+import math
+import os
+import time
+from typing import Optional
+
+if __package__ in (None, ""):
+    from _script_env import ensure_repo_root
+
+    ensure_repo_root(1)
+
+import numpy as np
+
+from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
+from alarm_flow_isahp.event_domain import (
+    DEVICE_DOMAIN_FIELD,
+    filter_and_annotate_device_domain,
+)
+from alarm_flow_isahp.ne_topology import NETopologyIndex
+from alarm_flow_isahp.sequences import (
+    alarm_type_from_title,
+    alarm_type_label,
+    event_type_label,
+)
+from alarm_flow_mhp.aggregator import load_alarm_mhp_artifact
+from alarm_flow_mhp.dynamic_state import DeviceStateTracker
+from alarm_flow_mhp.feature_spec import (
+    DecomposedFeatureScorer,
+    MuFeatureSpec,
+    RuntimeFeatureScorer,
+    RuntimeMuScorer,
+    build_node_context,
+    parse_label_entity_at,
+    runtime_ne_at,
+    topo_node_of,
+)
+from alarm_flow_mhp.stream_alarm_mhp import OnlineEvent, _summary_of
+from alarm_flow_mhp.topology_relation_prior import (
+    parse_topology_relation_prior,
+    topology_relation_weights,
+)
+from fault_grouping.alarm_events.identity import require_alarm_identity
+from fault_grouping.alarm_events.io import is_clear_alarm
+from mhp.feature_kernel import FeatureKernel
+from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
+from topology_tools.region_utils import load_ne_graph
+
+
+EPS = 1e-12
+ASSOCIATION_CACHE_FORMAT = "alarm_flow_mhp.period_association_cache"
+ASSOCIATION_CACHE_VERSION = 1
+
+
+@dataclass
+class PeriodStreamConfig:
+    aggregation_wait_sec: float = 30.0
+    period_idle_sec: float = 300.0
+    history_window_sec: float = 900.0
+    time_slack_sec: float = 0.0
+    late_penalty_half_life_sec: float = 1.0
+    time_scale_sec: float = 60.0
+    close_inactive_sec: float = 7200.0
+    min_group_events: int = 1
+    immigrant_bias: float = 1.0
+    feature_alpha_floor: float = 0.0
+    attach_threshold_ratio: float = 1.0
+    relative_attach_ratio: float = 0.8
+    max_related_periods: int = 8
+    max_core_periods: int = 4
+    merge_strength_ratio: float = 2.0
+    merge_min_evidence: int = 2
+    candidate_scope: str = "related"
+    topology_relation_prior: dict = field(default_factory=dict)
+
+    def validate(self):
+        if self.aggregation_wait_sec < 0:
+            raise ValueError("aggregation_wait_sec must be >= 0")
+        if self.period_idle_sec <= 0:
+            raise ValueError("period_idle_sec must be > 0")
+        if self.history_window_sec <= 0:
+            raise ValueError("history_window_sec must be > 0")
+        if self.time_slack_sec < 0:
+            raise ValueError("time_slack_sec must be >= 0")
+        if self.aggregation_wait_sec < self.time_slack_sec:
+            raise ValueError("aggregation_wait_sec must be >= time_slack_sec")
+        if self.late_penalty_half_life_sec <= 0:
+            raise ValueError("late_penalty_half_life_sec must be > 0")
+        if self.time_scale_sec <= 0:
+            raise ValueError("time_scale_sec must be > 0")
+        if self.close_inactive_sec < 0:
+            raise ValueError("close_inactive_sec must be >= 0")
+        if self.min_group_events < 1:
+            raise ValueError("min_group_events must be >= 1")
+        if self.immigrant_bias <= 0:
+            raise ValueError("immigrant_bias must be > 0")
+        if self.feature_alpha_floor < 0:
+            raise ValueError("feature_alpha_floor must be >= 0")
+        if self.attach_threshold_ratio <= 0:
+            raise ValueError("attach_threshold_ratio must be > 0")
+        if not 0 < self.relative_attach_ratio <= 1:
+            raise ValueError("relative_attach_ratio must be in (0, 1]")
+        if self.max_related_periods < 1:
+            raise ValueError("max_related_periods must be >= 1")
+        if self.max_core_periods < 1:
+            raise ValueError("max_core_periods must be >= 1")
+        if self.merge_strength_ratio <= 0:
+            raise ValueError("merge_strength_ratio must be > 0")
+        if self.merge_min_evidence < 1:
+            raise ValueError("merge_min_evidence must be >= 1")
+        if self.candidate_scope not in {"related", "global"}:
+            raise ValueError("candidate_scope must be 'related' or 'global'")
+
+
+def _association_plan_config(config: PeriodStreamConfig) -> dict:
+    """Only values that affect compiled edges or candidate coverage."""
+    return {
+        "history_window_sec": float(config.history_window_sec),
+        "time_slack_sec": float(config.time_slack_sec),
+        "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
+        "time_scale_sec": float(config.time_scale_sec),
+        "immigrant_bias": float(config.immigrant_bias),
+        "feature_alpha_floor": float(config.feature_alpha_floor),
+        "attach_threshold_ratio": float(config.attach_threshold_ratio),
+        "candidate_scope": str(config.candidate_scope),
+        "topology_relation_prior": {
+            str(key): float(value)
+            for key, value in sorted((config.topology_relation_prior or {}).items())
+        },
+    }
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def association_cache_fingerprint(
+    model_path,
+    ne_graph_path,
+    site_graph_path,
+    config,
+    topology_node_field="alarm_source",
+) -> dict:
+    """Fingerprint every input that can change the sparse association plan."""
+    node_field = str(topology_node_field or "alarm_source")
+    topology_graph_path = site_graph_path if node_field == "site_id" else ne_graph_path
+    return {
+        "model_sha256": _sha256_file(model_path),
+        "ne_graph_sha256": _sha256_file(ne_graph_path),
+        "topology_graph_sha256": _sha256_file(topology_graph_path),
+        "topology_node_field": node_field,
+        "plan_config": _association_plan_config(config),
+    }
+
+
+def _open_cache(path, mode):
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, mode, encoding="utf-8")
+    return open(path, mode, encoding="utf-8")
+
+
+def load_association_cache(path, expected_fingerprint=None) -> dict:
+    with _open_cache(path, "rt") as stream:
+        payload = json.load(stream)
+    if payload.get("format") != ASSOCIATION_CACHE_FORMAT:
+        raise ValueError(f"unsupported association cache format: {payload.get('format')!r}")
+    if int(payload.get("version", -1)) != ASSOCIATION_CACHE_VERSION:
+        raise ValueError(
+            f"unsupported association cache version: {payload.get('version')!r}"
+        )
+    if expected_fingerprint is not None:
+        actual = payload.get("fingerprint") or {}
+        if actual != expected_fingerprint:
+            changed = sorted(
+                key
+                for key in set(actual) | set(expected_fingerprint)
+                if actual.get(key) != expected_fingerprint.get(key)
+            )
+            raise ValueError(
+                "association cache does not match current model/graphs/config; "
+                f"changed={','.join(changed) or 'unknown'}"
+            )
+    return payload
+
+
+def write_association_cache(path, payload):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temp_path = f"{path}.tmp"
+    # Preserve gzip behavior for the temporary file as well.
+    if str(path).lower().endswith(".gz"):
+        temp_path += ".gz"
+    try:
+        with _open_cache(temp_path, "wt") as stream:
+            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+@dataclass(frozen=True)
+class PeriodType:
+    """Runtime event type: feature entity (normally NE id) + alarm type."""
+
+    entity: str
+    alarm_type: str
+
+
+@dataclass(frozen=True)
+class PeriodSignature:
+    period_type: PeriodType
+    initial_state: int
+
+
+def artifact_period_types(artifact):
+    """Known runtime period types reconstructed from the artifact vocabulary."""
+    type_fields = tuple(artifact.config.type_fields)
+    node_field = artifact.config.topology_node_field
+    result = set()
+    for label in artifact.vocabs.type_vocab.labels:
+        entity, alarm_type = parse_label_entity_at(label, type_fields, node_field)
+        entity = str(entity or "")
+        alarm_type = str(alarm_type or "")
+        if entity and alarm_type:
+            result.add(PeriodType(entity, alarm_type))
+    return sorted(result, key=lambda value: (value.entity, value.alarm_type))
+
+
+@dataclass
+class AlarmPeriod:
+    period_id: int
+    period_type: PeriodType
+    initial_state: tuple
+    initial_state_combo: int
+    first_ts: float
+    last_raise_ts: float
+    events: list[OnlineEvent] = field(default_factory=list)
+    timestamps: list[float] = field(default_factory=list)
+    status: str = "open"
+    close_ts: Optional[float] = None
+    close_reason: Optional[str] = None
+    idle_generation: int = 0
+    pending_generation: int = 0
+    pending_ready_ts: Optional[float] = None
+    harvested_version: int = 0
+    primary_group_id: Optional[int] = None
+
+    @property
+    def signature(self) -> PeriodSignature:
+        return PeriodSignature(self.period_type, self.initial_state_combo)
+
+    @property
+    def version(self) -> int:
+        return len(self.events)
+
+    @property
+    def is_dirty(self) -> bool:
+        return self.version > self.harvested_version
+
+    def append(self, event: OnlineEvent):
+        if self.status != "open":
+            raise ValueError(f"cannot append to closed AlarmPeriod {self.period_id}")
+        self.events.append(event)
+        self.timestamps.append(float(event.ts))
+        self.last_raise_ts = max(self.last_raise_ts, float(event.ts))
+        self.idle_generation += 1
+
+    def close(self, ts: float, reason: str):
+        if self.status != "open":
+            return False
+        self.status = "closed"
+        self.close_ts = float(ts)
+        self.close_reason = str(reason)
+        self.idle_generation += 1
+        return True
+
+
+@dataclass(frozen=True)
+class CompiledEdge:
+    target_signature: PeriodSignature
+    source_signature: PeriodSignature
+    alpha: float
+    base_score: float
+    threshold: float
+    past_window_sec: float
+    future_window_sec: float
+
+
+@dataclass
+class RelationEvidence:
+    target_period_id: int
+    source_period_id: int
+    target_event: OnlineEvent
+    source_event: OnlineEvent
+    score: float
+    strength: float
+    edge: CompiledEdge
+
+    @property
+    def period_pair(self):
+        return tuple(sorted((self.target_period_id, self.source_period_id)))
+
+
+@dataclass
+class MergeProposal:
+    group_ids: tuple
+    evidence_pairs: set = field(default_factory=set)
+    max_strength: float = 0.0
+    max_score: float = 0.0
+
+
+@dataclass
+class PeriodFaultGroup:
+    group_id: int
+    anchor_period_id: int
+    period_ids: set = field(default_factory=set)
+    core_period_ids: list = field(default_factory=list)
+    evidence_by_pair: dict = field(default_factory=dict)
+    start_ts: float = math.inf
+    last_ts: float = -math.inf
+
+
+def _state_combo(mark) -> int:
+    mark = tuple(mark or (0, 0, 0))
+    return (
+        (int(mark[0]) if len(mark) > 0 else 0)
+        + 2 * (int(mark[1]) if len(mark) > 1 else 0)
+        + 4 * (int(mark[2]) if len(mark) > 2 else 0)
+    )
+
+
+def _combo_state(combo: int) -> tuple:
+    combo = int(combo)
+    return (combo & 1, (combo >> 1) & 1, (combo >> 2) & 1)
+
+
+class CompiledAssociationPlan:
+    """Lazy materialization of MHP period-signature edges.
+
+    The first period of a new signature compiles its edges against already
+    observed signatures.  Later periods reuse the same edge and horizon tables.
+    ``related`` scope materializes only same-entity, same-site, or topology-hop
+    pairs; ``global`` evaluates every observed signature pair.
+    """
+
+    def __init__(self, scorer, mu_scorer, artifact, config: PeriodStreamConfig):
+        self.scorer = scorer
+        self.decomposed = DecomposedFeatureScorer(scorer)
+        self.mu_scorer = mu_scorer
+        self.artifact = artifact
+        self.config = config
+        rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
+        self.beta = float(rt.get("beta", scorer.beta))
+        if self.beta <= 0:
+            raise ValueError("feature beta must be > 0")
+        self.late_lambda = math.log(2.0) / (
+            config.late_penalty_half_life_sec / config.time_scale_sec
+        )
+        self.mu_by_at = rt.get("mu_by_alarm_type", {}) or {}
+        self.mu_default = float(rt.get("mu_default", 0.0))
+        self.signatures: set[PeriodSignature] = set()
+        self.edges_by_target: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
+        self.edges_by_source: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
+        self._mu_cache: dict[PeriodType, float] = {}
+        self.compiled_pair_count = 0
+        self.pruned_pair_count = 0
+        self.preloaded_signature_count = 0
+        self.preloaded_edge_count = 0
+
+    def _mu(self, period_type: PeriodType) -> float:
+        cached = self._mu_cache.get(period_type)
+        if cached is not None:
+            return cached
+        if self.mu_scorer is not None:
+            value = float(self.mu_scorer.mu_for(period_type.alarm_type, period_type.entity))
+        else:
+            value = float(self.mu_by_at.get(period_type.alarm_type, self.mu_default))
+        value *= self.config.immigrant_bias * self.config.attach_threshold_ratio
+        value = max(value, EPS)
+        self._mu_cache[period_type] = value
+        return value
+
+    def _related(self, a: PeriodSignature, b: PeriodSignature) -> bool:
+        if self.config.candidate_scope == "global":
+            return True
+        ae = a.period_type.entity
+        be = b.period_type.entity
+        if ae == be:
+            return True
+        an = topo_node_of(ae)
+        bn = topo_node_of(be)
+        if not an or not bn:
+            return False
+        if an == bn:
+            return True
+        infos = self.scorer.node_infos
+        ai = infos.get(an)
+        bi = infos.get(bn)
+        a_site = str(getattr(ai, "site_id", "") or "")
+        b_site = str(getattr(bi, "site_id", "") or "")
+        if a_site and a_site == b_site:
+            return True
+        topo = self.scorer.topology_index
+        hops = (getattr(topo, "undirected_hops", {}) or {}) if topo is not None else {}
+        return bool(hops.get(an, {}).get(bn, 0) or hops.get(bn, {}).get(an, 0))
+
+    def register_signature(self, signature: PeriodSignature):
+        if signature in self.signatures:
+            return
+        existing = list(self.signatures)
+        self.signatures.add(signature)
+        for other in existing + [signature]:
+            if not self._related(signature, other):
+                continue
+            self._compile(signature, other)
+            if signature != other:
+                self._compile(other, signature)
+
+    def _compile(self, target: PeriodSignature, source: PeriodSignature):
+        if source in self.edges_by_target.get(target, {}):
+            return
+        t = target.period_type
+        s = source.period_type
+        src_marks = np.asarray([_combo_state(source.initial_state)], dtype=np.float64)
+        tgt_marks = np.asarray([_combo_state(target.initial_state)], dtype=np.float64)
+        alpha = float(
+            self.decomposed.alpha_for_target(
+                t.alarm_type,
+                t.entity,
+                [s.alarm_type],
+                [s.entity],
+                src_marks=src_marks if self.scorer.n_dynamic > 0 else None,
+                tgt_marks=tgt_marks if self.scorer.n_dynamic > 3 else None,
+            )[0]
+        )
+        if alpha < self.config.feature_alpha_floor:
+            self.pruned_pair_count += 1
+            return
+        relation_weight = 1.0
+        if self.config.topology_relation_prior:
+            relation_weight = float(
+                topology_relation_weights(
+                    [topo_node_of(s.entity)],
+                    topo_node_of(t.entity),
+                    self.scorer.topology_index,
+                    self.scorer.node_infos,
+                    self.config.topology_relation_prior,
+                )[0]
+            )
+        base_score = alpha * self.beta * relation_weight
+        threshold = self._mu(t)
+        if base_score + EPS < threshold or base_score <= 0:
+            self.pruned_pair_count += 1
+            return
+        log_margin = max(0.0, math.log(base_score / threshold))
+        past_window = min(
+            self.config.history_window_sec,
+            log_margin / self.beta * self.config.time_scale_sec,
+        )
+        future_window = 0.0
+        if self.config.time_slack_sec > 0:
+            future_window = min(
+                self.config.time_slack_sec,
+                log_margin / self.late_lambda * self.config.time_scale_sec,
+            )
+        edge = CompiledEdge(
+            target_signature=target,
+            source_signature=source,
+            alpha=alpha,
+            base_score=base_score,
+            threshold=threshold,
+            past_window_sec=past_window,
+            future_window_sec=future_window,
+        )
+        self.edges_by_target[target][source] = edge
+        self.edges_by_source[source][target] = edge
+        self.compiled_pair_count += 1
+
+    def _candidate_period_type_pairs(self, period_types):
+        """Yield exactly the directed type pairs admitted by ``_related``.
+
+        The related-scope path indexes entity/node/site/topology reach first, so
+        offline compilation does not perform a blind all-signature quadratic
+        scan merely to reject unrelated pairs.
+        """
+        period_types = tuple(sorted(set(period_types), key=lambda x: (x.entity, x.alarm_type)))
+        if self.config.candidate_scope == "global":
+            for target in period_types:
+                for source in period_types:
+                    yield target, source
+            return
+
+        by_entity = defaultdict(set)
+        by_node = defaultdict(set)
+        by_site = defaultdict(set)
+        infos = self.scorer.node_infos
+        for period_type in period_types:
+            by_entity[period_type.entity].add(period_type)
+            node = topo_node_of(period_type.entity)
+            if node:
+                by_node[node].add(period_type)
+                info = infos.get(node)
+                site = str(getattr(info, "site_id", "") or "")
+                if site:
+                    by_site[site].add(period_type)
+
+        topo = self.scorer.topology_index
+        hops = (getattr(topo, "undirected_hops", {}) or {}) if topo is not None else {}
+        neighbor_nodes = defaultdict(set)
+        for left, row in hops.items():
+            for right, distance in (row or {}).items():
+                if distance:
+                    neighbor_nodes[left].add(right)
+                    neighbor_nodes[right].add(left)
+
+        for target in period_types:
+            candidates = set(by_entity[target.entity])
+            node = topo_node_of(target.entity)
+            if node:
+                candidates.update(by_node[node])
+                info = infos.get(node)
+                site = str(getattr(info, "site_id", "") or "")
+                if site:
+                    candidates.update(by_site[site])
+                for neighbor in neighbor_nodes.get(node, ()):
+                    candidates.update(by_node[neighbor])
+            for source in sorted(candidates, key=lambda x: (x.entity, x.alarm_type)):
+                yield target, source
+
+    def precompile_period_types(self, period_types, progress=None):
+        """Compile all eight frozen-state signatures for known period types."""
+        period_types = tuple(sorted(set(period_types), key=lambda x: (x.entity, x.alarm_type)))
+        states = tuple(range(8))
+        for period_type in period_types:
+            for state in states:
+                self.signatures.add(PeriodSignature(period_type, state))
+
+        type_pair_count = 0
+        for target_type, source_type in self._candidate_period_type_pairs(period_types):
+            for target_state in states:
+                target = PeriodSignature(target_type, target_state)
+                for source_state in states:
+                    source = PeriodSignature(source_type, source_state)
+                    self._compile(target, source)
+            type_pair_count += 1
+            if progress is not None:
+                progress(type_pair_count, self.compiled_pair_count, self.pruned_pair_count)
+        return type_pair_count
+
+    @staticmethod
+    def _encode_signature(signature):
+        return [
+            signature.period_type.entity,
+            signature.period_type.alarm_type,
+            int(signature.initial_state),
+        ]
+
+    @staticmethod
+    def _decode_signature(row):
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError("invalid association-cache signature row")
+        state = int(row[2])
+        if state < 0 or state > 7:
+            raise ValueError(f"invalid association-cache state: {state}")
+        return PeriodSignature(PeriodType(str(row[0]), str(row[1])), state)
+
+    def to_cache_payload(self, fingerprint, extra_metadata=None):
+        signatures = sorted(
+            self.signatures,
+            key=lambda x: (x.period_type.entity, x.period_type.alarm_type, x.initial_state),
+        )
+        edges = []
+        for target in signatures:
+            sources = self.edges_by_target.get(target, {})
+            for source, edge in sorted(
+                sources.items(),
+                key=lambda item: (
+                    item[0].period_type.entity,
+                    item[0].period_type.alarm_type,
+                    item[0].initial_state,
+                ),
+            ):
+                edges.append(
+                    self._encode_signature(target)
+                    + self._encode_signature(source)
+                    + [
+                        float(edge.alpha),
+                        float(edge.base_score),
+                        float(edge.threshold),
+                        float(edge.past_window_sec),
+                        float(edge.future_window_sec),
+                    ]
+                )
+        return {
+            "format": ASSOCIATION_CACHE_FORMAT,
+            "version": ASSOCIATION_CACHE_VERSION,
+            "fingerprint": dict(fingerprint),
+            "edges": edges,
+            "metadata": {
+                "signature_count": len(signatures),
+                "edge_count": len(edges),
+                "pruned_pair_count": int(self.pruned_pair_count),
+                **dict(extra_metadata or {}),
+            },
+        }
+
+    def load_cache_payload(self, payload):
+        # Coverage is reconstructed from the fingerprinted model vocabulary;
+        # the persistent payload remains a strictly sparse positive-edge table.
+        signatures = {
+            PeriodSignature(period_type, state)
+            for period_type in artifact_period_types(self.artifact)
+            for state in range(8)
+        }
+        declared_signature_count = int(
+            (payload.get("metadata") or {}).get("signature_count", -1)
+        )
+        if declared_signature_count != len(signatures):
+            raise ValueError(
+                "association-cache coverage does not match artifact vocabulary: "
+                f"cache={declared_signature_count}, artifact={len(signatures)}"
+            )
+        loaded_edges = 0
+        for row in payload.get("edges") or []:
+            if not isinstance(row, list) or len(row) != 11:
+                raise ValueError("invalid association-cache edge row")
+            target = self._decode_signature(row[:3])
+            source = self._decode_signature(row[3:6])
+            if target not in signatures or source not in signatures:
+                raise ValueError("association-cache edge references an uncovered signature")
+            values = [float(value) for value in row[6:]]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("association-cache edge contains a non-finite value")
+            edge = CompiledEdge(
+                target_signature=target,
+                source_signature=source,
+                alpha=values[0],
+                base_score=values[1],
+                threshold=values[2],
+                past_window_sec=values[3],
+                future_window_sec=values[4],
+            )
+            if source in self.edges_by_target.get(target, {}):
+                raise ValueError("association-cache contains a duplicate edge")
+            self.edges_by_target[target][source] = edge
+            self.edges_by_source[source][target] = edge
+            loaded_edges += 1
+        self.signatures.update(signatures)
+        self.preloaded_signature_count += len(signatures)
+        self.preloaded_edge_count += loaded_edges
+
+
+class AlarmPeriodMHPAssigner:
+    """Incremental AlarmPeriod grouping engine."""
+
+    def __init__(
+        self,
+        artifact,
+        config: PeriodStreamConfig,
+        feature_scorer,
+        mu_scorer=None,
+        association_cache=None,
+    ):
+        config.validate()
+        if getattr(artifact.config, "edge_mode", "device") != "feature":
+            raise ValueError("AlarmPeriod engine requires a feature-mode artifact")
+        if getattr(artifact.params, "kernel_type", "exp") != "exp":
+            raise ValueError("AlarmPeriod engine currently supports only the exponential kernel")
+        self.artifact = artifact
+        self.config = config
+        self.feature_scorer = feature_scorer
+        self.mu_scorer = mu_scorer
+        self.plan = CompiledAssociationPlan(feature_scorer, mu_scorer, artifact, config)
+        if association_cache is not None:
+            self.plan.load_cache_payload(association_cache)
+        self.state_tracker = DeviceStateTracker()
+        self.periods: dict[int, AlarmPeriod] = {}
+        self.open_period_by_type: dict[PeriodType, int] = {}
+        self.period_ids_by_signature: dict[PeriodSignature, set] = defaultdict(set)
+        self.period_by_occurrence: dict[tuple, int] = {}
+        self._idle_heap: list = []
+        self._pending_heap: list = []
+        self._heap_seq = 0
+        self.groups: dict[int, PeriodFaultGroup] = {}
+        self._group_redirect: dict[int, int] = {}
+        self.merge_proposals: dict[tuple, MergeProposal] = {}
+        self.closed_groups: list[dict] = []
+        self._next_event_index = 0
+        self._next_period_id = 0
+        self._next_group_id = 0
+        self.current_watermark = -math.inf
+        self.total_input_events = 0
+        self.total_raise_events = 0
+        self.total_clear_events = 0
+        self.dropped_no_type = 0
+        self.created_periods = 0
+        self.idle_closed_periods = 0
+        self.clear_closed_periods = 0
+        self.harvest_count = 0
+        self.relation_count = 0
+        self.period_attach_count = 0
+        self.group_merge_count = 0
+
+    # ---- ingest and period lifecycle ---------------------------------
+
+    def process(self, alarm_event: dict):
+        self.total_input_events += 1
+        ts = float(alarm_event.get("ts", 0.0))
+        self._close_idle_periods(ts)
+
+        alarm_payload = alarm_event.get("alarm", {}) if isinstance(alarm_event, dict) else {}
+        clear = is_clear_alarm(alarm_payload)
+        entity, parsed_at = runtime_ne_at(
+            alarm_event,
+            self.artifact.config.type_fields,
+            self.artifact.config.topology_node_field,
+        )
+        fallback_at = alarm_type_label(alarm_event)
+        alarm_type = parsed_at or fallback_at
+        state_at = alarm_type_from_title(alarm_event.get("alarm_title", ""))
+        snapshot = self.state_tracker.snapshot_then_apply(entity, state_at, clear)
+        frozen_mark = (int(snapshot[0]), int(snapshot[1]), int(snapshot[2]))
+
+        if not alarm_type:
+            self.dropped_no_type += 1
+            self._advance_watermark(ts)
+            return None
+
+        period_type = PeriodType(str(entity), str(alarm_type))
+        if clear:
+            self.total_clear_events += 1
+            self._handle_clear(alarm_event, period_type, ts)
+            self._advance_watermark(ts)
+            return None
+
+        type_label = event_type_label(alarm_event, self.artifact.config.type_fields)
+        type_id = self.artifact.vocabs.type_vocab.get(type_label)
+        event = OnlineEvent(
+            index=self._next_event_index,
+            ts=ts,
+            type_id=-1 if type_id is None else int(type_id),
+            type_label=type_label,
+            alarm=alarm_event,
+            alarm_type=str(alarm_type),
+            ne=str(entity),
+            src_mark=frozen_mark,
+        )
+        self._next_event_index += 1
+        self.total_raise_events += 1
+
+        period = self._open_or_create_period(period_type, event, frozen_mark)
+        self._remember_occurrence(alarm_event, period.period_id)
+        if period.primary_group_id is not None:
+            group = self._group(period.primary_group_id)
+            if group is not None:
+                group.last_ts = max(group.last_ts, ts)
+        self._schedule_idle(period)
+        self._schedule_harvest(period, ts)
+        self._advance_watermark(ts)
+        return period
+
+    def _open_or_create_period(self, period_type, event, frozen_mark):
+        pid = self.open_period_by_type.get(period_type)
+        period = self.periods.get(pid) if pid is not None else None
+        if period is None or period.status != "open":
+            period = AlarmPeriod(
+                period_id=self._next_period_id,
+                period_type=period_type,
+                initial_state=tuple(frozen_mark),
+                initial_state_combo=_state_combo(frozen_mark),
+                first_ts=float(event.ts),
+                last_raise_ts=float(event.ts),
+            )
+            self._next_period_id += 1
+            self.created_periods += 1
+            self.periods[period.period_id] = period
+            self.open_period_by_type[period_type] = period.period_id
+            self.period_ids_by_signature[period.signature].add(period.period_id)
+            self.plan.register_signature(period.signature)
+        period.append(event)
+        return period
+
+    def _identity_of(self, alarm_event):
+        try:
+            return require_alarm_identity(alarm_event)
+        except ValueError:
+            return None
+
+    def _remember_occurrence(self, alarm_event, period_id):
+        identity = self._identity_of(alarm_event)
+        if identity is not None:
+            self.period_by_occurrence[tuple(identity)] = int(period_id)
+
+    def _handle_clear(self, alarm_event, period_type, ts):
+        matched_period = None
+        identity = self._identity_of(alarm_event)
+        matched_by_identity = False
+        if identity is not None:
+            identity_key = tuple(identity)
+            if identity_key in self.period_by_occurrence:
+                matched_by_identity = True
+                pid = self.period_by_occurrence[identity_key]
+                matched_period = self.periods.get(pid)
+        if matched_period is None and not matched_by_identity:
+            pid = self.open_period_by_type.get(period_type)
+            matched_period = self.periods.get(pid) if pid is not None else None
+        if matched_period is None or matched_period.status != "open":
+            return
+        if matched_period.close(ts, "clear"):
+            self.clear_closed_periods += 1
+            if self.open_period_by_type.get(matched_period.period_type) == matched_period.period_id:
+                self.open_period_by_type.pop(matched_period.period_type, None)
+
+    def _schedule_idle(self, period: AlarmPeriod):
+        deadline = period.last_raise_ts + self.config.period_idle_sec
+        self._heap_seq += 1
+        heapq.heappush(
+            self._idle_heap,
+            (deadline, self._heap_seq, period.period_id, period.idle_generation),
+        )
+
+    def _schedule_harvest(self, period: AlarmPeriod, occurrence_ts: float):
+        if period.pending_ready_ts is not None:
+            return
+        period.pending_generation += 1
+        period.pending_ready_ts = float(occurrence_ts) + self.config.aggregation_wait_sec
+        self._heap_seq += 1
+        heapq.heappush(
+            self._pending_heap,
+            (
+                period.pending_ready_ts,
+                self._heap_seq,
+                period.period_id,
+                period.pending_generation,
+            ),
+        )
+
+    def _close_idle_periods(self, watermark: float):
+        while self._idle_heap and self._idle_heap[0][0] <= watermark:
+            deadline, _seq, pid, generation = heapq.heappop(self._idle_heap)
+            period = self.periods.get(pid)
+            if period is None or period.status != "open":
+                continue
+            if generation != period.idle_generation:
+                continue
+            if period.close(deadline, "idle"):
+                self.idle_closed_periods += 1
+                if self.open_period_by_type.get(period.period_type) == pid:
+                    self.open_period_by_type.pop(period.period_type, None)
+
+    def _advance_watermark(self, watermark: float):
+        self.current_watermark = max(self.current_watermark, float(watermark))
+        self._harvest_ready(self.current_watermark)
+        self._close_inactive_groups(self.current_watermark)
+        self._evict_expired_periods(self.current_watermark)
+
+    # ---- incremental harvest -----------------------------------------
+
+    def _harvest_ready(self, watermark: float):
+        while self._pending_heap and self._pending_heap[0][0] <= watermark:
+            _ready, _seq, pid, generation = heapq.heappop(self._pending_heap)
+            period = self.periods.get(pid)
+            if period is None or generation != period.pending_generation:
+                continue
+            period.pending_ready_ts = None
+            if not period.is_dirty:
+                continue
+            self._harvest_period(period, watermark)
+
+    def _harvest_period(self, period: AlarmPeriod, watermark: float):
+        start = period.harvested_version
+        # Every occurrence receives the configured fixed wait.  A pending item
+        # is anchored by the first unharvested occurrence and intentionally is
+        # not postponed by a storm; occurrences that arrived near its deadline
+        # remain dirty and get the next coalesced pending item.
+        mature_before = float(watermark) - self.config.aggregation_wait_sec + EPS
+        mature_version = bisect.bisect_right(period.timestamps, mature_before)
+        new_events = period.events[start:mature_version]
+        if not new_events:
+            if period.is_dirty:
+                self._schedule_harvest(period, period.timestamps[start])
+            return
+        relations = self._collect_relations(period, new_events)
+        self._apply_relations(period, relations)
+        period.harvested_version = mature_version
+        self.harvest_count += 1
+        if period.is_dirty:
+            self._schedule_harvest(period, period.timestamps[mature_version])
+
+    def _collect_relations(self, period: AlarmPeriod, new_events: list[OnlineEvent]):
+        best_by_directed_pair: dict[tuple, RelationEvidence] = {}
+        sig = period.signature
+
+        # Current period acts as target; only its newly mature times are probed.
+        for source_sig, edge in self.plan.edges_by_target.get(sig, {}).items():
+            for source_pid in tuple(self.period_ids_by_signature.get(source_sig, ())):
+                if source_pid == period.period_id:
+                    continue
+                source_period = self.periods.get(source_pid)
+                if not self._candidate_period_ok(source_period):
+                    continue
+                ev = self._best_for_new_targets(edge, period, new_events, source_period)
+                if ev is not None:
+                    self._keep_best_relation(best_by_directed_pair, ev)
+
+        # Current period acts as source; reverse index catches relationships to
+        # older target periods without rescanning every historical occurrence.
+        for target_sig, edge in self.plan.edges_by_source.get(sig, {}).items():
+            for target_pid in tuple(self.period_ids_by_signature.get(target_sig, ())):
+                if target_pid == period.period_id:
+                    continue
+                target_period = self.periods.get(target_pid)
+                if not self._candidate_period_ok(target_period):
+                    continue
+                ev = self._best_for_new_sources(edge, target_period, period, new_events)
+                if ev is not None:
+                    self._keep_best_relation(best_by_directed_pair, ev)
+
+        out = sorted(best_by_directed_pair.values(), key=lambda x: (-x.score, x.period_pair))
+        self.relation_count += len(out)
+        return out
+
+    def _candidate_period_ok(self, period):
+        if period is None or not period.events:
+            return False
+        if period.primary_group_id is not None and self._group(period.primary_group_id) is None:
+            return False
+        return True
+
+    @staticmethod
+    def _keep_best_relation(store, evidence):
+        key = (evidence.target_period_id, evidence.source_period_id)
+        old = store.get(key)
+        if old is None or evidence.score > old.score:
+            store[key] = evidence
+
+    def _past_score(self, edge, dt_sec):
+        return edge.base_score * math.exp(
+            -self.plan.beta * (float(dt_sec) / self.config.time_scale_sec)
+        )
+
+    def _future_score(self, edge, late_sec):
+        return edge.base_score * math.exp(
+            -self.plan.late_lambda * (float(late_sec) / self.config.time_scale_sec)
+        )
+
+    def _best_for_new_targets(self, edge, target_period, new_targets, source_period):
+        src_ts = source_period.timestamps
+        best = None
+        for target_event in new_targets:
+            t = target_event.ts
+            j = bisect.bisect_right(src_ts, t) - 1
+            if j >= 0:
+                dt = t - src_ts[j]
+                if dt <= edge.past_window_sec + EPS:
+                    score = self._past_score(edge, dt)
+                    best = self._evidence_if_better(
+                        best, edge, target_period, source_period,
+                        target_event, source_period.events[j], score,
+                    )
+            j = bisect.bisect_right(src_ts, t)
+            if j < len(src_ts):
+                late = src_ts[j] - t
+                if late <= edge.future_window_sec + EPS:
+                    score = self._future_score(edge, late)
+                    best = self._evidence_if_better(
+                        best, edge, target_period, source_period,
+                        target_event, source_period.events[j], score,
+                    )
+        return best
+
+    def _best_for_new_sources(self, edge, target_period, source_period, new_sources):
+        tgt_ts = target_period.timestamps
+        best = None
+        for source_event in new_sources:
+            s = source_event.ts
+            j = bisect.bisect_left(tgt_ts, s)
+            if j < len(tgt_ts):
+                dt = tgt_ts[j] - s
+                if dt <= edge.past_window_sec + EPS:
+                    score = self._past_score(edge, dt)
+                    best = self._evidence_if_better(
+                        best, edge, target_period, source_period,
+                        target_period.events[j], source_event, score,
+                    )
+            j = bisect.bisect_left(tgt_ts, s) - 1
+            if j >= 0:
+                late = s - tgt_ts[j]
+                if late <= edge.future_window_sec + EPS:
+                    score = self._future_score(edge, late)
+                    best = self._evidence_if_better(
+                        best, edge, target_period, source_period,
+                        target_period.events[j], source_event, score,
+                    )
+        return best
+
+    @staticmethod
+    def _evidence_if_better(best, edge, target_period, source_period,
+                            target_event, source_event, score):
+        if score + EPS < edge.threshold:
+            return best
+        evidence = RelationEvidence(
+            target_period_id=target_period.period_id,
+            source_period_id=source_period.period_id,
+            target_event=target_event,
+            source_event=source_event,
+            score=float(score),
+            strength=float(score / max(edge.threshold, EPS)),
+            edge=edge,
+        )
+        if best is None or evidence.score > best.score:
+            return evidence
+        return best
+
+    # ---- primary group assignment and controlled merging --------------
+
+    def _apply_relations(self, period: AlarmPeriod, relations: list[RelationEvidence]):
+        current_gid = self._resolve_group_id(period.primary_group_id)
+        if current_gid is None:
+            current_gid = self._choose_or_create_group(period, relations)
+        group = self.groups[current_gid]
+
+        usable = []
+        for rel in relations:
+            other_pid = rel.source_period_id if rel.target_period_id == period.period_id else rel.target_period_id
+            other = self.periods.get(other_pid)
+            if other is None:
+                continue
+            other_gid = self._resolve_group_id(other.primary_group_id)
+            if other_gid is None:
+                usable.append((rel, other))
+            elif other_gid == current_gid:
+                self._record_group_evidence(group, rel)
+            else:
+                self._record_merge_proposal(current_gid, other_gid, rel)
+
+        if period.period_id in group.core_period_ids and usable:
+            best_score = usable[0][0].score
+            kept = 0
+            for rel, other in usable:
+                if kept >= self.config.max_related_periods:
+                    break
+                if rel.score + EPS < best_score * self.config.relative_attach_ratio:
+                    break
+                if other.primary_group_id is not None:
+                    continue
+                self._attach_period(group, other, core=False)
+                self._record_group_evidence(group, rel)
+                kept += 1
+
+        self._try_ready_merge_proposals()
+
+    def _choose_or_create_group(self, period, relations):
+        by_group = defaultdict(list)
+        ungrouped = []
+        for rel in relations:
+            other_pid = rel.source_period_id if rel.target_period_id == period.period_id else rel.target_period_id
+            other = self.periods.get(other_pid)
+            if other is None:
+                continue
+            gid = self._resolve_group_id(other.primary_group_id)
+            if gid is None:
+                ungrouped.append((rel, other))
+            else:
+                by_group[gid].append((rel, other))
+
+        choices = []
+        for gid, items in by_group.items():
+            group = self.groups.get(gid)
+            if group is None:
+                continue
+            has_core_edge = any(other.period_id in group.core_period_ids for _rel, other in items)
+            distinct_members = len({other.period_id for _rel, other in items})
+            if has_core_edge or distinct_members >= 2:
+                choices.append((max(rel.score for rel, _other in items), gid, items))
+        choices.sort(key=lambda x: (-x[0], x[1]))
+
+        if choices:
+            _score, gid, items = choices[0]
+            group = self.groups[gid]
+            self._attach_period(group, period, core=False)
+            for rel, _other in items:
+                self._record_group_evidence(group, rel)
+            return gid
+
+        if ungrouped:
+            ungrouped.sort(key=lambda x: (-x[0].score, x[1].period_id))
+            rel, other = ungrouped[0]
+            group = self._new_group(period)
+            self._attach_period(group, other, core=True)
+            self._record_group_evidence(group, rel)
+            return group.group_id
+
+        return self._new_group(period).group_id
+
+    def _new_group(self, anchor_period: AlarmPeriod):
+        gid = self._next_group_id
+        self._next_group_id += 1
+        group = PeriodFaultGroup(group_id=gid, anchor_period_id=anchor_period.period_id)
+        self.groups[gid] = group
+        self._attach_period(group, anchor_period, core=True)
+        return group
+
+    def _attach_period(self, group, period, core=False):
+        gid = self._resolve_group_id(group.group_id)
+        if gid != group.group_id:
+            group = self.groups[gid]
+        existing_gid = self._resolve_group_id(period.primary_group_id)
+        if existing_gid is not None and existing_gid != group.group_id:
+            return False
+        if period.period_id in group.period_ids:
+            return False
+        group.period_ids.add(period.period_id)
+        period.primary_group_id = group.group_id
+        group.start_ts = min(group.start_ts, period.first_ts)
+        group.last_ts = max(group.last_ts, period.last_raise_ts)
+        if core and len(group.core_period_ids) < self.config.max_core_periods:
+            group.core_period_ids.append(period.period_id)
+        self.period_attach_count += 1
+        return True
+
+    @staticmethod
+    def _record_group_evidence(group, rel):
+        pair = rel.period_pair
+        old = group.evidence_by_pair.get(pair)
+        if old is None or rel.score > old.score:
+            group.evidence_by_pair[pair] = rel
+
+    def _record_merge_proposal(self, gid1, gid2, rel):
+        gid1 = self._resolve_group_id(gid1)
+        gid2 = self._resolve_group_id(gid2)
+        if gid1 is None or gid2 is None or gid1 == gid2:
+            return
+        key = tuple(sorted((gid1, gid2)))
+        proposal = self.merge_proposals.get(key)
+        if proposal is None:
+            proposal = MergeProposal(group_ids=key)
+            self.merge_proposals[key] = proposal
+        proposal.evidence_pairs.add(rel.period_pair)
+        proposal.max_strength = max(proposal.max_strength, rel.strength)
+        proposal.max_score = max(proposal.max_score, rel.score)
+
+    def _try_ready_merge_proposals(self):
+        ready = []
+        for key, proposal in list(self.merge_proposals.items()):
+            if (
+                len(proposal.evidence_pairs) >= self.config.merge_min_evidence
+                and proposal.max_strength >= self.config.merge_strength_ratio
+            ):
+                ready.append((proposal.max_strength, key))
+        for _strength, key in sorted(ready, key=lambda x: (-x[0], x[1])):
+            proposal = self.merge_proposals.pop(key, None)
+            if proposal is None:
+                continue
+            g1 = self._resolve_group_id(proposal.group_ids[0])
+            g2 = self._resolve_group_id(proposal.group_ids[1])
+            if g1 is None or g2 is None or g1 == g2:
+                continue
+            self._merge_groups(g1, g2)
+
+    def _merge_groups(self, gid1, gid2):
+        keep_id, drop_id = sorted((gid1, gid2))
+        keep = self.groups.get(keep_id)
+        drop = self.groups.get(drop_id)
+        if keep is None or drop is None:
+            return keep or drop
+        for pid in sorted(drop.period_ids):
+            period = self.periods.get(pid)
+            if period is None:
+                continue
+            period.primary_group_id = keep_id
+            keep.period_ids.add(pid)
+        core_candidates = keep.core_period_ids + drop.core_period_ids
+        core_candidates = sorted(
+            set(core_candidates),
+            key=lambda pid: (self.periods[pid].first_ts, pid),
+        )
+        keep.core_period_ids = core_candidates[: self.config.max_core_periods]
+        keep.start_ts = min(keep.start_ts, drop.start_ts)
+        keep.last_ts = max(keep.last_ts, drop.last_ts)
+        for pair, rel in drop.evidence_by_pair.items():
+            old = keep.evidence_by_pair.get(pair)
+            if old is None or rel.score > old.score:
+                keep.evidence_by_pair[pair] = rel
+        self.groups.pop(drop_id, None)
+        self._group_redirect[drop_id] = keep_id
+        self.group_merge_count += 1
+        return keep
+
+    def _resolve_group_id(self, gid):
+        if gid is None:
+            return None
+        path = []
+        while gid in self._group_redirect:
+            path.append(gid)
+            gid = self._group_redirect[gid]
+        for old in path:
+            self._group_redirect[old] = gid
+        return gid if gid in self.groups else None
+
+    def _group(self, gid):
+        gid = self._resolve_group_id(gid)
+        return self.groups.get(gid) if gid is not None else None
+
+    # ---- closure, eviction, output -----------------------------------
+
+    def _close_inactive_groups(self, watermark):
+        if self.config.close_inactive_sec <= 0:
+            return
+        cutoff = float(watermark) - self.config.close_inactive_sec
+        ready = []
+        for gid, group in self.groups.items():
+            if group.last_ts >= cutoff:
+                continue
+            periods = [self.periods.get(pid) for pid in group.period_ids]
+            if any(p is not None and (p.status == "open" or p.is_dirty) for p in periods):
+                continue
+            ready.append(gid)
+        for gid in ready:
+            self._finalize_group(gid)
+
+    def _finalize_group(self, gid):
+        group = self.groups.pop(gid, None)
+        if group is None:
+            return
+        record = self._group_record(group)
+        if record["event_count"] >= self.config.min_group_events:
+            self.closed_groups.append(record)
+
+    def _evict_expired_periods(self, watermark):
+        cutoff = float(watermark) - (
+            self.config.history_window_sec
+            + self.config.aggregation_wait_sec
+            + self.config.time_slack_sec
+        )
+        dead = []
+        for pid, period in self.periods.items():
+            # Active groups own their periods until group finalization; output,
+            # core-gating, and merge proposals all need the period metadata even
+            # after it has aged out of the candidate window.
+            if self._resolve_group_id(period.primary_group_id) is not None:
+                continue
+            if period.status == "closed" and period.last_raise_ts < cutoff:
+                if period.pending_ready_ts is None and not period.is_dirty:
+                    dead.append(pid)
+        for pid in dead:
+            period = self.periods.pop(pid, None)
+            if period is None:
+                continue
+            ids = self.period_ids_by_signature.get(period.signature)
+            if ids is not None:
+                ids.discard(pid)
+                if not ids:
+                    self.period_ids_by_signature.pop(period.signature, None)
+
+    def flush(self):
+        for period in list(self.periods.values()):
+            if period.status == "open":
+                period.close(period.last_raise_ts, "stream_end")
+                if self.open_period_by_type.get(period.period_type) == period.period_id:
+                    self.open_period_by_type.pop(period.period_type, None)
+            if period.is_dirty and period.pending_ready_ts is None:
+                self._schedule_harvest(period, period.last_raise_ts)
+        self._harvest_ready(math.inf)
+        self._try_ready_merge_proposals()
+        for gid in sorted(list(self.groups)):
+            self._finalize_group(gid)
+
+    def _group_record(self, group):
+        periods = [self.periods[pid] for pid in group.period_ids if pid in self.periods]
+        events = []
+        seen = set()
+        for period in periods:
+            for event in period.events:
+                if event.index not in seen:
+                    seen.add(event.index)
+                    events.append(event)
+        events.sort(key=lambda e: (e.ts, e.index))
+        summaries = [_summary_of(event) for event in events]
+        summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
+        anchor = self.periods.get(group.anchor_period_id)
+        root_event = anchor.events[0] if anchor is not None and anchor.events else events[0]
+        edges = []
+        for rel in sorted(group.evidence_by_pair.values(), key=lambda x: (-x.score, x.period_pair)):
+            if rel.target_period_id not in group.period_ids or rel.source_period_id not in group.period_ids:
+                continue
+            src = summary_by_index.get(rel.source_event.index, {})
+            tgt = summary_by_index.get(rel.target_event.index, {})
+            edges.append(
+                {
+                    "source_period_id": rel.source_period_id,
+                    "target_period_id": rel.target_period_id,
+                    "source_event_id": src.get("event_id", ""),
+                    "target_event_id": tgt.get("event_id", ""),
+                    "source_occurrence_uuid": src.get("occurrence_uuid", ""),
+                    "target_occurrence_uuid": tgt.get("occurrence_uuid", ""),
+                    "score": float(rel.score),
+                    "strength": float(rel.strength),
+                }
+            )
+        timestamps = [float(s["ts"]) for s in summaries]
+        gid_text = f"mhp-period-{group.group_id:06d}"
+        return {
+            "group_id": gid_text,
+            "cascade_id": group.group_id,
+            "rule": "alarm_flow_mhp_period",
+            "event_count": len(events),
+            "alarm_period_count": len(periods),
+            "start_ts": min(timestamps),
+            "end_ts": max(timestamps),
+            "duration_sec": max(timestamps) - min(timestamps),
+            "root_event": _summary_of(root_event),
+            "anchor_period_id": group.anchor_period_id,
+            "core_period_ids": list(group.core_period_ids),
+            "site_list": sorted({s["site_id"] for s in summaries if s.get("site_id")}),
+            "alarm_source_list": sorted(
+                {s["alarm_source"] for s in summaries if s.get("alarm_source")}
+            ),
+            "alarm_title_counts": dict(
+                Counter(s["alarm_title"] for s in summaries if s.get("alarm_title"))
+            ),
+            "alarm_type_counts": dict(
+                Counter(s["alarm_type"] for s in summaries if s.get("alarm_type"))
+            ),
+            "symptoms": summaries,
+            "edges": edges,
+        }
+
+    def stats(self):
+        open_periods = sum(1 for p in self.periods.values() if p.status == "open")
+        return {
+            "total_input_events": self.total_input_events,
+            "total_raise_events": self.total_raise_events,
+            "total_clear_events": self.total_clear_events,
+            "dropped_no_type": self.dropped_no_type,
+            "created_periods": self.created_periods,
+            "open_periods": open_periods,
+            "idle_closed_periods": self.idle_closed_periods,
+            "clear_closed_periods": self.clear_closed_periods,
+            "harvest_count": self.harvest_count,
+            "relation_count": self.relation_count,
+            "period_attach_count": self.period_attach_count,
+            "group_merge_count": self.group_merge_count,
+            "compiled_pair_count": self.plan.compiled_pair_count,
+            "pruned_pair_count": self.plan.pruned_pair_count,
+            "incremental_evaluated_pair_count": (
+                self.plan.compiled_pair_count + self.plan.pruned_pair_count
+            ),
+            "preloaded_signature_count": self.plan.preloaded_signature_count,
+            "preloaded_edge_count": self.plan.preloaded_edge_count,
+            "active_group_count": len(self.groups),
+            "closed_group_count": len(self.closed_groups),
+        }
+
+
+def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False):
+    if getattr(artifact.config, "edge_mode", "device") != "feature":
+        raise ValueError("AlarmPeriod inference requires edge_mode=feature")
+    md = artifact.training_metadata or {}
+    fk = md.get("feature_kernel")
+    rt = md.get("feature_runtime") or {}
+    if fk is None:
+        raise ValueError("feature-mode artifact missing feature_kernel")
+    node_field = artifact.config.topology_node_field
+    ne_graph_data = load_ne_graph(ne_graph_path)
+    graph_ctx = build_node_context(ne_graph_data, node_field)
+    topo_graph = load_ne_graph(site_graph_path) if node_field == "site_id" else ne_graph_data
+    infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
+    topo_idx = NETopologyIndex.from_graph(topo_graph, max_hops=infer_hops)
+    dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
+    n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
+    scorer = RuntimeFeatureScorer(
+        kernel=FeatureKernel.from_dict(fk),
+        at_vocab=rt.get("at_vocab", []),
+        graph_context=graph_ctx,
+        topology_index=topo_idx,
+        beta=float(rt.get("beta", 1.0)),
+        n_dynamic=n_dynamic,
+        domain_vocab=rt.get("domain_vocab", []),
+        node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
+    )
+    mu_scorer = None
+    if rt.get("mu_kernel") is not None and rt.get("mu_spec") is not None:
+        mu_scorer = RuntimeMuScorer(
+            mu_kernel=FeatureKernel.from_dict(rt["mu_kernel"]),
+            mu_spec=MuFeatureSpec.from_dict(rt["mu_spec"]),
+            graph_context=graph_ctx,
+        )
+    if not quiet:
+        print(
+            f"[period] feature scorer ready: dynamic={dyn_mode}, "
+            f"topology_hops={infer_hops}, node_field={node_field}",
+            flush=True,
+        )
+    return scorer, mu_scorer, ne_graph_data
+
+
+def _write_json(path, payload):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+
+
+def _write_jsonl(path, records):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    count = 0
+    with open(path, "w", encoding="utf-8") as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+    return count
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        description="AlarmPeriod-oriented online MHP grouping (feature mode)."
+    )
+    parser.add_argument("model", help="Trained alarm-flow MHP artifact JSON.")
+    parser.add_argument("alarms", help="Sorted alarm cache or raw alarm input.")
+    parser.add_argument("--groups-output", required=True, help="Output groups JSON.")
+    parser.add_argument("--edges-output", default="", help="Optional period evidence JSONL.")
+    parser.add_argument("--visual-output", default="", help="Optional visual-output JSONL.")
+    parser.add_argument(
+        "--association-cache",
+        default="",
+        help=(
+            "Optional offline sparse association cache (.json or .json.gz). "
+            "Known signatures are loaded from it; unseen online devices are "
+            "compiled incrementally in memory only."
+        ),
+    )
+    parser.add_argument("--ne-graph", default=NE_GRAPH_JSON, help=resource_display("ne_graph.json"))
+    parser.add_argument("--site-graph", default=SITE_GRAPH_JSON, help=resource_display("site_graph.json"))
+    parser.add_argument("--start-time", default="")
+    parser.add_argument("--end-time", default="")
+    parser.add_argument("--clear-delay-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--aggregation-wait-sec",
+        type=float,
+        default=None,
+        help="Fixed event-time maturity lag. Default: max(30s, time_slack_sec).",
+    )
+    parser.add_argument("--period-idle-sec", type=float, default=300.0)
+    parser.add_argument("--history-window-sec", type=float, default=None)
+    parser.add_argument("--time-slack-sec", type=float, default=None)
+    parser.add_argument("--late-penalty-half-life-sec", type=float, default=None)
+    parser.add_argument("--close-inactive-sec", type=float, default=7200.0)
+    parser.add_argument("--min-group-events", type=int, default=None)
+    parser.add_argument("--immigrant-bias", type=float, default=1.0)
+    parser.add_argument("--feature-alpha-floor", type=float, default=None)
+    parser.add_argument("--attach-threshold-ratio", type=float, default=1.0)
+    parser.add_argument("--relative-attach-ratio", type=float, default=0.8)
+    parser.add_argument("--max-related-periods", type=int, default=8)
+    parser.add_argument("--max-core-periods", type=int, default=4)
+    parser.add_argument("--merge-strength-ratio", type=float, default=2.0)
+    parser.add_argument("--merge-min-evidence", type=int, default=2)
+    parser.add_argument("--candidate-scope", choices=("related", "global"), default="related")
+    parser.add_argument(
+        "--topology-relation-prior",
+        default="",
+        help="Comma-separated relation multipliers, same format as stream_alarm_mhp.py.",
+    )
+    parser.add_argument("--progress-every", type=int, default=50_000)
+    parser.add_argument("--quiet", action="store_true")
+    return parser
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+    try:
+        relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    t0 = time.monotonic()
+    artifact = load_alarm_mhp_artifact(args.model)
+    scorer, mu_scorer, ne_graph_data = _build_runtime_scorers(
+        artifact, args.ne_graph, args.site_graph, quiet=args.quiet
+    )
+    events, alarm_metadata = load_ordered_alarm_events(
+        args.alarms,
+        topo_path=args.site_graph,
+        ne_graph_path=args.ne_graph,
+        start_time=args.start_time or None,
+        end_time=args.end_time or None,
+        clear_delay_sec=args.clear_delay_sec,
+        regions=artifact.config.regions,
+    )
+    if DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields):
+        events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
+        if not args.quiet:
+            print(f"[period] domain filter: {domain_stats}", flush=True)
+
+    history = (
+        float(args.history_window_sec)
+        if args.history_window_sec is not None
+        else float(artifact.config.history_window_sec)
+    )
+    slack = (
+        float(args.time_slack_sec)
+        if args.time_slack_sec is not None
+        else float(getattr(artifact.config, "time_slack_sec", 0.0))
+    )
+    aggregation_wait = (
+        float(args.aggregation_wait_sec)
+        if args.aggregation_wait_sec is not None
+        else max(30.0, slack)
+    )
+    late_half_life = (
+        float(args.late_penalty_half_life_sec)
+        if args.late_penalty_half_life_sec is not None
+        else float(getattr(artifact.config, "late_penalty_half_life_sec", 1.0))
+    )
+    floor = (
+        float(args.feature_alpha_floor)
+        if args.feature_alpha_floor is not None
+        else float(getattr(artifact.config, "edge_threshold", 0.0))
+    )
+    min_events = (
+        int(args.min_group_events)
+        if args.min_group_events is not None
+        else int(artifact.config.min_group_events)
+    )
+    config = PeriodStreamConfig(
+        aggregation_wait_sec=aggregation_wait,
+        period_idle_sec=args.period_idle_sec,
+        history_window_sec=history,
+        time_slack_sec=slack,
+        late_penalty_half_life_sec=late_half_life,
+        time_scale_sec=float(artifact.config.time_scale_sec),
+        close_inactive_sec=args.close_inactive_sec,
+        min_group_events=min_events,
+        immigrant_bias=args.immigrant_bias,
+        feature_alpha_floor=floor,
+        attach_threshold_ratio=args.attach_threshold_ratio,
+        relative_attach_ratio=args.relative_attach_ratio,
+        max_related_periods=args.max_related_periods,
+        max_core_periods=args.max_core_periods,
+        merge_strength_ratio=args.merge_strength_ratio,
+        merge_min_evidence=args.merge_min_evidence,
+        candidate_scope=args.candidate_scope,
+        topology_relation_prior=relation_prior,
+    )
+    try:
+        config.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    association_cache = None
+    if args.association_cache:
+        try:
+            fingerprint = association_cache_fingerprint(
+                args.model,
+                args.ne_graph,
+                args.site_graph,
+                config,
+                artifact.config.topology_node_field,
+            )
+            association_cache = load_association_cache(
+                args.association_cache, expected_fingerprint=fingerprint
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot load --association-cache: {exc}")
+        if not args.quiet:
+            cache_md = association_cache.get("metadata") or {}
+            print(
+                f"[period] association cache loaded: "
+                f"signatures={cache_md.get('signature_count', 0)}, "
+                f"edges={cache_md.get('edge_count', 0)}",
+                flush=True,
+            )
+
+    engine = AlarmPeriodMHPAssigner(
+        artifact,
+        config,
+        feature_scorer=scorer,
+        mu_scorer=mu_scorer,
+        association_cache=association_cache,
+    )
+    # The plan owns decoded edge objects now; release the JSON row arrays before
+    # processing a potentially large alarm stream.
+    association_cache = None
+    if not args.quiet:
+        print(
+            f"[period] events={len(events)}, wait={config.aggregation_wait_sec:g}s, "
+            f"idle={config.period_idle_sec:g}s, history={config.history_window_sec:g}s, "
+            f"scope={config.candidate_scope}, dynamic={getattr(artifact.config, 'dynamic_alpha', 'off')}",
+            flush=True,
+        )
+
+    for i, event in enumerate(events):
+        engine.process(event)
+        if args.progress_every and (i + 1) % args.progress_every == 0 and not args.quiet:
+            stats = engine.stats()
+            elapsed = time.monotonic() - t0
+            print(
+                f"[period] processed={i + 1}/{len(events)} "
+                f"rate={(i + 1) / max(elapsed, EPS):.0f}/s "
+                f"periods={stats['created_periods']} harvests={stats['harvest_count']} "
+                f"groups={stats['active_group_count']}+{stats['closed_group_count']}",
+                flush=True,
+            )
+    engine.flush()
+    stats = engine.stats()
+    elapsed = time.monotonic() - t0
+    metadata = {
+        "algorithm": "alarm_flow_mhp.alarm_period_stream",
+        "model": os.path.abspath(args.model),
+        "input": os.path.abspath(args.alarms),
+        "association_cache": (
+            os.path.abspath(args.association_cache) if args.association_cache else ""
+        ),
+        "alarm_metadata": alarm_metadata,
+        "config": {
+            key: value
+            for key, value in vars(config).items()
+        },
+        "stats": stats,
+        "elapsed_seconds": elapsed,
+    }
+    _write_json(args.groups_output, {"metadata": metadata, "groups": engine.closed_groups})
+    if args.edges_output:
+        edges = [edge for group in engine.closed_groups for edge in group.get("edges", ())]
+        _write_jsonl(args.edges_output, edges)
+    if args.visual_output:
+        from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
+
+        visual = AlarmMHPVisualOutputSession.from_files(
+            args.visual_output,
+            args.ne_graph,
+            args.site_graph,
+        )
+        visual.reset_output_file()
+        try:
+            visual.emit_groups(engine.closed_groups, finalization_reason="stream_end")
+        finally:
+            visual.close()
+    if not args.quiet:
+        print(
+            f"[period] done: groups={len(engine.closed_groups)}, "
+            f"periods={stats['created_periods']}, harvests={stats['harvest_count']}, "
+            f"preloaded_edges={stats['preloaded_edge_count']}, "
+            f"incremental_edges={stats['compiled_pair_count']}, elapsed={elapsed:.2f}s; "
+            f"output={args.groups_output}",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
