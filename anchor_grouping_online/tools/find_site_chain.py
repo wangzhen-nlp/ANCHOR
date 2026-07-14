@@ -24,7 +24,7 @@ DEFAULT_PREDICTION_CANDIDATES = [
 
 
 def normalize_site_id(site_id):
-    return str(site_id or "").strip().upper()
+    return str(site_id or "").strip()
 
 
 def default_prediction_json():

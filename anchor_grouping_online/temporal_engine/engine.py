@@ -298,7 +298,6 @@ class TemporalGraphEngine(
             if not site_id:
                 continue
             self._ne_to_site[ne_id] = site_id
-            self._ne_to_site[str(ne_id or "").strip().upper()] = site_id
         self._site_to_ne_ids = {
             site_id: tuple(ne_ids)
             for site_id, ne_ids in site_to_ne_ids.items()

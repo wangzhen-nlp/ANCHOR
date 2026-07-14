@@ -52,7 +52,7 @@ def normalize_domain(domain):
 
 
 def _get_site_id(ne_info):
-    return str(ne_info.get("site_id", "")).strip().upper()
+    return str(ne_info.get("site_id", "")).strip()
 
 
 # 跨类型连边的 domain 优先级（数值大者为上行侧）：Data > Transmission > Ran。
