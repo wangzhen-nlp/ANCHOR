@@ -341,15 +341,16 @@ def main():
     )
     parser.add_argument(
         "--dynamic-alpha",
-        choices=("off", "source", "source_target"),
+        choices=("off", "source", "target", "source_target"),
         default="off",
         help=(
             "Feature-mode DYNAMIC (stateful) α: condition excitation on devices' "
             "current uncleared link/power/offline alarms. 'off' (default) static "
             "only; 'source' adds the source device's 3 state booleans (exact, "
-            "penalized); 'source_target' adds source + target 3-state booleans "
-            "using the B-fast training approximation (target pre-state in E-step, "
-            "target state at source_ts in exposure). Needs clears in the input stream."
+            "penalized); 'target' adds only the target device's 3 pre-state "
+            "booleans; 'source_target' adds both. Target-aware modes use the "
+            "B-fast training approximation (target pre-state in E-step, target "
+            "state at source_ts in exposure). Needs clears in the input stream."
         ),
     )
     parser.add_argument("--alpha-prior-strength", type=float, default=10.0)

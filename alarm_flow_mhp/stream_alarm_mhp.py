@@ -484,11 +484,11 @@ class StreamMHPAssigner:
         # device's uncleared state at the parent's fire time).
         src_marks = (
             np.array([e.src_mark for e in src_events], dtype=np.float64)
-            if self.n_dynamic > 0 else None
+            if self.feature_scorer.source_dynamic_dim else None
         )
         tgt_marks = (
             np.tile(np.asarray(target_event.src_mark, dtype=np.float64).reshape(1, -1), (len(src_events), 1))
-            if self.n_dynamic > 3 else None
+            if self.feature_scorer.target_dynamic_dim else None
         )
         alpha = self.feature_scorer.alpha_for_target(
             target_event.alarm_type,
@@ -2067,6 +2067,7 @@ def main():
             topology_index=topo_idx,
             beta=float(rt.get("beta", 1.0)),
             n_dynamic=n_dynamic,
+            dynamic_mode=dyn_mode,
             domain_vocab=rt.get("domain_vocab", []),
             node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
         )

@@ -507,9 +507,10 @@ class MissingChainSampler:
             self._orphan_idx[last] = i
 
     def _zero_src_mark(self) -> tuple:
-        n_dynamic = int(getattr(self.adapter, "source_mark_dim", 0) or 0)
-        if n_dynamic <= 0:
+        n_dynamic = getattr(self.adapter, "source_mark_dim", None)
+        if n_dynamic is None:
             n_dynamic = min(int(getattr(self.adapter, "n_dynamic", 0) or 0), 3)
+        n_dynamic = int(n_dynamic or 0)
         return tuple(0 for _ in range(n_dynamic))
 
     def _source_mark_for_missing(self, source_type, ts: float) -> tuple:
@@ -519,9 +520,10 @@ class MissingChainSampler:
         return self._normalise_src_mark(source_mark_at(source_type, ts))
 
     def _normalise_src_mark(self, src_mark) -> tuple:
-        n_source = int(getattr(self.adapter, "source_mark_dim", 0) or 0)
-        if n_source <= 0:
+        n_source = getattr(self.adapter, "source_mark_dim", None)
+        if n_source is None:
             n_source = min(int(getattr(self.adapter, "n_dynamic", 0) or 0), 3)
+        n_source = int(n_source or 0)
         if n_source <= 0:
             return ()
         if src_mark is None:
@@ -1438,7 +1440,22 @@ class FeatureKernelAdapter:
         # mode, where the feature entity IS the topology node (no domain split).
         self._node_domains = getattr(feature_scorer, "node_domains", {}) or {}
         self.n_dynamic = int(getattr(feature_scorer, "n_dynamic", 0) or 0)
-        self.source_mark_dim = min(self.n_dynamic, 3)
+        self._explicit_dynamic_sides = (
+            hasattr(feature_scorer, "source_dynamic_dim")
+            and hasattr(feature_scorer, "target_dynamic_dim")
+        )
+        inferred_mode = "source_target" if self.n_dynamic == 6 else (
+            "source" if self.n_dynamic else "off"
+        )
+        self.dynamic_mode = str(getattr(feature_scorer, "dynamic_mode", inferred_mode))
+        inferred_source = 3 if self.dynamic_mode in {"source", "source_target"} else 0
+        inferred_target = 3 if self.dynamic_mode in {"target", "source_target"} else 0
+        self.source_mark_dim = int(
+            getattr(feature_scorer, "source_dynamic_dim", inferred_source) or 0
+        )
+        self.target_mark_dim = int(
+            getattr(feature_scorer, "target_dynamic_dim", inferred_target) or 0
+        )
         if candidate_max_hops is not None:
             self._max_hops = int(candidate_max_hops)
         else:
@@ -1510,34 +1527,49 @@ class FeatureKernelAdapter:
         return tuple((vals + tuple(0.0 for _ in range(self.source_mark_dim)))[: self.source_mark_dim])
 
     def _target_mark_tuple(self, target_mark=None) -> tuple:
-        if self.n_dynamic <= 3:
+        if self.target_mark_dim <= 0:
             return ()
         if target_mark is None:
-            return tuple(0.0 for _ in range(self.n_dynamic - 3))
+            return tuple(0.0 for _ in range(self.target_mark_dim))
         vals = tuple(float(v) for v in target_mark)
-        return tuple((vals + tuple(0.0 for _ in range(self.n_dynamic - 3)))[: self.n_dynamic - 3])
+        return tuple((vals + tuple(0.0 for _ in range(self.target_mark_dim)))[: self.target_mark_dim])
 
     def _mark_tuple(self, source_mark=None, target_mark=None) -> tuple:
         if self.n_dynamic <= 0:
             return ()
         src = self._source_mark_tuple(source_mark)
-        if self.n_dynamic <= 3:
-            return src
         return src + self._target_mark_tuple(target_mark)
 
-    def _mark_matrix(self, n: int, src_marks=None, target_mark=None, tgt_marks=None):
-        if self.n_dynamic <= 0:
-            return None
+    def _scorer_mark_kwargs(self, n: int, src_marks=None, target_mark=None, tgt_marks=None):
         import numpy as np
-
-        if src_marks is None:
-            src_marks = [None] * n
-        if tgt_marks is not None:
-            return np.asarray(
-                [self._mark_tuple(sm, tm) for sm, tm in zip(src_marks, tgt_marks)],
-                dtype=np.float64,
+        if not self._explicit_dynamic_sides:
+            if src_marks is None:
+                src_marks = [None] * n
+            if tgt_marks is not None:
+                combined = [
+                    self._mark_tuple(sm, tm) for sm, tm in zip(src_marks, tgt_marks)
+                ]
+            else:
+                combined = [self._mark_tuple(sm, target_mark) for sm in src_marks]
+            return {"src_marks": np.asarray(combined, dtype=np.float64)}
+        out = {}
+        if self.source_mark_dim:
+            if src_marks is None:
+                src_marks = [None] * n
+            out["src_marks"] = np.asarray(
+                [self._source_mark_tuple(sm) for sm in src_marks], dtype=np.float64
             )
-        return np.asarray([self._mark_tuple(mark, target_mark) for mark in src_marks], dtype=np.float64)
+        if not self.target_mark_dim:
+            return out
+        if tgt_marks is not None:
+            out["tgt_marks"] = np.asarray(
+                [self._target_mark_tuple(tm) for tm in tgt_marks], dtype=np.float64
+            )
+        else:
+            out["tgt_marks"] = np.asarray(
+                [self._target_mark_tuple(target_mark) for _ in range(n)], dtype=np.float64
+            )
+        return out
 
     def source_mark_at(self, source_type, ts: float) -> tuple:
         if self.source_mark_dim <= 0:
@@ -1547,7 +1579,7 @@ class FeatureKernelAdapter:
         return self._source_mark_tuple(self._source_mark_at(source_type, ts))
 
     def _target_mark_for(self, target_type, source_ts: Optional[float], source_ne: str, source_mark=None) -> tuple:
-        if self.n_dynamic <= 3:
+        if self.target_mark_dim <= 0:
             return ()
         try:
             _at, target_ne = target_type
@@ -1559,13 +1591,13 @@ class FeatureKernelAdapter:
             return self._target_mark_tuple()
         return self._target_mark_tuple(self._target_mark_at(target_ne, source_ts))
 
-    def _envelope_mark_matrix(self, n: int):
+    def _envelope_mark_kwargs(self, n: int):
         """Upper-envelope source mark for candidate enumeration: the mark that
         MAXIMIZES α over all 2^n_dynamic states. Since α = softplus(z_static +
         Σ_i mark_i·w_dyn_i) is monotonic in z, the max is at mark_i = 1{w_dyn_i>0}
         — so one call instead of 2^n. Returns None when no dynamic features."""
         if self.n_dynamic <= 0:
-            return None
+            return {}
         import numpy as np
 
         if self._envelope_mark is None:
@@ -1575,7 +1607,20 @@ class FeatureKernelAdapter:
             else:
                 # Scorer without weight introspection → over-inclusive all-ones.
                 self._envelope_mark = np.ones(self.n_dynamic, dtype=np.float64)
-        return np.tile(self._envelope_mark, (n, 1))
+        if not self._explicit_dynamic_sides:
+            return {"src_marks": np.tile(self._envelope_mark, (n, 1))}
+        out = {}
+        offset = 0
+        if self.source_mark_dim:
+            out["src_marks"] = np.tile(
+                self._envelope_mark[offset:offset + self.source_mark_dim], (n, 1)
+            )
+            offset += self.source_mark_dim
+        if self.target_mark_dim:
+            out["tgt_marks"] = np.tile(
+                self._envelope_mark[offset:offset + self.target_mark_dim], (n, 1)
+            )
+        return out
 
     def _neighbors(self, node: str) -> list:
         """Topology neighbors of a TOPOLOGY node (NE or site)."""
@@ -1622,7 +1667,8 @@ class FeatureKernelAdapter:
         (s_at, s_ne) = src_key
         (t_at, t_ne) = tgt_key
         arr = self.fs.alpha_for_target(
-            t_at, t_ne, [s_at], [s_ne], src_marks=self._mark_matrix(1, [source_mark], target_mark=target_mark)
+            t_at, t_ne, [s_at], [s_ne],
+            **self._scorer_mark_kwargs(1, [source_mark], target_mark=target_mark),
         )
         val = float(arr[0]) if len(arr) else 0.0
         if val < self.alpha_floor:
@@ -1683,9 +1729,9 @@ class FeatureKernelAdapter:
         if miss_i:
             (t_at, t_ne) = target_type
             ma = np.asarray(
-                    self.fs.alpha_for_target(
-                        t_at, t_ne, miss_at, miss_ne,
-                    src_marks=self._mark_matrix(len(miss_i), miss_mk, target_mark=target_mark),
+                self.fs.alpha_for_target(
+                    t_at, t_ne, miss_at, miss_ne,
+                    **self._scorer_mark_kwargs(len(miss_i), miss_mk, target_mark=target_mark),
                 ),
                 dtype=np.float64,
             )
@@ -1787,7 +1833,7 @@ class FeatureKernelAdapter:
         # The envelope is a SINGLE call with the α-maximizing mark (no 2^n loop).
         alphas = self.fs.alpha_for_target(
             t_at, t_ne, src_ats, src_nes,
-            src_marks=self._envelope_mark_matrix(len(src_ats)),
+            **self._envelope_mark_kwargs(len(src_ats)),
         )
         out: list[tuple] = []
         for at, ne, a in zip(src_ats, src_nes, alphas):
@@ -1810,7 +1856,7 @@ class FeatureKernelAdapter:
         source_mark_norm = self._source_mark_tuple(source_mark)
         mark = self._mark_tuple(source_mark_norm)
         cache_key = (source_type, mark)
-        if self.n_dynamic > 3:
+        if self.target_mark_dim:
             # Target marks vary with source_ts, so the cached sum must include
             # the exact timestamp slice. Do not round here: a target state change
             # at t must distinguish source_ts=t- from source_ts=t.
@@ -1833,7 +1879,7 @@ class FeatureKernelAdapter:
             if tgt_ats:
                 tgt_marks = None
                 alpha_kwargs = {}
-                if self.n_dynamic > 3:
+                if self.target_mark_dim:
                     tgt_marks = [
                         self._target_mark_for((at, ne), source_ts, s_ne, source_mark_norm)
                         for at, ne in zip(tgt_ats, tgt_nes)
@@ -1928,6 +1974,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         topology_index=topo_idx,
         beta=float(rt.get("beta", 1.0)),
         n_dynamic=n_dynamic,
+        dynamic_mode=dyn_mode,
         domain_vocab=rt.get("domain_vocab", []),
         node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
     )

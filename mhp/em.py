@@ -1331,6 +1331,135 @@ def fit_mhp_piecewise(
     )
 
 
+def log_likelihood_feature_dynamic(
+    events: EventCollection,
+    config: MHPConfig,
+    *,
+    cand_targets: np.ndarray,
+    cand_sources: np.ndarray,
+    cand_phi: np.ndarray,
+    kernel,
+    mu: np.ndarray,
+    src_combo: np.ndarray,
+    dynamic_combo_bits: np.ndarray,
+    tgt_combo: Optional[np.ndarray] = None,
+    dynamic_exposure_2d=None,
+) -> float:
+    """Observed feature-model LL with dynamic source/target state enabled.
+
+    This is the evaluation-only counterpart of ``fit_mhp_feature``'s E-step.
+    It intentionally consumes the same combo encoding and B-fast exposure so
+    held-out selection measures the actual dynamic kernel rather than the
+    materialized combo-0 baseline edges.
+    """
+    from .feature_kernel import softplus
+
+    cand_targets = np.asarray(cand_targets, dtype=np.int64)
+    cand_sources = np.asarray(cand_sources, dtype=np.int64)
+    cand_phi = np.asarray(cand_phi)
+    C = len(cand_targets)
+    if C == 0:
+        mu_empty = np.asarray(mu, dtype=np.float64)
+        return float(
+            np.log(np.maximum(mu_empty[events.dims], _EPS)).sum()
+            - events.T * mu_empty.sum()
+        )
+    keys = cand_targets * events.M + cand_sources
+    order = None
+    if C > 1 and not bool(np.all(keys[1:] >= keys[:-1])):
+        order = np.argsort(keys, kind="stable")
+        cand_targets = cand_targets[order]
+        cand_sources = cand_sources[order]
+        cand_phi = cand_phi[order]
+        keys = keys[order]
+
+    weights = np.asarray(kernel.weights, dtype=np.float64)
+    F = cand_phi.shape[1]
+    combo_bits_arr = np.asarray(dynamic_combo_bits, dtype=np.float64)
+    if weights.size != F + combo_bits_arr.shape[1]:
+        raise ValueError("dynamic feature kernel/feature matrix width mismatch")
+    z_static = cand_phi @ weights[:F]
+    z_dynamic = combo_bits_arr @ weights[F:]
+    scale = float(getattr(kernel, "alpha_scale", 1.0))
+
+    src_combo = np.asarray(src_combo, dtype=np.int64).reshape(-1)
+    if len(src_combo) != events.n:
+        raise ValueError("src_combo must be aligned to validation events")
+    target_aware = tgt_combo is not None
+    if target_aware:
+        tgt_combo = np.asarray(tgt_combo, dtype=np.int64).reshape(-1)
+        if len(tgt_combo) != events.n:
+            raise ValueError("tgt_combo must be aligned to validation events")
+
+    beta = float(config.beta_shared_value)
+    mu_arr = np.asarray(mu, dtype=np.float64)
+    ll_term1 = 0.0
+    chunk_size = max(int(config.chunk_size), 1)
+    for chunk_start in range(0, events.n, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, events.n)
+        tdims = events.dims[chunk_start:chunk_end]
+        (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+            events.times,
+            events.dims,
+            chunk_start,
+            chunk_end,
+            config.history_window,
+            config.max_history_events,
+            getattr(config, "time_slack", 0.0),
+        )
+        score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
+        if pair_dt.size:
+            pair_keys = pair_tdim.astype(np.int64) * events.M + pair_sdim.astype(np.int64)
+            idx = np.minimum(np.searchsorted(keys, pair_keys), C - 1)
+            valid = keys[idx] == pair_keys
+            if valid.any():
+                target_global = chunk_start + pair_tlocal[valid]
+                combo = (
+                    src_combo[pair_source[valid]] * 8 + tgt_combo[target_global]
+                    if target_aware else src_combo[pair_source[valid]]
+                )
+                dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
+                alpha = softplus(z_static[idx[valid]] + z_dynamic[combo]) * scale
+                score_pair[valid] = alpha * beta * np.exp(-beta * dt_eff) * late_weight
+        rate = np.maximum(mu_arr[tdims] + _segment_sum(score_pair, pair_tlocal, len(tdims)), _EPS)
+        ll_term1 += float(np.log(rate).sum())
+
+    slack_scale = 1.0 + beta * _negative_penalty_integral(config)
+    K = combo_bits_arr.shape[0]
+    if target_aware:
+        if dynamic_exposure_2d is None:
+            raise ValueError("target-aware validation LL requires dynamic_exposure_2d")
+        if _is_dynamic_exposure_coo(dynamic_exposure_2d):
+            rows, combos, values = _normalize_dynamic_exposure_coo(dynamic_exposure_2d, C, K)
+            if order is not None:
+                inv_order = np.empty(C, dtype=np.int64)
+                inv_order[order] = np.arange(C, dtype=np.int64)
+                rows = inv_order[np.asarray(rows, dtype=np.int64)]
+            compensator = float(
+                np.sum(
+                    np.asarray(values, dtype=np.float64)
+                    * slack_scale
+                    * softplus(z_static[rows] + z_dynamic[combos])
+                    * scale
+                )
+            )
+        else:
+            exposure = np.asarray(dynamic_exposure_2d, dtype=np.float64)
+            if order is not None:
+                exposure = exposure[order]
+            if exposure.shape != (C, K):
+                raise ValueError(f"dynamic_exposure_2d shape {exposure.shape} != {(C, K)}")
+            alpha_2d = softplus(z_static[:, None] + z_dynamic[None, :]) * scale
+            compensator = float(np.sum(exposure * slack_scale * alpha_2d))
+    else:
+        counts = np.zeros((events.M, K), dtype=np.float64)
+        np.add.at(counts, (events.dims, src_combo), 1.0)
+        exposure = counts[cand_sources]
+        alpha_2d = softplus(z_static[:, None] + z_dynamic[None, :]) * scale
+        compensator = float(np.sum(exposure * slack_scale * alpha_2d))
+    return float(ll_term1 - events.T * mu_arr.sum() - compensator)
+
+
 def fit_mhp_feature(
     events: EventCollection,
     config: MHPConfig,
@@ -1483,9 +1612,9 @@ def fit_mhp_feature(
             if len(tgt_combo) != N:
                 raise ValueError("tgt_combo must be aligned to events")
             if K_combo != 64:
-                raise ValueError("source_target dynamic mode requires 64 combo rows")
+                raise ValueError("target-aware dynamic mode requires 64 combo rows")
             if dynamic_exposure_2d is None:
-                raise ValueError("source_target dynamic mode requires dynamic_exposure_2d")
+                raise ValueError("target-aware dynamic mode requires dynamic_exposure_2d")
         exposure_2d = None
         exposure_combo_idx = None
         e_coo_real = None       # real exposure COO (no prior) — for the LL compensator
@@ -1493,7 +1622,7 @@ def fit_mhp_feature(
         slack_scale = 1.0 + float(beta_scalar) * _negative_penalty_integral(config)
         if dynamic_exposure_2d is not None and _is_dynamic_exposure_coo(dynamic_exposure_2d):
             if not use_target_dynamic:
-                raise ValueError("COO dynamic_exposure_2d is only supported for source_target dynamic mode")
+                raise ValueError("COO dynamic_exposure_2d is only supported for target-aware dynamic mode")
             _er, _ec, _ev = _normalize_dynamic_exposure_coo(dynamic_exposure_2d, C, K_combo)
             if config.time_slack > 0:
                 _ev = _ev.astype(np.float32, copy=False)
@@ -1771,12 +1900,20 @@ def fit_mhp_feature(
 
         active_mask = alpha_cand > config.edge_threshold
         active_eval = int(active_mask.sum())
-        # Spectral radius ρ of the active α matrix (combo-0 baseline) — the
-        # stationarity indicator. Reported each iter so over-excitation (ρ≥1)
-        # is visible during training, not only at the end.
-        _ai = np.flatnonzero(active_mask)
+        # Dynamic kernels must be stationary for every state combination, not
+        # just combo 0. Because α is non-negative and softplus is monotone, the
+        # entrywise envelope max_k α(c,k) upper-bounds every realizable state
+        # matrix; Perron-Frobenius monotonicity then makes its ρ a sound bound.
+        if use_dynamic:
+            alpha_stability = softplus(z_static_c + float(np.max(z_dyn_k)))
+        else:
+            alpha_stability = alpha_cand
+        stability_mask = alpha_stability > config.edge_threshold
+        _ai = np.flatnonzero(stability_mask)
         rho_eval = (
-            _spectral_radius_edges(cand_targets[_ai], cand_sources[_ai], alpha_cand[_ai], M)
+            _spectral_radius_edges(
+                cand_targets[_ai], cand_sources[_ai], alpha_stability[_ai], M
+            )
             if _ai.size else 0.0
         )
         entry = {
@@ -1789,6 +1926,9 @@ def fit_mhp_feature(
             "alpha_max": float(alpha_cand.max()),
             "alpha_median": float(np.median(alpha_cand)),
             "spectral_radius": float(rho_eval),
+            "spectral_radius_kind": (
+                "dynamic_state_envelope" if use_dynamic else "baseline"
+            ),
             "p_self_mean": float(p_self.mean()),
             "estep_seconds": float(estep_seconds),
             "mstep_seconds": 0.0,

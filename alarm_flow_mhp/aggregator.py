@@ -53,16 +53,18 @@ BETA_MODES = frozenset({"shared", "per_edge"})
 KERNEL_TYPES = frozenset({"exp", "piecewise"})
 EDGE_MODES = frozenset({"device", "feature"})
 # Dynamic (stateful) α features — condition excitation on the devices' current
-# uncleared-alarm state (link/power/offline), snapshotted at the source event's
-# fire time (train/infer-consistent, clear-aware). feature mode only.
+# uncleared-alarm state (link/power/offline), using read-before-write event
+# snapshots (train/infer-consistent, clear-aware). feature mode only.
 #   off           — static features only (current behavior)
 #   source        — +3 booleans: source device's uncleared state at t_j
 #                   (exact in both occurrence and compensator terms)
+#   target        — +3 booleans: target device pre-state. Training uses the
+#                   B-fast approximation described below for source_target.
 #   source_target — +6 booleans: source state plus target device pre-state.
 #                   Training uses the B-fast approximation: E-step reads the
 #                   target event's pre-state (time-slack safe); compensator
 #                   buckets target state sampled at source_ts.
-DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "source_target"})
+DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "target", "source_target"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -579,6 +581,17 @@ def _source_target_combo_bits(base_bits: np.ndarray) -> np.ndarray:
     )
 
 
+def _target_combo_bits(base_bits: np.ndarray) -> np.ndarray:
+    """64-row combo table whose features contain only the target 3-bit state.
+
+    ``fit_mhp_feature`` indexes target-aware combos as ``source * 8 + target``.
+    Target-only mode represents the source combo as zero, but retaining all 64
+    rows lets it reuse the source_target B-fast occurrence/exposure machinery.
+    """
+    base_bits = np.asarray(base_bits, dtype=np.float64)
+    return np.tile(base_bits, (base_bits.shape[0], 1))
+
+
 def _combo_arrays_from_timeline(state_timeline, device: str) -> tuple[np.ndarray, np.ndarray]:
     """Return timeline change points and packed 3-bit combos for one device."""
     device = str(device or "")
@@ -712,10 +725,11 @@ def _build_source_target_dynamic_exposure(
     train_src_combo: np.ndarray,
     train_pre_combo: np.ndarray,
     state_timeline,
+    dynamic_mode: str = "source_target",
     verbose: bool = False,
     as_coo: bool = False,
 ) -> np.ndarray | dict:
-    """B-fast source_target exposure buckets.
+    """B-fast target-aware exposure buckets.
 
     For each source event and candidate target type, sample the target device
     state at source_ts (or the source event's pre-state for same-NE pairs to
@@ -725,6 +739,7 @@ def _build_source_target_dynamic_exposure(
     cand_targets = np.asarray(cand_targets, dtype=np.int64)
     cand_sources = np.asarray(cand_sources, dtype=np.int64)
     C = len(cand_targets)
+    mode_label = str(dynamic_mode or "source_target")
     exposure = None
     row_dtype = np.int32 if C <= np.iinfo(np.int32).max else np.int64
     coo_rows = coo_cols = coo_vals = None
@@ -787,7 +802,7 @@ def _build_source_target_dynamic_exposure(
         gib = C * 64 * np.dtype(np.float32).itemsize / (1024 ** 3)
         mode = "COO" if as_coo else "dense"
         print(
-            f"[train] dynamic_alpha=source_target: building B-fast exposure "
+            f"[train] dynamic_alpha={mode_label}: building B-fast exposure "
             f"{mode} (dense equivalent {C}x64 float32 ~{gib:.1f} GiB), "
             f"grouping candidate rows ...",
             flush=True,
@@ -802,7 +817,7 @@ def _build_source_target_dynamic_exposure(
     group_ne = ne_sorted[starts]
     if verbose:
         print(
-            f"[train] dynamic_alpha=source_target: exposure groups={len(starts)} "
+            f"[train] dynamic_alpha={mode_label}: exposure groups={len(starts)} "
             f"(target_nes={len(np.unique(group_ne))}, source_types={len(np.unique(group_src))}, "
             f"avg_candidate_rows={C / max(len(starts), 1):.1f})",
             flush=True,
@@ -883,7 +898,7 @@ def _build_source_target_dynamic_exposure(
             now = time.monotonic()
             if now - last_beat >= 10.0:
                 print(
-                    f"[train] dynamic_alpha=source_target: exposure groups "
+                    f"[train] dynamic_alpha={mode_label}: exposure groups "
                     f"{gi}/{n_groups} ({100.0 * gi / max(n_groups, 1):.1f}%, "
                     f"{_fmt_secs(now - t0)})",
                     flush=True,
@@ -972,8 +987,11 @@ def train_alarm_mhp(
     # clears are dropped; combos pack the 3 uncleared-alarm booleans.
     train_src_combo = None
     train_tgt_combo = None
+    val_src_combo = None
+    val_tgt_combo = None
     dyn_combo_bits = None
     dyn_exposure_2d = None
+    val_dyn_exposure_2d = None
     dyn_feature_names = None
     if config.edge_mode == "feature" and config.dynamic_alpha != "off":
         from alarm_flow_mhp.dynamic_state import (
@@ -994,10 +1012,15 @@ def train_alarm_mhp(
             alarm_type_of=lambda e: alarm_type_from_title(e.get("alarm_title", "")),
         )
         combo_full = states_to_combo(ev_state_full)
-        train_src_combo = combo_full[: train_events.n]
+        train_state_combo = combo_full[: train_events.n]
+        val_state_combo = (
+            combo_full[train_events.n:train_events.n + val_events.n]
+            if val_events is not None else None
+        )
         base_combo_bits = _combo_bits(8)
         if config.dynamic_alpha == "source_target":
-            train_tgt_combo = train_src_combo.copy()
+            train_src_combo = train_state_combo
+            train_tgt_combo = train_state_combo.copy()
             dyn_combo_bits = _source_target_combo_bits(base_combo_bits)
             dyn_feature_names = [
                 "src_uncleared_link",
@@ -1007,21 +1030,46 @@ def train_alarm_mhp(
                 "tgt_uncleared_power",
                 "tgt_uncleared_offline",
             ]
+        elif config.dynamic_alpha == "target":
+            # fit_mhp_feature's target-aware representation is
+            # source_combo*8 + target_combo. Pinning source_combo to zero gives
+            # target-only occurrence/exposure buckets while learning only the
+            # three target-state weights.
+            train_src_combo = np.zeros_like(train_state_combo)
+            train_tgt_combo = train_state_combo.copy()
+            dyn_combo_bits = _target_combo_bits(base_combo_bits)
+            dyn_feature_names = [
+                "tgt_uncleared_link",
+                "tgt_uncleared_power",
+                "tgt_uncleared_offline",
+            ]
         else:
+            train_src_combo = train_state_combo
             dyn_combo_bits = base_combo_bits
             dyn_feature_names = ["src_uncleared_link", "src_uncleared_power", "src_uncleared_offline"]
+        if val_state_combo is not None:
+            if config.dynamic_alpha == "target":
+                val_src_combo = np.zeros_like(val_state_combo)
+                val_tgt_combo = val_state_combo.copy()
+            elif config.dynamic_alpha == "source_target":
+                val_src_combo = val_state_combo
+                val_tgt_combo = val_state_combo.copy()
+            else:
+                val_src_combo = val_state_combo
         if verbose:
-            nz = int((train_src_combo > 0).sum())
+            nz = int((train_state_combo > 0).sum())
+            role = "target" if config.dynamic_alpha == "target" else "source"
             msg = (
-                f"[train] dynamic_alpha={config.dynamic_alpha}: source marks on "
+                f"[train] dynamic_alpha={config.dynamic_alpha}: {role} marks on "
                 f"{nz}/{train_events.n} train events ({100.0*nz/max(train_events.n,1):.1f}% with active state)"
             )
             if train_tgt_combo is not None:
                 tnz = int((train_tgt_combo > 0).sum())
-                msg += (
-                    f"; target marks on {tnz}/{train_events.n} train events "
-                    f"({100.0*tnz/max(train_events.n,1):.1f}% with active state)"
-                )
+                if config.dynamic_alpha != "target":
+                    msg += (
+                        f"; target marks on {tnz}/{train_events.n} train events "
+                        f"({100.0*tnz/max(train_events.n,1):.1f}% with active state)"
+                    )
             print(msg, flush=True)
 
     _emit_progress(
@@ -1065,6 +1113,9 @@ def train_alarm_mhp(
             "active_edges": trace_entry["active_edges"],
             "log_likelihood_train": trace_entry["log_likelihood"],
             "spectral_radius": trace_entry.get("spectral_radius"),
+            "spectral_radius_kind": trace_entry.get(
+                "spectral_radius_kind", "baseline"
+            ),
         })
 
     # Topology prior (optional): sparse extra prior mass on topologically
@@ -1118,13 +1169,36 @@ def train_alarm_mhp(
         select_on_val = use_val and config.selection_metric == "val"
         # Opt-in spectral cap (feature mode): a snapshot is only ELIGIBLE as the
         # deployable best if its ρ ≤ stability_radius. Off → no ρ gate (legacy).
-        cap_on = bool(config.feature_spectral_cap) and config.edge_mode == "feature"
+        cap_on = (
+            bool(config.feature_spectral_cap)
+            and config.edge_mode == "feature"
+            and config.stability_radius > 0
+        )
         val_ll = None
         improved = True               # train metric → every train-best "improves"
         eligible = True
         if use_val:
-            from mhp.em import log_likelihood as mhp_ll
-            val_ll = float(mhp_ll(val_events, best_result.params, config=mhp_config))
+            if config.edge_mode == "feature" and config.dynamic_alpha != "off":
+                from mhp.em import log_likelihood_feature_dynamic
+
+                val_ll = float(
+                    log_likelihood_feature_dynamic(
+                        val_events,
+                        mhp_config,
+                        cand_targets=cand_t,
+                        cand_sources=cand_s,
+                        cand_phi=phi,
+                        kernel=best_result.feature_kernel,
+                        mu=best_result.params.mu,
+                        src_combo=val_src_combo,
+                        tgt_combo=val_tgt_combo,
+                        dynamic_combo_bits=dyn_combo_bits,
+                        dynamic_exposure_2d=val_dyn_exposure_2d,
+                    )
+                )
+            else:
+                from mhp.em import log_likelihood as mhp_ll
+                val_ll = float(mhp_ll(val_events, best_result.params, config=mhp_config))
             val_ll_history.append(val_ll)
         any_improved = False
         if select_on_val:
@@ -1197,9 +1271,9 @@ def train_alarm_mhp(
                 "val_event_count": (val_events.n if val_events else 0),
                 "type_count": M,
                 "active_edge_count": len(best_result.params.edge_alpha),
-                "spectral_radius": (
-                    float(best_result.params.spectral_radius())
-                    if len(best_result.params.edge_alpha) else None
+                "spectral_radius": trace_entry.get("spectral_radius"),
+                "spectral_radius_kind": trace_entry.get(
+                    "spectral_radius_kind", "baseline"
                 ),
                 "stability_radius": float(config.stability_radius),
                 "run_args": dict(run_args) if run_args else None,
@@ -1321,7 +1395,7 @@ def train_alarm_mhp(
             M,
             verbose=verbose,
         )
-        if config.dynamic_alpha == "source_target":
+        if config.dynamic_alpha in {"target", "source_target"}:
             state_timeline = ObservedStateTimeline()
             for ev in sorted(sorted_alarm_events, key=lambda e: float(e.get("ts", 0.0))):
                 ne, _ = runtime_ne_at(ev, config.type_fields, config.topology_node_field)
@@ -1342,7 +1416,9 @@ def train_alarm_mhp(
             )
             train_event_objs = sequence.events[: train_events.n]
             train_event_ne = [runtime_ne_at(ev, config.type_fields, config.topology_node_field)[0] for ev in train_event_objs]
-            train_abs_times = [float(t) for t in sequence.times[: train_events.n]]
+            # State timelines use raw event timestamps. sequence.times are
+            # rebased/scaled model times and must never be used for this lookup.
+            train_abs_times = [float(ev.get("ts", 0.0)) for ev in train_event_objs]
             dyn_exposure_2d = _build_source_target_dynamic_exposure(
                 train_events,
                 cand_t,
@@ -1353,6 +1429,7 @@ def train_alarm_mhp(
                 train_src_combo=train_src_combo,
                 train_pre_combo=train_tgt_combo,
                 state_timeline=state_timeline,
+                dynamic_mode=config.dynamic_alpha,
                 verbose=verbose,
                 as_coo=True,
             )
@@ -1364,7 +1441,7 @@ def train_alarm_mhp(
                     nonzero = int((dyn_exposure_2d > 0).sum())
                     total_slots = int(dyn_exposure_2d.size)
                 print(
-                    f"[train] dynamic_alpha=source_target: B-fast exposure buckets "
+                    f"[train] dynamic_alpha={config.dynamic_alpha}: B-fast exposure buckets "
                     f"nonzero={nonzero}/{total_slots}",
                     flush=True,
                 )
@@ -1372,6 +1449,29 @@ def train_alarm_mhp(
                 # Dense fallback: hand ownership to fit via a holder so it can
                 # release GiBs after converting to sparse COO.
                 dyn_exposure_2d = [dyn_exposure_2d]
+            if val_events is not None and val_events.n > 0:
+                val_event_objs = sequence.events[
+                    train_events.n:train_events.n + val_events.n
+                ]
+                val_event_ne = [
+                    runtime_ne_at(ev, config.type_fields, config.topology_node_field)[0]
+                    for ev in val_event_objs
+                ]
+                val_abs_times = [float(ev.get("ts", 0.0)) for ev in val_event_objs]
+                val_dyn_exposure_2d = _build_source_target_dynamic_exposure(
+                    val_events,
+                    cand_t,
+                    cand_s,
+                    type_ne=type_ne,
+                    train_event_ne=val_event_ne,
+                    train_abs_times=val_abs_times,
+                    train_src_combo=val_src_combo,
+                    train_pre_combo=val_tgt_combo,
+                    state_timeline=state_timeline,
+                    dynamic_mode=config.dynamic_alpha,
+                    verbose=verbose,
+                    as_coo=True,
+                )
         result = fit_mhp_feature(
             train_events,
             mhp_config,
@@ -1385,8 +1485,8 @@ def train_alarm_mhp(
             mu_feature_names=mu_spec.feature_names,
             cand_topo_score=cand_topo_score,     # topology pseudo-count prior
             topo_prior_boost=config.feature_topo_prior_boost,
-            src_combo=train_src_combo,            # dynamic stateful α (source mark)
-            tgt_combo=train_tgt_combo,            # source_target: target pre-state mark
+            src_combo=train_src_combo,            # dynamic stateful α (target mode pins this to zero)
+            tgt_combo=train_tgt_combo,            # target-aware modes: target pre-state mark
             dynamic_combo_bits=dyn_combo_bits,
             dynamic_exposure_2d=dyn_exposure_2d,
             dynamic_feature_names=dyn_feature_names,
@@ -1435,7 +1535,11 @@ def train_alarm_mhp(
         )
 
     from mhp.em import log_likelihood as mhp_ll
-    cap_on = bool(config.feature_spectral_cap) and config.edge_mode == "feature"
+    cap_on = (
+        bool(config.feature_spectral_cap)
+        and config.edge_mode == "feature"
+        and config.stability_radius > 0
+    )
 
     # 1) Model selection: prefer the val-LL-optimal snapshot (captured live during
     #    EM) over the train-final weights — the point of holding out data. With the
@@ -1462,14 +1566,38 @@ def train_alarm_mhp(
                     flush=True,
                 )
 
+    def _feature_state_envelope_radius(kernel) -> float:
+        """ρ of the entrywise max over all dynamic state combinations."""
+        from mhp.em import _spectral_radius_edges
+        from mhp.feature_kernel import softplus
+
+        weights = np.asarray(kernel.weights, dtype=np.float64)
+        n_static = int(phi.shape[1])
+        logits = np.asarray(phi @ weights[:n_static], dtype=np.float64)
+        if dyn_combo_bits is not None and weights.size > n_static:
+            dynamic_logits = np.asarray(dyn_combo_bits, dtype=np.float64) @ weights[n_static:]
+            logits += float(np.max(dynamic_logits))
+        alpha = softplus(logits) * float(getattr(kernel, "alpha_scale", 1.0))
+        keep = alpha > config.edge_threshold
+        if not keep.any():
+            return 0.0
+        return float(
+            _spectral_radius_edges(
+                np.asarray(cand_t)[keep],
+                np.asarray(cand_s)[keep],
+                alpha[keep],
+                M,
+            )
+        )
+
     # 2) Spectral cap (opt-in, feature mode). Idempotent: a no-op when the selected
     #    model already has ρ ≤ stability_radius (the common case — B picked a stable
     #    snapshot). Otherwise rescale α by stability_radius/ρ (ρ(c·A)=c·ρ(A), exact;
     #    relative edge structure preserved) and bake the scale into the kernel so
     #    inference — which recomputes α from w — applies the same cap. Works for any
     #    selection metric (incl. train) and the no-val case.
-    if cap_on and len(result.params.edge_alpha):
-        rho = float(result.params.spectral_radius())
+    if cap_on and result.feature_kernel is not None:
+        rho = _feature_state_envelope_radius(result.feature_kernel)
         if rho > config.stability_radius:
             scale = config.stability_radius / rho
             capped_kernel = result.feature_kernel
@@ -1491,10 +1619,11 @@ def train_alarm_mhp(
                 feature_kernel=capped_kernel,
             )
             if verbose:
+                capped_rho = _feature_state_envelope_radius(result.feature_kernel)
                 print(
                     f"[train] WARN: spectral cap — no model reached ρ ≤ "
                     f"{config.stability_radius:g}; rescaled α×{scale:.3f} "
-                    f"(ρ {rho:.3f} → {float(result.params.spectral_radius()):.3f}). Relative "
+                    f"(state-envelope ρ {rho:.3f} → {capped_rho:.3f}). Relative "
                     f"structure kept; a denser-graph config (e.g. NE topology) may be the "
                     f"deeper issue.",
                     flush=True,
@@ -1503,8 +1632,11 @@ def train_alarm_mhp(
     # 3) Stationarity report on the FINAL (selected + capped) model. Use a strict
     #    >-with-eps threshold: the cap rescales to ρ == stability_radius exactly, so
     #    a plain >= would mis-fire the WARN on a successfully-capped model.
-    if config.edge_mode == "feature" and config.stability_radius > 0 and len(result.params.edge_alpha):
-        rho = float(result.params.spectral_radius())
+    final_feature_rho = None
+    if config.edge_mode == "feature" and result.feature_kernel is not None:
+        final_feature_rho = _feature_state_envelope_radius(result.feature_kernel)
+    if config.edge_mode == "feature" and config.stability_radius > 0:
+        rho = float(final_feature_rho or 0.0)
         _eps = 1e-9
         if rho > config.stability_radius + _eps:
             if verbose:
@@ -1513,18 +1645,41 @@ def train_alarm_mhp(
                 _hint = ("(numerical residual after spectral cap)" if cap_on
                          else "Raise --feature-l2, or enable --feature-spectral-cap to enforce it.")
                 print(
-                    f"[train] WARN: feature-mode α spectral radius ρ={rho:.3f} > "
+                    f"[train] WARN: feature-mode α state-envelope spectral radius ρ={rho:.3f} > "
                     f"{config.stability_radius}. {_hint}",
                     flush=True,
                 )
         elif verbose:
             _capped = " [spectral cap applied]" if (cap_on and result.feature_kernel is not None
                                                     and result.feature_kernel.alpha_scale != 1.0) else ""
-            print(f"[train] feature-mode α spectral radius ρ={rho:.3f} (≤ {config.stability_radius}, OK){_capped}", flush=True)
+            print(
+                f"[train] feature-mode α state-envelope spectral radius "
+                f"ρ={rho:.3f} (≤ {config.stability_radius}, OK){_capped}",
+                flush=True,
+            )
 
     final_val_ll: Optional[float] = None
     if val_events is not None and val_events.n > 0:
-        final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
+        if config.edge_mode == "feature" and config.dynamic_alpha != "off":
+            from mhp.em import log_likelihood_feature_dynamic
+
+            final_val_ll = float(
+                log_likelihood_feature_dynamic(
+                    val_events,
+                    mhp_config,
+                    cand_targets=cand_t,
+                    cand_sources=cand_s,
+                    cand_phi=phi,
+                    kernel=result.feature_kernel,
+                    mu=result.params.mu,
+                    src_combo=val_src_combo,
+                    tgt_combo=val_tgt_combo,
+                    dynamic_combo_bits=dyn_combo_bits,
+                    dynamic_exposure_2d=val_dyn_exposure_2d,
+                )
+            )
+        else:
+            final_val_ll = float(mhp_ll(val_events, result.params, config=mhp_config))
         if verbose:
             print(
                 f"[train] held-out val LL on last {val_events.n} events: {final_val_ll:.2f} "
@@ -1581,12 +1736,18 @@ def train_alarm_mhp(
         "val_event_count": (val_events.n if val_events else 0),
         "type_count": M,
         "active_edge_count": len(result.params.edge_alpha),
-        # Stationarity: spectral radius of the learned α matrix (ρ<1 stationary,
-        # ρ≥1 over-excitation). Persisted so it is readable from the artifact
-        # without re-running or scraping the training log.
+        # Stationarity: feature-mode dynamic kernels store the entrywise
+        # all-state envelope ρ; other modes store the baseline α-matrix ρ.
+        # Persisted so it is readable without re-running training.
         "spectral_radius": (
-            float(result.params.spectral_radius())
-            if len(result.params.edge_alpha) else None
+            final_feature_rho
+            if config.edge_mode == "feature"
+            else (float(result.params.spectral_radius()) if len(result.params.edge_alpha) else None)
+        ),
+        "spectral_radius_kind": (
+            "dynamic_state_envelope"
+            if config.edge_mode == "feature" and config.dynamic_alpha != "off"
+            else "baseline"
         ),
         "stability_radius": float(config.stability_radius),
         "run_args": dict(run_args) if run_args else None,

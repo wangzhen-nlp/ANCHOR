@@ -669,8 +669,8 @@ class CompiledAssociationPlan:
                 t.entity,
                 [s.alarm_type],
                 [s.entity],
-                src_marks=src_marks if self.scorer.n_dynamic > 0 else None,
-                tgt_marks=tgt_marks if self.scorer.n_dynamic > 3 else None,
+                src_marks=src_marks if self.scorer.source_dynamic_dim else None,
+                tgt_marks=tgt_marks if self.scorer.target_dynamic_dim else None,
             )[0]
         )
         if alpha < self.config.feature_alpha_floor:
@@ -1643,6 +1643,7 @@ def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False
         topology_index=topo_idx,
         beta=float(rt.get("beta", 1.0)),
         n_dynamic=n_dynamic,
+        dynamic_mode=dyn_mode,
         domain_vocab=rt.get("domain_vocab", []),
         node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
     )

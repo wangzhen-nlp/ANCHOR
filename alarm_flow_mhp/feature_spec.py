@@ -745,7 +745,8 @@ class RuntimeFeatureScorer:
     """
 
     def __init__(self, kernel, at_vocab, graph_context, topology_index, beta: float,
-                 n_dynamic: int = 0, domain_vocab=(), node_domains=None):
+                 n_dynamic: int = 0, domain_vocab=(), node_domains=None,
+                 dynamic_mode: str | None = None):
         from mhp.feature_kernel import softplus
 
         self.kernel = kernel
@@ -762,6 +763,27 @@ class RuntimeFeatureScorer:
         # Dynamic (stateful) α: the kernel carries n_dynamic extra weights after
         # the static features; the caller appends per-candidate mark bits to φ.
         self.n_dynamic = int(n_dynamic)
+        if dynamic_mode is None:
+            # Backward-compatible inference for direct callers and old tests.
+            dynamic_mode = "source_target" if self.n_dynamic == 6 else (
+                "source" if self.n_dynamic else "off"
+            )
+        self.dynamic_mode = str(dynamic_mode)
+        expected_dynamic = {
+            "off": 0,
+            "source": 3,
+            "target": 3,
+            "source_target": 6,
+        }
+        if self.dynamic_mode not in expected_dynamic:
+            raise ValueError(f"unknown dynamic_mode={self.dynamic_mode!r}")
+        if self.n_dynamic != expected_dynamic[self.dynamic_mode]:
+            raise ValueError(
+                f"dynamic_mode={self.dynamic_mode!r} requires "
+                f"n_dynamic={expected_dynamic[self.dynamic_mode]}, got {self.n_dynamic}"
+            )
+        self.source_dynamic_dim = 3 if self.dynamic_mode in {"source", "source_target"} else 0
+        self.target_dynamic_dim = 3 if self.dynamic_mode in {"target", "source_target"} else 0
         if self.layout.n_features + self.n_dynamic != kernel.n_features:
             raise ValueError(
                 f"feature layout ({self.layout.n_features}) + dynamic ({self.n_dynamic}) "
@@ -778,44 +800,32 @@ class RuntimeFeatureScorer:
     def _dynamic_mark_matrix(self, n: int, src_marks=None, tgt_marks=None) -> np.ndarray:
         if self.n_dynamic <= 0:
             return np.zeros((n, 0), dtype=np.float64)
-        if src_marks is None:
-            src = np.zeros((n, min(self.n_dynamic, 3)), dtype=np.float64)
-        else:
-            src = np.asarray(src_marks, dtype=np.float64)
-            if src.ndim == 1:
-                src = src.reshape(1, -1)
-            if src.shape[0] != n:
-                src = np.tile(src.reshape(1, -1), (n, 1))
-        if src.shape[1] == self.n_dynamic:
-            return src.reshape(n, self.n_dynamic)
-        if self.n_dynamic <= 3:
-            out = np.zeros((n, self.n_dynamic), dtype=np.float64)
-            out[:, : min(src.shape[1], self.n_dynamic)] = src[:, : self.n_dynamic]
+
+        def _rows(marks, width):
+            if width <= 0:
+                return np.zeros((n, 0), dtype=np.float64)
+            if marks is None:
+                return np.zeros((n, width), dtype=np.float64)
+            arr = np.asarray(marks, dtype=np.float64)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            if arr.shape[0] != n:
+                arr = np.tile(arr.reshape(1, -1), (n, 1))
+            out = np.zeros((n, width), dtype=np.float64)
+            out[:, : min(arr.shape[1], width)] = arr[:, :width]
             return out
-        # source_target mode: first 3 dynamic bits are source state, next 3 are
-        # target pre-state. Missing target marks default to zero for callers that
-        # use this only as an upper/lower fallback.
-        out = np.zeros((n, self.n_dynamic), dtype=np.float64)
-        out[:, : min(src.shape[1], 3)] = src[:, : min(src.shape[1], 3)]
-        if tgt_marks is not None:
-            tgt = np.asarray(tgt_marks, dtype=np.float64)
-            if tgt.ndim == 1:
-                tgt = tgt.reshape(1, -1)
-            if tgt.shape[0] != n:
-                tgt = np.tile(tgt.reshape(1, -1), (n, 1))
-            width = min(tgt.shape[1], self.n_dynamic - 3)
-            out[:, 3: 3 + width] = tgt[:, :width]
-        return out
+
+        src = _rows(src_marks, self.source_dynamic_dim)
+        tgt = _rows(tgt_marks, self.target_dynamic_dim)
+        return np.concatenate([src, tgt], axis=1)
 
     def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
         """Vectorized α for one target vs a batch of source candidates.
 
         target_at/target_ne : scalars (alarm_type str, ne str)
         src_ats / src_nes   : lists of source alarm_type / ne
-        src_marks : source-mark bits; in source_target mode this may either be
-                    the full dynamic row or just the source 3-bit mark.
-        tgt_marks : optional target pre-state bits, used when n_dynamic has
-                    source+target state features.
+        src_marks : source-device state bits, required by source modes.
+        tgt_marks : target pre-state bits, required by target modes.
         Returns (n,) α array.
         """
         n = len(src_nes)
@@ -843,14 +853,16 @@ class RuntimeFeatureScorer:
             dom_v = self.layout.domain_ids([domain_of(s, self.node_infos) for s in src_nes])
         phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype, dom_u, dom_v)
         if self.n_dynamic > 0:
-            if src_marks is None:
-                raise ValueError("src_marks is required when RuntimeFeatureScorer.n_dynamic > 0")
+            if self.source_dynamic_dim and src_marks is None:
+                raise ValueError("src_marks is required for source dynamic mode")
+            if self.target_dynamic_dim and tgt_marks is None:
+                raise ValueError("tgt_marks is required for target dynamic mode")
             marks = self._dynamic_mark_matrix(n, src_marks=src_marks, tgt_marks=tgt_marks)
             phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)
 
     def envelope_mark(self):
-        """The source mark that MAXIMIZES α over all 2^n_dynamic states: bit i = 1
+        """The dynamic mark that MAXIMIZES α over all 2^n_dynamic states: bit i = 1
         iff the dynamic weight i is positive (softplus is monotonic in w·φ). Lets
         candidate enumeration use one call instead of a 2^n sweep."""
         if self.n_dynamic <= 0:
@@ -889,6 +901,10 @@ class RuntimeFeatureScorer:
             dom_u = self.layout.domain_ids([domain_of(t, self.node_infos) for t in tgt_nes])
         phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype, dom_u, dom_v)
         if self.n_dynamic > 0:
+            if self.source_dynamic_dim and src_mark is None:
+                raise ValueError("src_mark is required for source dynamic mode")
+            if self.target_dynamic_dim and tgt_marks is None:
+                raise ValueError("tgt_marks is required for target dynamic mode")
             marks = self._dynamic_mark_matrix(n, src_marks=src_mark, tgt_marks=tgt_marks)
             phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)
@@ -948,12 +964,13 @@ class DecomposedFeatureScorer:
         self.n_dynamic = int(scorer.n_dynamic)
         w_dyn = w[layout.n_features:layout.n_features + self.n_dynamic]
         bits = _combo_bits(8)
-        n_src = min(self.n_dynamic, 3)
+        n_src = int(scorer.source_dynamic_dim)
         self.src_mark_table = (
             bits[:, :n_src] @ w_dyn[:n_src] if n_src else np.zeros(8, dtype=np.float64)
         )
         self.w_dyn_tgt = (
-            w_dyn[3:self.n_dynamic].copy() if self.n_dynamic > 3 else np.zeros(0, dtype=np.float64)
+            w_dyn[n_src:n_src + scorer.target_dynamic_dim].copy()
+            if scorer.target_dynamic_dim else np.zeros(0, dtype=np.float64)
         )
         self.alpha_scale = float(scorer.kernel.alpha_scale)
         # OOV-padded lookup tables: index [id+1] so id=-1 hits the zero row/col
@@ -1069,7 +1086,7 @@ class DecomposedFeatureScorer:
                     + 2 * (sm[:, 1].astype(np.int64) if sm.shape[1] > 1 else 0)
                     + 4 * (sm[:, 2].astype(np.int64) if sm.shape[1] > 2 else 0)
                 )
-            if self.n_dynamic > 3 and tgt_marks is not None:
+            if len(self.w_dyn_tgt) and tgt_marks is not None:
                 tm = np.asarray(tgt_marks, dtype=np.float64).reshape(-1)
                 tgt_term = self.tgt_term(tuple(tm[:3]))
         return self.alpha_from_parts(
