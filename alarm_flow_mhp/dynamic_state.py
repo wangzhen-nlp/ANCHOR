@@ -92,6 +92,15 @@ def combo_bits(n_combos: int = 8) -> np.ndarray:
     return np.stack([k % 2, (k // 2) % 2, (k // 4) % 2], axis=1)
 
 
+def mark_to_combo(mark) -> int:
+    """Pack ONE (link, power, offline) 0/1 mark into its combo index — the
+    scalar counterpart of states_to_combo/combo_bits (single owner of the bit
+    order; keep all three consistent)."""
+    if not mark or len(mark) < STATE_DIM:
+        return 0
+    return int(mark[0]) + 2 * int(mark[1]) + 4 * int(mark[2])
+
+
 class DeviceStateTracker:
     """Incremental device-state machine for streaming inference (mirrors the
     forward pass used by `build_event_states`).

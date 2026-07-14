@@ -501,6 +501,10 @@ class StreamMHPAssigner:
         # α floor: treat too-weak edges as non-edges (inference analog of
         # device-mode edge_threshold) — guards the soft model against linking
         # unrelated pairs whose baseline α is small but positive.
+        # PARITY: the fast engine re-implements this floor + the relation-prior
+        # multiplier below (fast_stream._alpha_for_keys and
+        # _probe_global_signatures) — any semantic change here must be mirrored
+        # there, and test_fast_stream_parity pins the equivalence.
         if self._feat_alpha_floor > 0:
             alpha = np.where(alpha >= self._feat_alpha_floor, alpha, 0.0)
         b = self._feat_beta
@@ -544,13 +548,13 @@ class StreamMHPAssigner:
             return drop.dedupe_events()
         if drop is None:
             return keep.dedupe_events()
-        keep.dedupe_events()
-        keep_event_indexes = {event.index for event in keep.events}
-        drop_event_indexes = {event.index for event in drop.events}
+        # add() keeps event_indexes duplicate-proof, so no dedupe rescan; the
+        # subset check runs BEFORE the adds mutate keep's membership.
+        had_new_members = not (drop.event_indexes <= keep.event_indexes)
         for ev in list(drop.events):
             keep.add(ev)
         keep.snapshot_seq = max(keep.snapshot_seq, drop.snapshot_seq)
-        if drop_event_indexes - keep_event_indexes:
+        if had_new_members:
             # 两个旧快照的成员并集不等于“合并后的 cascade 已经输出过”。
             # 清空后允许 snapshot_ready_groups 立即产出完整合并版本。
             keep.last_snapshot_event_indexes = set()
@@ -758,9 +762,12 @@ class StreamMHPAssigner:
                 continue
             if cascade.start_ts > cutoff:
                 continue
-            event_indexes = {e.index for e in cascade.events}
-            if event_indexes == cascade.last_snapshot_event_indexes:
+            # Membership only grows (add dedupes; merges union), and the last
+            # snapshot is always a subset of current membership, so a length
+            # match IS set equality — O(1) unchanged-check on storm cascades.
+            if cascade.event_count() == len(cascade.last_snapshot_event_indexes):
                 continue
+            event_indexes = set(cascade.event_indexes)
             group = _cascade_to_group(cascade)
             base_group_id = group["group_id"]
             cascade.snapshot_seq += 1

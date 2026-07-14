@@ -43,8 +43,11 @@ Equivalence to the legacy scan:
 from __future__ import annotations
 
 import bisect
+import math
 
 import numpy as np
+
+from alarm_flow_mhp.dynamic_state import mark_to_combo
 
 from alarm_flow_mhp.feature_spec import (
     DecomposedFeatureScorer,
@@ -117,7 +120,9 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         self._by_entity: dict[str, dict] = {}      # entity -> {(at_id, mark): bucket}
         self._node_entities: dict[str, set] = {}   # topo node -> live entities
         self._site_nodes: dict[str, set] = {}      # site -> live topo nodes
-        self._by_at: dict[int, set] = {}           # at_id -> live entities
+        # at_id -> live bucket count. Drives the global-bound live mask; a
+        # counter (vs an entity set) makes the sweep cleanup trivially exact.
+        self._at_live_counts: dict[int, int] = {}
         self._entity_attrs: dict[str, tuple] = {}  # entity -> (node, site, vendor, netype, dom_id)
         # Signature buckets for the GLOBAL (unrelated) tier: an unrelated
         # candidate's α does not depend on entity identity (topo = same_ne =
@@ -131,6 +136,20 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         self._mu_cache: dict[tuple, float] = {}
         self._mu_cache_max = int(mu_cache_max)
         self._rel_base, self._glob_base = self._build_tier_bases()
+        # Per-event memoization: tier vectors and the global bound depend only
+        # on (target at, target mark combo) — ≤ (n_at+1)·8 distinct inputs —
+        # plus, for the bound, the set of live source ats (version-bumped by
+        # _bump_live_at, which clears the bound memo).
+        self._tier_memo: dict[tuple, tuple] = {}
+        self._bound_memo: dict[tuple, float] = {}
+        self._tier_all_ok = (
+            np.ones(self._n_at + 1, dtype=bool),
+            np.ones(self._n_at + 1, dtype=bool),
+        )
+        # index sweep runs on its own cadence (window-scaled), decoupled from
+        # the cascade-close throttle which can be configured much tighter.
+        self._sweep_interval = max(self._window * 0.5, self._close_scan_interval)
+        self._last_sweep_ts = -np.inf
         # watermark defer plumbing: index the freshly ingested event BEFORE the
         # watermark advance it triggers, matching the legacy buffer-append order.
         self._defer_watermark = False
@@ -181,17 +200,36 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
             rel[a, a] += topo_ub_same_at - topo_ub_diff_at
         return rel, glob
 
-    def _tier_vectors(self, tgt_at_id: int, tgt_term: float):
+    def _tier_vectors(self, tgt_at_id: int, mark_combo: int, tgt_term: float):
         """Boolean (n_at+1,) vectors over source-at ids (+1 shifted): can this
-        pair's α clear the floor when related / when unrelated?"""
+        pair's α clear the floor when related / when unrelated? Memoized on
+        (target at, target mark combo) — the only inputs."""
         floor = self._feat_alpha_floor
         if floor <= 0:
-            ones = np.ones(self._n_at + 1, dtype=bool)
-            return ones, ones
+            return self._tier_all_ok
+        key = (tgt_at_id, mark_combo)
+        hit = self._tier_memo.get(key)
+        if hit is not None:
+            return hit
         scale = self.decomposed.alpha_scale
         rel = softplus(self._rel_base[tgt_at_id + 1] + tgt_term) * scale >= floor
         glob = softplus(self._glob_base[tgt_at_id + 1] + tgt_term) * scale >= floor
-        return rel, glob
+        out = (rel, glob)
+        self._tier_memo[key] = out
+        return out
+
+    def _bump_live_at(self, at_id: int, delta: int):
+        """Adjust the live-bucket count of a source at; a 0↔live transition
+        changes the global-bound live mask, so the bound memo is invalidated."""
+        counts = self._at_live_counts
+        new = counts.get(at_id, 0) + delta
+        if new > 0:
+            if at_id not in counts:
+                self._bound_memo.clear()
+            counts[at_id] = new
+        else:
+            if counts.pop(at_id, None) is not None:
+                self._bound_memo.clear()
 
     # ------------------------------------------------------------------
     # Ingest hooks: index each modeled event before its watermark advance.
@@ -231,15 +269,9 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
             )
         return (node, site, vendor, netype, dom_id)
 
-    @staticmethod
-    def _mark_combo(mark) -> int:
-        if not mark or len(mark) < 3:
-            return 0
-        return int(mark[0]) + 2 * int(mark[1]) + 4 * int(mark[2])
-
     def _index_event(self, event: OnlineEvent):
         at_id = self._at_to_id.get(str(event.alarm_type), -1)
-        mark_idx = self._mark_combo(event.src_mark)
+        mark_idx = mark_to_combo(event.src_mark)
         ent = event.ne
         attrs = self._entity_attrs.get(ent)
         if attrs is None:
@@ -259,7 +291,7 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
                 if site:
                     self._site_nodes.setdefault(site, set()).add(node)
             ent_map[(at_id, mark_idx)] = bucket
-            self._by_at.setdefault(at_id, set()).add(ent)
+            self._bump_live_at(at_id, 1)
         bucket.append(event)
         _node, site, vendor, netype, dom_id = attrs
         sig = (at_id, vendor, netype, dom_id, bool(site), mark_idx)
@@ -281,7 +313,9 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         if hit is None:
             hit = float(self.mu_scorer.mu_for(event.alarm_type, event.ne))
             if len(self._mu_cache) >= self._mu_cache_max:
-                self._mu_cache.clear()
+                # FIFO-evict one entry (dicts are insertion-ordered); a full
+                # clear() would force a thundering re-fill of the hot set.
+                self._mu_cache.pop(next(iter(self._mu_cache)))
             self._mu_cache[key] = hit
         return hit * self.config.immigrant_bias
 
@@ -479,7 +513,7 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
                         break
                     jj -= 1
             if cand_ev is not None:
-                score = a_i * beta * float(np.exp(-beta * cand_dt))
+                score = a_i * beta * math.exp(-beta * cand_dt)
                 cand = (score, abs(t - cand_ev.ts), 0, cand_ev)
                 if self._better_candidate(cand, best):
                     best = cand
@@ -490,7 +524,7 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
                     ev = bucket.events[jj]
                     if ok(ev):
                         late = (ts_list[jj] - t) * inv_scale
-                        score = a_i * beta * float(np.exp(-self._lam * late))
+                        score = a_i * beta * math.exp(-self._lam * late)
                         cand = (score, ts_list[jj] - t, 1, ev)
                         if self._better_candidate(cand, best):
                             best = cand
@@ -498,22 +532,30 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
                     jj += 1
         return best
 
-    def _global_bound_score(self, tgt_at_id, tgt_term, glob_ok) -> float:
+    def _global_bound_score(self, tgt_at_id, mark_combo, tgt_term, glob_ok) -> float:
         """Sound upper bound on any UNRELATED (global-tier) candidate's score:
         max over live glob-ok source ats of softplus(glob_base)·scale·β, times
-        the best relation weight an unrelated pair can classify to."""
+        the best relation weight an unrelated pair can classify to. Memoized on
+        (target at, target mark combo); _bump_live_at invalidates the memo
+        whenever the set of live source ats changes."""
+        key = (tgt_at_id, mark_combo)
+        hit = self._bound_memo.get(key)
+        if hit is not None:
+            return hit
         live_mask = np.zeros(self._n_at + 1, dtype=bool)
-        for at_id in self._by_at:
+        for at_id in self._at_live_counts:
             live_mask[at_id + 1] = True
         mask = glob_ok & live_mask
         if not mask.any():
-            return -1.0
-        z = self._glob_base[tgt_at_id + 1][mask] + tgt_term
-        bound = float(np.max(softplus(z))) * self.decomposed.alpha_scale * self._feat_beta
-        prior = self._topology_relation_prior
-        if prior:
-            # unrelated pairs classify to cross_site or unknown only
-            bound *= max(float(prior.get("cross_site", 1.0)), float(prior.get("unknown", 1.0)))
+            bound = -1.0
+        else:
+            z = self._glob_base[tgt_at_id + 1][mask] + tgt_term
+            bound = float(np.max(softplus(z))) * self.decomposed.alpha_scale * self._feat_beta
+            prior = self._topology_relation_prior
+            if prior:
+                # unrelated pairs classify to cross_site or unknown only
+                bound *= max(float(prior.get("cross_site", 1.0)), float(prior.get("unknown", 1.0)))
+        self._bound_memo[key] = bound
         return bound
 
     def _best_parent(self, event: OnlineEvent, mu: float):
@@ -530,8 +572,9 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         self.scored_targets += 1
         d = self.decomposed
         tgt_at_id = self._at_to_id.get(str(event.alarm_type), -1)
+        mark_combo = mark_to_combo(event.src_mark)
         tgt_term = d.tgt_term(event.src_mark) if len(d.w_dyn_tgt) else 0.0
-        rel_ok, glob_ok = self._tier_vectors(tgt_at_id, tgt_term)
+        rel_ok, glob_ok = self._tier_vectors(tgt_at_id, mark_combo, tgt_term)
         if not rel_ok.any():
             self.fast_immigrant_shortcuts += 1
             return None, 0.0
@@ -600,7 +643,7 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         # sweep threshold is max(best, μ): a global argmax below μ still ends
         # as the same immigrant, and one below the best never wins the argmax.
         if glob_ok.any():
-            bound = self._global_bound_score(tgt_at_id, tgt_term, glob_ok)
+            bound = self._global_bound_score(tgt_at_id, mark_combo, tgt_term, glob_ok)
             threshold = mu if best is None else max(best[0], mu)
             if bound >= threshold:
                 best = self._probe_global_signatures(
@@ -668,7 +711,14 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
     def _close_inactive(self, now_ts: float):
         prev = self._last_close_scan_ts
         super()._close_inactive(now_ts)
-        if self._last_close_scan_ts != prev:
+        # The full O(live buckets) sweep gets its own window-scaled cadence:
+        # per-probe prune_before keeps hot buckets tidy, and the close throttle
+        # can be configured far tighter than index hygiene warrants.
+        if (
+            self._last_close_scan_ts != prev
+            and now_ts - self._last_sweep_ts >= self._sweep_interval
+        ):
+            self._last_sweep_ts = now_ts
             self._sweep_indexes(now_ts)
 
     def _sweep_indexes(self, now_ts: float):
@@ -684,19 +734,10 @@ class FastStreamMHPAssigner(StreamMHPAssigner):
         for key in dead_keys:
             self._buckets.pop(key, None)
             at_id, ent, mark_idx = key
+            self._bump_live_at(at_id, -1)
             ent_map = self._by_entity.get(ent)
             if ent_map is not None:
                 ent_map.pop((at_id, mark_idx), None)
-            # _by_at cleanup must run even when ent_map was already popped by an
-            # earlier dead key of the same entity, or stale entries accumulate
-            # and keep the global-bound live mask permanently over-wide.
-            if ent_map is None or not any(a == at_id for (a, _m) in ent_map):
-                ents = self._by_at.get(at_id)
-                if ents is not None:
-                    ents.discard(ent)
-                    if not ents:
-                        self._by_at.pop(at_id, None)
-            if ent_map is not None:
                 if not ent_map:
                     self._by_entity.pop(ent, None)
                     attrs = self._entity_attrs.get(ent)
