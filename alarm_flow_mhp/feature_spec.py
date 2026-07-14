@@ -892,3 +892,187 @@ class RuntimeFeatureScorer:
             marks = self._dynamic_mark_matrix(n, src_marks=src_mark, tgt_marks=tgt_marks)
             phi = np.concatenate([phi, marks], axis=1)
         return self.kernel.alpha(phi)
+
+
+class DecomposedFeatureScorer:
+    """φ-decomposed live α — numerically equal to RuntimeFeatureScorer but with
+    NO (C, F) feature-matrix construction.
+
+    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 8
+    scalars + optional domain one-hot + dynamic mark bits), so w·φ collapses to
+    table lookups + a handful of scalar terms:
+
+        z = w_bias + W_at[at_u, at_v] + w_same_at·[at_u==at_v]
+          + (w_topo + w_txa·same_at + w_txs·same_site)·topo
+          + w_same_ne·b + w_same_site·b + w_same_vendor·b + w_same_netype·b
+          + W_dom'[dom_u, dom_v]                       (same_domain folded in)
+          + SRC_TABLE[mark_combo] + tgt_term           (dynamic bits)
+        α = alpha_scale · softplus(z)
+
+    The one-hot blocks become the precomputed W_at / W_dom' tables; the 8
+    possible source-mark combos become an 8-entry table; the target-side
+    dynamic term is a per-target constant. To match the legacy path bit-for-bit
+    on the topo interaction columns, the topo score is rounded through float32
+    exactly like FeatureLayout.build_matrix stores it.
+    """
+
+    def __init__(self, scorer: RuntimeFeatureScorer):
+        from alarm_flow_mhp.dynamic_state import combo_bits as _combo_bits
+        from mhp.feature_kernel import softplus as _softplus
+
+        self.scorer = scorer
+        self._softplus = _softplus
+        layout = scorer.layout
+        self.layout = layout
+        w = np.asarray(scorer.kernel.weights, dtype=np.float64)
+        n_at = layout.n_at
+        j = 0
+        self.w_bias = float(w[j]); j += 1
+        self.W_at = w[j:j + n_at * n_at].reshape(n_at, n_at).copy(); j += n_at * n_at
+        (self.w_same_at, self.w_topo, self.w_same_ne, self.w_same_site,
+         self.w_same_vendor, self.w_same_netype,
+         self.w_topo_x_same_at, self.w_topo_x_same_site) = (float(x) for x in w[j:j + 8])
+        j += 8
+        self.n_dom = layout.n_dom
+        if layout.n_dom:
+            self.w_same_dom = float(w[j]); j += 1
+            self.W_dom = w[j:j + layout.n_dom ** 2].reshape(layout.n_dom, layout.n_dom).copy()
+            j += layout.n_dom ** 2
+        else:
+            self.w_same_dom = 0.0
+            self.W_dom = np.zeros((0, 0), dtype=np.float64)
+        if j != layout.n_features:
+            raise ValueError(
+                f"feature layout mismatch: consumed {j} weights, layout has {layout.n_features}"
+            )
+        self.n_dynamic = int(scorer.n_dynamic)
+        w_dyn = w[layout.n_features:layout.n_features + self.n_dynamic]
+        bits = _combo_bits(8)
+        n_src = min(self.n_dynamic, 3)
+        self.src_mark_table = (
+            bits[:, :n_src] @ w_dyn[:n_src] if n_src else np.zeros(8, dtype=np.float64)
+        )
+        self.w_dyn_tgt = (
+            w_dyn[3:self.n_dynamic].copy() if self.n_dynamic > 3 else np.zeros(0, dtype=np.float64)
+        )
+        self.alpha_scale = float(scorer.kernel.alpha_scale)
+        # OOV-padded lookup tables: index [id+1] so id=-1 hits the zero row/col
+        # (an OOV at/domain contributes no one-hot column, exactly like build_matrix).
+        self.W_at_pad = np.zeros((n_at + 1, n_at + 1), dtype=np.float64)
+        self.W_at_pad[1:, 1:] = self.W_at
+        self.W_dom_pad = np.zeros((layout.n_dom + 1, layout.n_dom + 1), dtype=np.float64)
+        if layout.n_dom:
+            self.W_dom_pad[1:, 1:] = self.W_dom + np.eye(layout.n_dom) * self.w_same_dom
+
+    def tgt_term(self, tgt_mark) -> float:
+        """Per-target dynamic constant: w_dyn[3:]·(target pre-state mark)."""
+        wt = self.w_dyn_tgt
+        if not len(wt):
+            return 0.0
+        m = tgt_mark or (0, 0, 0)
+        out = 0.0
+        for i in range(min(len(wt), len(m))):
+            out += float(wt[i]) * float(m[i])
+        return out
+
+    def logits_from_parts(
+        self,
+        tgt_at_id: int,
+        src_at_ids: np.ndarray,
+        topo: np.ndarray,
+        is_same_ne: np.ndarray,
+        same_site: np.ndarray,
+        same_vendor: np.ndarray,
+        same_netype: np.ndarray,
+        tgt_dom_id: int,
+        src_dom_ids: np.ndarray,
+        src_mark_idx: np.ndarray,
+        tgt_term: float,
+    ) -> np.ndarray:
+        """w·φ for a batch of source candidates against one target, from
+        precomputed per-candidate parts. All boolean arrays are 0/1 float."""
+        u = int(tgt_at_id)
+        at_v = np.asarray(src_at_ids, dtype=np.int64)
+        # Match build_matrix: φ stores topo (and its interaction columns) as
+        # float32; round through float32 so w·φ is numerically identical.
+        topo_r = np.asarray(topo, dtype=np.float32).astype(np.float64)
+        same_at = ((at_v == u) & (u >= 0) & (at_v >= 0)).astype(np.float64)
+        z = (
+            self.w_bias
+            + self.W_at_pad[u + 1, at_v + 1]
+            + self.w_same_at * same_at
+            + self.w_topo * topo_r
+            + self.w_same_ne * np.asarray(is_same_ne, dtype=np.float64)
+            + self.w_same_site * np.asarray(same_site, dtype=np.float64)
+            + self.w_same_vendor * np.asarray(same_vendor, dtype=np.float64)
+            + self.w_same_netype * np.asarray(same_netype, dtype=np.float64)
+            + self.w_topo_x_same_at * (topo_r * same_at)
+            + self.w_topo_x_same_site * (topo_r * np.asarray(same_site, dtype=np.float64))
+        )
+        if self.n_dom:
+            dv = np.asarray(src_dom_ids, dtype=np.int64)
+            z = z + self.W_dom_pad[int(tgt_dom_id) + 1, dv + 1]
+        if self.n_dynamic:
+            z = z + self.src_mark_table[np.asarray(src_mark_idx, dtype=np.int64)]
+            if tgt_term:
+                z = z + tgt_term
+        return z
+
+    def alpha_from_parts(self, *args, **kwargs) -> np.ndarray:
+        """softplus(logits)·alpha_scale — same postprocessing as FeatureKernel.alpha."""
+        z = self.logits_from_parts(*args, **kwargs)
+        a = self._softplus(z)
+        if self.alpha_scale != 1.0:
+            a = a * self.alpha_scale
+        return a
+
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
+        """Drop-in equivalent of RuntimeFeatureScorer.alpha_for_target (string
+        inputs). Attribute/topology lookups reuse the wrapped scorer's caches."""
+        s = self.scorer
+        n = len(src_nes)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        t_node = topo_node_of(target_ne)
+        u = s.at_to_id.get(str(target_at), -1)
+        at_v = np.array([s.at_to_id.get(str(a), -1) for a in src_ats], dtype=np.int64)
+        t_site, t_vendor, t_netype = s._attr(target_ne)
+        topo = np.empty(n, dtype=np.float64)
+        is_same_ne = np.empty(n, dtype=np.float64)
+        same_site = np.empty(n, dtype=np.float64)
+        same_vendor = np.empty(n, dtype=np.float64)
+        same_netype = np.empty(n, dtype=np.float64)
+        for i, sne in enumerate(src_nes):
+            topo[i] = _topo_score(topo_node_of(sne), t_node, s.topology_index, s._topo_cache)
+            is_same_ne[i] = 1.0 if sne == target_ne else 0.0
+            s_site, s_vendor, s_netype = s._attr(sne)
+            same_site[i] = 1.0 if (t_site and t_site == s_site) else 0.0
+            same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
+            same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
+        tgt_dom_id = -1
+        src_dom_ids = np.full(n, -1, dtype=np.int64)
+        if self.n_dom:
+            tgt_dom_id = self.layout._dom_to_id.get(domain_of(target_ne, s.node_infos), -1)
+            src_dom_ids = self.layout.domain_ids([domain_of(x, s.node_infos) for x in src_nes])
+        # dynamic marks: mirror _dynamic_mark_matrix semantics for the common
+        # streaming shapes — per-candidate (n,3) src marks + one target mark row.
+        src_mark_idx = np.zeros(n, dtype=np.int64)
+        tgt_term = 0.0
+        if self.n_dynamic:
+            if src_marks is not None:
+                sm = np.asarray(src_marks, dtype=np.float64)
+                if sm.ndim == 1:
+                    sm = np.tile(sm.reshape(1, -1), (n, 1))
+                sm = sm[:, :3]
+                src_mark_idx = (
+                    sm[:, 0].astype(np.int64)
+                    + 2 * (sm[:, 1].astype(np.int64) if sm.shape[1] > 1 else 0)
+                    + 4 * (sm[:, 2].astype(np.int64) if sm.shape[1] > 2 else 0)
+                )
+            if self.n_dynamic > 3 and tgt_marks is not None:
+                tm = np.asarray(tgt_marks, dtype=np.float64).reshape(-1)
+                tgt_term = self.tgt_term(tuple(tm[:3]))
+        return self.alpha_from_parts(
+            u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
+            tgt_dom_id, src_dom_ids, src_mark_idx, tgt_term,
+        )

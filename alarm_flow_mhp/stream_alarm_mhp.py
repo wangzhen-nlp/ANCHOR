@@ -112,9 +112,12 @@ class Cascade:
     last_snapshot_event_indexes: set = field(default_factory=set)
     snapshot_frontier_uuids: set = field(default_factory=set)
     snapshot_related_uuids: set = field(default_factory=set)
+    # Membership index for O(1) add()/dedupe — a plain any() scan makes every
+    # bind O(cascade size), which goes quadratic on storm-sized cascades.
+    event_indexes: set = field(default_factory=set)
 
     def add(self, event: OnlineEvent):
-        if any(e.index == event.index for e in self.events):
+        if event.index in self.event_indexes:
             return
         if not self.events:
             self.root_index = event.index
@@ -122,6 +125,7 @@ class Cascade:
         else:
             self.start_ts = min(self.start_ts, event.ts)
         self.events.append(event)
+        self.event_indexes.add(event.index)
         self.last_ts = max(self.last_ts, event.ts)
         event.cascade_id = self.cascade_id
 
@@ -139,6 +143,7 @@ class Cascade:
             unique_events.append(event)
         if len(unique_events) != len(self.events):
             self.events = unique_events
+        self.event_indexes = seen_indexes
         return self
 
 
@@ -556,44 +561,56 @@ class StreamMHPAssigner:
         self.cascades.pop(drop_id, None)
         return keep
 
-    def _assign_parent(self, event: OnlineEvent):
-        """Finalize one modeled event's parent assignment."""
-        if event.finalized:
-            return event
-        # Score candidates + immigrant baseline μ. Feature mode is INDUCTIVE:
-        # μ = softplus(w_μ·ψ) from the type's own features (parameterized).
+    def _immigrant_mu(self, event: OnlineEvent) -> float:
+        """Immigrant baseline μ · immigrant_bias for one event. Feature mode is
+        INDUCTIVE: μ = softplus(w_μ·ψ) from the type's own features."""
         if self.feature_mode:
-            positions, scores = self._candidate_scores_feature(event)
             if self.mu_scorer is not None:
                 base_mu = self.mu_scorer.mu_for(event.alarm_type, event.ne)
             else:
                 base_mu = self._mu_by_at.get(event.alarm_type, self._mu_default)
-            mu = base_mu * self.config.immigrant_bias
+            return base_mu * self.config.immigrant_bias
+        return float(self.params.mu[event.type_id]) * self.config.immigrant_bias
+
+    def _bind_immigrant(self, event: OnlineEvent, mu: float):
+        """Immigrant/root. If this event already has a cascade because earlier
+        children picked it as a future parent, keep that component."""
+        cascade = self._ensure_cascade(event)
+        event.parent_index = -1
+        event.parent_score = mu
+        self.total_immigrants += 1
+        return cascade
+
+    def _bind_to_parent(self, event: OnlineEvent, parent_event: OnlineEvent, score: float):
+        parent_cascade = self._ensure_cascade(parent_event)
+        event_cascade = self._ensure_cascade(event)
+        cascade = (
+            self._merge_cascades(parent_cascade.cascade_id, event_cascade.cascade_id)
+            if parent_cascade.cascade_id != event_cascade.cascade_id
+            else parent_cascade
+        )
+        cascade.add(parent_event)
+        cascade.add(event)
+        event.parent_index = parent_event.index
+        event.parent_score = float(score)
+        return cascade
+
+    def _assign_parent(self, event: OnlineEvent):
+        """Finalize one modeled event's parent assignment."""
+        if event.finalized:
+            return event
+        if self.feature_mode:
+            positions, scores = self._candidate_scores_feature(event)
         else:
             positions, scores = self._candidate_scores(event)
-            mu = float(self.params.mu[event.type_id]) * self.config.immigrant_bias
+        mu = self._immigrant_mu(event)
 
         if scores.size == 0 or scores.max() < mu:
-            # Immigrant/root. If this event already has a cascade because earlier
-            # children picked it as a future parent, keep that component.
-            cascade = self._ensure_cascade(event)
-            event.parent_index = -1
-            event.parent_score = mu
-            self.total_immigrants += 1
+            self._bind_immigrant(event, mu)
         else:
             best_local = int(scores.argmax())
             parent_event = self._buf_events[int(positions[best_local])]
-            parent_cascade = self._ensure_cascade(parent_event)
-            event_cascade = self._ensure_cascade(event)
-            cascade = (
-                self._merge_cascades(parent_cascade.cascade_id, event_cascade.cascade_id)
-                if parent_cascade.cascade_id != event_cascade.cascade_id
-                else parent_cascade
-            )
-            cascade.add(parent_event)
-            cascade.add(event)
-            event.parent_index = parent_event.index
-            event.parent_score = float(scores[best_local])
+            self._bind_to_parent(event, parent_event, float(scores[best_local]))
         event.finalized = True
         return event
 
@@ -1332,6 +1349,34 @@ def _run_imputation(artifact, alarm_events, args, stream_config, quiet=False, vi
     return groups, stats
 
 
+def _print_stream_profile(timer, engine: str):
+    """Flat per-phase timing table. Phases nest (process ⊇ assign_parent ⊇
+    score/mu; close/snapshot inside process), so cum times overlap — the table
+    is for locating the bottleneck, not for summing to wall."""
+    wall = timer.wall_elapsed
+    print()
+    print("=" * 78)
+    print(f"stream 性能分析（engine={engine}, wall={wall:.3f}s）")
+    print("=" * 78)
+    order = (
+        ("stream.process", "每事件入流（含下面所有子阶段）"),
+        ("stream.assign_parent", "父指派（含 score + mu）"),
+        ("stream.score", "候选收集 + α 打分"),
+        ("stream.mu", "immigrant μ"),
+        ("stream.close_scan", "不活跃 cascade 关闭扫描"),
+        ("stream.snapshot_scan", "visual 快照扫描"),
+    )
+    for name, hint in order:
+        slot = timer._phases.get(name)
+        if slot is None:
+            continue
+        total, count = slot
+        pct = total / wall * 100 if wall > 0 else 0.0
+        avg_us = total / max(count, 1) * 1e6
+        print(f"  {name:<24s} {total:>9.3f}s {count:>9d}次 {pct:>6.1f}%  avg={avg_us:>9.1f}µs  ← {hint}")
+    print("=" * 78)
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -1596,6 +1641,33 @@ def main():
         default=50_000,
         help="Print stream progress every N events. 0 = silent. Default: 50000.",
     )
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "legacy", "fast"),
+        default="auto",
+        help=(
+            "Assigner engine. 'fast' = indexed candidate gathering + decomposed "
+            "α (feature mode only; same grouping semantics, see fast_stream.py). "
+            "'legacy' = the original sliding-window scan. 'auto' (default) picks "
+            "fast for feature-mode artifacts, legacy otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--fast-candidate-cap",
+        type=int,
+        default=0,
+        help=(
+            "Fast engine only: approximate the legacy max_history_events "
+            "truncation with a |Δt| radius containing ~this many live events. "
+            "0 (default) scores all relevant in-window events — usually "
+            "strictly better in storms; set >0 only for legacy A/B parity."
+        ),
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Print per-phase timing (gather/score/assign/close/snapshot) at the end.",
+    )
     # ---- missing-chain imputation (fixed-lag sampler) --------------------
     parser.add_argument(
         "--impute",
@@ -1825,8 +1897,9 @@ def main():
         t_imp_start = time.monotonic()
         visual_output = None
         if args.visual_output:
-            from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
-
+            # NOTE: no local import here — a function-local import of
+            # AlarmMHPVisualOutputSession would shadow the module-level import
+            # for ALL of main(), breaking the non-impute path (UnboundLocalError).
             visual_output = AlarmMHPVisualOutputSession.from_files(
                 args.visual_output,
                 args.ne_graph,
@@ -2015,9 +2088,46 @@ def main():
         elif not args.quiet:
             print("[stream] μ: per-alarm-type table (no parameterized μ in artifact)", flush=True)
 
-    assigner = StreamMHPAssigner(
-        artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
-    )
+    engine = args.engine
+    if engine == "auto":
+        engine = "fast" if feature_scorer is not None else "legacy"
+    if engine == "fast" and feature_scorer is None:
+        parser.error("--engine fast requires a feature-mode artifact (device mode uses legacy)")
+    if engine == "fast":
+        from alarm_flow_mhp.fast_stream import FastStreamMHPAssigner
+
+        assigner = FastStreamMHPAssigner(
+            artifact,
+            stream_config,
+            feature_scorer=feature_scorer,
+            mu_scorer=mu_scorer,
+            candidate_cap=args.fast_candidate_cap,
+        )
+    else:
+        assigner = StreamMHPAssigner(
+            artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
+        )
+    if not args.quiet:
+        print(f"[stream] engine: {engine}", flush=True)
+
+    timer = None
+    if args.profile:
+        from fault_grouping.matching.profiling import PhaseTimer
+
+        timer = PhaseTimer()
+        timer.mark_wall_start()
+        timer.wrap_method(assigner, "process", "stream.process")
+        timer.wrap_method(assigner, "_assign_parent", "stream.assign_parent")
+        timer.wrap_method(assigner, "_close_inactive", "stream.close_scan")
+        timer.wrap_method(assigner, "snapshot_ready_groups", "stream.snapshot_scan")
+        timer.wrap_method(assigner, "_immigrant_mu", "stream.mu")
+        if engine == "fast":
+            timer.wrap_method(assigner, "_best_parent", "stream.score")
+        else:
+            score_attr = (
+                "_candidate_scores_feature" if feature_scorer is not None else "_candidate_scores"
+            )
+            timer.wrap_method(assigner, score_attr, "stream.score")
     visual_output = None
     visual_group_cursor = 0
     visual_snapshot_age_sec = float(args.visual_snapshot_age_sec or 0.0)
@@ -2090,6 +2200,10 @@ def main():
             visual_output.close()
     t_stream_end = time.monotonic()
     visual_count = visual_output.emitted_count if visual_output is not None else 0
+
+    if timer is not None:
+        timer.mark_wall_end()
+        _print_stream_profile(timer, engine)
 
     stats = assigner.stats()
     groups = assigner.closed_groups
