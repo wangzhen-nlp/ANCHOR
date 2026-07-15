@@ -155,6 +155,13 @@ class AlarmMHPConfig:
     # to parity without changing existing feature-mode runs.
     feature_spectral_cap: bool = False
     chunk_size: int = 20_000
+    # E-step worker threads (1 = serial; 0 = auto: min(8, cpu count)). Chunk
+    # results merge in chunk order, so the trained model does not depend on it.
+    estep_workers: int = 1
+    # GPU offload of the E-step chunk math ("auto" = CUDA else CPU; needs
+    # torch — silently stays on CPU without it). "cpu" pins the exactly
+    # reproducible CPU path; "cuda" requires that device.
+    estep_device: str = "cpu"
     # Kernel shape. "exp" = single exponential (α·β·exp(-β·dt)); "piecewise" =
     # two-stage: exp fit selects edges, then box-basis EM learns per-bucket
     # weights θ. bucket_edges_sec are right edges in REAL seconds.
@@ -263,6 +270,10 @@ class AlarmMHPConfig:
             raise ValueError("stability_radius must be < 1.0 (set to <= 0 to disable)")
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be >= 1")
+        if self.estep_workers < 0:
+            raise ValueError("estep_workers must be >= 0 (0 = auto)")
+        if self.estep_device not in ("auto", "cpu", "cuda"):
+            raise ValueError("estep_device must be one of auto|cpu|cuda")
         if self.kernel_type not in KERNEL_TYPES:
             raise ValueError(f"kernel_type must be one of {sorted(KERNEL_TYPES)}")
         if self.kernel_type == "piecewise":
@@ -327,6 +338,8 @@ class AlarmMHPConfig:
             branching_cap=self.branching_cap,
             stability_radius=self.stability_radius,
             chunk_size=self.chunk_size,
+            estep_workers=self.estep_workers,
+            estep_device=self.estep_device,
             kernel_type=self.kernel_type,
             # Convert real-second bucket edges to model time (same scale as window)
             bucket_edges=tuple(e / self.time_scale_sec for e in self.bucket_edges_sec),

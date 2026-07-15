@@ -26,12 +26,17 @@ and at most `max_active_sources_per_dim` sources are kept per target.
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from itertools import islice
+import os
 import time
 from typing import Callable, Optional
 
 import numpy as np
 
+from .estep_backend import resolve_estep_backend
 from .events import EventCollection
 from .params import MHPParams, bucket_index_vec, bucket_widths
 
@@ -86,6 +91,17 @@ class MHPConfig:
     # peak pair memory is chunk_size · max_history_events · ~16 bytes. With
     # defaults: 20k · 128 · 16 = 40 MB.
     chunk_size: int = 20_000
+    # Parallel E-step: worker threads scanning chunks concurrently. 1 = serial;
+    # 0 = auto (min(8, cpu count)). Chunk results are merged in chunk order,
+    # so the outcome is deterministic and independent of the thread count.
+    # Peak memory grows by ~(workers + 2) in-flight chunks.
+    estep_workers: int = 1
+    # GPU offload of the E-step chunk math (needs PyTorch). "auto" = CUDA if
+    # available, else pure CPU — safe default everywhere. "cpu" forces CPU;
+    # "cuda" requires that device. CUDA results are statistically equivalent
+    # but atomics are not run-to-run deterministic — set "cpu" when bitwise
+    # reproducibility matters. See mhp/estep_backend.py.
+    estep_device: str = "cpu"
     # Piecewise (box-basis) kernel. When kernel_type == "piecewise", training
     # runs two stages: (1) exp-kernel fit selects the sparse active edge set,
     # (2) a box-basis EM learns per-edge per-bucket weights θ on those edges.
@@ -165,6 +181,37 @@ def _segment_sum(values: np.ndarray, segment_ids: np.ndarray, n_segments: int) -
     return out
 
 
+def _resolve_estep_workers(config: MHPConfig, n_chunks: int) -> int:
+    w = int(getattr(config, "estep_workers", 0) or 0)
+    if w <= 0:
+        w = min(8, os.cpu_count() or 1)
+    return max(1, min(w, max(n_chunks, 1)))
+
+
+def _iter_chunks_ordered(worker, chunk_bounds, n_workers: int):
+    """Run worker(chunk_start, chunk_end) over chunks, yielding results in
+    chunk order. Threads (not processes) so the read-only inputs — event
+    arrays, α, feature tables — are shared without copies; the heavy NumPy
+    kernels in the chunk body (sorting, ufuncs) release the GIL. Yielding in
+    submission order keeps the caller's accumulation deterministic regardless
+    of scheduling, and the in-flight window bounds peak pair memory to
+    ~(n_workers + 2) chunks."""
+    if n_workers <= 1 or len(chunk_bounds) <= 1:
+        for cs, ce in chunk_bounds:
+            yield worker(cs, ce)
+        return
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        pending = deque()
+        bounds = iter(chunk_bounds)
+        for cs, ce in islice(bounds, n_workers + 2):
+            pending.append(pool.submit(worker, cs, ce))
+        for cs, ce in bounds:
+            yield pending.popleft().result()
+            pending.append(pool.submit(worker, cs, ce))
+        while pending:
+            yield pending.popleft().result()
+
+
 def _spectral_radius_edges(edge_targets, edge_sources, edge_alpha, M, power_iter: int = 80) -> float:
     """Spectral radius ρ of the branching matrix A[target, source]=|α| via power
     iteration — identical to MHPParams.spectral_radius, but callable on raw edge
@@ -190,18 +237,24 @@ def _spectral_radius_edges(edge_targets, edge_sources, edge_alpha, M, power_iter
     return float(prev)
 
 
-def _append_sparse_dynamic_resp(parts, cand_idx: np.ndarray, combo_idx: np.ndarray, values: np.ndarray, K: int):
-    """Append chunk-level sparse responsibility sums by dynamic combo."""
+def _compress_sparse_dynamic_resp(cand_idx: np.ndarray, combo_idx: np.ndarray, values: np.ndarray, K: int):
+    """Compress chunk-level responsibilities into sparse per-combo sums.
+
+    Returns a list of (combo, rows, sums) triples — a pure function so the
+    parallel E-step can run it inside a chunk worker and let the merge loop
+    append the parts in deterministic chunk order."""
     if len(cand_idx) == 0:
-        return
+        return []
     flat = cand_idx.astype(np.int64, copy=False) * int(K) + combo_idx.astype(np.int64, copy=False)
     uniq, inv = np.unique(flat, return_inverse=True)
     sums = np.bincount(inv, weights=values).astype(np.float32, copy=False)
     combos = (uniq % int(K)).astype(np.int64, copy=False)
     rows = (uniq // int(K)).astype(np.int64, copy=False)
+    out = []
     for k in np.unique(combos):
         mask = combos == k
-        parts[int(k)].append((rows[mask].astype(np.int32, copy=False), sums[mask]))
+        out.append((int(k), rows[mask].astype(np.int32, copy=False), sums[mask]))
+    return out
 
 
 def _finalize_sparse_dynamic_resp(parts, C: int):
@@ -314,18 +367,34 @@ def _build_chunk_pair_arrays(
         pair_source = pair_source[keep_self]
         pair_target = pair_target[keep_self]
         ev_idx = ev_idx[keep_self]
-        abs_dt = np.abs(times[pair_target] - times[pair_source]).astype(np.float32)
-        # Keep the nearest `max_hist` per target: sort by (target, |dt|), then
-        # take within-group rank < max_hist.
+        # Keep the nearest `max_hist` per target — but only over-cap targets
+        # need the (target, |dt|) sort, and they are typically a tiny fraction
+        # (the past side is pre-capped by `start`; only future-side slack rows
+        # can push a target over). Sorting just those rows instead of the whole
+        # chunk cuts the builder cost by ~10x; under-cap targets keep all their
+        # rows. Pairs are emitted in window order (ascending source per
+        # target): the same pair SET the full lexsort selected, in a different
+        # order, so accumulation differs only at float rounding noise.
         counts_excl = np.bincount(ev_idx, minlength=chunk_size)
-        g_start = np.zeros(chunk_size, dtype=np.int64)
-        np.cumsum(counts_excl[:-1], out=g_start[1:])
-        order = np.lexsort((abs_dt, ev_idx))         # primary ev_idx, secondary |dt|
-        rank = np.arange(order.size, dtype=np.int32) - g_start[ev_idx[order]].astype(np.int32, copy=False)
-        sel = order[rank < max_hist]
-        pair_source = pair_source[sel]
-        pair_target = pair_target[sel]
-        counts = np.bincount(ev_idx[sel], minlength=chunk_size).astype(np.int64)
+        over_t = counts_excl > max_hist
+        if over_t.any():
+            over_rows = over_t[ev_idx]
+            over_idx = np.flatnonzero(over_rows)
+            sub_ev = ev_idx[over_idx]
+            sub_abs = np.abs(
+                times[pair_target[over_idx]] - times[pair_source[over_idx]]
+            ).astype(np.float32)
+            order = np.lexsort((sub_abs, sub_ev))    # primary target, secondary |dt|
+            sub_counts = np.where(over_t, counts_excl, 0)
+            g_start = np.zeros(chunk_size, dtype=np.int64)
+            np.cumsum(sub_counts[:-1], out=g_start[1:])
+            rank = np.arange(order.size, dtype=np.int64) - g_start[sub_ev[order]]
+            keep_rows = ~over_rows
+            keep_rows[over_idx[order[rank < max_hist]]] = True
+            pair_source = pair_source[keep_rows]
+            pair_target = pair_target[keep_rows]
+            ev_idx = ev_idx[keep_rows]
+        counts = np.bincount(ev_idx, minlength=chunk_size).astype(np.int64)
         pair_dt = (times[pair_target] - times[pair_source]).astype(np.float32)
         pair_target_dim = dims[pair_target]
         pair_source_dim = dims[pair_source]
@@ -559,9 +628,15 @@ def _run_estep_iteration(
     )
     mu_num = np.zeros(M, dtype=np.float64)
     log_likelihood = 0.0
+    want_beta_dt = beta_num_dt is not None
+    gpu = resolve_estep_backend(config)
+    has_slack = getattr(config, "time_slack", 0.0) > 0.0
 
-    for chunk_start in range(0, N, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, N)
+    def _chunk_worker(chunk_start: int, chunk_end: int):
+        """E-step on one chunk. Reads only shared immutable inputs; returns
+        per-chunk partials. The (flat_uv, α/β contribution) scatter arrays are
+        returned raw and merged with np.add.at on the main thread — np.add.at
+        has a fast path on contiguous f64, so the serial merge is negligible."""
         chunk_size_local = chunk_end - chunk_start
         target_dims_chunk = dims[chunk_start:chunk_end]
         mu_chunk = mu[target_dims_chunk]
@@ -588,11 +663,8 @@ def _run_estep_iteration(
             # All chunk events are immigrants (no candidate parents in window)
             rate = np.maximum(mu_chunk, _EPS)
             p_self_chunk = np.ones(chunk_size_local, dtype=np.float64)
-            p_self[chunk_start:chunk_end] = p_self_chunk
             mu_num_chunk = _segment_sum(p_self_chunk, target_dims_chunk, M)
-            mu_num += mu_num_chunk
-            log_likelihood += float(np.log(rate).sum())
-            continue
+            return p_self_chunk, None, None, None, mu_num_chunk, float(np.log(rate).sum())
 
         # E-step on this chunk
         alpha_pair = alpha[pair_target_dim, pair_source_dim]
@@ -601,27 +673,49 @@ def _run_estep_iteration(
         beta_pair = beta if np.ndim(beta) == 0 else beta[pair_target_dim, pair_source_dim]
         pair_dt_eff, late_weight = _apply_time_slack(pair_dt, config)
         # Score: α · β · exp(-β · max(Δt,0)) · late_penalty(max(-Δt,0))
-        score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt_eff) * late_weight
-        # rate_per_event = μ_{u_i} + Σ_j score(i, j)
-        sum_score = _segment_sum(score_pair.astype(np.float64), pair_target_local, chunk_size_local)
-        rate = np.maximum(mu_chunk + sum_score, _EPS)
-        p_self_chunk = mu_chunk / rate
-        p_self[chunk_start:chunk_end] = p_self_chunk
-        # p_ij[p] = score[p] / rate[target_local]
-        p_ij = score_pair / rate[pair_target_local].astype(np.float32)
-
-        # Accumulate per-type sufficient stats
-        flat_uv = pair_target_dim.astype(np.int64) * M + pair_source_dim.astype(np.int64)
-        np.add.at(alpha_num.ravel(), flat_uv, p_ij.astype(np.float64))
-        if beta_num_dt is not None:
-            np.add.at(
-                beta_num_dt.ravel(),
-                flat_uv,
-                p_ij.astype(np.float64) * pair_dt_eff.astype(np.float64),
+        if gpu is not None:
+            p_self_chunk, p_ij, ll_chunk = gpu.chunk_scores(
+                a=alpha_pair,
+                softplus_a=False,
+                beta=beta_pair,
+                dt=pair_dt_eff,
+                late_weight=late_weight if has_slack else None,
+                tlocal=pair_target_local,
+                mu_chunk=mu_chunk,
+                csize=chunk_size_local,
             )
+        else:
+            score_pair = alpha_pair * beta_pair * np.exp(-beta_pair * pair_dt_eff) * late_weight
+            # rate_per_event = μ_{u_i} + Σ_j score(i, j)
+            sum_score = _segment_sum(score_pair.astype(np.float64), pair_target_local, chunk_size_local)
+            rate = np.maximum(mu_chunk + sum_score, _EPS)
+            p_self_chunk = mu_chunk / rate
+            # p_ij[p] = score[p] / rate[target_local]
+            p_ij = score_pair / rate[pair_target_local].astype(np.float32)
+            ll_chunk = float(np.log(rate).sum())
+
+        # Per-type sufficient stats: hand back the raw scatter arrays.
+        flat_uv = pair_target_dim.astype(np.int64) * M + pair_source_dim.astype(np.int64)
+        alpha_vals = p_ij.astype(np.float64, copy=False)
+        beta_vals = alpha_vals * pair_dt_eff.astype(np.float64) if want_beta_dt else None
         mu_num_chunk = _segment_sum(p_self_chunk, target_dims_chunk, M)
+        return p_self_chunk, flat_uv, alpha_vals, beta_vals, mu_num_chunk, ll_chunk
+
+    chunk_bounds = [(cs, min(cs + chunk_size, N)) for cs in range(0, N, chunk_size)]
+    n_workers = _resolve_estep_workers(config, len(chunk_bounds))
+    alpha_num_flat = alpha_num.ravel()
+    beta_num_flat = beta_num_dt.ravel() if want_beta_dt else None
+    for (chunk_start, chunk_end), out in zip(
+        chunk_bounds, _iter_chunks_ordered(_chunk_worker, chunk_bounds, n_workers)
+    ):
+        p_self_chunk, flat_uv, alpha_vals, beta_vals, mu_num_chunk, ll_chunk = out
+        p_self[chunk_start:chunk_end] = p_self_chunk
+        if flat_uv is not None:
+            np.add.at(alpha_num_flat, flat_uv, alpha_vals)
+            if beta_num_flat is not None and beta_vals is not None:
+                np.add.at(beta_num_flat, flat_uv, beta_vals)
         mu_num += mu_num_chunk
-        log_likelihood += float(np.log(rate).sum())
+        log_likelihood += ll_chunk
 
     return p_self, alpha_num, beta_num_dt, mu_num, log_likelihood
 
@@ -695,9 +789,13 @@ def fit_mhp(
 
     t_total_start = time.monotonic()
     if config.verbose:
+        _n_chunks = (N + max(int(config.chunk_size), 1) - 1) // max(int(config.chunk_size), 1)
+        _gpu = resolve_estep_backend(config)
         print(
             f"[mhp] events={N}, types={M}, chunk_size={config.chunk_size}, "
-            f"max_history_events={config.max_history_events}",
+            f"max_history_events={config.max_history_events}, "
+            f"estep_workers={_resolve_estep_workers(config, _n_chunks)}, "
+            f"backend={_gpu.name if _gpu is not None else 'cpu'}",
             flush=True,
         )
 
@@ -1720,15 +1818,20 @@ def fit_mhp_feature(
         safe_chunk = max(1_000, int(pair_row_cap // max(max_history_events + 1, 1)))
         chunk_size = min(chunk_size, safe_chunk)
 
+    gpu = resolve_estep_backend(config)
+    has_slack = getattr(config, "time_slack", 0.0) > 0.0
+
     t_total_start = time.monotonic()
     if config.verbose:
         chunk_msg = f"chunk_size={chunk_size}"
         if chunk_size != requested_chunk_size:
             chunk_msg += f" (auto-reduced from {requested_chunk_size} for time_slack)"
+        _n_chunks = (N + chunk_size - 1) // chunk_size
         print(
             f"[mhp-feat] events={N}, candidate pairs={C}, features={F}, "
             f"mu_features={(mu_phi.shape[1] if use_mu_features else 0)}, "
-            f"{chunk_msg}",
+            f"{chunk_msg}, estep_workers={_resolve_estep_workers(config, _n_chunks)}, "
+            f"backend={gpu.name if gpu is not None else 'cpu'}",
             flush=True,
         )
 
@@ -1782,26 +1885,11 @@ def fit_mhp_feature(
         mu_num = np.zeros(M, dtype=np.float64)
         ll_term1 = 0.0
 
-        # Intra-iteration progress: the E-step scans ~N/chunk_size chunks, which
-        # can take minutes on large data — print a throttled heartbeat so a long
-        # iteration doesn't look hung.
-        n_chunks = (N + chunk_size - 1) // chunk_size
-        _estep_t0 = time.monotonic()
-        _last_beat = _estep_t0
-        for ci, chunk_start in enumerate(range(0, N, chunk_size)):
-            chunk_end = min(chunk_start + chunk_size, N)
+        def _feature_chunk_worker(chunk_start: int, chunk_end: int):
+            """Feature-mode E-step on one chunk. Reads only shared immutable
+            inputs (events, μ, current z/α tables); responsibilities come back
+            pre-compressed so the serial merge below touches unique slots only."""
             csize = chunk_end - chunk_start
-            if config.verbose and n_chunks > 1:
-                _now = time.monotonic()
-                if _now - _last_beat >= 10.0:
-                    rate = chunk_end / max(_now - _estep_t0, 1e-9)
-                    print(
-                        f"[mhp-feat]   iter={it:3d} E-step chunk {ci + 1}/{n_chunks} "
-                        f"({chunk_end}/{N} events, {rate:.0f} evt/s, "
-                        f"{_fmt_secs(_now - _estep_t0)})",
-                        flush=True,
-                    )
-                    _last_beat = _now
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
             (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
@@ -1811,20 +1899,20 @@ def fit_mhp_feature(
             )
             if pair_dt.size == 0:
                 rate = np.maximum(mu_chunk, _EPS)
-                p_self[chunk_start:chunk_end] = 1.0
-                mu_num += _segment_sum(np.ones(csize), tdims_chunk, M)
-                ll_term1 += float(np.log(rate).sum())
-                continue
+                p_self_chunk = np.ones(csize, dtype=np.float64)
+                mu_num_chunk = _segment_sum(p_self_chunk, tdims_chunk, M)
+                return p_self_chunk, None, mu_num_chunk, float(np.log(rate).sum())
             # Map each pair to its candidate index (binary search). Negative dt
             # candidates are possible only within time_slack and are discounted.
             pk = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
             idx = np.minimum(np.searchsorted(cand_keys, pk), C - 1)
             valid = cand_keys[idx] == pk
-            score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
-            combo_v = None
-            if valid.any():
+            has_valid = bool(valid.any())
+            vi = combo_v = None
+            a_in = pair_dt_eff = late_weight = None
+            apply_softplus = False
+            if has_valid:
                 vi = idx[valid]
-                b = float(beta_scalar)
                 pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
                 if use_dynamic:
                     if use_target_dynamic:
@@ -1837,31 +1925,86 @@ def fit_mhp_feature(
                         # Source-only: per-pair α uses the source event's mark
                         # combo at fire time.
                         combo_v = src_combo[pair_source[valid]]
-                    a_pair = softplus(z_static_c[vi] + z_dyn_k[combo_v])
-                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
+                    # α = softplus(z_static + z_dyn); gathers on CPU, softplus
+                    # on the GPU when one is active.
+                    a_in = z_static_c[vi] + z_dyn_k[combo_v]
+                    apply_softplus = True
                 else:
-                    score_pair[valid] = alpha_cand[vi] * b * np.exp(-b * pair_dt_eff) * late_weight
-            sum_score = _segment_sum(score_pair, pair_tlocal, csize)
-            rate = np.maximum(mu_chunk + sum_score, _EPS)
-            p_self_chunk = mu_chunk / rate
+                    a_in = alpha_cand[vi]
+            if gpu is not None:
+                p_self_chunk, p_ij_valid, ll_chunk = gpu.chunk_scores(
+                    a=a_in if has_valid else np.zeros(0, dtype=np.float64),
+                    softplus_a=apply_softplus,
+                    beta=float(beta_scalar),
+                    dt=pair_dt_eff if has_valid else np.zeros(0, dtype=np.float32),
+                    late_weight=late_weight if (has_valid and has_slack) else None,
+                    tlocal=pair_tlocal[valid] if has_valid else np.zeros(0, dtype=np.int64),
+                    mu_chunk=mu_chunk,
+                    csize=csize,
+                )
+            else:
+                score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
+                if has_valid:
+                    b = float(beta_scalar)
+                    a_pair = softplus(a_in) if apply_softplus else a_in
+                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
+                sum_score = _segment_sum(score_pair, pair_tlocal, csize)
+                rate = np.maximum(mu_chunk + sum_score, _EPS)
+                p_self_chunk = mu_chunk / rate
+                p_ij_valid = (score_pair / rate[pair_tlocal])[valid] if has_valid else None
+                ll_chunk = float(np.log(rate).sum())
+            resp_payload = None
+            if has_valid:
+                if use_dynamic and use_sparse_resp:
+                    # Sparse path: same unique-compress as the serial code did,
+                    # just run inside the worker; parts merge in chunk order.
+                    resp_payload = _compress_sparse_dynamic_resp(
+                        vi, combo_v, p_ij_valid, K_combo
+                    )
+                elif use_dynamic:
+                    resp_payload = (vi * K_combo + combo_v, p_ij_valid)
+                else:
+                    resp_payload = (vi, p_ij_valid)
+            mu_num_chunk = _segment_sum(p_self_chunk, tdims_chunk, M)
+            return p_self_chunk, resp_payload, mu_num_chunk, ll_chunk
+
+        # Chunks run on estep_workers threads; results are merged here in chunk
+        # order, so accumulation is deterministic regardless of the thread count.
+        # The heartbeat keeps a long E-step from looking hung.
+        n_chunks = (N + chunk_size - 1) // chunk_size
+        chunk_bounds = [(cs, min(cs + chunk_size, N)) for cs in range(0, N, chunk_size)]
+        n_workers = _resolve_estep_workers(config, n_chunks)
+        _estep_t0 = time.monotonic()
+        _last_beat = _estep_t0
+        for ci, ((chunk_start, chunk_end), out) in enumerate(
+            zip(chunk_bounds, _iter_chunks_ordered(_feature_chunk_worker, chunk_bounds, n_workers))
+        ):
+            p_self_chunk, resp_payload, mu_num_chunk, ll_chunk = out
             p_self[chunk_start:chunk_end] = p_self_chunk
-            p_ij = score_pair / rate[pair_tlocal]
-            if valid.any():
+            mu_num += mu_num_chunk
+            ll_term1 += ll_chunk
+            if resp_payload is not None:
                 if use_dynamic:
                     if use_sparse_resp:
-                        _append_sparse_dynamic_resp(
-                            n_resp2d_parts,
-                            vi,
-                            combo_v,
-                            p_ij[valid],
-                            K_combo,
-                        )
+                        for k, rows, sums in resp_payload:
+                            n_resp2d_parts[k].append((rows, sums))
                     else:
-                        np.add.at(n_resp2d.reshape(-1), vi * K_combo + combo_v, p_ij[valid])
+                        flat, vals = resp_payload
+                        np.add.at(n_resp2d.reshape(-1), flat, vals)
                 else:
-                    np.add.at(n_resp, idx[valid], p_ij[valid])
-            mu_num += _segment_sum(p_self_chunk, tdims_chunk, M)
-            ll_term1 += float(np.log(rate).sum())
+                    idx_v, vals = resp_payload
+                    np.add.at(n_resp, idx_v, vals)
+            if config.verbose and n_chunks > 1:
+                _now = time.monotonic()
+                if _now - _last_beat >= 10.0:
+                    rate = chunk_end / max(_now - _estep_t0, 1e-9)
+                    print(
+                        f"[mhp-feat]   iter={it:3d} E-step chunk {ci + 1}/{n_chunks} "
+                        f"({chunk_end}/{N} events, {rate:.0f} evt/s, "
+                        f"{_fmt_secs(_now - _estep_t0)})",
+                        flush=True,
+                    )
+                    _last_beat = _now
 
         estep_seconds = time.monotonic() - _estep_t0
         if config.verbose and n_chunks > 1:

@@ -2,11 +2,12 @@
 """Offline compiler for the AlarmPeriod MHP sparse association cache.
 
 The cache covers every feature entity in the supplied NE graph crossed with
-every alarm type learned by the feature artifact, plus all eight frozen
-dynamic-state combinations. It stores only edges whose peak score reaches the
-configured immigrant threshold. The online engine reconstructs this universe
-from the same fingerprinted graph/model inputs, so zero-edge signatures need
-no persistent negative records.
+every alarm type learned by the feature artifact. It stores only edges whose
+peak score reaches the configured immigrant threshold. In target-dynamic mode,
+only the target's eight frozen states are materialized because source state
+cannot affect alpha. The online engine reconstructs this universe from the
+same fingerprinted graph/model inputs, so zero-edge signatures need no
+persistent negative records.
 
 Devices added after the graph snapshot (or alarm types absent from the model
 vocabulary) are compiled incrementally by ``stream_alarm_period_mhp.py`` and
@@ -32,10 +33,12 @@ from alarm_flow_mhp.aggregator import load_alarm_mhp_artifact
 from alarm_flow_mhp.stream_alarm_period_mhp import (
     ASSOCIATION_CACHE_FORMAT,
     ASSOCIATION_CACHE_VERSION,
+    CACHE_STATE_LAYOUT_TARGET_ONLY,
     CompiledAssociationPlan,
     PeriodStreamConfig,
     _build_runtime_scorers,
     association_cache_fingerprint,
+    association_cache_state_layout,
     build_compact_csr_arrays,
     graph_period_types,
     write_association_cache,
@@ -58,10 +61,22 @@ class _BinaryEdgeSpool:
 
     _FLOAT_FIELDS = ("base_scores", "thresholds", "past_windows", "future_windows")
 
-    def __init__(self, directory, period_types, buffer_size=100_000):
+    def __init__(
+        self,
+        directory,
+        period_types,
+        state_layout,
+        buffer_size=100_000,
+    ):
         self.period_types = tuple(period_types)
         self.type_to_id = {value: index for index, value in enumerate(self.period_types)}
+        self.state_layout = str(state_layout)
         self.signature_count = len(self.period_types) * 8
+        self.source_key_count = (
+            len(self.period_types)
+            if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+            else self.signature_count
+        )
         self.id_dtype = (
             np.uint32
             if self.signature_count <= np.iinfo(np.uint32).max
@@ -81,7 +96,9 @@ class _BinaryEdgeSpool:
             self.type_to_id[target.period_type] * 8 + target.initial_state
         )
         self.buffers["source_signature_ids"].append(
-            self.type_to_id[source.period_type] * 8 + source.initial_state
+            self.type_to_id[source.period_type]
+            if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+            else self.type_to_id[source.period_type] * 8 + source.initial_state
         )
         self.buffers["base_scores"].append(edge.base_score)
         self.buffers["thresholds"].append(edge.threshold)
@@ -117,6 +134,7 @@ class _BinaryEdgeSpool:
                 empty_values,
                 empty_values,
                 self.signature_count,
+                source_key_count=self.source_key_count,
             )
         raw = {
             "target_signature_ids": np.memmap(
@@ -138,6 +156,7 @@ class _BinaryEdgeSpool:
             raw["past_windows"],
             raw["future_windows"],
             self.signature_count,
+            source_key_count=self.source_key_count,
         )
 
 
@@ -243,6 +262,10 @@ def main():
         )
 
     plan = CompiledAssociationPlan(scorer, mu_scorer, artifact, config)
+    state_layout = association_cache_state_layout(
+        getattr(artifact.config, "dynamic_alpha", "off")
+    )
+    state_expansion = 8 if state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY else 64
     candidate_t0 = time.monotonic()
     prepared_candidates = plan.prepare_candidate_period_types(period_types)
     period_types = prepared_candidates["period_types"]
@@ -250,7 +273,9 @@ def main():
     if not args.quiet:
         print(
             f"[period-cache] total_type_pairs={total_type_pairs}, "
-            f"max_state_edges={total_type_pairs * 64}, "
+            f"state_layout={state_layout}, "
+            f"states_per_type_pair={state_expansion}, "
+            f"max_state_edges={total_type_pairs * state_expansion}, "
             f"candidate_index_elapsed={time.monotonic() - candidate_t0:.1f}s, "
             "estimated_active_edges=pending, ETA=pending",
             flush=True,
@@ -304,7 +329,7 @@ def main():
         render_progress(type_pairs, active_edges, pruned_pairs)
 
     with tempfile.TemporaryDirectory(prefix="alarm-period-cache-") as spool_dir:
-        spool = _BinaryEdgeSpool(spool_dir, period_types)
+        spool = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
         type_pair_count = plan.precompile_period_types(
             period_types,
             progress=report,
@@ -341,6 +366,8 @@ def main():
                 "type_universe": "graph",
                 "period_type_count": len(period_types),
                 "signature_count": len(period_types) * 8,
+                "source_key_count": spool.source_key_count,
+                "state_layout": state_layout,
                 "edge_count": spool.count,
                 "pruned_pair_count": plan.pruned_pair_count,
                 "graph_entity_count": graph_entity_count,

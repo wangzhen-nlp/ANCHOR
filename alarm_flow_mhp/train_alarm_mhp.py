@@ -153,6 +153,8 @@ def _build_config(args):
         stability_radius=args.stability_radius,
         feature_spectral_cap=args.feature_spectral_cap,
         chunk_size=args.chunk_size,
+        estep_workers=args.estep_workers,
+        estep_device=args.estep_device,
         kernel_type=args.kernel_type,
         bucket_edges_sec=_parse_bucket_edges(args.bucket_edges_sec),
         val_split=args.val_split,
@@ -439,6 +441,29 @@ def main():
             "Events processed per chunk in E-step. Peak pair memory per chunk "
             "is chunk_size * max_history_events * ~16 bytes. Default 20000 "
             "(~40 MB at K=128). Bump to 50000 for 2M+ events if you have headroom."
+        ),
+    )
+    parser.add_argument(
+        "--estep-workers",
+        type=int,
+        default=1,
+        help=(
+            "Worker threads for the chunked E-step scan. 0 = auto "
+            "(min(8, cpu count)), 1 = serial. Chunk results merge in chunk "
+            "order, so the trained model is identical for any worker count; "
+            "peak memory grows by ~(workers + 2) in-flight chunks. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--estep-device",
+        choices=("auto", "cpu", "cuda"),
+        default="cpu",
+        help=(
+            "GPU offload for the E-step chunk math (requires torch). 'auto' "
+            "picks CUDA when available, else stays on CPU — safe without "
+            "torch installed. GPU results are statistically equivalent but "
+            "not bit-identical to CPU; use 'cpu' for exact reproducibility. "
+            "Default: cpu."
         ),
     )
     # Held-out validation (the thing that makes training meaningful):
