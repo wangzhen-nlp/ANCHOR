@@ -65,6 +65,7 @@ EDGE_MODES = frozenset({"device", "feature"})
 #                   target event's pre-state (time-slack safe); compensator
 #                   buckets target state sampled at source_ts.
 DYNAMIC_ALPHA_MODES = frozenset({"off", "source", "target", "source_target"})
+CLEAR_TIME_TEACHER_MODES = frozenset({"redistribute", "full"})
 ARTIFACT_TYPE = "alarm_flow_mhp.v1"
 
 # Default piecewise bucket right-edges in REAL SECONDS. Short-end dense to
@@ -106,6 +107,16 @@ class AlarmMHPConfig:
     min_events: int = 2
     time_scale_sec: float = 60.0
     include_clear: bool = False
+    # Training-only privileged signal from alarm clear timestamps.  A positive
+    # boost multiplies candidate-parent responsibilities by
+    #   1 + boost * exp(-|clear_i-clear_j| / tau)
+    # without adding clear time to the deployed feature vector.  "redistribute"
+    # (default) preserves each event's original immigrant/triggered mass and only
+    # reallocates responsibility among candidate parents; "full" renormalizes
+    # the boosted parent scores together with μ.
+    clear_time_teacher_boost: float = 0.0
+    clear_time_teacher_tau_sec: float = 60.0
+    clear_time_teacher_mode: str = "redistribute"
     # EM hyperparameters:
     max_iters: int = 30
     tol: float = 1e-4
@@ -218,6 +229,15 @@ class AlarmMHPConfig:
             raise ValueError("max_iters must be >= 1")
         if self.tol < 0:
             raise ValueError("tol must be >= 0")
+        if self.clear_time_teacher_boost < 0:
+            raise ValueError("clear_time_teacher_boost must be non-negative")
+        if self.clear_time_teacher_tau_sec <= 0:
+            raise ValueError("clear_time_teacher_tau_sec must be > 0")
+        if self.clear_time_teacher_mode not in CLEAR_TIME_TEACHER_MODES:
+            raise ValueError(
+                "clear_time_teacher_mode must be one of "
+                f"{sorted(CLEAR_TIME_TEACHER_MODES)}"
+            )
         if self.alpha_prior_strength <= 0:
             raise ValueError("alpha_prior_strength must be > 0")
         if self.alpha_prior_mean < 0:
@@ -525,6 +545,42 @@ def summarize_alarm_event(event, index):
         ),
         "告警清除时间": _event_metadata_value(event, "告警清除时间", "clear_time"),
     }
+
+
+def _aligned_clear_times(events):
+    """Parse per-event clear timestamps into an aligned float64/NaN array.
+
+    The teacher consumes absolute wall-clock seconds, not model-scaled event
+    times.  A clear timestamp earlier than its own occurrence is treated as bad
+    metadata and therefore neutral rather than becoming a misleading signal.
+    """
+    from fault_grouping.alarm_events.io import parse_datetime_text
+
+    out = np.full(len(events), np.nan, dtype=np.float64)
+    stats = {
+        "event_count": int(len(events)),
+        "valid_count": 0,
+        "missing_count": 0,
+        "invalid_count": 0,
+        "before_occurrence_count": 0,
+    }
+    for i, event in enumerate(events):
+        text = _event_metadata_value(event, "告警清除时间", "clear_time")
+        if not text:
+            stats["missing_count"] += 1
+            continue
+        try:
+            clear_ts = float(parse_datetime_text(text, "告警清除时间").timestamp())
+        except (ValueError, OverflowError, OSError):
+            stats["invalid_count"] += 1
+            continue
+        occurrence_ts = float(event.get("ts", 0.0)) if isinstance(event, dict) else 0.0
+        if clear_ts + 1e-6 < occurrence_ts:
+            stats["before_occurrence_count"] += 1
+            continue
+        out[i] = clear_ts
+        stats["valid_count"] += 1
+    return out, stats
 
 
 def _event_type_counts(sequence):
@@ -995,6 +1051,49 @@ def train_alarm_mhp(
     train_events = _events_to_collection(train_view, M)
     val_events = _events_to_collection(val_view, M) if val_view is not None else None
 
+    train_clear_times = None
+    clear_teacher_stats = {
+        "enabled": bool(config.clear_time_teacher_boost > 0),
+        "boost": float(config.clear_time_teacher_boost),
+        "tau_sec": float(config.clear_time_teacher_tau_sec),
+        "mode": config.clear_time_teacher_mode,
+    }
+    if config.clear_time_teacher_boost > 0:
+        clear_times_full, parse_stats = _aligned_clear_times(sequence.events)
+        train_clear_times = clear_times_full[: train_events.n]
+        clear_teacher_stats.update(parse_stats)
+        clear_teacher_stats["train_valid_count"] = int(np.isfinite(train_clear_times).sum())
+        if verbose:
+            print(
+                "[train] clear-time teacher: "
+                f"mode={config.clear_time_teacher_mode}, "
+                f"boost={config.clear_time_teacher_boost:g}, "
+                f"tau={config.clear_time_teacher_tau_sec:g}s, "
+                f"train_clear={clear_teacher_stats['train_valid_count']}/{train_events.n}",
+                flush=True,
+            )
+            if clear_teacher_stats["train_valid_count"] < 2:
+                print(
+                    "[train] WARN: clear-time teacher has fewer than two valid "
+                    "training clear timestamps and will be effectively neutral",
+                    flush=True,
+                )
+    teacher_kwargs = {
+        "clear_times": train_clear_times,
+        "clear_time_teacher_boost": float(config.clear_time_teacher_boost),
+        "clear_time_teacher_tau": float(config.clear_time_teacher_tau_sec),
+        "clear_time_teacher_mode": config.clear_time_teacher_mode,
+        # A teacher E-step no longer guarantees monotone raw train LL. When val
+        # drives selection, expose every current snapshot instead of only raw-
+        # train-LL records so validation really sees the full trajectory.
+        "snapshot_callback_every_iter": bool(
+            config.clear_time_teacher_boost > 0
+            and val_events is not None
+            and val_events.n > 0
+            and config.selection_metric == "val"
+        ),
+    }
+
     # Dynamic (stateful) α: per-modeled-event marks, aligned to the TRAIN slice.
     # The state machine runs over the full stream (clears included) before
     # clears are dropped; combos pack the 3 uncleared-alarm booleans.
@@ -1097,12 +1196,10 @@ def train_alarm_mhp(
     mhp_config = config.mhp_config()
     mhp_config.verbose = verbose
 
-    # Live held-out val LL → model selection + early stop. EM ascends train LL
-    # monotonically, so best_callback fires ~every iter; we eval val LL on each
-    # such snapshot (one forward LL pass over the val tail, no M-step) and keep
-    # the snapshot at the val-LL peak. This makes the saved model the
-    # generalizing one instead of the most train-overfit one. With val_split=0
-    # the tracking is inert and behavior is unchanged (every train-best written).
+    # Live held-out val LL → model selection + early stop. Pure EM exposes each
+    # new train-LL best as before. A clear-time teacher breaks raw-LL monotonicity,
+    # so teacher+val mode explicitly exposes EVERY current snapshot; val can then
+    # select across the complete trajectory instead of a train-best-only subset.
     val_ll_history: list[float] = []
     val_trace: list[dict] = []
     val_state = {
@@ -1125,6 +1222,9 @@ def train_alarm_mhp(
             "iter": trace_entry["iter"],
             "active_edges": trace_entry["active_edges"],
             "log_likelihood_train": trace_entry["log_likelihood"],
+            "parameter_delta_rel": trace_entry.get("parameter_delta_rel"),
+            "convergence_delta_rel": trace_entry.get("convergence_delta_rel"),
+            "convergence_metric": trace_entry.get("convergence_metric"),
             "spectral_radius": trace_entry.get("spectral_radius"),
             "spectral_radius_kind": trace_entry.get(
                 "spectral_radius_kind", "baseline"
@@ -1172,9 +1272,8 @@ def train_alarm_mhp(
     feat_node_domains = {}
 
     def write_best_checkpoint(best_result: MHPResult, trace_entry: dict) -> bool:
-        # Called by EM whenever train LL hits a new best (≈ every iter, since EM
-        # ascends monotonically). Returns True to request early stop (val LL has
-        # plateaued); the feature-mode loop honors this signal.
+        # Pure EM calls this on train-LL records; teacher+val calls it every
+        # iteration. Returns True to request early stop when val LL plateaus.
         use_val = val_events is not None and val_events.n > 0
         # Whether the held-out metric drives selection/early-stop, vs. just being
         # printed. "train" (default) → legacy: every train-best is the new best,
@@ -1297,6 +1396,7 @@ def train_alarm_mhp(
                 "type_labels": list(vocabs.type_vocab.labels),
                 "time_slack_sec": float(config.time_slack_sec),
                 "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
+                "clear_time_teacher": dict(clear_teacher_stats),
                 "feature_kernel": (
                     best_result.feature_kernel.to_dict()
                     if best_result.feature_kernel is not None else None
@@ -1505,6 +1605,7 @@ def train_alarm_mhp(
             dynamic_feature_names=dyn_feature_names,
             iter_callback=iter_callback,
             best_callback=write_best_checkpoint,
+            **teacher_kwargs,
         )
         # Stationarity is reported below, AFTER val-selection + the optional
         # spectral cap, so it reflects the actually-deployed model (not the
@@ -1522,6 +1623,7 @@ def train_alarm_mhp(
             iter_callback=iter_callback,
             topo_prior_flat=topo_prior_flat,
             topo_prior_score=topo_prior_score,
+            **teacher_kwargs,
         )
         # Stage 2: box-basis EM on the fixed edges from stage 1.
         if verbose:
@@ -1536,6 +1638,7 @@ def train_alarm_mhp(
             edge_sources=stage1.params.edge_sources,
             init_mu=stage1.params.mu,
             best_callback=write_best_checkpoint,
+            **teacher_kwargs,
         )
     else:
         result = fit_mhp(
@@ -1545,6 +1648,7 @@ def train_alarm_mhp(
             best_callback=write_best_checkpoint,
             topo_prior_flat=topo_prior_flat,
             topo_prior_score=topo_prior_score,
+            **teacher_kwargs,
         )
 
     from mhp.em import log_likelihood as mhp_ll
@@ -1772,6 +1876,7 @@ def train_alarm_mhp(
         "type_labels": list(vocabs.type_vocab.labels),
         "time_slack_sec": float(config.time_slack_sec),
         "late_penalty_half_life_sec": float(config.late_penalty_half_life_sec),
+        "clear_time_teacher": clear_teacher_stats,
         "cascade_size_stats_soft": cascade_stats_soft,
         "cascade_size_stats": cascade_stats_hard,
         "topology_consistency": topology_report,

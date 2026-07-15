@@ -11,6 +11,7 @@ Also checks device-mode φ is unchanged (no domain columns) and μ parity.
 import os
 import sys
 import unittest
+from datetime import datetime
 
 import numpy as np
 
@@ -34,6 +35,14 @@ from alarm_flow_mhp.feature_spec import (
     make_entity,
 )
 from mhp.feature_kernel import FeatureKernel
+from mhp.em import (
+    MHPConfig as CoreMHPConfig,
+    _apply_clear_time_teacher,
+    _run_estep_iteration,
+    fit_mhp,
+    fit_mhp_feature,
+)
+from mhp.events import EventCollection
 from alarm_flow_mhp.feature_spec import MuFeatureSpec
 
 LINK = "Physical Port Down"      # -> link
@@ -268,6 +277,200 @@ def test_site_domain_source_target_dynamic_mode():
         "tgt_uncleared_power",
         "tgt_uncleared_offline",
     ]
+
+
+def _clear_teacher_fixture():
+    events = EventCollection(
+        times=np.array([0.0, 0.0, 1.0]),
+        dims=np.array([0, 1, 2]),
+        M=3,
+        T=2.0,
+    )
+    config = CoreMHPConfig(
+        history_window=5.0,
+        max_history_events=4,
+        beta_mode="shared",
+        beta_shared_value=1.0,
+        chunk_size=8,
+        estep_device="cpu",
+        verbose=False,
+    )
+    alpha = np.zeros((3, 3), dtype=np.float32)
+    alpha[2, 0] = 0.5
+    alpha[2, 1] = 0.5
+    mu = np.array([0.2, 0.2, 0.2])
+    # Target clear matches source 0; source 1 is far outside tau.
+    clear_times = np.array([100.0, 1000.0, 100.0])
+    return events, config, alpha, mu, clear_times
+
+
+def test_clear_teacher_posterior_modes():
+    p_self = np.array([0.4], dtype=np.float64)
+    p_parent = np.array([0.3, 0.3], dtype=np.float64)
+    target_local = np.array([0, 0], dtype=np.int64)
+    target = np.array([2, 2], dtype=np.int64)
+    source = np.array([0, 1], dtype=np.int64)
+    clear_times = np.array([100.0, 1000.0, 100.0])
+
+    red_self, red_parent = _apply_clear_time_teacher(
+        p_self, p_parent, target_local, target, source, clear_times,
+        boost=1.0, tau=10.0, mode="redistribute",
+    )
+    np.testing.assert_allclose(red_self, p_self)
+    assert np.isclose(red_parent.sum(), p_parent.sum())
+    assert red_parent[0] > red_parent[1]
+
+    full_self, full_parent = _apply_clear_time_teacher(
+        p_self, p_parent, target_local, target, source, clear_times,
+        boost=1.0, tau=10.0, mode="full",
+    )
+    assert full_self[0] < p_self[0]
+    assert full_parent[0] > full_parent[1]
+    assert np.isclose(full_self[0] + full_parent.sum(), 1.0)
+
+    missing = np.full(3, np.nan)
+    missing_self, missing_parent = _apply_clear_time_teacher(
+        p_self, p_parent, target_local, target, source, missing,
+        boost=5.0, tau=10.0, mode="full",
+    )
+    assert missing_self is p_self
+    assert missing_parent is p_parent
+
+
+def test_clear_teacher_device_estep_keeps_true_ll():
+    events, config, alpha, mu, clear_times = _clear_teacher_fixture()
+    beta = np.float32(1.0)
+    base = _run_estep_iteration(events, alpha, beta, mu, config)
+    taught = _run_estep_iteration(
+        events,
+        alpha,
+        beta,
+        mu,
+        config,
+        clear_times=clear_times,
+        clear_time_teacher_boost=1.0,
+        clear_time_teacher_tau=10.0,
+        clear_time_teacher_mode="redistribute",
+    )
+
+    base_p_self, base_alpha_num, _, _, base_ll_term = base
+    taught_p_self, taught_alpha_num, _, _, taught_ll_term = taught
+    np.testing.assert_allclose(taught_p_self, base_p_self)
+    assert np.isclose(taught_ll_term, base_ll_term)
+    assert np.isclose(base_alpha_num[2, 0], base_alpha_num[2, 1])
+    assert taught_alpha_num[2, 0] > taught_alpha_num[2, 1]
+
+
+def test_clear_teacher_feature_mstep_learns_preferred_feature():
+    events, _, _, _, clear_times = _clear_teacher_fixture()
+    phi = np.array([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]], dtype=np.float32)
+    callback_iters = []
+    result = fit_mhp_feature(
+        events,
+        CoreMHPConfig(
+            history_window=5.0,
+            max_history_events=4,
+            max_iters=2,
+            tol=0.0,
+            beta_mode="shared",
+            beta_shared_value=1.0,
+            edge_threshold=0.0,
+            chunk_size=8,
+            estep_device="cpu",
+            verbose=False,
+        ),
+        cand_targets=np.array([2, 2]),
+        cand_sources=np.array([0, 1]),
+        cand_phi=phi,
+        feature_names=["bias", "preferred", "other"],
+        l2=1e-3,
+        clear_times=clear_times,
+        clear_time_teacher_boost=1.0,
+        clear_time_teacher_tau=10.0,
+        clear_time_teacher_mode="redistribute",
+        best_callback=lambda _result, entry: callback_iters.append(entry["iter"]),
+        snapshot_callback_every_iter=True,
+    )
+    edge_alpha = {
+        (int(t), int(s)): float(a)
+        for t, s, a in zip(
+            result.params.edge_targets,
+            result.params.edge_sources,
+            result.params.edge_alpha,
+        )
+    }
+    assert edge_alpha[(2, 0)] > edge_alpha[(2, 1)]
+    assert callback_iters == list(range(result.iterations_run))
+    assert all(entry["convergence_metric"] == "parameters" for entry in result.trace)
+
+
+def test_clear_teacher_nonmonotone_train_ll_still_snapshots_every_iteration():
+    rng = np.random.default_rng(0)
+    n, m = 120, 5
+    times = np.cumsum(rng.exponential(0.3, n))
+    dims = rng.integers(0, m, n)
+    events = EventCollection(times=times, dims=dims, M=m, T=float(times[-1] + 1.0))
+    clear_times = (
+        np.floor((times + rng.normal(0.0, 8.0, n)) / 2.0) * 2.0
+        + rng.integers(0, 3, n) * 30.0
+    )
+    callback_iters = []
+    result = fit_mhp(
+        events,
+        CoreMHPConfig(
+            history_window=4.0,
+            max_history_events=20,
+            max_iters=12,
+            tol=0.0,
+            alpha_prior_strength=1.0,
+            beta_shared_value=1.0,
+            chunk_size=50,
+            edge_threshold=0.0,
+            max_active_sources_per_dim=5,
+            branching_cap=0.95,
+            verbose=False,
+        ),
+        clear_times=clear_times,
+        clear_time_teacher_boost=100.0,
+        clear_time_teacher_tau=0.5,
+        clear_time_teacher_mode="redistribute",
+        best_callback=lambda _result, entry: callback_iters.append(entry["iter"]),
+        snapshot_callback_every_iter=True,
+    )
+    train_ll = np.asarray([entry["log_likelihood"] for entry in result.trace])
+    assert np.any(np.diff(train_ll) < 0.0)  # teacher breaks raw-LL monotonicity
+    assert callback_iters == list(range(result.iterations_run))
+    assert all(entry["convergence_metric"] == "parameters" for entry in result.trace)
+    assert all(entry["parameter_delta_rel"] is not None for entry in result.trace)
+
+
+def test_clear_teacher_alarm_adapter_aligns_and_records_metadata():
+    events = _events()
+    for start in range(0, len(events), 3):
+        group = events[start:start + 3]
+        clear_ts = max(event["ts"] for event in group) + 30.0
+        clear_text = datetime.fromtimestamp(clear_ts).strftime("%Y-%m-%d %H:%M:%S")
+        for event in group:
+            event["alarm"]["告警清除时间"] = clear_text
+
+    artifact = train_alarm_mhp(
+        events,
+        AlarmMHPConfig(
+            edge_mode="device",
+            history_window_sec=60.0,
+            time_scale_sec=60.0,
+            max_iters=2,
+            min_events=2,
+            clear_time_teacher_boost=0.5,
+            clear_time_teacher_tau_sec=60.0,
+            clear_time_teacher_mode="redistribute",
+        ),
+        verbose=False,
+    )
+    teacher = artifact.training_metadata["clear_time_teacher"]
+    assert teacher["enabled"] is True
+    assert teacher["train_valid_count"] == len(events)
+    assert teacher["mode"] == "redistribute"
 
 
 def load_tests(_loader, _tests, _pattern):

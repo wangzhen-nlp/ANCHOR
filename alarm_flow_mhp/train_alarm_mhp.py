@@ -126,6 +126,9 @@ def _build_config(args):
         min_events=args.min_events,
         time_scale_sec=args.time_scale_sec,
         include_clear=args.include_clear,
+        clear_time_teacher_boost=args.clear_time_teacher_boost,
+        clear_time_teacher_tau_sec=args.clear_time_teacher_tau_sec,
+        clear_time_teacher_mode=args.clear_time_teacher_mode,
         max_iters=args.max_iters,
         tol=args.tol,
         alpha_prior_strength=args.alpha_prior_strength,
@@ -278,6 +281,33 @@ def main():
     parser.add_argument("--min-events", type=int, default=2)
     parser.add_argument("--time-scale-sec", type=float, default=60.0)
     parser.add_argument("--include-clear", action="store_true")
+    parser.add_argument(
+        "--clear-time-teacher-boost",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-only clear-time affinity strength lambda. Candidate-parent "
+            "weight is 1 + lambda*exp(-abs(clear_i-clear_j)/tau). 0 disables "
+            "the teacher and preserves legacy training exactly. Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--clear-time-teacher-tau-sec",
+        type=float,
+        default=60.0,
+        help="Clear-time affinity decay scale tau in wall-clock seconds. Default: 60.",
+    )
+    parser.add_argument(
+        "--clear-time-teacher-mode",
+        choices=("redistribute", "full"),
+        default="redistribute",
+        help=(
+            "How clear affinity changes E-step responsibilities. 'redistribute' "
+            "keeps the original immigrant/triggered mass and only reallocates "
+            "among parent candidates (safer default); 'full' renormalizes boosted "
+            "parents together with mu. Inference never uses clear time."
+        ),
+    )
     # EM:
     parser.add_argument(
         "--max-iters",

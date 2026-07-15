@@ -158,6 +158,128 @@ def _apply_time_slack(pair_dt: np.ndarray, config: MHPConfig):
     return dt_eff, weight
 
 
+def _validate_clear_time_teacher(
+    clear_times: Optional[np.ndarray],
+    n_events: int,
+    boost: float,
+    tau: float,
+    mode: str,
+) -> Optional[np.ndarray]:
+    """Validate and normalize an optional training-only clear-time teacher.
+
+    Clear timestamps and ``tau`` must use the same units.  The alarm adapter
+    passes absolute Unix seconds, independently of the MHP event-time scaling.
+    Missing or invalid timestamps are represented by NaN and are neutral.
+    """
+    boost = float(boost)
+    tau = float(tau)
+    if boost < 0:
+        raise ValueError("clear_time_teacher_boost must be non-negative")
+    if tau <= 0:
+        raise ValueError("clear_time_teacher_tau must be > 0")
+    if mode not in {"redistribute", "full"}:
+        raise ValueError("clear_time_teacher_mode must be 'redistribute' or 'full'")
+    if boost == 0:
+        return None
+    if clear_times is None:
+        raise ValueError("clear_times are required when clear_time_teacher_boost > 0")
+    out = np.asarray(clear_times, dtype=np.float64).reshape(-1)
+    if len(out) != int(n_events):
+        raise ValueError(f"clear_times length {len(out)} != event count {n_events}")
+    return out
+
+
+def _apply_clear_time_teacher(
+    p_self: np.ndarray,
+    p_parent: np.ndarray,
+    pair_target_local: np.ndarray,
+    pair_target: np.ndarray,
+    pair_source: np.ndarray,
+    clear_times: Optional[np.ndarray],
+    *,
+    boost: float,
+    tau: float,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply clear-time affinity to already-normalized E-step posteriors.
+
+    Keeping this after the ordinary score normalization has two useful
+    properties: CPU and GPU use exactly the same teacher transformation, and
+    the caller can continue reporting the true occurrence-process LL rather
+    than a teacher-augmented pseudo likelihood.
+    """
+    if clear_times is None or float(boost) == 0.0 or len(p_parent) == 0:
+        return p_self, p_parent
+
+    target_clear = clear_times[np.asarray(pair_target, dtype=np.int64)]
+    source_clear = clear_times[np.asarray(pair_source, dtype=np.int64)]
+    observed = np.isfinite(target_clear) & np.isfinite(source_clear)
+    if not observed.any():
+        return p_self, p_parent
+
+    weights = np.ones(len(p_parent), dtype=np.float64)
+    delta = np.abs(target_clear[observed] - source_clear[observed])
+    weights[observed] += float(boost) * np.exp(-delta / float(tau))
+    weighted = np.asarray(p_parent, dtype=np.float64) * weights
+
+    tlocal = np.asarray(pair_target_local, dtype=np.int64)
+    csize = len(p_self)
+    weighted_sum = _segment_sum(weighted, tlocal, csize)
+    if mode == "redistribute":
+        # Preserve P(triggered | event) and only alter P(parent=j | triggered).
+        original_sum = _segment_sum(
+            np.asarray(p_parent, dtype=np.float64), tlocal, csize
+        )
+        scale = np.divide(
+            original_sum,
+            weighted_sum,
+            out=np.ones_like(original_sum),
+            where=weighted_sum > _EPS,
+        )
+        return p_self, weighted * scale[tlocal]
+
+    # Full teacher: boosted parents compete with the immigrant posterior too.
+    denom = np.asarray(p_self, dtype=np.float64) + weighted_sum
+    denom = np.maximum(denom, _EPS)
+    return np.asarray(p_self, dtype=np.float64) / denom, weighted / denom[tlocal]
+
+
+def _relative_parameter_change(*parameter_pairs) -> float:
+    """Max relative parameter change without materializing dense differences.
+
+    Device-mode alpha/beta matrices can be several GiB, so this scans flat
+    chunks and keeps only small temporaries.  A scale floor of one makes the
+    configured tolerance an absolute tolerance for sub-unit Hawkes parameters.
+    """
+    max_change = 0.0
+    for old, new in parameter_pairs:
+        if old is None or new is None:
+            continue
+        old_arr = np.asarray(old)
+        new_arr = np.asarray(new)
+        if old_arr.shape != new_arr.shape:
+            raise ValueError(
+                f"parameter shape changed during EM: {old_arr.shape} -> {new_arr.shape}"
+            )
+        old_flat = old_arr.reshape(-1)
+        new_flat = new_arr.reshape(-1)
+        max_diff = 0.0
+        max_old = 0.0
+        scan = 1_000_000
+        for start in range(0, old_flat.size, scan):
+            end = min(start + scan, old_flat.size)
+            old_chunk = old_flat[start:end]
+            new_chunk = new_flat[start:end]
+            if old_chunk.size:
+                max_diff = max(
+                    max_diff,
+                    float(np.max(np.abs(new_chunk - old_chunk))),
+                )
+                max_old = max(max_old, float(np.max(np.abs(old_chunk))))
+        max_change = max(max_change, max_diff / max(max_old, 1.0))
+    return float(max_change)
+
+
 @dataclass
 class MHPResult:
     params: MHPParams
@@ -602,6 +724,11 @@ def _run_estep_iteration(
     beta: np.ndarray,
     mu: np.ndarray,
     config: MHPConfig,
+    *,
+    clear_times: Optional[np.ndarray] = None,
+    clear_time_teacher_boost: float = 0.0,
+    clear_time_teacher_tau: float = 1.0,
+    clear_time_teacher_mode: str = "redistribute",
 ):
     """One full E-step pass, chunked, accumulating M-step sufficient stats.
 
@@ -642,8 +769,8 @@ def _run_estep_iteration(
         mu_chunk = mu[target_dims_chunk]
 
         (
-            _,
-            _,
+            pair_target,
+            pair_source,
             pair_dt,
             pair_target_dim,
             pair_source_dim,
@@ -693,6 +820,18 @@ def _run_estep_iteration(
             # p_ij[p] = score[p] / rate[target_local]
             p_ij = score_pair / rate[pair_target_local].astype(np.float32)
             ll_chunk = float(np.log(rate).sum())
+
+        p_self_chunk, p_ij = _apply_clear_time_teacher(
+            p_self_chunk,
+            p_ij,
+            pair_target_local,
+            pair_target,
+            pair_source,
+            clear_times,
+            boost=clear_time_teacher_boost,
+            tau=clear_time_teacher_tau,
+            mode=clear_time_teacher_mode,
+        )
 
         # Per-type sufficient stats: hand back the raw scatter arrays.
         flat_uv = pair_target_dim.astype(np.int64) * M + pair_source_dim.astype(np.int64)
@@ -770,6 +909,11 @@ def fit_mhp(
     best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
     topo_prior_flat: Optional[np.ndarray] = None,
     topo_prior_score: Optional[np.ndarray] = None,
+    clear_times: Optional[np.ndarray] = None,
+    clear_time_teacher_boost: float = 0.0,
+    clear_time_teacher_tau: float = 1.0,
+    clear_time_teacher_mode: str = "redistribute",
+    snapshot_callback_every_iter: bool = False,
 ) -> MHPResult:
     """Run MAP EM on the event sequence.
 
@@ -781,6 +925,14 @@ def fit_mhp(
     M = events.M
     N = events.n
     horizon = events.T
+    clear_times = _validate_clear_time_teacher(
+        clear_times,
+        N,
+        clear_time_teacher_boost,
+        clear_time_teacher_tau,
+        clear_time_teacher_mode,
+    )
+    teacher_enabled = clear_times is not None
     if getattr(config, "time_slack", 0.0) > 0 and config.beta_mode == "per_edge":
         raise NotImplementedError(
             "time_slack > 0 currently supports beta_mode='shared' only; "
@@ -853,7 +1005,15 @@ def fit_mhp(
         t_iter_start = time.monotonic()
         # E-step (chunked) returns sufficient statistics for M-step
         p_self, alpha_num, beta_num_dt, mu_num, ll_term1 = _run_estep_iteration(
-            events, alpha, beta, mu, config
+            events,
+            alpha,
+            beta,
+            mu,
+            config,
+            clear_times=clear_times,
+            clear_time_teacher_boost=clear_time_teacher_boost,
+            clear_time_teacher_tau=clear_time_teacher_tau,
+            clear_time_teacher_mode=clear_time_teacher_mode,
         )
         t_estep_end = time.monotonic()
 
@@ -934,6 +1094,15 @@ def fit_mhp(
         # Sparsity and stability
         n_rescaled = _apply_branching_cap(alpha_new, config.branching_cap)
         _apply_top_k_per_target(alpha_new, config.max_active_sources_per_dim, config.edge_threshold)
+        parameter_delta_rel = (
+            _relative_parameter_change(
+                (alpha, alpha_new),
+                (beta, beta_new),
+                (mu, mu_new),
+            )
+            if teacher_enabled else None
+        )
+        convergence_delta_rel = parameter_delta_rel if teacher_enabled else delta_rel
 
         t_iter_end = time.monotonic()
         iter_total = t_iter_end - t_iter_start
@@ -943,6 +1112,11 @@ def fit_mhp(
             "iter": it,
             "log_likelihood": float(ll),
             "delta_rel": float(delta_rel),
+            "parameter_delta_rel": (
+                float(parameter_delta_rel) if parameter_delta_rel is not None else None
+            ),
+            "convergence_delta_rel": float(convergence_delta_rel),
+            "convergence_metric": "parameters" if teacher_enabled else "log_likelihood",
             "branching_rescaled": n_rescaled,
             "active_edges": active_edges,
             "mu_max": float(mu.max()),
@@ -960,38 +1134,62 @@ def fit_mhp(
         trace.append(trace_entry)
         if iter_callback is not None:
             iter_callback(trace_entry)
-        if is_best and best_callback is not None:
-            if best_beta_scalar is not None:
-                edge_beta_arr = np.full(len(best_edge_targets), best_beta_scalar, dtype=np.float64)
+        stop_requested = False
+        if best_callback is not None and (is_best or snapshot_callback_every_iter):
+            if snapshot_callback_every_iter:
+                snap_t, snap_s = np.nonzero(alpha)
+                snap_alpha = alpha[snap_t, snap_s].astype(np.float64)
+                snap_mu = mu.copy()
+                snap_p_self = p_self
+                snap_ll = float(ll)
+                if np.ndim(beta) == 0:
+                    snap_beta = np.full(len(snap_t), float(beta), dtype=np.float64)
+                else:
+                    snap_beta = beta[snap_t, snap_s].astype(np.float64)
             else:
-                edge_beta_arr = (
-                    best_edge_beta if best_edge_beta is not None else np.zeros(len(best_edge_targets))
-                )
+                snap_t = best_edge_targets
+                snap_s = best_edge_sources
+                snap_alpha = best_edge_alpha
+                snap_mu = best_mu
+                snap_p_self = best_p_self
+                snap_ll = float(best_ll)
+                if best_beta_scalar is not None:
+                    snap_beta = np.full(
+                        len(best_edge_targets), best_beta_scalar, dtype=np.float64
+                    )
+                else:
+                    snap_beta = (
+                        best_edge_beta
+                        if best_edge_beta is not None
+                        else np.zeros(len(best_edge_targets))
+                    )
             checkpoint_params = MHPParams.from_edges(
                 M=M,
-                mu=best_mu,
-                edge_targets=best_edge_targets,
-                edge_sources=best_edge_sources,
-                edge_alpha=best_edge_alpha,
-                edge_beta=edge_beta_arr,
+                mu=snap_mu,
+                edge_targets=snap_t,
+                edge_sources=snap_s,
+                edge_alpha=snap_alpha,
+                edge_beta=snap_beta,
                 edge_threshold=config.edge_threshold,
                 max_active_sources_per_dim=config.max_active_sources_per_dim,
                 beta_shared=(config.beta_mode == "shared"),
             )
-            best_callback(
+            callback_result = best_callback(
                 MHPResult(
                     params=checkpoint_params,
-                    log_likelihood=best_ll,
+                    log_likelihood=snap_ll,
                     iterations_run=len(trace),
                     converged=False,
                     trace=list(trace),
-                    p_self=best_p_self,
+                    p_self=snap_p_self,
                 ),
                 trace_entry,
             )
+            stop_requested = bool(callback_result) and snapshot_callback_every_iter
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
+                f"convΔ={convergence_delta_rel:.2e} "
                 f"active_edges={active_edges} "
                 f"μ.max={trace_entry['mu_max']:.4f} "
                 f"α.max={trace_entry['alpha_max']:.4f} "
@@ -1006,10 +1204,14 @@ def fit_mhp(
         beta = beta_new
         mu = mu_new
 
-        if it > 0 and delta_rel < config.tol:
+        if stop_requested:
+            break
+        if it > 0 and convergence_delta_rel < config.tol:
             if config.verbose:
                 print(
-                    f"[mhp] converged at iter {it} (Δrel={delta_rel:.2e} < tol={config.tol:.2e})",
+                    f"[mhp] converged at iter {it} "
+                    f"({trace_entry['convergence_metric']} Δrel="
+                    f"{convergence_delta_rel:.2e} < tol={config.tol:.2e})",
                     flush=True,
                 )
             converged = True
@@ -1164,6 +1366,11 @@ def fit_mhp_piecewise(
     init_mu: np.ndarray,
     iter_callback: Optional[Callable[[dict], None]] = None,
     best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
+    clear_times: Optional[np.ndarray] = None,
+    clear_time_teacher_boost: float = 0.0,
+    clear_time_teacher_tau: float = 1.0,
+    clear_time_teacher_mode: str = "redistribute",
+    snapshot_callback_every_iter: bool = False,
 ) -> MHPResult:
     """Stage-2 box-basis kernel learning on a FIXED active edge set.
 
@@ -1181,6 +1388,14 @@ def fit_mhp_piecewise(
     M = events.M
     N = events.n
     horizon = events.T
+    clear_times = _validate_clear_time_teacher(
+        clear_times,
+        N,
+        clear_time_teacher_boost,
+        clear_time_teacher_tau,
+        clear_time_teacher_mode,
+    )
+    teacher_enabled = clear_times is not None
     bucket_edges = np.asarray(config.bucket_edges, dtype=np.float64)
     B = len(bucket_edges)
     if B == 0:
@@ -1271,7 +1486,15 @@ def fit_mhp_piecewise(
             csize = chunk_end - chunk_start
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
-            (_, _, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+            (
+                pair_target,
+                pair_source,
+                pair_dt,
+                pair_tdim,
+                pair_sdim,
+                pair_tlocal,
+                _,
+            ) = _build_chunk_pair_arrays(
                 events.times, events.dims, chunk_start, chunk_end,
                 config.history_window, max(int(config.max_history_events), 1),
                 getattr(config, "time_slack", 0.0),
@@ -1293,8 +1516,19 @@ def fit_mhp_piecewise(
             sum_score = _segment_sum(score_pair, pair_tlocal, csize)
             rate = np.maximum(mu_chunk + sum_score, _EPS)
             p_self_chunk = mu_chunk / rate
-            p_self[chunk_start:chunk_end] = p_self_chunk
             p_ij = score_pair / rate[pair_tlocal]
+            p_self_chunk, p_ij = _apply_clear_time_teacher(
+                p_self_chunk,
+                p_ij,
+                pair_tlocal,
+                pair_target,
+                pair_source,
+                clear_times,
+                boost=clear_time_teacher_boost,
+                tau=clear_time_teacher_tau,
+                mode=clear_time_teacher_mode,
+            )
+            p_self[chunk_start:chunk_end] = p_self_chunk
             if valid.any():
                 flat = pe[valid].astype(np.int64) * B + pb[valid]
                 np.add.at(resp.ravel(), flat, p_ij[valid])
@@ -1335,10 +1569,21 @@ def fit_mhp_piecewise(
         else:
             n_rescaled = 0
 
+        parameter_delta_rel = (
+            _relative_parameter_change((theta, theta_new), (mu, mu_new))
+            if teacher_enabled else None
+        )
+        convergence_delta_rel = parameter_delta_rel if teacher_enabled else delta_rel
+
         trace_entry = {
             "iter": it,
             "log_likelihood": float(ll),
             "delta_rel": float(delta_rel),
+            "parameter_delta_rel": (
+                float(parameter_delta_rel) if parameter_delta_rel is not None else None
+            ),
+            "convergence_delta_rel": float(convergence_delta_rel),
+            "convergence_metric": "parameters" if teacher_enabled else "log_likelihood",
             "branching_rescaled": n_rescaled,
             "active_edges": E,
             "mu_max": float(mu.max()),
@@ -1350,11 +1595,22 @@ def fit_mhp_piecewise(
         trace.append(trace_entry)
         if iter_callback is not None:
             iter_callback(trace_entry)
-        if is_best and best_callback is not None:
-            branching = (best_theta * widths[None, :]).sum(axis=1)
+        stop_requested = False
+        if best_callback is not None and (is_best or snapshot_callback_every_iter):
+            if snapshot_callback_every_iter:
+                snap_theta = theta
+                snap_mu = mu
+                snap_p_self = p_self
+                snap_ll = float(ll)
+            else:
+                snap_theta = best_theta
+                snap_mu = best_mu
+                snap_p_self = best_p_self
+                snap_ll = float(best_ll)
+            branching = (snap_theta * widths[None, :]).sum(axis=1)
             checkpoint_params = MHPParams.from_edges(
                 M=M,
-                mu=best_mu,
+                mu=snap_mu,
                 edge_targets=edge_targets,
                 edge_sources=edge_sources,
                 edge_alpha=branching,
@@ -1362,23 +1618,25 @@ def fit_mhp_piecewise(
                 edge_threshold=0.0,
                 max_active_sources_per_dim=config.max_active_sources_per_dim,
                 kernel_type="piecewise",
-                edge_theta=best_theta,
+                edge_theta=snap_theta,
                 bucket_edges=tuple(config.bucket_edges),
             )
-            best_callback(
+            callback_result = best_callback(
                 MHPResult(
                     params=checkpoint_params,
-                    log_likelihood=best_ll,
+                    log_likelihood=snap_ll,
                     iterations_run=len(trace),
                     converged=False,
                     trace=list(trace),
-                    p_self=best_p_self,
+                    p_self=snap_p_self,
                 ),
                 trace_entry,
             )
+            stop_requested = bool(callback_result) and snapshot_callback_every_iter
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp-pw] iter={it:3d} ll={ll:.2f} Δ={delta_rel:.2e} "
+                f"convΔ={convergence_delta_rel:.2e} "
                 f"branch.median={trace_entry['branching_median']:.4f} "
                 f"branch.max={trace_entry['branching_max']:.4f} "
                 f"μ.max={trace_entry['mu_max']:.4f} "
@@ -1390,10 +1648,16 @@ def fit_mhp_piecewise(
 
         theta = theta_new
         mu = mu_new
-        if it > 0 and delta_rel < config.tol:
+        if stop_requested:
+            break
+        if it > 0 and convergence_delta_rel < config.tol:
             converged = True
             if config.verbose:
-                print(f"[mhp-pw] converged at iter {it} (Δrel={delta_rel:.2e})", flush=True)
+                print(
+                    f"[mhp-pw] converged at iter {it} "
+                    f"({trace_entry['convergence_metric']} Δrel={convergence_delta_rel:.2e})",
+                    flush=True,
+                )
             break
         prev_ll = ll
 
@@ -1581,6 +1845,11 @@ def fit_mhp_feature(
     dynamic_feature_names: Optional[list] = None,
     iter_callback: Optional[Callable[[dict], None]] = None,
     best_callback: Optional[Callable[[MHPResult, dict], None]] = None,
+    clear_times: Optional[np.ndarray] = None,
+    clear_time_teacher_boost: float = 0.0,
+    clear_time_teacher_tau: float = 1.0,
+    clear_time_teacher_mode: str = "redistribute",
+    snapshot_callback_every_iter: bool = False,
 ) -> MHPResult:
     """Feature-weighted MAP EM: α on a fixed CANDIDATE pair set is a log-linear
     function of pair features, α_c = softplus(w · φ_c). EM alternates:
@@ -1602,6 +1871,14 @@ def fit_mhp_feature(
     M = events.M
     N = events.n
     horizon = events.T
+    clear_times = _validate_clear_time_teacher(
+        clear_times,
+        N,
+        clear_time_teacher_boost,
+        clear_time_teacher_tau,
+        clear_time_teacher_mode,
+    )
+    teacher_enabled = clear_times is not None
     if getattr(config, "time_slack", 0.0) > 0 and config.beta_mode != "shared":
         raise NotImplementedError(
             "feature time_slack > 0 currently supports beta_mode='shared' only"
@@ -1892,7 +2169,15 @@ def fit_mhp_feature(
             csize = chunk_end - chunk_start
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
-            (_, pair_source, pair_dt, pair_tdim, pair_sdim, pair_tlocal, _) = _build_chunk_pair_arrays(
+            (
+                pair_target,
+                pair_source,
+                pair_dt,
+                pair_tdim,
+                pair_sdim,
+                pair_tlocal,
+                _,
+            ) = _build_chunk_pair_arrays(
                 events.times, events.dims, chunk_start, chunk_end,
                 history_window, max_history_events,
                 getattr(config, "time_slack", 0.0),
@@ -1953,6 +2238,18 @@ def fit_mhp_feature(
                 p_self_chunk = mu_chunk / rate
                 p_ij_valid = (score_pair / rate[pair_tlocal])[valid] if has_valid else None
                 ll_chunk = float(np.log(rate).sum())
+            if has_valid:
+                p_self_chunk, p_ij_valid = _apply_clear_time_teacher(
+                    p_self_chunk,
+                    p_ij_valid,
+                    pair_tlocal[valid],
+                    pair_target[valid],
+                    pair_source[valid],
+                    clear_times,
+                    boost=clear_time_teacher_boost,
+                    tau=clear_time_teacher_tau,
+                    mode=clear_time_teacher_mode,
+                )
             resp_payload = None
             if has_valid:
                 if use_dynamic and use_sparse_resp:
@@ -2078,6 +2375,13 @@ def fit_mhp_feature(
             "iter_seconds": 0.0,
         }
 
+        # The E-step/LL above used these parameter objects. Keep their references
+        # for an every-iteration validation snapshot before rebinding w/mu below.
+        iter_w = w
+        iter_mu = mu
+        iter_w_mu = w_mu if use_mu_features else None
+        iter_p_self = p_self
+
         # M-step. α: gradient ascent on Σ[N_c log α_c − E_c α_c]. μ: same
         # gradient optimizer on the symmetric Σ_u[S_u log μ_u − T·μ_u] when
         # parameterized (mu_phi), else per-type closed form.
@@ -2176,6 +2480,23 @@ def fit_mhp_feature(
             w_mu_new = None
             mu_new = np.maximum(mu_num / max(horizon, _EPS), 0.05 / horizon)
 
+        parameter_delta_rel = (
+            _relative_parameter_change(
+                (iter_w, w_new),
+                (iter_mu, mu_new),
+                (iter_w_mu, w_mu_new),
+            )
+            if teacher_enabled else None
+        )
+        convergence_delta_rel = parameter_delta_rel if teacher_enabled else delta_rel
+        entry["parameter_delta_rel"] = (
+            float(parameter_delta_rel) if parameter_delta_rel is not None else None
+        )
+        entry["convergence_delta_rel"] = float(convergence_delta_rel)
+        entry["convergence_metric"] = (
+            "parameters" if teacher_enabled else "log_likelihood"
+        )
+
         w = w_new
         mu = mu_new
         if use_mu_features:
@@ -2186,24 +2507,37 @@ def fit_mhp_feature(
         trace.append(entry)
         if iter_callback is not None:
             iter_callback(entry)
-        if is_best and best_callback is not None:
+        stop_requested = False
+        if best_callback is not None and (is_best or snapshot_callback_every_iter):
+            if snapshot_callback_every_iter:
+                snap_w = iter_w
+                snap_mu = iter_mu
+                snap_w_mu = iter_w_mu
+                snap_p_self = iter_p_self
+                snap_ll = float(ll_eval)
+            else:
+                snap_w = best_w
+                snap_mu = best_mu
+                snap_w_mu = best_w_mu
+                snap_p_self = best_p_self
+                snap_ll = float(best_ll)
             kernel_names = list(feature_names)
             if use_dynamic:
                 kernel_names = kernel_names + list(dynamic_feature_names or [])
-            checkpoint_kernel = FeatureKernel(weights=best_w, feature_names=kernel_names, l2=l2_alpha)
+            checkpoint_kernel = FeatureKernel(weights=snap_w, feature_names=kernel_names, l2=l2_alpha)
             checkpoint_mu_kernel = (
-                FeatureKernel(weights=best_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
-                if use_mu_features and best_w_mu is not None
+                FeatureKernel(weights=snap_w_mu, feature_names=list(mu_feature_names or []), l2=l2)
+                if use_mu_features and snap_w_mu is not None
                 else None
             )
             if use_dynamic:
-                alpha_checkpoint = softplus(cand_phi @ best_w[:F])
+                alpha_checkpoint = softplus(cand_phi @ snap_w[:F])
             else:
                 alpha_checkpoint = checkpoint_kernel.alpha(cand_phi)
             keep = alpha_checkpoint > config.edge_threshold
             checkpoint_params = MHPParams.from_edges(
                 M=M,
-                mu=best_mu,
+                mu=snap_mu,
                 edge_targets=cand_targets[keep],
                 edge_sources=cand_sources[keep],
                 edge_alpha=alpha_checkpoint[keep],
@@ -2215,17 +2549,18 @@ def fit_mhp_feature(
             _stop_signal = best_callback(
                 MHPResult(
                     params=checkpoint_params,
-                    log_likelihood=best_ll,
+                    log_likelihood=snap_ll,
                     iterations_run=len(trace),
                     converged=False,
                     trace=list(trace),
-                    p_self=best_p_self,
+                    p_self=snap_p_self,
                     feature_kernel=checkpoint_kernel,
                     mu_kernel=checkpoint_mu_kernel,
                 ),
                 entry,
             )
-            if _stop_signal:
+            stop_requested = bool(_stop_signal) and snapshot_callback_every_iter
+            if stop_requested:
                 # best_callback (held-out LL tracker) asked to stop: val LL has
                 # plateaued. The val-optimal snapshot is already captured caller-
                 # side, so break here rather than burn iters overfitting train.
@@ -2245,6 +2580,7 @@ def fit_mhp_feature(
         if config.verbose and (it % max(config.log_every, 1) == 0 or it == config.max_iters - 1):
             print(
                 f"[mhp-feat] iter={it:3d} ll={ll_eval:.2f} Δ={delta_rel:.2e} "
+                f"convΔ={convergence_delta_rel:.2e} "
                 f"active(>thr)={active_eval}/{C} "
                 f"α.median={entry['alpha_median']:.4f} α.max={entry['alpha_max']:.4f} "
                 f"ρ={entry['spectral_radius']:.3f} "
@@ -2253,10 +2589,14 @@ def fit_mhp_feature(
                 f"(E={_fmt_secs(entry['estep_seconds'])} M={_fmt_secs(entry['mstep_seconds'])})",
                 flush=True,
             )
-        if it > 0 and delta_rel < config.tol:
+        if it > 0 and convergence_delta_rel < config.tol:
             converged = True
             if config.verbose:
-                print(f"[mhp-feat] converged at iter {it} (Δrel={delta_rel:.2e})", flush=True)
+                print(
+                    f"[mhp-feat] converged at iter {it} "
+                    f"({entry['convergence_metric']} Δrel={convergence_delta_rel:.2e})",
+                    flush=True,
+                )
             break
         prev_ll = ll_eval
 
