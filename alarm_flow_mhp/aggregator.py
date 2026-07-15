@@ -733,22 +733,58 @@ def _counts64_from_target_intervals(
         counts64[:64:8] = source_prefix8[-1]
         return counts64
 
-    first_right = int(np.searchsorted(source_times, target_change_times[0], side="right"))
-    if first_right > 0:
-        counts64[:64:8] += source_prefix8[first_right] - source_prefix8[0]
+    # For just a handful of changes, setting up vectorized index arrays costs
+    # more than the tiny scalar scan. Keep this fast path for quiet targets.
+    if target_change_times.size <= 4:
+        left = int(
+            np.searchsorted(source_times, target_change_times[0], side="right")
+        )
+        if left > 0:
+            counts64[:64:8] += source_prefix8[left] - source_prefix8[0]
+        for j, tgt_k in enumerate(target_combos):
+            right = (
+                int(
+                    np.searchsorted(
+                        source_times, target_change_times[j + 1], side="right"
+                    )
+                )
+                if j + 1 < len(target_change_times)
+                else n
+            )
+            if right > left:
+                counts64[int(tgt_k)::8] += source_prefix8[right] - source_prefix8[left]
+            left = right
+            if left >= n:
+                break
+        return counts64
 
-    left = first_right
-    for j, tgt_k in enumerate(target_combos):
-        if j + 1 < len(target_change_times):
-            right = int(np.searchsorted(source_times, target_change_times[j + 1], side="right"))
-        else:
-            right = n
-        if right > left:
-            start = int(tgt_k)
-            counts64[start::8] += source_prefix8[right] - source_prefix8[left]
-        left = right
-        if left >= n:
-            break
+    # Find all state-interval boundaries in one vectorized search instead of a
+    # Python loop issuing one searchsorted per change point.  For interval j,
+    # sources in (change[j], change[j+1]] see target_combos[j].  Prefix
+    # differences give its eight source-combo counts, which are accumulated
+    # into the small target-combo x source-combo table below.
+    rights = np.searchsorted(source_times, target_change_times, side="right")
+    by_target_source = np.zeros((8, 8), dtype=np.float32)
+    first_right = int(rights[0])
+    if first_right > 0:
+        by_target_source[0] += source_prefix8[first_right] - source_prefix8[0]
+
+    interval_rights = np.empty_like(rights)
+    if len(rights) > 1:
+        interval_rights[:-1] = rights[1:]
+    interval_rights[-1] = n
+    active = interval_rights > rights
+    if active.any():
+        interval_counts = (
+            source_prefix8[interval_rights[active]] - source_prefix8[rights[active]]
+        )
+        np.add.at(
+            by_target_source,
+            np.asarray(target_combos, dtype=np.int64)[active],
+            interval_counts,
+        )
+    # Flatten as source_combo * 8 + target_combo, matching the E-step combo id.
+    counts64[:] = by_target_source.T.reshape(-1)
     return counts64
 
 
@@ -841,15 +877,17 @@ def _build_source_target_dynamic_exposure(
             new_cols[:coo_size] = coo_cols[:coo_size]
             new_vals[:coo_size] = coo_vals[:coo_size]
             coo_rows, coo_cols, coo_vals = new_rows, new_cols, new_vals
-        pos = coo_size
         rows_cast = np.asarray(rows, dtype=row_dtype)
-        for k in nz:
-            k_int = int(k)
-            nxt = pos + len(rows_cast)
-            coo_rows[pos:nxt] = rows_cast
-            coo_cols[pos:nxt] = k_int
-            coo_vals[pos:nxt] = counts[k_int]
-            pos = nxt
+        n_rows = len(rows_cast)
+        n_cols = len(nz)
+        # Fill the (nonzero bucket, candidate row) block by broadcasting into
+        # destination views. This preserves the old bucket-major COO order but
+        # removes the per-bucket Python assignment loop.
+        coo_rows[coo_size:end].reshape(n_cols, n_rows)[:] = rows_cast
+        coo_cols[coo_size:end].reshape(n_cols, n_rows)[:] = np.asarray(
+            nz, dtype=np.uint8
+        )[:, None]
+        coo_vals[coo_size:end].reshape(n_cols, n_rows)[:] = counts[nz, None]
         coo_size = end
 
     # Encode target NE strings as small integer ids, then lexsort candidate rows
