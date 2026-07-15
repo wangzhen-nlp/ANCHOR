@@ -788,6 +788,63 @@ def _counts64_from_target_intervals(
     return counts64
 
 
+def _counts8_target_intervals(
+    source_times: np.ndarray,
+    target_change_times: np.ndarray,
+    target_combos: np.ndarray,
+) -> np.ndarray:
+    """Pure-target counterpart of ``_counts64_from_target_intervals``.
+
+    ``dynamic_alpha=target`` pins the source combo to zero, so only combo ids
+    0..7 can be populated. Count interval lengths directly instead of building
+    an eight-column source-combo prefix and a 64-cell cross product.
+    """
+    counts8 = np.zeros(8, dtype=np.float32)
+    n = len(source_times)
+    if n == 0:
+        return counts8
+    if target_change_times.size == 0:
+        counts8[0] = n
+        return counts8
+
+    if target_change_times.size <= 4:
+        left = int(
+            np.searchsorted(source_times, target_change_times[0], side="right")
+        )
+        counts8[0] += left
+        for j, tgt_k in enumerate(target_combos):
+            right = (
+                int(
+                    np.searchsorted(
+                        source_times, target_change_times[j + 1], side="right"
+                    )
+                )
+                if j + 1 < len(target_change_times)
+                else n
+            )
+            if right > left:
+                counts8[int(tgt_k)] += right - left
+            left = right
+            if left >= n:
+                break
+        return counts8
+
+    rights = np.searchsorted(source_times, target_change_times, side="right")
+    counts8[0] += int(rights[0])
+    interval_rights = np.empty_like(rights)
+    if len(rights) > 1:
+        interval_rights[:-1] = rights[1:]
+    interval_rights[-1] = n
+    active = interval_rights > rights
+    if active.any():
+        np.add.at(
+            counts8,
+            np.asarray(target_combos, dtype=np.int64)[active],
+            (interval_rights[active] - rights[active]).astype(np.float32),
+        )
+    return counts8
+
+
 def _presort_feature_candidates_for_em(
     cand_t: np.ndarray,
     cand_s: np.ndarray,
@@ -845,6 +902,7 @@ def _build_source_target_dynamic_exposure(
     cand_sources = np.asarray(cand_sources, dtype=np.int64)
     C = len(cand_targets)
     mode_label = str(dynamic_mode or "source_target")
+    target_only = mode_label == "target"
     exposure = None
     row_dtype = np.int32 if C <= np.iinfo(np.int32).max else np.int64
     coo_rows = coo_cols = coo_vals = None
@@ -861,11 +919,8 @@ def _build_source_target_dynamic_exposure(
     else:
         exposure = np.zeros((C, 64), dtype=np.float32)
 
-    def append_coo(rows: np.ndarray, nz: np.ndarray, counts: np.ndarray):
-        nonlocal coo_rows, coo_cols, coo_vals, coo_size, coo_cap
-        if len(rows) == 0 or len(nz) == 0:
-            return
-        needed = int(len(rows) * len(nz))
+    def ensure_coo_capacity(needed: int) -> int:
+        nonlocal coo_rows, coo_cols, coo_vals, coo_cap
         end = coo_size + needed
         if end > coo_cap:
             while end > coo_cap:
@@ -877,6 +932,14 @@ def _build_source_target_dynamic_exposure(
             new_cols[:coo_size] = coo_cols[:coo_size]
             new_vals[:coo_size] = coo_vals[:coo_size]
             coo_rows, coo_cols, coo_vals = new_rows, new_cols, new_vals
+        return end
+
+    def append_coo(rows: np.ndarray, nz: np.ndarray, counts: np.ndarray):
+        nonlocal coo_size
+        if len(rows) == 0 or len(nz) == 0:
+            return
+        needed = int(len(rows) * len(nz))
+        end = ensure_coo_capacity(needed)
         rows_cast = np.asarray(rows, dtype=row_dtype)
         n_rows = len(rows_cast)
         n_cols = len(nz)
@@ -888,6 +951,20 @@ def _build_source_target_dynamic_exposure(
             nz, dtype=np.uint8
         )[:, None]
         coo_vals[coo_size:end].reshape(n_cols, n_rows)[:] = counts[nz, None]
+        coo_size = end
+
+    def append_coo_entries(
+        rows: np.ndarray, combos: np.ndarray, values: np.ndarray
+    ):
+        """Append an already-expanded COO block in one contiguous write."""
+        nonlocal coo_size
+        needed = len(rows)
+        if needed == 0:
+            return
+        end = ensure_coo_capacity(needed)
+        coo_rows[coo_size:end] = np.asarray(rows, dtype=row_dtype)
+        coo_cols[coo_size:end] = np.asarray(combos, dtype=np.uint8)
+        coo_vals[coo_size:end] = np.asarray(values, dtype=np.float32)
         coo_size = end
 
     # Encode target NE strings as small integer ids, then lexsort candidate rows
@@ -934,12 +1011,26 @@ def _build_source_target_dynamic_exposure(
     dim_order = np.argsort(dims, kind="stable")
     dims_sorted = dims[dim_order]
     train_abs_times_arr = np.asarray(train_abs_times, dtype=np.float64)
-    train_src_combo_arr = np.asarray(train_src_combo, dtype=np.uint8)
+    train_src_combo_arr = (
+        None if target_only else np.asarray(train_src_combo, dtype=np.uint8)
+    )
     train_pre_combo_arr = np.asarray(train_pre_combo, dtype=np.uint8)
     timeline_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    source_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    source_cache: dict[
+        int,
+        tuple[
+            np.ndarray,
+            Optional[np.ndarray],
+            np.ndarray,
+            Optional[np.ndarray],
+        ],
+    ] = {}
 
-    def source_stats(src_tid: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def source_stats(
+        src_tid: int,
+    ) -> tuple[
+        np.ndarray, Optional[np.ndarray], np.ndarray, Optional[np.ndarray]
+    ]:
         src_tid = int(src_tid)
         cached = source_cache.get(src_tid)
         if cached is not None:
@@ -948,9 +1039,9 @@ def _build_source_target_dynamic_exposure(
         right = np.searchsorted(dims_sorted, src_tid, side="right")
         event_idx = dim_order[left:right]
         source_times = train_abs_times_arr[event_idx]
-        source_combo = train_src_combo_arr[event_idx]
+        source_combo = None if target_only else train_src_combo_arr[event_idx]
         source_pre_combo = train_pre_combo_arr[event_idx]
-        prefix8 = _source_combo_prefix(source_combo)
+        prefix8 = None if target_only else _source_combo_prefix(source_combo)
         cached = (source_times, source_combo, source_pre_combo, prefix8)
         source_cache[src_tid] = cached
         return cached
@@ -958,59 +1049,271 @@ def _build_source_target_dynamic_exposure(
     n_groups = len(starts)
     last_beat = time.monotonic()
     t0 = last_beat
-    for gi, (start, end, src_tid, ne_id) in enumerate(zip(starts, ends, group_src, group_ne), start=1):
-        source_times, source_combo, source_pre_combo, prefix8 = source_stats(int(src_tid))
-        if len(source_times) == 0:
-            continue
-        rows = row_order[start:end]
-        tgt_ne = ne_labels[int(ne_id)]
-        # Same-NE exposure uses each source event's pre-state so the source
-        # event's own raise is not included in the sampled target state. Since
-        # alarm_source is part of the type label, all events for src_tid share
-        # the same source NE, making this an O(n_src) path once per source type.
-        if tgt_ne and str(type_ne[int(src_tid)] or "") == tgt_ne:
-            combo_idx = source_combo.astype(np.uint8) * np.uint8(8) + source_pre_combo
-            counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(np.float32, copy=False)
-        else:
+    if target_only and n_groups:
+        # Groups are already ordered by target NE. Querying the target timeline
+        # once for all source events in an NE block removes a large number of
+        # tiny NumPy calls when there are many candidate source types. Keep the
+        # interval path for sparse timelines or very event-dense source groups.
+        ne_boundary = np.flatnonzero(group_ne[1:] != group_ne[:-1]) + 1
+        ne_starts = np.concatenate(([0], ne_boundary))
+        ne_ends = np.concatenate((ne_boundary, [n_groups]))
+        for ne_start, ne_end in zip(ne_starts, ne_ends):
+            block_size = int(ne_end - ne_start)
+            block_counts = np.zeros((block_size, 8), dtype=np.float32)
+            tgt_ne = ne_labels[int(group_ne[ne_start])]
             if tgt_ne not in timeline_cache:
-                timeline_cache[tgt_ne] = _combo_arrays_from_timeline(state_timeline, tgt_ne)
+                timeline_cache[tgt_ne] = _combo_arrays_from_timeline(
+                    state_timeline, tgt_ne
+                )
             target_times, target_combo = timeline_cache[tgt_ne]
-            # Interval-prefix counting is exact and usually much cheaper than
-            # querying target state at every source event. For extremely chattery
-            # targets, fall back to the vectorized event-time lookup.
-            if target_times.size and target_times.size > max(256, len(source_times) // 4):
+
+            other_local = []
+            other_times = []
+            total_other_events = 0
+            for local, group_idx in enumerate(range(int(ne_start), int(ne_end))):
+                src_tid = int(group_src[group_idx])
+                stats = source_stats(src_tid)
+                source_times, _, source_pre_combo, _ = stats
+                if len(source_times) == 0:
+                    continue
+                # Source events' pre-state must still be used for same-NE
+                # source groups; they cannot share the timeline lookup.
+                if tgt_ne and str(type_ne[src_tid] or "") == tgt_ne:
+                    block_counts[local] = np.bincount(
+                        source_pre_combo.astype(np.int64), minlength=8
+                    ).astype(np.float32, copy=False)
+                else:
+                    other_local.append(local)
+                    other_times.append(source_times)
+                    total_other_events += len(source_times)
+
+            interval_work = len(other_times) * int(target_times.size)
+            use_batch_lookup = (
+                target_times.size > 4
+                and total_other_events > 0
+                and total_other_events <= interval_work
+            )
+            if use_batch_lookup:
+                if len(other_times) == 1:
+                    query_times = other_times[0]
+                else:
+                    query_times = np.concatenate(other_times)
+                event_groups = np.repeat(
+                    np.asarray(other_local, dtype=np.int64),
+                    np.fromiter(
+                        (len(times) for times in other_times),
+                        dtype=np.int64,
+                        count=len(other_times),
+                    ),
+                )
                 tgt_combo = _timeline_combos_at_many(
                     state_timeline,
                     tgt_ne,
-                    source_times,
+                    query_times,
                     timeline_cache,
                 )
-                combo_idx = source_combo.astype(np.uint8) * np.uint8(8) + tgt_combo
-                counts = np.bincount(combo_idx.astype(np.int64), minlength=64).astype(np.float32, copy=False)
+                event_groups *= 8
+                event_groups += tgt_combo.astype(np.int64, copy=False)
+                block_counts += np.bincount(
+                    event_groups, minlength=block_size * 8
+                ).reshape(block_size, 8).astype(np.float32, copy=False)
             else:
-                counts = _counts64_from_target_intervals(
-                    source_times,
-                    prefix8,
-                    target_times,
-                    target_combo,
-                )
-        nz = np.flatnonzero(counts > 0)
-        if as_coo:
-            append_coo(rows, nz, counts)
-        else:
-            for k in nz:
-                exposure[rows, k] += counts[k]
+                for local, source_times in zip(other_local, other_times):
+                    # Extremely chattery targets are cheaper to query at event
+                    # times even when the entire NE block was too dense to batch.
+                    if target_times.size and target_times.size > max(
+                        256, len(source_times) // 4
+                    ):
+                        tgt_combo = _timeline_combos_at_many(
+                            state_timeline,
+                            tgt_ne,
+                            source_times,
+                            timeline_cache,
+                        )
+                        block_counts[local] = np.bincount(
+                            tgt_combo.astype(np.int64), minlength=8
+                        ).astype(np.float32, copy=False)
+                    else:
+                        block_counts[local] = _counts8_target_intervals(
+                            source_times, target_times, target_combo
+                        )
 
-        if verbose:
-            now = time.monotonic()
-            if now - last_beat >= 10.0:
-                print(
-                    f"[train] dynamic_alpha={mode_label}: exposure groups "
-                    f"{gi}/{n_groups} ({100.0 * gi / max(n_groups, 1):.1f}%, "
-                    f"{_fmt_secs(now - t0)})",
-                    flush=True,
+            if as_coo:
+                # Expand nonzero (group, combo) entries in bounded vectorized
+                # chunks. This preserves the old group -> combo -> candidate-row
+                # COO order without allocating several full-NE temporary arrays.
+                nz_group, nz_combo = np.nonzero(block_counts > 0)
+                entry_groups = int(ne_start) + nz_group
+                entry_starts = starts[entry_groups]
+                entry_lengths = ends[entry_groups] - entry_starts
+                total_entries = int(entry_lengths.sum())
+                if total_entries:
+                    max_chunk_entries = 500_000
+                    cumulative_entries = np.cumsum(
+                        entry_lengths, dtype=np.int64
+                    )
+                    entry_idx = 0
+                    n_entries = len(entry_lengths)
+                    while entry_idx < n_entries:
+                        emitted_before = (
+                            int(cumulative_entries[entry_idx - 1])
+                            if entry_idx
+                            else 0
+                        )
+                        entry_end = int(
+                            np.searchsorted(
+                                cumulative_entries,
+                                emitted_before + max_chunk_entries,
+                                side="right",
+                            )
+                        )
+                        if entry_end == entry_idx:
+                            # One (group, combo) entry can itself contain more
+                            # candidate rows than the chunk cap. Split its row
+                            # slice directly while retaining its exact order.
+                            row_start = int(entry_starts[entry_idx])
+                            row_end = row_start + int(entry_lengths[entry_idx])
+                            combo = int(nz_combo[entry_idx])
+                            value = float(
+                                block_counts[
+                                    nz_group[entry_idx], nz_combo[entry_idx]
+                                ]
+                            )
+                            for part_start in range(
+                                row_start, row_end, max_chunk_entries
+                            ):
+                                part_end = min(
+                                    part_start + max_chunk_entries, row_end
+                                )
+                                part_rows = row_order[part_start:part_end]
+                                append_coo_entries(
+                                    part_rows,
+                                    np.full(len(part_rows), combo, dtype=np.uint8),
+                                    np.full(
+                                        len(part_rows), value, dtype=np.float32
+                                    ),
+                                )
+                            entry_idx += 1
+                            continue
+
+                        chunk_lengths = entry_lengths[entry_idx:entry_end]
+                        chunk_starts = entry_starts[entry_idx:entry_end]
+                        chunk_total = int(chunk_lengths.sum())
+                        chunk_ends = np.cumsum(chunk_lengths, dtype=np.int64)
+                        chunk_starts_flat = chunk_ends - chunk_lengths
+                        row_positions = np.arange(chunk_total, dtype=np.int64)
+                        row_positions += np.repeat(
+                            chunk_starts - chunk_starts_flat, chunk_lengths
+                        )
+                        expanded_rows = np.asarray(
+                            row_order[row_positions], dtype=row_dtype
+                        )
+                        expanded_combos = np.repeat(
+                            nz_combo[entry_idx:entry_end].astype(
+                                np.uint8, copy=False
+                            ),
+                            chunk_lengths,
+                        )
+                        expanded_values = np.repeat(
+                            block_counts[
+                                nz_group[entry_idx:entry_end],
+                                nz_combo[entry_idx:entry_end],
+                            ],
+                            chunk_lengths,
+                        )
+                        append_coo_entries(
+                            expanded_rows, expanded_combos, expanded_values
+                        )
+                        entry_idx = entry_end
+            else:
+                for local, group_idx in enumerate(
+                    range(int(ne_start), int(ne_end))
+                ):
+                    counts = block_counts[local]
+                    nz = np.flatnonzero(counts > 0)
+                    rows = row_order[starts[group_idx] : ends[group_idx]]
+                    for k in nz:
+                        exposure[rows, k] += counts[k]
+
+            if verbose:
+                now = time.monotonic()
+                if now - last_beat >= 10.0:
+                    gi = int(ne_end)
+                    print(
+                        f"[train] dynamic_alpha={mode_label}: exposure groups "
+                        f"{gi}/{n_groups} ({100.0 * gi / max(n_groups, 1):.1f}%, "
+                        f"{_fmt_secs(now - t0)})",
+                        flush=True,
+                    )
+                    last_beat = now
+    else:
+        for gi, (start, end, src_tid, ne_id) in enumerate(
+            zip(starts, ends, group_src, group_ne), start=1
+        ):
+            source_times, source_combo, source_pre_combo, prefix8 = source_stats(
+                int(src_tid)
+            )
+            if len(source_times) == 0:
+                continue
+            rows = row_order[start:end]
+            tgt_ne = ne_labels[int(ne_id)]
+            # Same-NE exposure uses each source event's pre-state so the source
+            # event's own raise is not included in the sampled target state.
+            if tgt_ne and str(type_ne[int(src_tid)] or "") == tgt_ne:
+                combo_idx = (
+                    source_combo.astype(np.uint8) * np.uint8(8) + source_pre_combo
                 )
-                last_beat = now
+                counts = np.bincount(
+                    combo_idx.astype(np.int64), minlength=64
+                ).astype(np.float32, copy=False)
+            else:
+                if tgt_ne not in timeline_cache:
+                    timeline_cache[tgt_ne] = _combo_arrays_from_timeline(
+                        state_timeline, tgt_ne
+                    )
+                target_times, target_combo = timeline_cache[tgt_ne]
+                # Interval-prefix counting is exact and usually much cheaper than
+                # querying target state at every source event. For extremely
+                # chattery targets, use the vectorized event-time lookup.
+                if target_times.size and target_times.size > max(
+                    256, len(source_times) // 4
+                ):
+                    tgt_combo = _timeline_combos_at_many(
+                        state_timeline,
+                        tgt_ne,
+                        source_times,
+                        timeline_cache,
+                    )
+                    combo_idx = (
+                        source_combo.astype(np.uint8) * np.uint8(8) + tgt_combo
+                    )
+                    counts = np.bincount(
+                        combo_idx.astype(np.int64), minlength=64
+                    ).astype(np.float32, copy=False)
+                else:
+                    counts = _counts64_from_target_intervals(
+                        source_times,
+                        prefix8,
+                        target_times,
+                        target_combo,
+                    )
+            nz = np.flatnonzero(counts > 0)
+            if as_coo:
+                append_coo(rows, nz, counts)
+            else:
+                for k in nz:
+                    exposure[rows, k] += counts[k]
+
+            if verbose:
+                now = time.monotonic()
+                if now - last_beat >= 10.0:
+                    print(
+                        f"[train] dynamic_alpha={mode_label}: exposure groups "
+                        f"{gi}/{n_groups} ({100.0 * gi / max(n_groups, 1):.1f}%, "
+                        f"{_fmt_secs(now - t0)})",
+                        flush=True,
+                    )
+                    last_beat = now
     if as_coo:
         coo_rows.resize(coo_size, refcheck=False)
         coo_cols.resize(coo_size, refcheck=False)
