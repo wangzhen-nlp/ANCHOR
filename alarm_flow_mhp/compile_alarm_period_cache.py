@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import tempfile
 import time
 
@@ -44,16 +43,8 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
     write_association_cache,
 )
 from alarm_flow_mhp.topology_relation_prior import parse_topology_relation_prior
+from alarm_tools.progress_utils import ProgressBar
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
-
-
-def _format_duration(seconds):
-    seconds = max(0.0, float(seconds))
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    if seconds < 3600:
-        return f"{int(seconds // 60)}m{seconds % 60:04.1f}s"
-    return f"{int(seconds // 3600)}h{int((seconds % 3600) // 60):02d}m"
 
 
 class _BinaryEdgeSpool:
@@ -361,38 +352,24 @@ def main():
         parser.error("binary association cache output must end with .npz")
 
     last_report = 0
-    compile_t0 = time.monotonic()
-    interactive_progress = bool(getattr(sys.stdout, "isatty", lambda: False)())
-    last_line_width = 0
+    progress_bar = (
+        ProgressBar(total_type_pairs, "编译 AlarmPeriod 关联缓存")
+        if not args.quiet and args.progress_every
+        else None
+    )
 
-    def render_progress(type_pairs, active_edges, pruned_pairs, final=False):
-        nonlocal last_line_width
-        elapsed = time.monotonic() - compile_t0
-        rate = type_pairs / max(elapsed, 1e-12)
-        remaining = max(total_type_pairs - type_pairs, 0)
-        eta = remaining / max(rate, 1e-12)
+    def update_progress(type_pairs, active_edges, pruned_pairs):
+        if progress_bar is None:
+            return
         estimated_active_edges = (
             round(active_edges / type_pairs * total_type_pairs) if type_pairs else 0
         )
         active_ratio = active_edges / max(active_edges + pruned_pairs, 1)
-        fraction = type_pairs / max(total_type_pairs, 1)
-        bar_width = 28
-        filled = min(bar_width, int(fraction * bar_width))
-        if final and type_pairs >= total_type_pairs:
-            filled = bar_width
-        bar = "█" * filled + "░" * (bar_width - filled)
-        line = (
-            f"[period-cache] [{bar}] {fraction * 100:6.2f}% "
-            f"{type_pairs:,}/{total_type_pairs:,} pairs | "
-            f"edges={active_edges:,} ({active_ratio:.1%}, est={estimated_active_edges:,}) | "
-            f"{rate:.1f} pairs/s | ETA {_format_duration(eta)}"
+        progress_bar.extra_text = (
+            f"edges={active_edges:,} ({active_ratio:.1%}, "
+            f"est={estimated_active_edges:,})"
         )
-        if interactive_progress:
-            padded = line.ljust(last_line_width)
-            print(f"\r{padded}", end="\n" if final else "", flush=True)
-            last_line_width = len(line)
-        else:
-            print(line, flush=True)
+        progress_bar.set(type_pairs)
 
     def report(type_pairs, active_edges, pruned_pairs):
         nonlocal last_report
@@ -401,7 +378,7 @@ def main():
         if type_pairs - last_report < args.progress_every:
             return
         last_report = type_pairs
-        render_progress(type_pairs, active_edges, pruned_pairs)
+        update_progress(type_pairs, active_edges, pruned_pairs)
 
     with tempfile.TemporaryDirectory(prefix="alarm-period-cache-") as spool_dir:
         spool = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
@@ -415,13 +392,14 @@ def main():
                 edge_sink=spool.append,
                 edge_batch_sink=spool.append_batch,
             )
-            if not args.quiet and args.progress_every:
-                render_progress(
+            if progress_bar is not None:
+                update_progress(
                     type_pair_count,
                     plan.compiled_pair_count,
                     plan.pruned_pair_count,
-                    final=True,
                 )
+                progress_bar.close()
+                progress_bar = None
             if not args.quiet:
                 print(
                     f"[period-cache] scoring complete; building CSR and compressing "
@@ -456,6 +434,9 @@ def main():
             }
             write_association_cache(args.output, payload)
         finally:
+            if progress_bar is not None:
+                progress_bar.close()
+                progress_bar = None
             # np.asarray(memmap) keeps the underlying Windows file mapping alive.
             # Drop every view before closing mappings and leaving TemporaryDirectory.
             if payload is not None:

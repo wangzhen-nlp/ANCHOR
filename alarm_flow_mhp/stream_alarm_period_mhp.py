@@ -71,6 +71,7 @@ from alarm_flow_mhp.topology_relation_prior import (
     parse_topology_relation_prior,
     topology_relation_weights,
 )
+from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.alarm_events.identity import require_alarm_identity
 from fault_grouping.alarm_events.io import is_clear_alarm
 from mhp.feature_kernel import FeatureKernel
@@ -1102,6 +1103,7 @@ class AlarmPeriodMHPAssigner:
         feature_scorer,
         mu_scorer=None,
         association_cache=None,
+        closed_group_sink=None,
     ):
         config.validate()
         if getattr(artifact.config, "edge_mode", "device") != "feature":
@@ -1127,7 +1129,8 @@ class AlarmPeriodMHPAssigner:
         self.groups: dict[int, PeriodFaultGroup] = {}
         self._group_redirect: dict[int, int] = {}
         self.merge_proposals: dict[tuple, MergeProposal] = {}
-        self.closed_groups: list[dict] = []
+        self.closed_group_sink = closed_group_sink
+        self.closed_group_count = 0
         self._next_event_index = 0
         self._next_period_id = 0
         self._next_group_id = 0
@@ -1674,7 +1677,10 @@ class AlarmPeriodMHPAssigner:
             return
         record = self._group_record(group)
         if record["event_count"] >= self.config.min_group_events:
-            self.closed_groups.append(record)
+            if self.closed_group_sink is None:
+                raise RuntimeError("incremental closed-group sink is not configured")
+            self.closed_group_sink(record)
+            self.closed_group_count += 1
 
     def _evict_expired_periods(self, watermark):
         cutoff = float(watermark) - (
@@ -1808,7 +1814,7 @@ class AlarmPeriodMHPAssigner:
                 else 0
             ),
             "active_group_count": len(self.groups),
-            "closed_group_count": len(self.closed_groups),
+            "closed_group_count": self.closed_group_count,
         }
 
 
@@ -1855,25 +1861,109 @@ def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False
     return scorer, mu_scorer, ne_graph_data
 
 
-def _write_json(path, payload):
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
+class IncrementalPeriodOutput:
+    """Durable JSONL output for finalized groups and their optional views."""
+
+    FORMAT = "alarm_flow_mhp.period_groups_jsonl"
+    VERSION = 1
+
+    def __init__(
+        self,
+        groups_path,
+        metadata,
+        edges_path="",
+        visual_path="",
+        ne_graph_path=NE_GRAPH_JSON,
+        site_graph_path=SITE_GRAPH_JSON,
+    ):
+        self.groups_path = os.path.abspath(groups_path)
+        self.edges_path = os.path.abspath(edges_path) if edges_path else ""
+        self.group_count = 0
+        self.edge_count = 0
+        self._closed = False
+        self.groups_stream = None
+        self.edges_stream = None
+        self.visual = None
+        try:
+            for path in (self.groups_path, self.edges_path):
+                if path:
+                    parent = os.path.dirname(path)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+            self.groups_stream = open(
+                self.groups_path, "w", encoding="utf-8", buffering=1
+            )
+            if self.edges_path:
+                self.edges_stream = open(
+                    self.edges_path, "w", encoding="utf-8", buffering=1
+                )
+            if visual_path:
+                from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
+
+                self.visual = AlarmMHPVisualOutputSession.from_files(
+                    visual_path, ne_graph_path, site_graph_path
+                )
+                self.visual.reset_output_file()
+            self._write_group_record(
+                {
+                    "record_type": "metadata",
+                    "format": self.FORMAT,
+                    "version": self.VERSION,
+                    "metadata": dict(metadata),
+                }
+            )
+        except Exception:
+            self.close()
+            raise
+
+    def _write_group_record(self, record):
+        if self.groups_stream is None:
+            raise RuntimeError("incremental groups output is not open")
+        self.groups_stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.groups_stream.flush()
+
+    def emit_group(self, group):
+        if self._closed:
+            raise RuntimeError("incremental period output is already closed")
+        self._write_group_record({"record_type": "group", "group": group})
+        self.group_count += 1
+        if self.edges_stream is not None:
+            for edge in group.get("edges", ()):
+                self.edges_stream.write(json.dumps(edge, ensure_ascii=False) + "\n")
+                self.edge_count += 1
+            self.edges_stream.flush()
+        if self.visual is not None:
+            self.visual.emit_groups([group], finalization_reason="period_finalized")
+
+    def close(self, summary=None):
+        if self._closed:
+            return
+        if summary is not None and self.groups_stream is not None:
+            self._write_group_record(
+                {
+                    "record_type": "summary",
+                    "summary": {
+                        **dict(summary),
+                        "emitted_group_count": self.group_count,
+                        "emitted_edge_count": self.edge_count,
+                    },
+                }
+            )
+        self._closed = True
+        if self.groups_stream is not None:
+            self.groups_stream.close()
+            self.groups_stream = None
+        if self.edges_stream is not None:
+            self.edges_stream.close()
+            self.edges_stream = None
+        if self.visual is not None:
+            self.visual.close()
 
 
-def _write_jsonl(path, records):
-    parent = os.path.dirname(os.path.abspath(path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    count = 0
-    with open(path, "w", encoding="utf-8") as stream:
-        for record in records:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
-    return count
+def _default_visual_output(groups_output):
+    path = str(groups_output)
+    base = path[:-6] if path.lower().endswith(".jsonl") else os.path.splitext(path)[0]
+    return f"{base}.visual.jsonl"
 
 
 def _build_parser():
@@ -1882,9 +1972,17 @@ def _build_parser():
     )
     parser.add_argument("model", help="Trained alarm-flow MHP artifact JSON.")
     parser.add_argument("alarms", help="Sorted alarm cache or raw alarm input.")
-    parser.add_argument("--groups-output", required=True, help="Output groups JSON.")
+    parser.add_argument(
+        "--groups-output",
+        required=True,
+        help="Incremental groups JSONL; truncated at startup and flushed per finalized group.",
+    )
     parser.add_argument("--edges-output", default="", help="Optional period evidence JSONL.")
-    parser.add_argument("--visual-output", default="", help="Optional visual-output JSONL.")
+    parser.add_argument(
+        "--visual-output",
+        default="",
+        help="Visual JSONL; default: <groups-output without .jsonl>.visual.jsonl.",
+    )
     parser.add_argument(
         "--association-cache",
         default="",
@@ -1933,6 +2031,10 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    if not str(args.groups_output).lower().endswith(".jsonl"):
+        parser.error("--groups-output must end with .jsonl (incremental format)")
+    if not args.visual_output:
+        args.visual_output = _default_visual_output(args.groups_output)
     try:
         relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
     except ValueError as exc:
@@ -2049,7 +2151,34 @@ def main():
     # The plan owns decoded edge objects now; release the JSON row arrays before
     # processing a potentially large alarm stream.
     association_cache = None
+    run_metadata = {
+        "algorithm": "alarm_flow_mhp.alarm_period_stream",
+        "model": os.path.abspath(args.model),
+        "input": os.path.abspath(args.alarms),
+        "association_cache": (
+            os.path.abspath(args.association_cache) if args.association_cache else ""
+        ),
+        "groups_output": os.path.abspath(args.groups_output),
+        "edges_output": os.path.abspath(args.edges_output) if args.edges_output else "",
+        "visual_output": os.path.abspath(args.visual_output),
+        "alarm_metadata": alarm_metadata,
+        "config": {key: value for key, value in vars(config).items()},
+    }
+    output = IncrementalPeriodOutput(
+        args.groups_output,
+        run_metadata,
+        edges_path=args.edges_output,
+        visual_path=args.visual_output,
+        ne_graph_path=args.ne_graph,
+        site_graph_path=args.site_graph,
+    )
+    engine.closed_group_sink = output.emit_group
     if not args.quiet:
+        print(
+            f"[period] incremental outputs: groups={args.groups_output}, "
+            f"edges={args.edges_output or '<disabled>'}, visual={args.visual_output}",
+            flush=True,
+        )
         print(
             f"[period] events={len(events)}, wait={config.aggregation_wait_sec:g}s, "
             f"idle={config.period_idle_sec:g}s, history={config.history_window_sec:g}s, "
@@ -2057,60 +2186,59 @@ def main():
             flush=True,
         )
 
-    for i, event in enumerate(events):
-        engine.process(event)
-        if args.progress_every and (i + 1) % args.progress_every == 0 and not args.quiet:
-            stats = engine.stats()
-            elapsed = time.monotonic() - t0
-            print(
-                f"[period] processed={i + 1}/{len(events)} "
-                f"rate={(i + 1) / max(elapsed, EPS):.0f}/s "
-                f"periods={stats['created_periods']} harvests={stats['harvest_count']} "
-                f"groups={stats['active_group_count']}+{stats['closed_group_count']}",
-                flush=True,
-            )
-    engine.flush()
-    stats = engine.stats()
-    elapsed = time.monotonic() - t0
-    metadata = {
-        "algorithm": "alarm_flow_mhp.alarm_period_stream",
-        "model": os.path.abspath(args.model),
-        "input": os.path.abspath(args.alarms),
-        "association_cache": (
-            os.path.abspath(args.association_cache) if args.association_cache else ""
-        ),
-        "alarm_metadata": alarm_metadata,
-        "config": {
-            key: value
-            for key, value in vars(config).items()
-        },
-        "stats": stats,
-        "elapsed_seconds": elapsed,
-    }
-    _write_json(args.groups_output, {"metadata": metadata, "groups": engine.closed_groups})
-    if args.edges_output:
-        edges = [edge for group in engine.closed_groups for edge in group.get("edges", ())]
-        _write_jsonl(args.edges_output, edges)
-    if args.visual_output:
-        from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
-
-        visual = AlarmMHPVisualOutputSession.from_files(
-            args.visual_output,
-            args.ne_graph,
-            args.site_graph,
-        )
-        visual.reset_output_file()
+    process_progress = (
+        ProgressBar(len(events), "处理 AlarmPeriod 告警")
+        if args.progress_every and not args.quiet
+        else None
+    )
+    if process_progress is not None:
+        process_progress.extra_text = "periods=0 harvests=0 groups=0+0"
+    completed = False
+    stats = None
+    elapsed = 0.0
+    try:
         try:
-            visual.emit_groups(engine.closed_groups, finalization_reason="stream_end")
+            for i, event in enumerate(events):
+                engine.process(event)
+                if process_progress is not None:
+                    process_progress.update()
+                    if (i + 1) % args.progress_every == 0:
+                        progress_stats = engine.stats()
+                        process_progress.extra_text = (
+                            f"periods={progress_stats['created_periods']} "
+                            f"harvests={progress_stats['harvest_count']} "
+                            f"groups={progress_stats['active_group_count']}+"
+                            f"{progress_stats['closed_group_count']}"
+                        )
         finally:
-            visual.close()
+            if process_progress is not None:
+                progress_stats = engine.stats()
+                process_progress.extra_text = (
+                    f"periods={progress_stats['created_periods']} "
+                    f"harvests={progress_stats['harvest_count']} "
+                    f"groups={progress_stats['active_group_count']}+"
+                    f"{progress_stats['closed_group_count']}"
+                )
+                process_progress.close()
+        engine.flush()
+        completed = True
+    finally:
+        stats = engine.stats()
+        elapsed = time.monotonic() - t0
+        output.close(
+            {
+                "status": "complete" if completed else "interrupted",
+                "stats": stats,
+                "elapsed_seconds": elapsed,
+            }
+        )
     if not args.quiet:
         print(
-            f"[period] done: groups={len(engine.closed_groups)}, "
+            f"[period] done: groups={stats['closed_group_count']}, "
             f"periods={stats['created_periods']}, harvests={stats['harvest_count']}, "
             f"preloaded_edges={stats['preloaded_edge_count']}, "
             f"incremental_edges={stats['compiled_pair_count']}, elapsed={elapsed:.2f}s; "
-            f"output={args.groups_output}",
+            f"groups_output={args.groups_output}, visual_output={args.visual_output}",
             flush=True,
         )
 
