@@ -847,16 +847,105 @@ class CompiledAssociationPlan:
             for source in self._candidate_sources(target, prepared):
                 yield target, source
 
+    def _precompile_target_only_batches(self, prepared, progress, edge_batch_sink):
+        """Vectorized offline compiler for target-dynamic cache rows.
+
+        Static pair features are evaluated once per PeriodType pair. The eight
+        target-state terms are then broadcast over that vector, avoiding eight
+        repeated topology/attribute passes and one Python call per state edge.
+        """
+        type_pair_count = 0
+        target_terms = np.asarray(
+            [self.decomposed.tgt_term(_combo_state(state)) for state in range(8)],
+            dtype=np.float64,
+        )
+        for target_type in prepared["period_types"]:
+            source_types = self._candidate_sources(target_type, prepared)
+            source_count = len(source_types)
+            if source_count:
+                source_alarm_types = [value.alarm_type for value in source_types]
+                source_entities = [value.entity for value in source_types]
+                logits = self.decomposed.logits_for_target(
+                    target_type.alarm_type,
+                    target_type.entity,
+                    source_alarm_types,
+                    source_entities,
+                )
+                alpha = self.decomposed._softplus(
+                    logits.reshape(1, -1) + target_terms.reshape(-1, 1)
+                )
+                if self.decomposed.alpha_scale != 1.0:
+                    alpha = alpha * self.decomposed.alpha_scale
+                if self.config.topology_relation_prior:
+                    relation_weights = topology_relation_weights(
+                        [topo_node_of(value) for value in source_entities],
+                        topo_node_of(target_type.entity),
+                        self.scorer.topology_index,
+                        self.scorer.node_infos,
+                        self.config.topology_relation_prior,
+                    )
+                else:
+                    relation_weights = np.ones(source_count, dtype=np.float64)
+                base_scores = alpha * self.beta * relation_weights.reshape(1, -1)
+                threshold = self._mu(target_type)
+                keep = ~(
+                    (alpha < self.config.feature_alpha_floor)
+                    | (base_scores + EPS < threshold)
+                    | (base_scores <= 0)
+                )
+                kept_count = int(np.count_nonzero(keep))
+                self.compiled_pair_count += kept_count
+                self.pruned_pair_count += int(keep.size) - kept_count
+                if kept_count:
+                    target_states, source_indices = np.nonzero(keep)
+                    kept_scores = base_scores[target_states, source_indices]
+                    log_margins = np.maximum(
+                        0.0, np.log(kept_scores / threshold)
+                    )
+                    past_windows = np.minimum(
+                        self.config.history_window_sec,
+                        log_margins / self.beta * self.config.time_scale_sec,
+                    )
+                    if self.config.time_slack_sec > 0:
+                        future_windows = np.minimum(
+                            self.config.time_slack_sec,
+                            log_margins / self.late_lambda * self.config.time_scale_sec,
+                        )
+                    else:
+                        future_windows = np.zeros(kept_count, dtype=np.float64)
+                    edge_batch_sink(
+                        target_type,
+                        target_states,
+                        source_types,
+                        source_indices,
+                        kept_scores,
+                        threshold,
+                        past_windows,
+                        future_windows,
+                    )
+            type_pair_count += source_count
+            if progress is not None:
+                progress(type_pair_count, self.compiled_pair_count, self.pruned_pair_count)
+        return type_pair_count
+
     def precompile_period_types(
         self,
         period_types,
         progress=None,
         prepared_candidates=None,
         edge_sink=None,
+        edge_batch_sink=None,
     ):
         """Compile all eight frozen-state signatures for known period types."""
         prepared = prepared_candidates or self.prepare_candidate_period_types(period_types)
         period_types = prepared["period_types"]
+        if (
+            edge_batch_sink is not None
+            and self.cache_state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+        ):
+            return self._precompile_target_only_batches(
+                prepared, progress, edge_batch_sink
+            )
         states = tuple(range(8))
         source_states = (
             (0,)

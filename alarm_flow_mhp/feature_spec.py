@@ -1043,9 +1043,13 @@ class DecomposedFeatureScorer:
             a = a * self.alpha_scale
         return a
 
-    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
-        """Drop-in equivalent of RuntimeFeatureScorer.alpha_for_target (string
-        inputs). Attribute/topology lookups reuse the wrapped scorer's caches."""
+    def logits_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
+        """Static/source-state logits for one target against many sources.
+
+        The target-state contribution is deliberately omitted so callers that
+        need all eight target states can compute the relatively expensive
+        topology/attribute parts once, then add eight scalar target terms.
+        """
         s = self.scorer
         n = len(src_nes)
         if n == 0:
@@ -1074,7 +1078,6 @@ class DecomposedFeatureScorer:
         # dynamic marks: mirror _dynamic_mark_matrix semantics for the common
         # streaming shapes — per-candidate (n,3) src marks + one target mark row.
         src_mark_idx = np.zeros(n, dtype=np.int64)
-        tgt_term = 0.0
         if self.n_dynamic:
             if src_marks is not None:
                 sm = np.asarray(src_marks, dtype=np.float64)
@@ -1086,10 +1089,23 @@ class DecomposedFeatureScorer:
                     + 2 * (sm[:, 1].astype(np.int64) if sm.shape[1] > 1 else 0)
                     + 4 * (sm[:, 2].astype(np.int64) if sm.shape[1] > 2 else 0)
                 )
-            if len(self.w_dyn_tgt) and tgt_marks is not None:
-                tm = np.asarray(tgt_marks, dtype=np.float64).reshape(-1)
-                tgt_term = self.tgt_term(tuple(tm[:3]))
-        return self.alpha_from_parts(
+        return self.logits_from_parts(
             u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
-            tgt_dom_id, src_dom_ids, src_mark_idx, tgt_term,
+            tgt_dom_id, src_dom_ids, src_mark_idx, 0.0,
         )
+
+    def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
+        """Drop-in equivalent of RuntimeFeatureScorer.alpha_for_target (string
+        inputs). Attribute/topology lookups reuse the wrapped scorer's caches."""
+        z = self.logits_for_target(
+            target_at, target_ne, src_ats, src_nes, src_marks=src_marks
+        )
+        if len(self.w_dyn_tgt) and tgt_marks is not None:
+            tm = np.asarray(tgt_marks, dtype=np.float64).reshape(-1)
+            target_term = self.tgt_term(tuple(tm[:3]))
+            if target_term:
+                z = z + target_term
+        a = self._softplus(z)
+        if self.alpha_scale != 1.0:
+            a = a * self.alpha_scale
+        return a

@@ -90,8 +90,12 @@ class _BinaryEdgeSpool:
         }
         self.streams = {name: open(path, "wb") for name, path in self.paths.items()}
         self.buffers = {name: [] for name in self.paths}
+        self.batch_buffers = {name: [] for name in self.paths}
+        self.batch_count = 0
 
     def append(self, target, source, edge):
+        if self.batch_count:
+            self.flush()
         self.buffers["target_signature_ids"].append(
             self.type_to_id[target.period_type] * 8 + target.initial_state
         )
@@ -108,16 +112,68 @@ class _BinaryEdgeSpool:
         if len(self.buffers["base_scores"]) >= self.buffer_size:
             self.flush()
 
-    def flush(self):
-        size = len(self.buffers["base_scores"])
+    def append_batch(
+        self,
+        target_type,
+        target_states,
+        source_types,
+        source_indices,
+        base_scores,
+        threshold,
+        past_windows,
+        future_windows,
+    ):
+        """Append vectorized target-dynamic rows without per-edge objects."""
+        if self.buffers["base_scores"]:
+            self.flush()
+        target_states = np.asarray(target_states, dtype=self.id_dtype)
+        source_indices = np.asarray(source_indices, dtype=np.int64)
+        size = len(target_states)
         if not size:
             return
-        for name in ("target_signature_ids", "source_signature_ids"):
-            np.asarray(self.buffers[name], dtype=self.id_dtype).tofile(self.streams[name])
-        for name in self._FLOAT_FIELDS:
-            np.asarray(self.buffers[name], dtype=np.float64).tofile(self.streams[name])
-        for values in self.buffers.values():
-            values.clear()
+        source_type_ids = np.fromiter(
+            (self.type_to_id[value] for value in source_types),
+            dtype=self.id_dtype,
+            count=len(source_types),
+        )
+        values = {
+            "target_signature_ids": (
+                self.type_to_id[target_type] * 8 + target_states
+            ).astype(self.id_dtype, copy=False),
+            "source_signature_ids": source_type_ids[source_indices],
+            "base_scores": np.asarray(base_scores, dtype=np.float64),
+            "thresholds": np.full(size, float(threshold), dtype=np.float64),
+            "past_windows": np.asarray(past_windows, dtype=np.float64),
+            "future_windows": np.asarray(future_windows, dtype=np.float64),
+        }
+        for name, value in values.items():
+            self.batch_buffers[name].append(value)
+        self.batch_count += size
+        self.count += size
+        if self.batch_count >= self.buffer_size:
+            self.flush()
+
+    def flush(self):
+        size = len(self.buffers["base_scores"])
+        if size:
+            for name in ("target_signature_ids", "source_signature_ids"):
+                np.asarray(self.buffers[name], dtype=self.id_dtype).tofile(self.streams[name])
+            for name in self._FLOAT_FIELDS:
+                np.asarray(self.buffers[name], dtype=np.float64).tofile(self.streams[name])
+            for values in self.buffers.values():
+                values.clear()
+        if self.batch_count:
+            for name in ("target_signature_ids", "source_signature_ids"):
+                np.concatenate(self.batch_buffers[name]).astype(
+                    self.id_dtype, copy=False
+                ).tofile(self.streams[name])
+            for name in self._FLOAT_FIELDS:
+                np.concatenate(self.batch_buffers[name]).astype(
+                    np.float64, copy=False
+                ).tofile(self.streams[name])
+            for values in self.batch_buffers.values():
+                values.clear()
+            self.batch_count = 0
 
     def arrays(self):
         self.flush()
@@ -266,6 +322,11 @@ def main():
         getattr(artifact.config, "dynamic_alpha", "off")
     )
     state_expansion = 8 if state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY else 64
+    compile_backend = (
+        "cpu-vectorized"
+        if state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+        else "cpu-scalar"
+    )
     candidate_t0 = time.monotonic()
     prepared_candidates = plan.prepare_candidate_period_types(period_types)
     period_types = prepared_candidates["period_types"]
@@ -274,6 +335,7 @@ def main():
         print(
             f"[period-cache] total_type_pairs={total_type_pairs}, "
             f"state_layout={state_layout}, "
+            f"backend={compile_backend}, "
             f"states_per_type_pair={state_expansion}, "
             f"max_state_edges={total_type_pairs * state_expansion}, "
             f"candidate_index_elapsed={time.monotonic() - candidate_t0:.1f}s, "
@@ -335,6 +397,7 @@ def main():
             progress=report,
             prepared_candidates=prepared_candidates,
             edge_sink=spool.append,
+            edge_batch_sink=spool.append_batch,
         )
         if not args.quiet and args.progress_every:
             render_progress(
