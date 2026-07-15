@@ -2023,7 +2023,12 @@ def _build_parser():
         default="",
         help="Comma-separated relation multipliers, same format as stream_alarm_mhp.py.",
     )
-    parser.add_argument("--progress-every", type=int, default=50_000)
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="Refresh live counters every N events; default 1 (display is time-throttled). 0 disables.",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -2033,6 +2038,8 @@ def main():
     args = parser.parse_args()
     if not str(args.groups_output).lower().endswith(".jsonl"):
         parser.error("--groups-output must end with .jsonl (incremental format)")
+    if args.progress_every < 0:
+        parser.error("--progress-every must be >= 0")
     if not args.visual_output:
         args.visual_output = _default_visual_output(args.groups_output)
     try:
@@ -2191,8 +2198,16 @@ def main():
         if args.progress_every and not args.quiet
         else None
     )
+
+    def live_progress_text():
+        return (
+            f"periods={engine.created_periods} "
+            f"harvests={engine.harvest_count} "
+            f"groups={len(engine.groups)}+{engine.closed_group_count}"
+        )
+
     if process_progress is not None:
-        process_progress.extra_text = "periods=0 harvests=0 groups=0+0"
+        process_progress.extra_text = live_progress_text()
     completed = False
     stats = None
     elapsed = 0.0
@@ -2201,24 +2216,12 @@ def main():
             for i, event in enumerate(events):
                 engine.process(event)
                 if process_progress is not None:
-                    process_progress.update()
                     if (i + 1) % args.progress_every == 0:
-                        progress_stats = engine.stats()
-                        process_progress.extra_text = (
-                            f"periods={progress_stats['created_periods']} "
-                            f"harvests={progress_stats['harvest_count']} "
-                            f"groups={progress_stats['active_group_count']}+"
-                            f"{progress_stats['closed_group_count']}"
-                        )
+                        process_progress.extra_text = live_progress_text()
+                    process_progress.update()
         finally:
             if process_progress is not None:
-                progress_stats = engine.stats()
-                process_progress.extra_text = (
-                    f"periods={progress_stats['created_periods']} "
-                    f"harvests={progress_stats['harvest_count']} "
-                    f"groups={progress_stats['active_group_count']}+"
-                    f"{progress_stats['closed_group_count']}"
-                )
+                process_progress.extra_text = live_progress_text()
                 process_progress.close()
         engine.flush()
         completed = True
