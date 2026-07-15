@@ -92,6 +92,7 @@ class _BinaryEdgeSpool:
         self.buffers = {name: [] for name in self.paths}
         self.batch_buffers = {name: [] for name in self.paths}
         self.batch_count = 0
+        self.memmaps = []
 
     def append(self, target, source, edge):
         if self.batch_count:
@@ -204,6 +205,7 @@ class _BinaryEdgeSpool:
             raw[name] = np.memmap(
                 self.paths[name], dtype=np.float64, mode="r", shape=(self.count,)
             )
+        self.memmaps = list(raw.values())
         return build_compact_csr_arrays(
             raw["target_signature_ids"],
             raw["source_signature_ids"],
@@ -214,6 +216,17 @@ class _BinaryEdgeSpool:
             self.signature_count,
             source_key_count=self.source_key_count,
         )
+
+    def release_mmaps(self):
+        """Release spool mappings before Windows removes the temp directory."""
+        for stream in self.streams.values():
+            if not stream.closed:
+                stream.close()
+        for array in self.memmaps:
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None and not mmap.closed:
+                mmap.close()
+        self.memmaps.clear()
 
 
 def _build_parser():
@@ -392,53 +405,63 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="alarm-period-cache-") as spool_dir:
         spool = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
-        type_pair_count = plan.precompile_period_types(
-            period_types,
-            progress=report,
-            prepared_candidates=prepared_candidates,
-            edge_sink=spool.append,
-            edge_batch_sink=spool.append_batch,
-        )
-        if not args.quiet and args.progress_every:
-            render_progress(
-                type_pair_count,
-                plan.compiled_pair_count,
-                plan.pruned_pair_count,
-                final=True,
+        arrays = None
+        payload = None
+        try:
+            type_pair_count = plan.precompile_period_types(
+                period_types,
+                progress=report,
+                prepared_candidates=prepared_candidates,
+                edge_sink=spool.append,
+                edge_batch_sink=spool.append_batch,
             )
-        if not args.quiet:
-            print(
-                f"[period-cache] scoring complete; building CSR and compressing "
-                f"{spool.count:,} positive edges ...",
-                flush=True,
+            if not args.quiet and args.progress_every:
+                render_progress(
+                    type_pair_count,
+                    plan.compiled_pair_count,
+                    plan.pruned_pair_count,
+                    final=True,
+                )
+            if not args.quiet:
+                print(
+                    f"[period-cache] scoring complete; building CSR and compressing "
+                    f"{spool.count:,} positive edges ...",
+                    flush=True,
+                )
+            arrays = spool.arrays()
+            fingerprint = association_cache_fingerprint(
+                args.model,
+                args.ne_graph,
+                args.site_graph,
+                config,
+                artifact.config.topology_node_field,
             )
-        arrays = spool.arrays()
-        fingerprint = association_cache_fingerprint(
-            args.model,
-            args.ne_graph,
-            args.site_graph,
-            config,
-            artifact.config.topology_node_field,
-        )
-        payload = {
-            "format": ASSOCIATION_CACHE_FORMAT,
-            "version": ASSOCIATION_CACHE_VERSION,
-            "fingerprint": fingerprint,
-            "arrays": arrays,
-            "metadata": {
-                "type_universe": "graph",
-                "period_type_count": len(period_types),
-                "signature_count": len(period_types) * 8,
-                "source_key_count": spool.source_key_count,
-                "state_layout": state_layout,
-                "edge_count": spool.count,
-                "pruned_pair_count": plan.pruned_pair_count,
-                "graph_entity_count": graph_entity_count,
-                "model_alarm_type_count": alarm_type_count,
-                "directed_period_type_pair_count": type_pair_count,
-            },
-        }
-        write_association_cache(args.output, payload)
+            payload = {
+                "format": ASSOCIATION_CACHE_FORMAT,
+                "version": ASSOCIATION_CACHE_VERSION,
+                "fingerprint": fingerprint,
+                "arrays": arrays,
+                "metadata": {
+                    "type_universe": "graph",
+                    "period_type_count": len(period_types),
+                    "signature_count": len(period_types) * 8,
+                    "source_key_count": spool.source_key_count,
+                    "state_layout": state_layout,
+                    "edge_count": spool.count,
+                    "pruned_pair_count": plan.pruned_pair_count,
+                    "graph_entity_count": graph_entity_count,
+                    "model_alarm_type_count": alarm_type_count,
+                    "directed_period_type_pair_count": type_pair_count,
+                },
+            }
+            write_association_cache(args.output, payload)
+        finally:
+            # np.asarray(memmap) keeps the underlying Windows file mapping alive.
+            # Drop every view before closing mappings and leaving TemporaryDirectory.
+            if payload is not None:
+                payload.pop("arrays", None)
+            arrays = None
+            spool.release_mmaps()
     elapsed = time.monotonic() - t0
     if not args.quiet:
         print(
