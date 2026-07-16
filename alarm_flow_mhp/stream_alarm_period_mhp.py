@@ -45,6 +45,8 @@ import numpy as np
 from alarm_flow_isahp.alarm_io import load_ordered_alarm_events
 from alarm_flow_isahp.event_domain import (
     DEVICE_DOMAIN_FIELD,
+    SUPPORTED_DEVICE_DOMAINS,
+    build_ne_domain_bucket_map,
     filter_and_annotate_device_domain,
 )
 from alarm_flow_isahp.ne_topology import NETopologyIndex
@@ -73,10 +75,21 @@ from alarm_flow_mhp.topology_relation_prior import (
 )
 from alarm_tools.progress_utils import ProgressBar
 from fault_grouping.alarm_events.identity import require_alarm_identity
-from fault_grouping.alarm_events.io import is_clear_alarm
+from fault_grouping.alarm_events.io import is_clear_alarm, parse_datetime_text
+from fault_grouping.alarm_events.sorted_cache import (
+    SortedAlarmCacheStream,
+    is_sorted_alarm_cache_file,
+    iter_sorted_alarm_cache_items,
+)
 from mhp.feature_kernel import FeatureKernel
+from ne_link_learning.core import normalize_text
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
-from topology_tools.region_utils import load_ne_graph
+from topology_tools.region_utils import (
+    build_ne_region_map,
+    event_region,
+    load_ne_graph,
+    parse_regions,
+)
 
 
 EPS = 1e-12
@@ -1966,6 +1979,158 @@ def _default_visual_output(groups_output):
     return f"{base}.visual.jsonl"
 
 
+def _iter_time_windowed_cache_items(items, start_ts, end_ts, time_stats):
+    """Emulate prepare-time --start-time/--end-time on an already-built cache.
+
+    The batch path windows raw rows by 告警首次发生时间 and then trims trailing
+    clear events.  A cached clear item no longer carries its raise time (the
+    field is overwritten with the effective clear time), so the raise-side
+    window is enforced through the shared raise/clear identity: clears whose
+    raise fell before the window are dropped with it.  Clears are buffered
+    until the next in-window raise, so the buffer left at the end is exactly
+    the ``trim_trailing_clear_alarms`` tail; because the cache is ts-sorted,
+    reading can also stop at the first item past ``end_ts``.
+    """
+    excluded_raise_identities = set()
+    pending_clears = []
+    for item in items:
+        ts = float(item.get("ts", 0.0))
+        if end_ts is not None and ts > end_ts:
+            time_stats["stopped_early"] = True
+            break
+        time_stats["input_event_count"] += 1
+        if is_clear_alarm(item.get("alarm", {})):
+            if start_ts is not None:
+                identity = require_alarm_identity(item)
+                if identity in excluded_raise_identities:
+                    excluded_raise_identities.discard(identity)
+                    time_stats["dropped_clear_event_count"] += 1
+                    continue
+            pending_clears.append(item)
+            continue
+        if start_ts is not None and ts < start_ts:
+            excluded_raise_identities.add(require_alarm_identity(item))
+            time_stats["dropped_raise_event_count"] += 1
+            continue
+        if pending_clears:
+            time_stats["kept_event_count"] += len(pending_clears)
+            yield from pending_clears
+            pending_clears.clear()
+        time_stats["kept_event_count"] += 1
+        yield item
+    time_stats["trimmed_trailing_clear_count"] = len(pending_clears)
+
+
+def _stream_sorted_cache_events(
+    path,
+    ne_graph_data,
+    *,
+    start_time="",
+    end_time="",
+    regions="",
+    annotate_domain=False,
+    filter_stats=None,
+):
+    """Lazily iterate a sorted alarm cache without materializing the events.
+
+    Applies the same time window, region filter, and device-domain
+    annotation/filter as the batch loading path, in the same order.  Counters
+    accumulate into ``filter_stats`` while iterating, so they are complete
+    only after the stream is exhausted.  Validation is eager; only the
+    returned iterator is lazy.
+    """
+    filter_stats = filter_stats if filter_stats is not None else {}
+    start_ts = (
+        parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
+    )
+    end_ts = parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("start_time 不能晚于 end_time")
+    time_stats = None
+    if start_ts is not None or end_ts is not None:
+        time_stats = {
+            "enabled": True,
+            "stage": "sorted_cache_stream",
+            "start_time": str(start_time or ""),
+            "end_time": str(end_time or ""),
+            "input_event_count": 0,
+            "kept_event_count": 0,
+            "dropped_raise_event_count": 0,
+            "dropped_clear_event_count": 0,
+            "trimmed_trailing_clear_count": 0,
+            "stopped_early": False,
+        }
+        filter_stats["time_filter"] = time_stats
+    selected_regions = frozenset(parse_regions(regions))
+    region_stats = None
+    ne_region_map = {}
+    if selected_regions:
+        ne_region_map = build_ne_region_map(ne_graph_data)
+        region_stats = {
+            "enabled": True,
+            "stage": "sorted_cache_stream",
+            "regions": sorted(selected_regions),
+            "allowed_device_count": sum(
+                1 for region in ne_region_map.values() if region in selected_regions
+            ),
+            "input_event_count": 0,
+            "kept_event_count": 0,
+            "dropped_event_count": 0,
+            "unknown_region_event_count": 0,
+            "kept_region_counts": {},
+            "dropped_region_counts": {},
+        }
+        filter_stats["region_filter"] = region_stats
+    domain_stats = None
+    domain_map = {}
+    if annotate_domain:
+        domain_map = build_ne_domain_bucket_map(ne_graph_data)
+        domain_stats = {
+            "enabled": True,
+            "supported_domains": sorted(SUPPORTED_DEVICE_DOMAINS),
+            "input_event_count": 0,
+            "kept_event_count": 0,
+            "dropped_event_count": 0,
+            "dropped_by_domain": {},
+        }
+        filter_stats["domain_filter"] = domain_stats
+
+    def _events():
+        items = iter_sorted_alarm_cache_items(path)
+        if time_stats is not None:
+            items = _iter_time_windowed_cache_items(items, start_ts, end_ts, time_stats)
+        for event in items:
+            if region_stats is not None:
+                region_stats["input_event_count"] += 1
+                region = event_region(event, ne_region_map)
+                if region not in selected_regions:
+                    if not region:
+                        region_stats["unknown_region_event_count"] += 1
+                    counts = region_stats["dropped_region_counts"]
+                    key = region or "<unknown>"
+                    counts[key] = counts.get(key, 0) + 1
+                    region_stats["dropped_event_count"] += 1
+                    continue
+                counts = region_stats["kept_region_counts"]
+                counts[region] = counts.get(region, 0) + 1
+                region_stats["kept_event_count"] += 1
+            if domain_stats is not None:
+                domain_stats["input_event_count"] += 1
+                ne_id = normalize_text(event.get("alarm_source", ""))
+                domain = domain_map.get(ne_id, "")
+                event[DEVICE_DOMAIN_FIELD] = domain
+                if domain not in SUPPORTED_DEVICE_DOMAINS:
+                    counts = domain_stats["dropped_by_domain"]
+                    key = domain or "UNKNOWN_DEVICE"
+                    counts[key] = counts.get(key, 0) + 1
+                    domain_stats["dropped_event_count"] += 1
+                    continue
+                domain_stats["kept_event_count"] += 1
+            yield event
+
+    return _events()
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         description="AlarmPeriod-oriented online MHP grouping (feature mode)."
@@ -1994,9 +2159,22 @@ def _build_parser():
     )
     parser.add_argument("--ne-graph", default=NE_GRAPH_JSON, help=resource_display("ne_graph.json"))
     parser.add_argument("--site-graph", default=SITE_GRAPH_JSON, help=resource_display("site_graph.json"))
-    parser.add_argument("--start-time", default="")
-    parser.add_argument("--end-time", default="")
-    parser.add_argument("--clear-delay-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--start-time",
+        default="",
+        help="Only process alarms whose first-occurrence time is >= this; works for raw and sorted-cache input.",
+    )
+    parser.add_argument(
+        "--end-time",
+        default="",
+        help="Only process alarms whose first-occurrence time is <= this; works for raw and sorted-cache input.",
+    )
+    parser.add_argument(
+        "--clear-delay-sec",
+        type=float,
+        default=0.0,
+        help="Clear-effective delay for raw input; sorted caches bake this in at prepare time.",
+    )
     parser.add_argument(
         "--aggregation-wait-sec",
         type=float,
@@ -2062,25 +2240,56 @@ def main():
     scorer, mu_scorer, ne_graph_data = _build_runtime_scorers(
         artifact, args.ne_graph, args.site_graph, quiet=args.quiet
     )
-    events, alarm_metadata = load_ordered_alarm_events(
-        args.alarms,
-        topo_path=args.site_graph,
-        ne_graph_path=args.ne_graph,
-        start_time=args.start_time or None,
-        end_time=args.end_time or None,
-        clear_delay_sec=args.clear_delay_sec,
-        regions=args.regions,
-    )
+    annotate_domain = DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields)
+    streaming_input = is_sorted_alarm_cache_file(args.alarms)
+    stream_filter_stats = {}
+    if streaming_input:
+        # Sorted caches are consumed straight off disk: the engine, the
+        # region/domain filters, and the outputs are all incremental, so the
+        # full event list never materializes in memory.  Filter statistics are
+        # only complete at the end and go into the summary record.
+        cache_stream = SortedAlarmCacheStream(args.alarms)
+        alarm_metadata = dict(cache_stream.metadata)
+        total_events = len(cache_stream)
+        if args.clear_delay_sec and not args.quiet:
+            print(
+                "[period] note: --clear-delay-sec is baked into the sorted cache "
+                "at prepare time and is ignored for cache input.",
+                flush=True,
+            )
+        try:
+            events = _stream_sorted_cache_events(
+                args.alarms,
+                ne_graph_data,
+                start_time=args.start_time,
+                end_time=args.end_time,
+                regions=args.regions,
+                annotate_domain=annotate_domain,
+                filter_stats=stream_filter_stats,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        events, alarm_metadata = load_ordered_alarm_events(
+            args.alarms,
+            topo_path=args.site_graph,
+            ne_graph_path=args.ne_graph,
+            start_time=args.start_time or None,
+            end_time=args.end_time or None,
+            clear_delay_sec=args.clear_delay_sec,
+            regions=args.regions,
+        )
+        if annotate_domain:
+            events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
+            if not args.quiet:
+                print(f"[period] domain filter: {domain_stats}", flush=True)
+        total_events = len(events)
     if artifact.config.regions and not args.regions:
         print(
             f"[period] note: artifact was trained with regions={list(artifact.config.regions)}, "
             "but inference no longer inherits them; pass --regions to filter.",
             flush=True,
         )
-    if DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields):
-        events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
-        if not args.quiet:
-            print(f"[period] domain filter: {domain_stats}", flush=True)
 
     history = (
         float(args.history_window_sec)
@@ -2187,6 +2396,7 @@ def main():
         "edges_output": os.path.abspath(args.edges_output) if args.edges_output else "",
         "visual_output": os.path.abspath(args.visual_output),
         "alarm_metadata": alarm_metadata,
+        "streaming_input": bool(streaming_input),
         "config": {key: value for key, value in vars(config).items()},
     }
     output = IncrementalPeriodOutput(
@@ -2205,14 +2415,16 @@ def main():
             flush=True,
         )
         print(
-            f"[period] events={len(events)}, wait={config.aggregation_wait_sec:g}s, "
+            f"[period] events={total_events}"
+            f"{' (cache header, streamed)' if streaming_input else ''}, "
+            f"wait={config.aggregation_wait_sec:g}s, "
             f"idle={config.period_idle_sec:g}s, history={config.history_window_sec:g}s, "
             f"scope={config.candidate_scope}, dynamic={getattr(artifact.config, 'dynamic_alpha', 'off')}",
             flush=True,
         )
 
     process_progress = (
-        ProgressBar(len(events), "处理 AlarmPeriod 告警")
+        ProgressBar(total_events, "处理 AlarmPeriod 告警")
         if args.progress_every and not args.quiet
         else None
     )
@@ -2246,14 +2458,17 @@ def main():
     finally:
         stats = engine.stats()
         elapsed = time.monotonic() - t0
-        output.close(
-            {
-                "status": "complete" if completed else "interrupted",
-                "stats": stats,
-                "elapsed_seconds": elapsed,
-            }
-        )
+        summary = {
+            "status": "complete" if completed else "interrupted",
+            "stats": stats,
+            "elapsed_seconds": elapsed,
+        }
+        if stream_filter_stats:
+            summary["input_filter_stats"] = stream_filter_stats
+        output.close(summary)
     if not args.quiet:
+        for name, filter_summary in stream_filter_stats.items():
+            print(f"[period] {name} (streamed): {filter_summary}", flush=True)
         print(
             f"[period] done: groups={stats['closed_group_count']}, "
             f"periods={stats['created_periods']}, harvests={stats['harvest_count']}, "
