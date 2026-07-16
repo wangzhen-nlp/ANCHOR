@@ -24,6 +24,7 @@ from ticket_recall.ticket_recall_utils import (
     alarm_record_identity_key,
     build_ne_to_domain_map,
     build_site_alarm_map_for_sites,
+    build_visualization_case_record,
     build_site_has_domain_map,
     build_group_site_time_index,
     build_site_to_group_index,
@@ -253,6 +254,60 @@ def _build_potential_groups_by_alarm_id(source_to_alarm_ids, alarm_id_to_target_
     return result
 
 
+def _build_group_site_alarm_ids(group_to_site_alarms):
+    """group -> site -> 告警实例键集合，用于 require-domain-per-site 裁剪站点后同步裁剪告警。"""
+    result = {}
+    for group_id, site_alarm_map in group_to_site_alarms.items():
+        per_site = {}
+        for site_id, alarms in site_alarm_map.items():
+            normalized_site_id = _normalize_text(site_id)
+            if not normalized_site_id:
+                continue
+            alarm_keys = set()
+            for record in alarms:
+                alarm_key = alarm_record_identity_key(record)
+                if alarm_key is not None:
+                    alarm_keys.add(alarm_key)
+            if alarm_keys:
+                per_site[normalized_site_id] = alarm_keys
+        result[group_id] = per_site
+    return result
+
+
+def _resolve_gold_alarm_ids(gold_id, gold_to_alarm_ids, gold_to_site_alarm_ids, gold_sites, restrict_to_sites):
+    if not restrict_to_sites:
+        return set(gold_to_alarm_ids.get(gold_id, set()))
+
+    per_site = gold_to_site_alarm_ids.get(gold_id, {})
+    alarm_ids = set()
+    for site_id in gold_sites:
+        alarm_ids.update(per_site.get(site_id, set()))
+    return alarm_ids
+
+
+def _build_alarm_identity_overlap(ultimate_alarm_universe, alarm_group_alarm_universe):
+    """告警实例键跨两侧的重合情况。
+
+    两侧的 occurrence_uuid 都由 alarm_content_uuid 对原始告警记录取值，所以只有在
+    group output 和 alarm 输入确实来自同一份告警导出时才会对上。重合度接近 0 通常意味着
+    传错了告警文件，此时告警级指标没有意义。
+    """
+    intersection = ultimate_alarm_universe & alarm_group_alarm_universe
+    union = ultimate_alarm_universe | alarm_group_alarm_universe
+    return {
+        "ultimate_side_alarm_count": len(ultimate_alarm_universe),
+        "alarm_group_side_alarm_count": len(alarm_group_alarm_universe),
+        "shared_alarm_count": len(intersection),
+        "ultimate_side_shared_ratio": (
+            len(intersection) / len(ultimate_alarm_universe) if ultimate_alarm_universe else 0.0
+        ),
+        "alarm_group_side_shared_ratio": (
+            len(intersection) / len(alarm_group_alarm_universe) if alarm_group_alarm_universe else 0.0
+        ),
+        "jaccard": len(intersection) / len(union) if union else 0.0,
+    }
+
+
 def _build_gold_site_count_distribution(details):
     counts = defaultdict(int)
     for item in details:
@@ -346,6 +401,158 @@ def _build_case_details_for_direction(details, gold_group_to_site_alarms, pred_g
     return case_details
 
 
+def _build_side_viewer_case(
+    group_id,
+    method,
+    display_sites,
+    associated_sites,
+    missing_sites,
+    context_sites,
+    site_alarms,
+    recall,
+    note,
+    group_ids,
+    ne_graph_data,
+):
+    """把一侧的故障组包装成传播图查看器能直接吃的 group 记录。
+
+    站点角色借用查看器已有的三套配色：associated=两侧共有，missing=只有本侧有，
+    context=对侧比本侧多出来的。
+    """
+    detail = {
+        "ticket_id": group_id,
+        "ticket_site_count": len(display_sites),
+        "ticket_sites": list(display_sites),
+        "display_sites": list(display_sites),
+        "associated_sites": list(associated_sites),
+        "associated_site_alarms": build_site_alarm_map_for_sites(site_alarms, associated_sites),
+        "missing_sites": list(missing_sites),
+        "missing_site_alarms": build_site_alarm_map_for_sites(site_alarms, missing_sites),
+        "context_sites": list(context_sites),
+        "context_site_alarms": build_site_alarm_map_for_sites(site_alarms, context_sites),
+        "associated_site_count": len(associated_sites),
+        "missing_site_count": len(missing_sites),
+        "fault_groups": list(group_ids),
+        "recall": recall,
+        "note": note,
+    }
+    return build_visualization_case_record(detail, method, ne_graph_data=ne_graph_data)
+
+
+def _build_comparison_case_records(
+    details,
+    direction,
+    direction_label,
+    gold_label,
+    pred_label,
+    gold_group_to_site_alarms,
+    pred_group_to_site_alarms,
+    ne_graph_data,
+    max_cases=0,
+):
+    """每个 gold 组一条记录，带上它自己和对侧命中组的完整内容，供对比浏览器渲染。"""
+    ranked = sorted(
+        details,
+        key=lambda item: (
+            float(item.get("f1", 0.0) or 0.0),
+            -int(item.get("gold_site_count", 0) or 0),
+            item.get("gold_id", ""),
+        ),
+    )
+    if max_cases > 0:
+        ranked = ranked[:max_cases]
+
+    records = []
+    for item in ranked:
+        gold_id = item.get("gold_id", "")
+        gold_sites = sorted(item.get("gold_sites", []))
+        pred_sites = sorted(item.get("predicted_sites", []))
+        shared_sites = sorted(set(gold_sites) & set(pred_sites))
+        gold_only_sites = sorted(set(gold_sites) - set(pred_sites))
+        pred_only_sites = sorted(set(pred_sites) - set(gold_sites))
+        pred_group_ids = list(item.get("effective_predicted_groups", []))
+
+        gold_site_alarms = gold_group_to_site_alarms.get(gold_id, {})
+        pred_site_alarms = _merge_group_site_alarms(pred_group_ids, pred_group_to_site_alarms)
+
+        note = (
+            f"{gold_label} {gold_id}：{len(gold_sites)} 个站点；"
+            f"{pred_label} 命中 {len(pred_group_ids)} 个组、{len(pred_sites)} 个站点；"
+            f"共有 {len(shared_sites)}，仅{gold_label}有 {len(gold_only_sites)}，仅{pred_label}有 {len(pred_only_sites)}"
+        )
+
+        records.append({
+            "direction": direction,
+            "direction_label": direction_label,
+            "case_id": gold_id,
+            "gold_site_count": len(gold_sites),
+            "shared_sites": shared_sites,
+            "gold_only_sites": gold_only_sites,
+            "pred_only_sites": pred_only_sites,
+            "site_recall": item.get("recall", 0.0),
+            "site_precision": item.get("precision", 0.0),
+            "site_f1": item.get("f1", 0.0),
+            "alarm_recall": item.get("alarm_recall", 0.0),
+            "alarm_precision": item.get("alarm_precision", 0.0),
+            "alarm_f1": item.get("alarm_f1", 0.0),
+            "gold_alarm_count": item.get("gold_alarm_count", 0),
+            "predicted_alarm_count": item.get("predicted_alarm_count", 0),
+            "matched_alarm_count": item.get("matched_alarm_count", 0),
+            "gold_alarms_missing_from_pred_universe_count": item.get(
+                "gold_alarms_missing_from_pred_universe_count", 0
+            ),
+            "note": note,
+            "gold_side": {
+                "present": True,
+                "label": gold_label,
+                "group_ids": [gold_id],
+                "sites": gold_sites,
+                "site_count": len(gold_sites),
+                "alarm_count": item.get("gold_alarm_count", 0),
+                "shared_sites": shared_sites,
+                "own_only_sites": gold_only_sites,
+                "viewer_case": _build_side_viewer_case(
+                    group_id=gold_id,
+                    method=f"{direction}::gold",
+                    display_sites=gold_sites,
+                    associated_sites=shared_sites,
+                    missing_sites=gold_only_sites,
+                    context_sites=[],
+                    site_alarms=gold_site_alarms,
+                    recall=item.get("recall", 0.0),
+                    note=note,
+                    group_ids=[gold_id],
+                    ne_graph_data=ne_graph_data,
+                ),
+            },
+            "pred_side": {
+                "present": bool(pred_group_ids),
+                "label": pred_label,
+                "group_ids": pred_group_ids,
+                "sites": pred_sites,
+                "site_count": len(pred_sites),
+                "alarm_count": item.get("predicted_alarm_count", 0),
+                "shared_sites": shared_sites,
+                "own_only_sites": pred_only_sites,
+                "viewer_case": _build_side_viewer_case(
+                    group_id=gold_id,
+                    method=f"{direction}::pred",
+                    display_sites=pred_sites,
+                    associated_sites=shared_sites,
+                    missing_sites=[],
+                    context_sites=pred_only_sites,
+                    site_alarms=pred_site_alarms,
+                    recall=item.get("recall", 0.0),
+                    note=note,
+                    group_ids=pred_group_ids,
+                    ne_graph_data=ne_graph_data,
+                ) if pred_group_ids else None,
+            },
+        })
+
+    return records
+
+
 def _filter_metric_details_to_unrecalled(metric_result):
     """仅过滤输出明细，不改变已经计算好的整体指标。"""
     if not isinstance(metric_result, dict):
@@ -414,17 +621,28 @@ def _compute_direction_metrics(
     only_one=False,
     loose_gold_to_pred_groups=None,
     potential_gold_to_pred_groups=None,
+    gold_to_alarm_ids=None,
+    gold_to_site_alarm_ids=None,
+    pred_group_to_alarm_ids=None,
+    pred_side_alarm_universe=None,
 ):
     details = []
     total_recall = 0.0
     total_precision = 0.0
     total_f1 = 0.0
+    total_alarm_recall = 0.0
+    total_alarm_precision = 0.0
+    total_alarm_f1 = 0.0
     gold_alarm_domains = gold_alarm_domains or {}
     gold_has_offline = gold_has_offline or {}
     site_has_no_domain = site_has_no_domain or {}
     site_has_required_domain = site_has_required_domain or {}
     loose_gold_to_pred_groups = loose_gold_to_pred_groups or {}
     potential_gold_to_pred_groups = potential_gold_to_pred_groups or {}
+    gold_to_alarm_ids = gold_to_alarm_ids or {}
+    gold_to_site_alarm_ids = gold_to_site_alarm_ids or {}
+    pred_group_to_alarm_ids = pred_group_to_alarm_ids or {}
+    pred_side_alarm_universe = pred_side_alarm_universe or set()
 
     for gold_id in sorted(gold_to_sites.keys()):
         if no_domain_alarm and no_domain_alarm in gold_alarm_domains.get(gold_id, set()):
@@ -466,6 +684,27 @@ def _compute_direction_metrics(
 
         true_positive_sites, recall, precision, f1 = _compute_site_metrics(gold_sites, predicted_sites)
 
+        # 告警级口径：站点级选组结果(effective_predicted_groups)保持复用，只把比较对象换成告警实例键，
+        # 这样两种粒度描述的是同一组配对关系，差异只来自粒度本身。
+        gold_alarm_ids = _resolve_gold_alarm_ids(
+            gold_id,
+            gold_to_alarm_ids,
+            gold_to_site_alarm_ids,
+            gold_sites,
+            bool(require_domain_per_site),
+        )
+        predicted_alarm_ids = set()
+        for predicted_group_id in effective_predicted_groups:
+            predicted_alarm_ids.update(pred_group_to_alarm_ids.get(predicted_group_id, set()))
+
+        matched_alarm_ids, alarm_recall, alarm_precision, alarm_f1 = _compute_site_metrics(
+            gold_alarm_ids,
+            predicted_alarm_ids,
+        )
+        # 对侧告警全集里根本不存在的 gold 告警：这部分不是分组分歧，而是另一侧压根没见过这条告警
+        # （例如 MHP 过滤掉了，或该告警没有故障组ID）。单列出来便于把口径噪声和真实差距分开。
+        gold_alarms_missing_from_pred_universe = gold_alarm_ids - pred_side_alarm_universe
+
         details.append({
             "gold_id": gold_id,
             "gold_site_count": len(gold_sites),
@@ -485,11 +724,21 @@ def _compute_direction_metrics(
             "recall": recall,
             "precision": precision,
             "f1": f1,
+            "gold_alarm_count": len(gold_alarm_ids),
+            "predicted_alarm_count": len(predicted_alarm_ids),
+            "matched_alarm_count": len(matched_alarm_ids),
+            "gold_alarms_missing_from_pred_universe_count": len(gold_alarms_missing_from_pred_universe),
+            "alarm_recall": alarm_recall,
+            "alarm_precision": alarm_precision,
+            "alarm_f1": alarm_f1,
         })
 
         total_recall += recall
         total_precision += precision
         total_f1 += f1
+        total_alarm_recall += alarm_recall
+        total_alarm_precision += alarm_precision
+        total_alarm_f1 += alarm_f1
 
     details.sort(
         key=lambda item: (
@@ -506,6 +755,13 @@ def _compute_direction_metrics(
         "average_recall": total_recall / evaluated_count if evaluated_count else 0.0,
         "average_precision": total_precision / evaluated_count if evaluated_count else 0.0,
         "average_f1": total_f1 / evaluated_count if evaluated_count else 0.0,
+        "average_alarm_recall": total_alarm_recall / evaluated_count if evaluated_count else 0.0,
+        "average_alarm_precision": total_alarm_precision / evaluated_count if evaluated_count else 0.0,
+        "average_alarm_f1": total_alarm_f1 / evaluated_count if evaluated_count else 0.0,
+        "gold_alarms_missing_from_pred_universe_total": sum(
+            item.get("gold_alarms_missing_from_pred_universe_count", 0) for item in details
+        ),
+        "gold_alarm_total": sum(item.get("gold_alarm_count", 0) for item in details),
         "details": details,
     }
 
@@ -528,6 +784,8 @@ def compute_ultimate_group_alarm_group_metrics(
     output_file=None,
     ultimate_case_jsonl_output_file=None,
     alarm_group_case_jsonl_output_file=None,
+    comparison_jsonl_output_file=None,
+    comparison_max_cases=2000,
 ):
     stage_total = 3 + int(bool(loose)) + int(bool(potential))
     current_stage = 1
@@ -610,6 +868,11 @@ def compute_ultimate_group_alarm_group_metrics(
         current_stage += 1
 
     print(f"阶段 {stage_total}/{stage_total}：分别按正向/反向口径计算平均指标...")
+    ultimate_site_alarm_ids = _build_group_site_alarm_ids(ultimate_group_to_site_alarms)
+    alarm_group_site_alarm_ids = _build_group_site_alarm_ids(alarm_group_to_site_alarms)
+    ultimate_alarm_universe = set(alarm_id_to_ultimate_groups.keys())
+    alarm_group_alarm_universe = set(alarm_id_to_alarm_groups.keys())
+
     ultimate_as_gold = _compute_direction_metrics(
         gold_to_sites=ultimate_group_to_sites,
         gold_to_pred_groups=ultimate_group_to_alarm_groups,
@@ -626,6 +889,10 @@ def compute_ultimate_group_alarm_group_metrics(
         only_one=only_one,
         loose_gold_to_pred_groups=ultimate_group_to_loose_alarm_groups,
         potential_gold_to_pred_groups=ultimate_group_to_potential_alarm_groups,
+        gold_to_alarm_ids=ultimate_group_to_alarm_ids,
+        gold_to_site_alarm_ids=ultimate_site_alarm_ids,
+        pred_group_to_alarm_ids=alarm_group_to_alarm_ids,
+        pred_side_alarm_universe=alarm_group_alarm_universe,
     )
     alarm_group_as_gold = _compute_direction_metrics(
         gold_to_sites=alarm_group_to_sites,
@@ -643,6 +910,10 @@ def compute_ultimate_group_alarm_group_metrics(
         only_one=only_one,
         loose_gold_to_pred_groups=alarm_group_to_loose_ultimate_groups,
         potential_gold_to_pred_groups=alarm_group_to_potential_ultimate_groups,
+        gold_to_alarm_ids=alarm_group_to_alarm_ids,
+        gold_to_site_alarm_ids=alarm_group_site_alarm_ids,
+        pred_group_to_alarm_ids=ultimate_group_to_alarm_ids,
+        pred_side_alarm_universe=ultimate_alarm_universe,
     )
 
     if only_unrecalled_predictions:
@@ -666,6 +937,10 @@ def compute_ultimate_group_alarm_group_metrics(
         "only_unrecalled_predictions_mode": only_unrecalled_predictions,
         "ultimate_group_count": len(ultimate_group_to_sites),
         "alarm_group_count": len(alarm_group_to_sites),
+        "alarm_identity_overlap": _build_alarm_identity_overlap(
+            ultimate_alarm_universe,
+            alarm_group_alarm_universe,
+        ),
         "ultimate_group_as_gold": ultimate_as_gold,
         "alarm_group_as_gold": alarm_group_as_gold,
     }
@@ -706,6 +981,35 @@ def compute_ultimate_group_alarm_group_metrics(
         result["alarm_group_as_gold_case_jsonl_output"] = alarm_group_case_jsonl_output_file
         result["alarm_group_as_gold_case_count"] = len(alarm_group_case_records)
 
+    if output_file and not comparison_jsonl_output_file:
+        comparison_jsonl_output_file = _derive_case_output_path(output_file, "comparison")
+
+    if comparison_jsonl_output_file:
+        comparison_records = _build_comparison_case_records(
+            ultimate_as_gold["details"],
+            direction="ultimate_group_as_gold",
+            direction_label="生成的故障组 作为 gold",
+            gold_label="生成的故障组",
+            pred_label="原始故障组ID组",
+            gold_group_to_site_alarms=ultimate_group_to_site_alarms,
+            pred_group_to_site_alarms=alarm_group_to_site_alarms,
+            ne_graph_data=ne_graph_data,
+            max_cases=comparison_max_cases,
+        ) + _build_comparison_case_records(
+            alarm_group_as_gold["details"],
+            direction="alarm_group_as_gold",
+            direction_label="原始故障组ID组 作为 gold",
+            gold_label="原始故障组ID组",
+            pred_label="生成的故障组",
+            gold_group_to_site_alarms=alarm_group_to_site_alarms,
+            pred_group_to_site_alarms=ultimate_group_to_site_alarms,
+            ne_graph_data=ne_graph_data,
+            max_cases=comparison_max_cases,
+        )
+        write_jsonl_records(comparison_jsonl_output_file, comparison_records)
+        result["comparison_case_jsonl_output"] = comparison_jsonl_output_file
+        result["comparison_case_count"] = len(comparison_records)
+
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
@@ -719,7 +1023,7 @@ def main():
     )
     parser.add_argument(
         "group_output",
-        help="match_rules.py 的输出文件，支持 jsonl/zip/目录",
+        help="match_rules.py 的输出文件，或流式推理的 visual jsonl（如 stream_alarm_period_mhp.py 的 *.visual.jsonl），支持 jsonl/zip/目录",
     )
     parser.add_argument(
         "alarms",
@@ -796,6 +1100,16 @@ def main():
         help="告警故障组ID 作为 gold 的未满召回样本可视化 jsonl；默认随主输出生成同名 sidecar",
     )
     parser.add_argument(
+        "--comparison-jsonl-output",
+        help="两侧故障组并排对比的 jsonl，可直接加载到 visualization/group_comparison_browser.html；默认随主输出生成同名 sidecar",
+    )
+    parser.add_argument(
+        "--comparison-max-cases",
+        type=int,
+        default=2000,
+        help="对比 jsonl 每个方向最多输出的样本数，按站点级 F1 升序取最差的；0 表示不限制，默认: 2000",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         default="ultimate_group_alarm_group_metrics.json",
@@ -822,22 +1136,44 @@ def main():
         output_file=args.output,
         ultimate_case_jsonl_output_file=args.ultimate_case_jsonl_output,
         alarm_group_case_jsonl_output_file=args.alarm_group_case_jsonl_output,
+        comparison_jsonl_output_file=args.comparison_jsonl_output,
+        comparison_max_cases=args.comparison_max_cases,
     )
 
-    print("【终极 group 作为 gold】")
-    print(f"样本数: {result['ultimate_group_as_gold']['sample_count']}")
-    print(f"gold站点数分布: {result['ultimate_group_as_gold']['gold_site_count_distribution']}")
-    print(f"平均召回率: {result['ultimate_group_as_gold']['average_recall']:.6f}")
-    print(f"平均准确率: {result['ultimate_group_as_gold']['average_precision']:.6f}")
-    print(f"平均F1: {result['ultimate_group_as_gold']['average_f1']:.6f}")
+    overlap = result["alarm_identity_overlap"]
+    print("【告警实例键重合度】")
+    print(f"终极group侧告警数: {overlap['ultimate_side_alarm_count']}")
+    print(f"告警故障组ID侧告警数: {overlap['alarm_group_side_alarm_count']}")
+    print(f"两侧共有告警数: {overlap['shared_alarm_count']} (Jaccard {overlap['jaccard']:.6f})")
+    if overlap["shared_alarm_count"] == 0:
+        print("警告: 两侧没有任何共有告警，告警级指标不可信，请确认 group output 与 alarms 来自同一份告警导出")
 
-    print("【告警故障组ID 作为 gold】")
-    print(f"样本数: {result['alarm_group_as_gold']['sample_count']}")
-    print(f"gold站点数分布: {result['alarm_group_as_gold']['gold_site_count_distribution']}")
-    print(f"平均召回率: {result['alarm_group_as_gold']['average_recall']:.6f}")
-    print(f"平均准确率: {result['alarm_group_as_gold']['average_precision']:.6f}")
-    print(f"平均F1: {result['alarm_group_as_gold']['average_f1']:.6f}")
+    for title, key in (
+        ("终极 group 作为 gold", "ultimate_group_as_gold"),
+        ("告警故障组ID 作为 gold", "alarm_group_as_gold"),
+    ):
+        section = result[key]
+        print(f"【{title}】")
+        print(f"样本数: {section['sample_count']}")
+        print(f"gold站点数分布: {section['gold_site_count_distribution']}")
+        print(f"[站点级] 平均召回率: {section['average_recall']:.6f}")
+        print(f"[站点级] 平均准确率: {section['average_precision']:.6f}")
+        print(f"[站点级] 平均F1: {section['average_f1']:.6f}")
+        print(f"[告警级] 平均召回率: {section['average_alarm_recall']:.6f}")
+        print(f"[告警级] 平均准确率: {section['average_alarm_precision']:.6f}")
+        print(f"[告警级] 平均F1: {section['average_alarm_f1']:.6f}")
+        print(
+            f"gold告警中对侧全集不存在的条数: {section['gold_alarms_missing_from_pred_universe_total']}"
+            f" / {section['gold_alarm_total']}"
+        )
+
     print(f"结果已输出到: {args.output}")
+    if result.get("comparison_case_jsonl_output"):
+        print(
+            f"两侧对比 jsonl: {result['comparison_case_jsonl_output']} "
+            f"({result.get('comparison_case_count', 0)} 条)，"
+            f"用 visualization/group_comparison_browser.html 打开"
+        )
     if result.get("ultimate_group_as_gold_case_jsonl_output"):
         print(
             f"终极group-case jsonl: {result['ultimate_group_as_gold_case_jsonl_output']} "

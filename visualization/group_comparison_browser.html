@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>故障组对比浏览器</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", "PingFang SC", Tahoma, sans-serif;
+            background: #f4f7fb;
+            color: #1f2937;
+        }
+        .page { max-width: 1360px; margin: 0 auto; padding: 24px; }
+        .hero {
+            background: linear-gradient(135deg, #fff 0%, #eef8f2 100%);
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 18px;
+        }
+        .hero h1 { margin: 0 0 6px; font-size: 21px; }
+        .sub { color: #6b7280; font-size: 13px; margin-bottom: 14px; }
+        .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        .controls input[type="search"], .controls select {
+            padding: 6px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            background: #fff;
+        }
+        .controls input[type="search"] { min-width: 240px; }
+        .controls label { font-size: 13px; color: #4b5563; display: flex; align-items: center; gap: 5px; }
+        .status { font-size: 13px; color: #4b5563; margin-top: 10px; }
+        .summary { font-size: 13px; color: #6b7280; margin-bottom: 10px; }
+        .empty {
+            background: #fff;
+            border: 1px dashed #d1d5db;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            color: #9ca3af;
+        }
+        .case-card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            padding: 16px;
+            margin-bottom: 14px;
+        }
+        .case-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            border-bottom: 1px solid #f3f4f6;
+            padding-bottom: 10px;
+            margin-bottom: 12px;
+        }
+        .case-title { font-size: 15px; font-weight: 600; font-family: ui-monospace, Menlo, monospace; }
+        .case-meta { font-size: 12px; color: #6b7280; margin-top: 3px; }
+        .metric-strip { display: flex; gap: 14px; flex-wrap: wrap; }
+        .metric { text-align: right; }
+        .metric-label { font-size: 11px; color: #9ca3af; }
+        .metric-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+        .side-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        @media (max-width: 900px) { .side-grid { grid-template-columns: 1fr; } }
+        .side-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 12px;
+            background: #fbfdff;
+        }
+        .side-card.pred { background: #fffdf7; }
+        .side-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .side-title { font-size: 13px; font-weight: 600; }
+        .field { margin-bottom: 8px; }
+        .field-label { font-size: 11px; color: #9ca3af; margin-bottom: 3px; }
+        .field-value { font-size: 12px; word-break: break-all; font-family: ui-monospace, Menlo, monospace; }
+        .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+        .chip {
+            display: inline-block;
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-size: 11px;
+            font-family: ui-monospace, Menlo, monospace;
+            border: 1px solid transparent;
+        }
+        .chip.shared { background: #ecfdf5; color: #065f46; border-color: #a7f3d0; }
+        .chip.only { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+        .pill {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 1px 8px;
+            font-size: 11px;
+            background: #eef2ff;
+            color: #3730a3;
+        }
+        .pill.warn { background: #fef3c7; color: #92400e; }
+        .pill.ok { background: #d1fae5; color: #065f46; }
+        .legend { font-size: 12px; color: #6b7280; display: flex; gap: 12px; align-items: center; margin-top: 10px; }
+        button {
+            padding: 5px 11px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #fff;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        button:hover:not(:disabled) { background: #f9fafb; }
+        button:disabled { opacity: .5; cursor: not-allowed; }
+        .open-btn { border-color: #93c5fd; color: #1d4ed8; }
+        .pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 16px; }
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="hero">
+        <h1>生成故障组 vs 原始故障组ID 对比浏览器</h1>
+        <div class="sub">
+            加载 <code>*.comparison.cases.jsonl</code> 后，每个卡片对应一个 gold 故障组，
+            左右并排展示它本身和对侧命中的组：站点按“两侧共有 / 仅本侧有”着色，可分别打开传播图详情。
+        </div>
+        <div class="controls">
+            <input id="fileInput" type="file" accept=".jsonl,.json,.txt">
+            <select id="directionFilter">
+                <option value="">全部方向</option>
+                <option value="ultimate_group_as_gold">生成的故障组 作为 gold</option>
+                <option value="alarm_group_as_gold">原始故障组ID组 作为 gold</option>
+            </select>
+            <input id="searchInput" type="search" placeholder="搜索故障组ID / 站点ID">
+            <label><input id="diffOnly" type="checkbox"> 只看有分歧的（站点级 F1 &lt; 1）</label>
+            <select id="sortBy">
+                <option value="site_f1">按站点级 F1 升序</option>
+                <option value="alarm_f1">按告警级 F1 升序</option>
+                <option value="gold_site_count">按 gold 站点数降序</option>
+            </select>
+        </div>
+        <div class="status" id="status">请选择一个 `comparison.cases.jsonl` 文件</div>
+        <div class="legend">
+            <span><span class="chip shared">站点</span> 两侧共有</span>
+            <span><span class="chip only">站点</span> 仅本侧有（对侧没圈进来）</span>
+        </div>
+    </div>
+
+    <div class="summary" id="summary"></div>
+    <div class="empty" id="emptyState">请选择一个 `comparison.cases.jsonl` 文件</div>
+    <div id="list"></div>
+    <div class="pager" id="pager" style="display:none;"></div>
+</div>
+
+<script>
+    let records = [];
+    let filteredRecords = [];
+    let currentPage = 1;
+    const pageSize = 50;
+
+    function parseJsonl(text) {
+        return text.split(/\r?\n/).map(l => l.trim()).filter(Boolean).map((line, index) => {
+            try {
+                return JSON.parse(line);
+            } catch (error) {
+                throw new Error(`第 ${index + 1} 行解析失败: ${error.message}`);
+            }
+        });
+    }
+
+    function escapeHtml(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function pct(value) {
+        return `${(Number(value || 0) * 100).toFixed(2)}%`;
+    }
+
+    function renderSiteChips(sites, sharedSites) {
+        if (!Array.isArray(sites) || sites.length === 0) {
+            return '<span class="field-value">-</span>';
+        }
+        const shared = new Set(sharedSites || []);
+        return '<div class="chips">' + sites.map(siteId => {
+            const cls = shared.has(siteId) ? 'chip shared' : 'chip only';
+            return `<span class="${cls}">${escapeHtml(siteId)}</span>`;
+        }).join('') + '</div>';
+    }
+
+    function renderSide(item, sideKey) {
+        const side = item[sideKey] || {};
+        const cardClass = sideKey === 'pred_side' ? 'side-card pred' : 'side-card';
+
+        if (!side.present) {
+            return `
+                <div class="${cardClass}">
+                    <div class="side-head">
+                        <div class="side-title">${escapeHtml(side.label || sideKey)}</div>
+                        <span class="pill warn">无对应组</span>
+                    </div>
+                    <div class="field"><div class="field-value">对侧没有任何组包含这个 gold 组的告警。</div></div>
+                </div>
+            `;
+        }
+
+        const onlyCount = (side.own_only_sites || []).length;
+        const pillClass = onlyCount === 0 ? 'pill ok' : 'pill warn';
+        const pillText = onlyCount === 0 ? '站点全部共有' : `${onlyCount} 个站点对侧没有`;
+
+        return `
+            <div class="${cardClass}">
+                <div class="side-head">
+                    <div class="side-title">${escapeHtml(side.label || sideKey)}</div>
+                    <span class="${pillClass}">${pillText}</span>
+                </div>
+                <div class="field">
+                    <div class="field-label">故障组 ID（${(side.group_ids || []).length} 个）</div>
+                    <div class="field-value">${escapeHtml((side.group_ids || []).join(', ')) || '-'}</div>
+                </div>
+                <div class="field">
+                    <div class="field-label">站点（${side.site_count || 0} 个）· 告警 ${side.alarm_count || 0} 条</div>
+                    ${renderSiteChips(side.sites, side.shared_sites)}
+                </div>
+                <button class="open-btn"
+                        onclick="openSideDetail('${escapeHtml(item.direction)}', '${escapeHtml(item.case_id)}', '${escapeHtml(sideKey)}')">
+                    查看传播图
+                </button>
+            </div>
+        `;
+    }
+
+    function openSideDetail(direction, caseId, sideKey) {
+        const item = records.find(r => String(r.direction) === String(direction) && String(r.case_id) === String(caseId));
+        if (!item) return;
+        const side = item[sideKey];
+        if (!side || !side.viewer_case) {
+            window.alert('该侧没有可展示的故障组内容');
+            return;
+        }
+        const sessionKey = `group_comparison_case_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        localStorage.setItem(sessionKey, JSON.stringify({ group: side.viewer_case }));
+        window.open(`ne_propagation_visualizer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
+    }
+
+    function filterRecords() {
+        const direction = document.getElementById('directionFilter').value;
+        const query = document.getElementById('searchInput').value.trim().toLowerCase();
+        const diffOnly = document.getElementById('diffOnly').checked;
+        const sortBy = document.getElementById('sortBy').value;
+
+        filteredRecords = records.filter(item => {
+            if (direction && item.direction !== direction) return false;
+            if (diffOnly && Number(item.site_f1 || 0) >= 1) return false;
+            if (!query) return true;
+            const haystack = [
+                item.case_id,
+                ...(item.gold_side?.group_ids || []),
+                ...(item.pred_side?.group_ids || []),
+                ...(item.gold_side?.sites || []),
+                ...(item.pred_side?.sites || []),
+            ].map(v => String(v || '').toLowerCase());
+            return haystack.some(v => v.includes(query));
+        });
+
+        filteredRecords.sort((a, b) => {
+            if (sortBy === 'gold_site_count') {
+                return Number(b.gold_site_count || 0) - Number(a.gold_site_count || 0);
+            }
+            return Number(a[sortBy] || 0) - Number(b[sortBy] || 0);
+        });
+    }
+
+    function renderRecords() {
+        const list = document.getElementById('list');
+        const emptyState = document.getElementById('emptyState');
+        const summary = document.getElementById('summary');
+
+        filterRecords();
+        const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+        if (currentPage > totalPages) currentPage = totalPages;
+        const start = (currentPage - 1) * pageSize;
+        const pageItems = filteredRecords.slice(start, start + pageSize);
+
+        summary.textContent = records.length
+            ? `总样本 ${records.length} 条，过滤后 ${filteredRecords.length} 条，当前展示 ${filteredRecords.length ? start + 1 : 0}-${Math.min(start + pageSize, filteredRecords.length)}`
+            : '';
+
+        if (pageItems.length === 0) {
+            list.innerHTML = '';
+            emptyState.style.display = 'block';
+            emptyState.textContent = records.length === 0
+                ? '请选择一个 `comparison.cases.jsonl` 文件'
+                : '当前筛选条件下没有样本';
+            renderPager();
+            return;
+        }
+
+        emptyState.style.display = 'none';
+        list.innerHTML = pageItems.map(item => {
+            const missingUniverse = Number(item.gold_alarms_missing_from_pred_universe_count || 0);
+            const missingNote = missingUniverse
+                ? `<span class="pill warn">${missingUniverse} 条 gold 告警对侧压根没见过</span>`
+                : '';
+            return `
+                <div class="case-card">
+                    <div class="case-head">
+                        <div>
+                            <div class="case-title">${escapeHtml(item.case_id)}</div>
+                            <div class="case-meta">
+                                ${escapeHtml(item.direction_label || item.direction)} ·
+                                gold 站点数 ${escapeHtml(item.gold_site_count || 0)} ·
+                                共有 ${(item.shared_sites || []).length} /
+                                仅 gold ${(item.gold_only_sites || []).length} /
+                                仅对侧 ${(item.pred_only_sites || []).length}
+                                ${missingNote}
+                            </div>
+                        </div>
+                        <div class="metric-strip">
+                            <div class="metric">
+                                <div class="metric-label">站点 召回/准确/F1</div>
+                                <div class="metric-value">${pct(item.site_recall)} / ${pct(item.site_precision)} / ${pct(item.site_f1)}</div>
+                            </div>
+                            <div class="metric">
+                                <div class="metric-label">告警 召回/准确/F1</div>
+                                <div class="metric-value">${pct(item.alarm_recall)} / ${pct(item.alarm_precision)} / ${pct(item.alarm_f1)}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="side-grid">
+                        ${renderSide(item, 'gold_side')}
+                        ${renderSide(item, 'pred_side')}
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        renderPager();
+    }
+
+    function renderPager() {
+        const pager = document.getElementById('pager');
+        const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+        pager.style.display = filteredRecords.length > 0 ? 'flex' : 'none';
+        pager.innerHTML = `
+            <button onclick="changePage(-1)" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>
+            <span>第 ${currentPage} / ${totalPages} 页</span>
+            <button onclick="changePage(1)" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>
+        `;
+    }
+
+    function changePage(delta) {
+        const totalPages = Math.max(1, Math.ceil(filteredRecords.length / pageSize));
+        currentPage = Math.min(totalPages, Math.max(1, currentPage + delta));
+        renderRecords();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function loadText(text, pathLabel) {
+        try {
+            records = parseJsonl(text);
+        } catch (error) {
+            document.getElementById('status').textContent = `加载失败: ${error.message}`;
+            return;
+        }
+        currentPage = 1;
+        const directions = new Set(records.map(r => r.direction));
+        document.getElementById('status').textContent =
+            `已加载 ${records.length} 条对比样本，覆盖 ${directions.size} 个方向${pathLabel ? ` · 文件: ${pathLabel}` : ''}`;
+        renderRecords();
+    }
+
+    document.getElementById('fileInput').addEventListener('change', function (event) {
+        const file = event.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = e => loadText(e.target.result, file.name);
+        reader.readAsText(file);
+    });
+
+    ['directionFilter', 'sortBy'].forEach(id => {
+        document.getElementById(id).addEventListener('change', () => { currentPage = 1; renderRecords(); });
+    });
+    document.getElementById('diffOnly').addEventListener('change', () => { currentPage = 1; renderRecords(); });
+    document.getElementById('searchInput').addEventListener('input', () => { currentPage = 1; renderRecords(); });
+</script>
+</body>
+</html>
