@@ -29,9 +29,9 @@ except ImportError as exc:
     TK_IMPORT_ERROR = exc
 
 if __package__ in (None, ""):
-    from _script_env import ensure_repo_root
+    from _script_env import ensure_package_parent
 
-    ensure_repo_root()
+    ensure_package_parent()
 
 from anchor_grouping_online.resource_buffer import load_resource_buffer
 from anchor_grouping_online.tools.topology_resources import RESOURCE_BUFFER_JSONL
