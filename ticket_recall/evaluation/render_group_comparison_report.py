@@ -19,10 +19,21 @@ if __package__ in (None, ""):
 
     ensure_repo_root(2)
 
-DIRECTIONS = (
+# compare_visual_alarm_groups.py 用 mhp_group_as_gold，compute_ultimate_group_alarm_group_metrics.py
+# 用 ultimate_group_as_gold；两者结构一致，按实际存在的键渲染。
+DIRECTION_CANDIDATES = (
+    ("mhp_group_as_gold", "MHP 生成的故障组 作为 gold", "MHP 生成的故障组当基准，看告警故障组ID能否复现它"),
     ("ultimate_group_as_gold", "终极 group 作为 gold", "生成的故障组当基准，看告警故障组ID能否复现它"),
     ("alarm_group_as_gold", "告警故障组ID 作为 gold", "告警故障组ID当基准，看生成的故障组能否复现它"),
 )
+
+
+def _resolve_directions(metrics):
+    return [
+        (key, title, hint)
+        for key, title, hint in DIRECTION_CANDIDATES
+        if isinstance(metrics.get(key), dict)
+    ]
 
 METRIC_ROWS = (
     ("召回率", "average_recall", "average_alarm_recall"),
@@ -131,6 +142,20 @@ def _render_flags(metrics):
     return f'<div class="flags">{parts}</div>'
 
 
+def _render_symptom_scope(metrics):
+    if not metrics.get("virtual_symptoms_excluded"):
+        return ""
+    return f"""
+<div class="card note">
+  <h2>告警口径</h2>
+  <p>生成组一侧：真实 symptom {_fmt_int(metrics.get('real_symptom_count'))} 条，
+  其中带故障组ID的 {_fmt_int(metrics.get('symptom_with_group_id_count'))} 条；
+  已剔除虚拟/推断 symptom {_fmt_int(metrics.get('skipped_virtual_symptom_count'))} 条
+  （模型补出来的告警，原始流里不存在，occurrence_uuid 是随机生成的，不参与指标）。</p>
+</div>
+"""
+
+
 def _render_overlap(overlap):
     shared = int(overlap.get("shared_alarm_count", 0) or 0)
     card_class = "card warn" if shared == 0 else "card"
@@ -145,7 +170,7 @@ def _render_overlap(overlap):
   <h2>告警实例键重合度</h2>
   {warning}
   <table>
-    <tr><th>终极 group 侧告警数</th><td class="num">{_fmt_int(overlap.get('ultimate_side_alarm_count'))}</td>
+    <tr><th>生成组侧告警数</th><td class="num">{_fmt_int(overlap.get('ultimate_side_alarm_count'))}</td>
         <th>其中两侧共有占比</th><td class="num">{_fmt_ratio(overlap.get('ultimate_side_shared_ratio'))}</td></tr>
     <tr><th>告警故障组ID 侧告警数</th><td class="num">{_fmt_int(overlap.get('alarm_group_side_alarm_count'))}</td>
         <th>其中两侧共有占比</th><td class="num">{_fmt_ratio(overlap.get('alarm_group_side_shared_ratio'))}</td></tr>
@@ -267,11 +292,35 @@ def _render_direction(metrics, key, title, hint, worst_limit):
 """
 
 
-def render_report(metrics, worst_limit=20):
-    direction_cards = "".join(
-        _render_direction(metrics, key, title, hint, worst_limit)
-        for key, title, hint in DIRECTIONS
+def _render_scope_sections(metrics, worst_limit):
+    """alarm-scope 为 both 时按口径分段渲染；否则退回顶层镜像的主口径。"""
+    scopes = metrics.get("scopes")
+    if not isinstance(scopes, dict) or len(scopes) <= 1:
+        return f'<div class="grid">{_render_directions(metrics, worst_limit)}</div>'
+
+    sections = []
+    for scope_name, scope_result in scopes.items():
+        overlap_html = ""
+        if scope_name == "raw" and scope_result.get("alarm_identity_overlap"):
+            overlap_html = _render_overlap(scope_result["alarm_identity_overlap"])
+        sections.append(f"""
+<h2 style="margin:26px 0 10px;font-size:19px">告警范围口径：{_esc(scope_result.get('alarm_scope_label', scope_name))}</h2>
+<p class="subtitle">告警故障组 {_fmt_int(scope_result.get('alarm_group_count'))} 个</p>
+{overlap_html}
+<div class="grid">{_render_directions(scope_result, worst_limit)}</div>
+""")
+    return "".join(sections)
+
+
+def _render_directions(section_metrics, worst_limit):
+    return "".join(
+        _render_direction(section_metrics, key, title, hint, worst_limit)
+        for key, title, hint in _resolve_directions(section_metrics)
     )
+
+
+def render_report(metrics, worst_limit=20):
+    direction_cards = _render_scope_sections(metrics, worst_limit)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -285,18 +334,17 @@ def render_report(metrics, worst_limit=20):
 <div class="page">
   <h1>生成故障组 vs 告警故障组ID 对比报告</h1>
   <p class="subtitle">
-    生成的故障组 {_fmt_int(metrics.get('ultimate_group_count'))} 个，
+    生成的故障组 {_fmt_int(metrics.get('mhp_group_count', metrics.get('ultimate_group_count')))} 个，
     告警故障组ID 聚出 {_fmt_int(metrics.get('alarm_group_count'))} 个。
     两个方向互为基准，站点级与告警级两种粒度并列。
   </p>
+  {_render_symptom_scope(metrics)}
   <div class="card">
     <h2>口径</h2>
     {_render_flags(metrics)}
   </div>
-  {_render_overlap(metrics.get('alarm_identity_overlap', {}))}
-  <div class="grid">
-    {direction_cards}
-  </div>
+  {_render_overlap(metrics['alarm_identity_overlap']) if (metrics.get('alarm_identity_overlap') and not (isinstance(metrics.get('scopes'), dict) and len(metrics['scopes']) > 1)) else ''}
+  {direction_cards}
 </div>
 </body>
 </html>
