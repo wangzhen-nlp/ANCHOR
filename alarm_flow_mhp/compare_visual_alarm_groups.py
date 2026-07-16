@@ -480,7 +480,28 @@ def _visual_alarm_side(indexes):
     return {key: indexes[key] for key in ALARM_SIDE_KEYS}
 
 
-def _build_raw_alarm_side(alarms_input, *, ne_graph_file, group_field):
+def _annotate_mhp_group_on_alarms(alarm_group_to_site_alarms, mhp_group_to_alarm_keys):
+    """给 raw 口径的告警证据回填 mhp_group_id。
+
+    原始告警上没有"我被哪个 MHP 组消费了"的信息，但 MHP 侧有每个组的告警键集合，
+    按 (eid, occurrence_uuid) 反查即可。回填后为空表示 MHP 没消费这条告警。
+    """
+    alarm_key_to_mhp_groups = defaultdict(set)
+    for mhp_group_id, alarm_keys in (mhp_group_to_alarm_keys or {}).items():
+        for alarm_key in alarm_keys:
+            alarm_key_to_mhp_groups[alarm_key].add(mhp_group_id)
+
+    for site_alarm_map in alarm_group_to_site_alarms.values():
+        for records in site_alarm_map.values():
+            for record in records:
+                alarm_key = alarm_record_identity_key(record)
+                mhp_group_ids = sorted(alarm_key_to_mhp_groups.get(alarm_key, ()))
+                if mhp_group_ids:
+                    record["mhp_group_id"] = ",".join(mhp_group_ids)
+                    record["来源故障组UUID"] = mhp_group_ids[0]
+
+
+def _build_raw_alarm_side(alarms_input, *, ne_graph_file, group_field, mhp_group_to_alarm_keys=None):
     """raw 口径：告警组由完整原始告警流构成，包含 MHP 从未消费到的告警。
 
     注意两侧的 occurrence_uuid 都由 alarm_content_uuid 对原始告警记录取哈希
@@ -499,6 +520,7 @@ def _build_raw_alarm_side(alarms_input, *, ne_graph_file, group_field):
         ne_graph_file=ne_graph_file,
         group_field=group_field,
     )
+    _annotate_mhp_group_on_alarms(alarm_group_to_site_alarms, mhp_group_to_alarm_keys)
     return {
         "alarm_group_to_sites": alarm_group_to_sites,
         "alarm_group_to_alarm_keys": alarm_group_to_alarm_keys,
@@ -663,6 +685,7 @@ def compare_visual_alarm_groups(
             alarms_input,
             ne_graph_file=ne_graph_file,
             group_field=group_field,
+            mhp_group_to_alarm_keys=indexes["mhp_group_to_alarm_keys"],
         )
 
     scope_names = ["visual", "raw"] if alarm_scope == "both" else [alarm_scope]
@@ -932,7 +955,12 @@ def main():
     parser.add_argument(
         "--comparison-jsonl-output",
         default=None,
-        help="两侧故障组并排对比的 jsonl，可加载到 visualization/group_comparison_browser.html；默认随主输出生成 sidecar，none 关闭",
+        metavar="PATH",
+        help=(
+            "两侧故障组并排对比的 jsonl，写到指定路径，可加载到 "
+            "visualization/group_comparison_browser.html。"
+            "不传则不生成——每条记录内嵌两侧的传播图数据，文件很大"
+        ),
     )
     parser.add_argument(
         "--comparison-max-cases",
@@ -963,9 +991,8 @@ def main():
     if _is_disabled(alarm_case_output):
         alarm_case_output = None
 
+    # 内嵌两侧 viewer_case 让这个文件很大，所以只在显式给了路径时才产出。
     comparison_output = args.comparison_jsonl_output
-    if comparison_output is None and args.output:
-        comparison_output = _derive_case_output_path(args.output, "comparison")
     if _is_disabled(comparison_output):
         comparison_output = None
 

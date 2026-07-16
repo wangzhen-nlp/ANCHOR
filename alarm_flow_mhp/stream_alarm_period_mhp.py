@@ -2008,7 +2008,17 @@ def _build_parser():
     parser.add_argument("--time-slack-sec", type=float, default=None)
     parser.add_argument("--late-penalty-half-life-sec", type=float, default=None)
     parser.add_argument("--close-inactive-sec", type=float, default=7200.0)
-    parser.add_argument("--min-group-events", type=int, default=None)
+    parser.add_argument(
+        "--min-group-events",
+        type=int,
+        default=1,
+        help="Groups with fewer events are dropped at finalization; default 1 keeps all groups.",
+    )
+    parser.add_argument(
+        "--regions",
+        default="",
+        help="Optional region filter for input alarms; default: no filtering (artifact regions are NOT inherited).",
+    )
     parser.add_argument("--immigrant-bias", type=float, default=1.0)
     parser.add_argument("--feature-alpha-floor", type=float, default=None)
     parser.add_argument("--attach-threshold-ratio", type=float, default=1.0)
@@ -2059,8 +2069,14 @@ def main():
         start_time=args.start_time or None,
         end_time=args.end_time or None,
         clear_delay_sec=args.clear_delay_sec,
-        regions=artifact.config.regions,
+        regions=args.regions,
     )
+    if artifact.config.regions and not args.regions:
+        print(
+            f"[period] note: artifact was trained with regions={list(artifact.config.regions)}, "
+            "but inference no longer inherits them; pass --regions to filter.",
+            flush=True,
+        )
     if DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields):
         events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
         if not args.quiet:
@@ -2091,11 +2107,13 @@ def main():
         if args.feature_alpha_floor is not None
         else float(getattr(artifact.config, "edge_threshold", 0.0))
     )
-    min_events = (
-        int(args.min_group_events)
-        if args.min_group_events is not None
-        else int(artifact.config.min_group_events)
-    )
+    min_events = int(args.min_group_events)
+    if int(artifact.config.min_group_events) != min_events:
+        print(
+            f"[period] note: artifact min_group_events={int(artifact.config.min_group_events)} "
+            f"is no longer inherited; using {min_events} (override with --min-group-events).",
+            flush=True,
+        )
     config = PeriodStreamConfig(
         aggregation_wait_sec=aggregation_wait,
         period_idle_sec=args.period_idle_sec,
