@@ -341,6 +341,7 @@ def _build_comparison_case_records(
     site_to_ne_ids,
     site_coord_index,
     max_cases=0,
+    alarm_scope="",
 ):
     """每个 gold 组一条记录，带上它自己和对侧命中组的完整内容，供对比浏览器渲染。"""
     ranked = sorted(
@@ -354,7 +355,8 @@ def _build_comparison_case_records(
     if max_cases > 0:
         ranked = ranked[:max_cases]
 
-    progress = ProgressBar(len(ranked), f"构造对比样本 {direction}") if ranked else None
+    progress_label = f"构造对比样本 {alarm_scope}/{direction}".replace("/", "/", 1) if alarm_scope else f"构造对比样本 {direction}"
+    progress = ProgressBar(len(ranked), progress_label) if ranked else None
     records = []
     for item in ranked:
         if progress is not None:
@@ -377,6 +379,8 @@ def _build_comparison_case_records(
         )
 
         records.append({
+            "alarm_scope": alarm_scope,
+            "alarm_scope_label": ALARM_SCOPE_LABELS.get(alarm_scope, alarm_scope),
             "direction": direction,
             "direction_label": direction_label,
             "case_id": gold_id,
@@ -630,7 +634,7 @@ def compare_visual_alarm_groups(
     mhp_case_jsonl_output_file=None,
     alarm_group_case_jsonl_output_file=None,
     comparison_jsonl_output_file=None,
-    comparison_max_cases=2000,
+    comparison_max_cases=0,
 ):
     ne_graph_data = load_ne_graph_data(ne_graph_file)
     ne_to_domain = build_ne_to_domain_map(ne_graph_data)
@@ -757,31 +761,38 @@ def compare_visual_alarm_groups(
         comparison_site_coord_index.update(
             build_site_coord_index_from_site_graph(load_site_graph_data())
         )
-        comparison_records = _build_comparison_case_records(
-            mhp_group_as_gold["details"],
-            direction="mhp_group_as_gold",
-            direction_label="MHP 生成的故障组 作为 gold",
-            gold_label="MHP 生成的故障组",
-            pred_label="原始故障组ID组",
-            gold_group_to_site_alarms=indexes["mhp_group_to_site_alarms"],
-            pred_group_to_site_alarms=primary_alarm_side["alarm_group_to_site_alarms"],
-            ne_graph_data=ne_graph_data,
-            site_to_ne_ids=comparison_site_to_ne_ids,
-            site_coord_index=comparison_site_coord_index,
-            max_cases=comparison_max_cases,
-        ) + _build_comparison_case_records(
-            alarm_group_as_gold["details"],
-            direction="alarm_group_as_gold",
-            direction_label="原始故障组ID组 作为 gold",
-            gold_label="原始故障组ID组",
-            pred_label="MHP 生成的故障组",
-            gold_group_to_site_alarms=primary_alarm_side["alarm_group_to_site_alarms"],
-            pred_group_to_site_alarms=indexes["mhp_group_to_site_alarms"],
-            ne_graph_data=ne_graph_data,
-            site_to_ne_ids=comparison_site_to_ne_ids,
-            site_coord_index=comparison_site_coord_index,
-            max_cases=comparison_max_cases,
-        )
+        comparison_records = []
+        for scope_name in scope_names:
+            scope_alarm_side = alarm_sides[scope_name]
+            scope_label = ALARM_SCOPE_LABELS[scope_name]
+            comparison_records += _build_comparison_case_records(
+                scopes[scope_name]["mhp_group_as_gold"]["details"],
+                direction="mhp_group_as_gold",
+                direction_label=f"MHP 生成的故障组 作为 gold（{scope_label}）",
+                gold_label="MHP 生成的故障组",
+                pred_label="原始故障组ID组",
+                gold_group_to_site_alarms=indexes["mhp_group_to_site_alarms"],
+                pred_group_to_site_alarms=scope_alarm_side["alarm_group_to_site_alarms"],
+                ne_graph_data=ne_graph_data,
+                site_to_ne_ids=comparison_site_to_ne_ids,
+                site_coord_index=comparison_site_coord_index,
+                max_cases=comparison_max_cases,
+                alarm_scope=scope_name,
+            )
+            comparison_records += _build_comparison_case_records(
+                scopes[scope_name]["alarm_group_as_gold"]["details"],
+                direction="alarm_group_as_gold",
+                direction_label=f"原始故障组ID组 作为 gold（{scope_label}）",
+                gold_label="原始故障组ID组",
+                pred_label="MHP 生成的故障组",
+                gold_group_to_site_alarms=scope_alarm_side["alarm_group_to_site_alarms"],
+                pred_group_to_site_alarms=indexes["mhp_group_to_site_alarms"],
+                ne_graph_data=ne_graph_data,
+                site_to_ne_ids=comparison_site_to_ne_ids,
+                site_coord_index=comparison_site_coord_index,
+                max_cases=comparison_max_cases,
+                alarm_scope=scope_name,
+            )
         write_jsonl_records(comparison_jsonl_output_file, comparison_records)
         result["comparison_case_jsonl_output"] = comparison_jsonl_output_file
         result["comparison_case_count"] = len(comparison_records)
@@ -926,8 +937,12 @@ def main():
     parser.add_argument(
         "--comparison-max-cases",
         type=int,
-        default=2000,
-        help="对比 jsonl 每个方向最多输出的样本数，按站点级 F1 升序取最差的；0 表示不限制，默认: 2000",
+        default=0,
+        help=(
+            "对比 jsonl 每个方向/每种口径最多输出的样本数，按站点级 F1 升序取最差的。"
+            "默认 0 表示全量不截断；样本多时文件会很大，浏览器一次性解析可能吃不消，"
+            "这时可以设个上限只看最差的那批"
+        ),
     )
     parser.add_argument(
         "-o",
@@ -1002,11 +1017,18 @@ def main():
     if args.output:
         print(f"结果已输出到: {args.output}")
     if result.get("comparison_case_jsonl_output"):
+        comparison_path = result["comparison_case_jsonl_output"]
+        size_mb = os.path.getsize(comparison_path) / (1024 * 1024) if os.path.exists(comparison_path) else 0.0
         print(
-            f"两侧对比 jsonl: {result['comparison_case_jsonl_output']} "
-            f"({result.get('comparison_case_count', 0)} 条)，"
+            f"两侧对比 jsonl: {comparison_path} "
+            f"({result.get('comparison_case_count', 0)} 条, {size_mb:.1f} MB)，"
             f"用 visualization/group_comparison_browser.html 打开"
         )
+        if size_mb > 200:
+            print(
+                "提示: 文件较大，浏览器一次性解析可能很慢或崩溃；"
+                "如需要可用 --comparison-max-cases N 只保留最差的 N 个样本"
+            )
     if result.get("mhp_group_as_gold_case_jsonl_output"):
         print(
             f"MHP group-case jsonl: {result['mhp_group_as_gold_case_jsonl_output']} "

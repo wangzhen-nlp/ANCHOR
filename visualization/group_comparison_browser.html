@@ -124,10 +124,11 @@
         </div>
         <div class="controls">
             <input id="fileInput" type="file" accept=".jsonl,.json,.txt">
+            <select id="scopeFilter">
+                <option value="">全部告警范围口径</option>
+            </select>
             <select id="directionFilter">
                 <option value="">全部方向</option>
-                <option value="ultimate_group_as_gold">生成的故障组 作为 gold</option>
-                <option value="alarm_group_as_gold">原始故障组ID组 作为 gold</option>
             </select>
             <input id="searchInput" type="search" placeholder="搜索故障组ID / 站点ID">
             <label><input id="diffOnly" type="checkbox"> 只看有分歧的（站点级 F1 &lt; 1）</label>
@@ -242,13 +243,46 @@
         window.open(`ne_propagation_visualizer.html?session_key=${encodeURIComponent(sessionKey)}`, '_blank');
     }
 
+    // 方向的取值随脚本而异（mhp_group_as_gold / ultimate_group_as_gold），从数据里取，别写死
+    function rebuildDirectionFilter() {
+        const select = document.getElementById('directionFilter');
+        const directions = [];
+        records.forEach(r => {
+            if (r.direction && !directions.some(d => d.value === r.direction)) {
+                directions.push({ value: r.direction, label: r.direction_label || r.direction });
+            }
+        });
+        const current = select.value;
+        select.innerHTML = '<option value="">全部方向</option>' +
+            directions.map(d => `<option value="${escapeHtml(d.value)}">${escapeHtml(d.label)}</option>`).join('');
+        if (directions.some(d => d.value === current)) select.value = current;
+    }
+
+    function rebuildScopeFilter() {
+        const select = document.getElementById('scopeFilter');
+        const scopes = [];
+        records.forEach(r => {
+            if (r.alarm_scope && !scopes.some(s => s.value === r.alarm_scope)) {
+                scopes.push({ value: r.alarm_scope, label: r.alarm_scope_label || r.alarm_scope });
+            }
+        });
+        // 只有一种口径时没有可选项，藏起来省得占地方
+        select.style.display = scopes.length > 1 ? '' : 'none';
+        const current = select.value;
+        select.innerHTML = '<option value="">全部告警范围口径</option>' +
+            scopes.map(s => `<option value="${escapeHtml(s.value)}">${escapeHtml(s.label)}</option>`).join('');
+        if (scopes.some(s => s.value === current)) select.value = current;
+    }
+
     function filterRecords() {
+        const scope = document.getElementById('scopeFilter').value;
         const direction = document.getElementById('directionFilter').value;
         const query = document.getElementById('searchInput').value.trim().toLowerCase();
         const diffOnly = document.getElementById('diffOnly').checked;
         const sortBy = document.getElementById('sortBy').value;
 
         filteredRecords = records.filter(item => {
+            if (scope && item.alarm_scope !== scope) return false;
             if (direction && item.direction !== direction) return false;
             if (diffOnly && Number(item.site_f1 || 0) >= 1) return false;
             if (!query) return true;
@@ -307,6 +341,7 @@
                         <div>
                             <div class="case-title">${escapeHtml(item.case_id)}</div>
                             <div class="case-meta">
+                                ${item.alarm_scope ? `<span class="pill">${escapeHtml(item.alarm_scope)}</span> ` : ''}
                                 ${escapeHtml(item.direction_label || item.direction)} ·
                                 gold 站点数 ${escapeHtml(item.gold_site_count || 0)} ·
                                 共有 ${(item.shared_sites || []).length} /
@@ -363,9 +398,13 @@
             return;
         }
         currentPage = 1;
+        rebuildScopeFilter();
+        rebuildDirectionFilter();
         const directions = new Set(records.map(r => r.direction));
+        const scopes = new Set(records.map(r => r.alarm_scope).filter(Boolean));
+        const scopeText = scopes.size > 1 ? `，${scopes.size} 种告警范围口径` : '';
         document.getElementById('status').textContent =
-            `已加载 ${records.length} 条对比样本，覆盖 ${directions.size} 个方向${pathLabel ? ` · 文件: ${pathLabel}` : ''}`;
+            `已加载 ${records.length} 条对比样本，覆盖 ${directions.size} 个方向${scopeText}${pathLabel ? ` · 文件: ${pathLabel}` : ''}`;
         renderRecords();
     }
 
@@ -377,7 +416,7 @@
         reader.readAsText(file);
     });
 
-    ['directionFilter', 'sortBy'].forEach(id => {
+    ['scopeFilter', 'directionFilter', 'sortBy'].forEach(id => {
         document.getElementById(id).addEventListener('change', () => { currentPage = 1; renderRecords(); });
     });
     document.getElementById('diffOnly').addEventListener('change', () => { currentPage = 1; renderRecords(); });
