@@ -25,6 +25,7 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_tools.alarm_inputs import stream_alarm_inputs
+from fault_grouping.alarm_events.io import parse_datetime_text
 from alarm_flow_mhp.missing_chain_sampler import MHP_VIRTUAL_RULE
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import (
@@ -501,12 +502,26 @@ def _annotate_mhp_group_on_alarms(alarm_group_to_site_alarms, mhp_group_to_alarm
                     record["来源故障组UUID"] = mhp_group_ids[0]
 
 
-def _build_raw_alarm_side(alarms_input, *, ne_graph_file, group_field, mhp_group_to_alarm_keys=None):
+def _build_raw_alarm_side(
+    alarms_input,
+    *,
+    ne_graph_file,
+    group_field,
+    mhp_group_to_alarm_keys=None,
+    start_time="",
+    end_time="",
+):
     """raw 口径：告警组由完整原始告警流构成，包含 MHP 从未消费到的告警。
 
-    注意两侧的 occurrence_uuid 都由 alarm_content_uuid 对原始告警记录取哈希
-    （见 fault_grouping/alarm_events/io.py），所以只有传入同一份告警导出时告警级才对得上；
+    输入可以是原始告警导出（JSONL/CSV/ZIP/目录），也可以是
+    stream_alarm_period_mhp.py 用的排序告警缓存——缓存条目直接复用 prepare 时
+    算好的 occurrence_uuid，天然和 visual 侧对齐。传原始导出时两侧的
+    occurrence_uuid 都由 alarm_content_uuid 对原始告警记录取哈希
+    （见 fault_grouping/alarm_events/io.py），所以必须是跑 visual 时的同一份导出；
     不一致时 alarm_identity_overlap 会暴露出来。
+
+    start_time/end_time 按告警首次发生时间过滤原始告警，与
+    stream_alarm_period_mhp.py 的时间窗口径一致。
     """
     (
         alarm_group_to_sites,
@@ -519,6 +534,8 @@ def _build_raw_alarm_side(alarms_input, *, ne_graph_file, group_field, mhp_group
         alarms_input,
         ne_graph_file=ne_graph_file,
         group_field=group_field,
+        start_time=start_time or None,
+        end_time=end_time or None,
     )
     _annotate_mhp_group_on_alarms(alarm_group_to_site_alarms, mhp_group_to_alarm_keys)
     return {
@@ -640,6 +657,8 @@ def compare_visual_alarm_groups(
     *,
     alarms_input=None,
     alarm_scope="visual",
+    alarm_start_time="",
+    alarm_end_time="",
     group_field="故障组ID",
     ne_graph_file=None,
     min_site_num=0,
@@ -686,6 +705,8 @@ def compare_visual_alarm_groups(
             ne_graph_file=ne_graph_file,
             group_field=group_field,
             mhp_group_to_alarm_keys=indexes["mhp_group_to_alarm_keys"],
+            start_time=alarm_start_time,
+            end_time=alarm_end_time,
         )
 
     scope_names = ["visual", "raw"] if alarm_scope == "both" else [alarm_scope]
@@ -734,6 +755,8 @@ def compare_visual_alarm_groups(
         "virtual_symptoms_excluded": True,
         "case_scope": case_scope,
         "alarm_scope": alarm_scope,
+        "alarm_start_time": alarm_start_time or "",
+        "alarm_end_time": alarm_end_time or "",
         "primary_alarm_scope": primary_scope,
         "mhp_group_count": len(indexes["mhp_group_to_sites"]),
         "alarm_group_count": primary["alarm_group_count"],
@@ -862,7 +885,11 @@ def main():
         "alarms",
         nargs="?",
         default="",
-        help="兼容旧命令的可选参数；新 visual-only 评估不再读取原始告警输入",
+        help=(
+            "raw/both 口径的原始告警输入：JSONL/CSV/ZIP/目录，或推理时用的"
+            "排序告警缓存（推荐，与 visual 侧的告警 identity 天然对齐）；"
+            "默认 visual-only 评估不读取该参数"
+        ),
     )
     parser.add_argument(
         "--group-field",
@@ -953,6 +980,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--start-time",
+        default="",
+        help=(
+            "只统计告警首次发生时间 >= 此时间的原始告警；仅作用于 raw/both 口径的 "
+            "alarms 输入（visual 侧由推理时的时间窗决定），原始导出和排序告警缓存都支持"
+        ),
+    )
+    parser.add_argument(
+        "--end-time",
+        default="",
+        help="只统计告警首次发生时间 <= 此时间的原始告警；其余同 --start-time",
+    )
+    parser.add_argument(
         "--comparison-jsonl-output",
         default=None,
         metavar="PATH",
@@ -998,11 +1038,28 @@ def main():
 
     if args.alarm_scope in ("raw", "both") and not args.alarms:
         parser.error("--alarm-scope raw/both 需要提供 alarms 位置参数（原始告警输入）")
+    if (args.start_time or args.end_time) and args.alarm_scope not in ("raw", "both"):
+        parser.error("--start-time/--end-time 只作用于 raw/both 口径的 alarms 输入")
+    try:
+        start_ts = (
+            parse_datetime_text(args.start_time, "start_time").timestamp()
+            if args.start_time else None
+        )
+        end_ts = (
+            parse_datetime_text(args.end_time, "end_time").timestamp()
+            if args.end_time else None
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        parser.error("--start-time 不能晚于 --end-time")
 
     result = compare_visual_alarm_groups(
         visual_output=args.visual_output,
         alarms_input=args.alarms,
         alarm_scope=args.alarm_scope,
+        alarm_start_time=args.start_time,
+        alarm_end_time=args.end_time,
         group_field=args.group_field,
         ne_graph_file=args.ne_graph,
         min_site_num=args.min_site_num,

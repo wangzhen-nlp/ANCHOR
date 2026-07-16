@@ -12,6 +12,11 @@ if __package__ in (None, ""):
 from alarm_tools.alarm_types import OFFLINE_ALARMS
 from alarm_tools.alarm_inputs import build_ne_to_site_map, stream_alarm_inputs
 from fault_grouping.alarm_events.identity import alarm_content_uuid
+from fault_grouping.alarm_events.io import is_clear_alarm, parse_datetime_text
+from fault_grouping.alarm_events.sorted_cache import (
+    is_sorted_alarm_cache_file,
+    iter_sorted_alarm_cache_items,
+)
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import _extract_group_id, _extract_group_sites
 from ticket_recall.evaluation.recall_common import (
@@ -182,7 +187,61 @@ def _build_ultimate_group_indexes(group_records, group_field, ne_to_domain=None)
     )
 
 
-def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
+def _stream_raw_alarm_records(alarm_input, start_time=None, end_time=None):
+    """统一原始告警输入：JSONL/CSV/ZIP/目录，或推理引擎用的排序告警缓存。
+
+    缓存条目必须复用 prepare 时算好的 occurrence_uuid：缓存里的 alarm 载荷被改写过
+    （清除行覆盖了告警首次发生时间，还补了告警编码ID），对它重算 alarm_content_uuid
+    会和 visual 侧对不上。同一条原始告警在缓存里有 raise/clear 两行且 identity 相同，
+    跳过清除行以还原"一条原始告警一条记录"的口径。
+
+    start_time/end_time 按告警首次发生时间过滤，与 stream_alarm_period_mhp.py
+    的时间窗口径一致；缓存的 raise 行 ts 就是首次发生时间，且整体按 ts 有序，
+    所以越过 end_time 后可以直接停止读取。
+    """
+    start_ts = (
+        parse_datetime_text(start_time, "start_time").timestamp() if start_time else None
+    )
+    end_ts = parse_datetime_text(end_time, "end_time").timestamp() if end_time else None
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("start_time 不能晚于 end_time")
+
+    if is_sorted_alarm_cache_file(alarm_input):
+        for item in iter_sorted_alarm_cache_items(alarm_input, show_progress=True):
+            ts = float(item.get("ts", 0.0))
+            if end_ts is not None and ts > end_ts:
+                break
+            payload = item.get("alarm", {})
+            if not isinstance(payload, dict) or is_clear_alarm(payload):
+                continue
+            if start_ts is not None and ts < start_ts:
+                continue
+            record = dict(payload)
+            record["occurrence_uuid"] = item.get("occurrence_uuid", "")
+            site_id = _normalize_text(item.get("site_id", ""))
+            if site_id:
+                # 缓存里的 site_id 是 prepare 时校验过的解析结果，覆盖原字段
+                # 才能和引擎实际使用的站点保持一致。
+                record["站点ID"] = site_id
+            yield record
+        return
+    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
+        if start_ts is not None or end_ts is not None:
+            occurred_ts = parse_datetime_text(
+                str(alarm.get("告警首次发生时间", "")).strip(), "告警首次发生时间"
+            ).timestamp()
+            if start_ts is not None and occurred_ts < start_ts:
+                continue
+            if end_ts is not None and occurred_ts > end_ts:
+                continue
+        record = dict(alarm)
+        record["occurrence_uuid"] = alarm_content_uuid(record)
+        yield record
+
+
+def _build_alarm_group_site_index(
+    alarm_input, ne_graph_file, group_field, start_time=None, end_time=None
+):
     ne_to_site = {}
     ne_to_domain = {}
     if ne_graph_file and os.path.exists(ne_graph_file):
@@ -202,9 +261,7 @@ def _build_alarm_group_site_index(alarm_input, ne_graph_file, group_field):
     alarm_group_alarm_domains = defaultdict(set)
     alarm_group_has_offline = defaultdict(bool)
     alarm_id_to_alarm_groups = defaultdict(set)
-    for alarm in stream_alarm_inputs(alarm_input, show_progress=True):
-        alarm = dict(alarm)
-        alarm["occurrence_uuid"] = alarm_content_uuid(alarm)
+    for alarm in _stream_raw_alarm_records(alarm_input, start_time=start_time, end_time=end_time):
         group_ids = _parse_group_ids(alarm.get(group_field, ""))
         if not group_ids:
             continue
