@@ -16,7 +16,7 @@ outside this set have no edge (α=0); the candidate set is what the kernel score
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 
@@ -70,6 +70,250 @@ def domain_of(entity, node_infos=None):
     return (getattr(info, "domain_bucket", "") or "") if info is not None else ""
 
 
+# Domain buckets kept as-is by phi_node_domain; OTHER/MISSING/unknown-device
+# all collapse into OTHER (they carry no distinct propagation semantics, and
+# merging keeps the dom-pair one-hot block at 4×4). Both φ and ψ (μ features)
+# use this merged 4-bucket view of the NE graph's domain_bucket.
+_PHI_NODE_DOMAINS = frozenset({"DATA", "RAN", "TRANSMISSION"})
+
+
+def phi_node_domain(info):
+    """Merged domain bucket of a graph node: RAN/TRANSMISSION/DATA pass through,
+    everything else (OTHER, MISSING, node absent from the graph) → OTHER."""
+    bucket = (getattr(info, "domain_bucket", "") or "") if info is not None else ""
+    return bucket if bucket in _PHI_NODE_DOMAINS else "OTHER"
+
+
+def phi_domain_of(entity, node_infos=None):
+    """Merged feature domain of an entity. Composite (site×domain) entities pass
+    their embedded label domain through unchanged; bare nodes merge their
+    NE-graph ``domain_bucket`` via :func:`phi_node_domain`."""
+    node, dom = split_entity(entity)
+    if dom:
+        return dom
+    return phi_node_domain((node_infos or {}).get(node))
+
+
+class SiteStats:
+    """Site/device structural summaries for the φ graph columns.
+
+    Derived deterministically from ``node_infos`` (NE → site) and the topology
+    index's undirected 1-hop adjacency, so training and inference agree given
+    the same graph snapshot — the same consistency contract topo_score already
+    relies on. In site mode the NE-level summary is retained for pair-level
+    site features, while single-device degree features remain zero.
+
+    Feature scaling is saturating x/(x+k) — bounded in [0,1), monotone, and
+    dataset-independent (no normalizer to persist).
+    """
+
+    SIZE_K = 8.0    # site with 8 NEs → 0.5; hubs saturate toward 1
+    LINK_K = 4.0    # 4 inter-site NE links → 0.5
+    DEGREE_K = 4.0  # device with 4 undirected neighbors → 0.5
+    SITE_LOAD_K = 8.0  # site with 8 total NE-link endpoints → 0.5
+
+    def __init__(self, node_infos, topology_index, undirected_neighbors=None):
+        node_site = {}
+        sizes = Counter()
+        site_domain_counts = defaultdict(Counter)
+        for node, info in (node_infos or {}).items():
+            s = getattr(info, "site_id", "") or ""
+            node_site[node] = s
+            if s:
+                sizes[s] += 1
+                site_domain_counts[s][phi_node_domain(info)] += 1
+        pair_links = Counter()
+        site_link_ends = Counter()
+        site_all_link_ends = Counter()
+        node_degrees = Counter()
+        undirected = (
+            undirected_neighbors
+            if undirected_neighbors is not None
+            else (getattr(topology_index, "undirected_hops", {}) or {})
+        )
+        self._undirected = undirected
+        self._direct_neighbor_sets = undirected_neighbors is not None
+        for node, neighbors in undirected.items():
+            hop_items = (
+                ((nbr, 1) for nbr in neighbors)
+                if undirected_neighbors is not None
+                else neighbors.items()
+            )
+            for nbr, hop in hop_items:
+                if hop != 1 or not (node < nbr):   # each undirected link once
+                    continue
+                node_degrees[node] += 1
+                node_degrees[nbr] += 1
+                site_a = node_site.get(node, "")
+                site_b = node_site.get(nbr, "")
+                if site_a:
+                    site_all_link_ends[site_a] += 1
+                if site_b:
+                    site_all_link_ends[site_b] += 1
+                if not site_a or not site_b:
+                    continue
+                # Link endpoints are the denominator for normalized shares.
+                # An intra-site link contributes two endpoints to that site.
+                site_link_ends[site_a] += 1
+                site_link_ends[site_b] += 1
+                if site_b == site_a:
+                    continue
+                key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+                pair_links[key] += 1
+        self.sizes = sizes
+        self.pair_links = pair_links
+        self.site_link_ends = site_link_ends
+        self.site_all_link_ends = site_all_link_ends
+        self.node_degrees = node_degrees
+        self.site_domain_counts = site_domain_counts
+        self.site_domain_norms = {
+            site: sum(float(n) ** 2 for n in counts.values()) ** 0.5
+            for site, counts in site_domain_counts.items()
+        }
+
+    def size_feat(self, site) -> float:
+        n = self.sizes.get(site, 0) if site else 0
+        return n / (n + self.SIZE_K)
+
+    def link_feat(self, site_a, site_b) -> float:
+        """Inter-site connectivity; 0 for same/unknown sites (same_site covers
+        the former, and an unknown site has no graph links by construction)."""
+        if not site_a or not site_b or site_a == site_b:
+            return 0.0
+        key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+        n = self.pair_links.get(key, 0)
+        return n / (n + self.LINK_K)
+
+    def site_link_ratio(self, site_a, site_b) -> float:
+        """Share of both sites' NE-link endpoints devoted to this site pair."""
+        if not site_a or not site_b or site_a == site_b:
+            return 0.0
+        key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+        between = self.pair_links.get(key, 0)
+        total_ends = self.site_link_ends.get(site_a, 0) + self.site_link_ends.get(site_b, 0)
+        return (2.0 * between / total_ends) if total_ends else 0.0
+
+    def site_link_density(self, site_a, site_b) -> float:
+        """Inter-site NE links divided by all possible cross-site NE pairs."""
+        if not site_a or not site_b or site_a == site_b:
+            return 0.0
+        key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+        possible = self.sizes.get(site_a, 0) * self.sizes.get(site_b, 0)
+        return (self.pair_links.get(key, 0) / possible) if possible else 0.0
+
+    def site_size_balance(self, site_a, site_b) -> float:
+        """Similarity of site sizes: min(size_a,size_b) / max(size_a,size_b)."""
+        if not site_a or not site_b:
+            return 0.0
+        a = self.sizes.get(site_a, 0)
+        b = self.sizes.get(site_b, 0)
+        return (min(a, b) / max(a, b)) if a and b else 0.0
+
+    def site_domain_cosine(self, site_a, site_b) -> float:
+        """Cosine similarity of the sites' merged four-bucket domain counts."""
+        if not site_a or not site_b:
+            return 0.0
+        a = self.site_domain_counts.get(site_a)
+        b = self.site_domain_counts.get(site_b)
+        if site_a == site_b and a:
+            return 1.0
+        norm = self.site_domain_norms.get(site_a, 0.0) * self.site_domain_norms.get(site_b, 0.0)
+        if not a or not b or not norm:
+            return 0.0
+        # Four buckets at most; iterate the smaller mapping.
+        if len(a) > len(b):
+            a, b = b, a
+        dot = sum(float(n) * b.get(domain, 0) for domain, n in a.items())
+        return dot / norm
+
+    def degree_feat(self, node) -> float:
+        """Saturating undirected 1-hop degree of one device."""
+        n = self.node_degrees.get(node, 0) if node else 0
+        return n / (n + self.DEGREE_K)
+
+    def site_link_load(self, site) -> float:
+        """Saturating number of all undirected NE-link endpoints at a site."""
+        n = self.site_all_link_ends.get(site, 0) if site else 0
+        return n / (n + self.SITE_LOAD_K)
+
+    def domain_share(self, site, domain) -> float:
+        """Share of a site's devices in one merged domain bucket."""
+        total = self.sizes.get(site, 0) if site else 0
+        if not total or not domain:
+            return 0.0
+        return self.site_domain_counts.get(site, {}).get(str(domain), 0) / total
+
+    def device_link_ratio(self, node_a, node_b) -> float:
+        """Share of both devices' link endpoints occupied by their direct edge."""
+        if not node_a or not node_b or node_a == node_b:
+            return 0.0
+        neighbors = self._undirected.get(
+            node_a, set() if self._direct_neighbor_sets else {}
+        )
+        linked = (
+            node_b in neighbors
+            if self._direct_neighbor_sets
+            else neighbors.get(node_b) == 1
+        )
+        if not linked:
+            return 0.0
+        total_degree = self.node_degrees.get(node_a, 0) + self.node_degrees.get(node_b, 0)
+        return (2.0 / total_degree) if total_degree else 0.0
+
+
+class GeoStats:
+    """Cached-input geographic features for a pair of sites.
+
+    Coordinates come from ``GraphContext.site_coords`` when available, falling
+    back to the first valid NE coordinate per site. Distance is transformed to
+    a bounded proximity so it stays on the same numerical scale as the other φ
+    columns and requires no fitted/persisted standardizer.
+    """
+
+    PROXIMITY_KM = 10.0  # 10 km -> 0.5
+
+    def __init__(self, node_infos, site_coords=None):
+        self.coords = dict(site_coords or {})
+        for info in (node_infos or {}).values():
+            site = getattr(info, "site_id", "") or ""
+            lat = getattr(info, "latitude", None)
+            lon = getattr(info, "longitude", None)
+            if site and site not in self.coords and lat is not None and lon is not None:
+                self.coords[site] = (float(lat), float(lon))
+        from ne_link_learning.core import haversine_km
+
+        self._haversine_km = haversine_km
+        self._pair_cache = {}
+
+    def pair_features(self, site_a, site_b) -> tuple[float, float]:
+        """Return ``(geo_proximity, geo_distance_missing)`` for one site pair."""
+        key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+        hit = self._pair_cache.get(key)
+        if hit is not None:
+            return hit
+        # A shared, known site id proves zero distance even when that site's
+        # coordinates are absent. Empty ids remain genuinely unknown.
+        if site_a and site_a == site_b:
+            out = (1.0, 0.0)
+            self._pair_cache[key] = out
+            return out
+        a = self.coords.get(site_a) if site_a else None
+        b = self.coords.get(site_b) if site_b else None
+        if a is None or b is None:
+            out = (0.0, 1.0)
+            self._pair_cache[key] = out
+            return out
+        distance_km = self._haversine_km(a[0], a[1], b[0], b[1])
+        if distance_km is None:
+            out = (0.0, 1.0)
+            self._pair_cache[key] = out
+            return out
+        k = self.PROXIMITY_KM
+        out = (k / (float(distance_km) + k), 0.0)
+        self._pair_cache[key] = out
+        return out
+
+
 class FeatureLayout:
     """Canonical φ(target, source) construction shared by training and
     inference, so the feature vector is byte-identical on both sides.
@@ -82,8 +326,8 @@ class FeatureLayout:
     def __init__(self, at_vocab, domain_vocab=()):
         self.at_vocab = list(at_vocab)
         self.n_at = max(len(self.at_vocab), 1)
-        # Domain-pair features are OFF (empty vocab) unless device_domain is part
-        # of the type — so device/NE-mode φ is byte-identical to the legacy layout.
+        # Domain block: label-sourced device_domain vocab in site×domain mode,
+        # merged 4-bucket node domains (phi_node_domain) in device mode.
         self.domain_vocab = list(domain_vocab)
         self.n_dom = len(self.domain_vocab)
         self._dom_to_id = {d: i for i, d in enumerate(self.domain_vocab)}
@@ -103,6 +347,18 @@ class FeatureLayout:
             "same_ne_type",
             "topo_x_same_at",
             "topo_x_same_site",
+            "tgt_site_size",       # saturating site NE-count of the target's site
+            "src_site_size",       # ... of the source's site
+            "site_link_score",     # saturating inter-site NE-link count (0 = same/unknown site)
+            "site_link_ratio",     # share of the two sites' NE-link endpoints
+            "site_link_density",   # inter-site NE links / possible cross-site NE pairs
+            "site_size_balance",   # min(site sizes) / max(site sizes)
+            "site_domain_cosine",  # cosine similarity of merged domain-count vectors
+            "tgt_undirected_degree",  # saturating target-device undirected degree
+            "src_undirected_degree",  # saturating source-device undirected degree
+            "device_link_ratio",   # share of the two devices' link endpoints
+            "geo_proximity",       # 10 / (distance_km + 10); 0 when coordinates are missing
+            "geo_distance_missing",
         ]
         if self.n_dom:
             names.append("same_domain")
@@ -116,8 +372,14 @@ class FeatureLayout:
         return len(self.feature_names)
 
     def domain_ids(self, domains) -> np.ndarray:
-        """Map a sequence of domain strings to layout ids (-1 = OOV / no domain)."""
+        """Map a sequence of domain strings to layout ids (-1 = OOV / no domain).
+        Callers resolve domains via phi_domain_of, so values are already merged
+        buckets; an OOV here is a bucket absent from training → no dom column."""
         return np.array([self._dom_to_id.get(str(d), -1) for d in domains], dtype=np.int64)
+
+    def dom_id(self, domain) -> int:
+        """Scalar counterpart of :meth:`domain_ids`."""
+        return self._dom_to_id.get(str(domain), -1)
 
     def build_matrix(
         self,
@@ -130,18 +392,31 @@ class FeatureLayout:
         same_netype: np.ndarray,
         dom_u: np.ndarray = None,
         dom_v: np.ndarray = None,
+        tgt_site_size: np.ndarray = None,
+        src_site_size: np.ndarray = None,
+        site_link: np.ndarray = None,
+        site_link_ratio: np.ndarray = None,
+        site_link_density: np.ndarray = None,
+        site_size_balance: np.ndarray = None,
+        site_domain_cosine: np.ndarray = None,
+        tgt_undirected_degree: np.ndarray = None,
+        src_undirected_degree: np.ndarray = None,
+        device_link_ratio: np.ndarray = None,
+        geo_proximity: np.ndarray = None,
+        geo_missing: np.ndarray = None,
     ) -> np.ndarray:
         """All inputs are length-C arrays (at_*/dom_* int, rest float/bool).
 
         ``dom_u``/``dom_v`` are domain layout ids (see :meth:`domain_ids`); they
         are required iff this layout has a non-empty domain vocab.
+        Optional structural/geographic inputs become zero columns when omitted.
         """
         # φ is built in float32 (halves the (C, F) matrix, the dominant memory block
         # at large candidate counts; 0/1 indicators + a topo score in [0,1] are
         # exactly/near-exactly representable, and φ·w promotes to float64 so the dot
         # product keeps full precision). Columns are written into a PREALLOCATED
-        # matrix in place rather than column_stack'd, so the 18 column arrays and the
-        # stacked output never coexist (which would ~double the peak). dom_u/dom_v
+        # matrix in place rather than column_stack'd, so feature-column arrays and
+        # the stacked output never coexist (which would ~double the peak). dom_u/dom_v
         # stay int64 (they are ids, not features).
         _F = np.float32
         C = len(at_u)
@@ -162,6 +437,18 @@ class FeatureLayout:
         phi[:, j] = np.asarray(same_netype, dtype=_F); j += 1
         phi[:, j] = topo * same_at; j += 1
         phi[:, j] = topo * same_site; j += 1
+        phi[:, j] = 0.0 if tgt_site_size is None else np.asarray(tgt_site_size, dtype=_F); j += 1
+        phi[:, j] = 0.0 if src_site_size is None else np.asarray(src_site_size, dtype=_F); j += 1
+        phi[:, j] = 0.0 if site_link is None else np.asarray(site_link, dtype=_F); j += 1
+        phi[:, j] = 0.0 if site_link_ratio is None else np.asarray(site_link_ratio, dtype=_F); j += 1
+        phi[:, j] = 0.0 if site_link_density is None else np.asarray(site_link_density, dtype=_F); j += 1
+        phi[:, j] = 0.0 if site_size_balance is None else np.asarray(site_size_balance, dtype=_F); j += 1
+        phi[:, j] = 0.0 if site_domain_cosine is None else np.asarray(site_domain_cosine, dtype=_F); j += 1
+        phi[:, j] = 0.0 if tgt_undirected_degree is None else np.asarray(tgt_undirected_degree, dtype=_F); j += 1
+        phi[:, j] = 0.0 if src_undirected_degree is None else np.asarray(src_undirected_degree, dtype=_F); j += 1
+        phi[:, j] = 0.0 if device_link_ratio is None else np.asarray(device_link_ratio, dtype=_F); j += 1
+        phi[:, j] = 0.0 if geo_proximity is None else np.asarray(geo_proximity, dtype=_F); j += 1
+        phi[:, j] = 0.0 if geo_missing is None else np.asarray(geo_missing, dtype=_F); j += 1
         if self.n_dom:
             if dom_u is None or dom_v is None:
                 raise ValueError("domain ids required: this FeatureLayout has a domain vocab")
@@ -178,18 +465,19 @@ class MuFeatureSpec:
     """Single-type features ψ(u) for the inductive immigrant baseline
     μ(u) = softplus(w_μ · ψ(u)).
 
-    Uses only INDUCTIVE attributes of the type's device (alarm_type, ne_type,
-    vendor, network domain) — deliberately NOT the type's own historical event
-    count, which wouldn't generalize to new devices and would reintroduce
-    per-device memorization. Categorical blocks are one-hot with capped vocabs;
-    an unseen category at inference falls back to the bias + remaining blocks.
+    Uses only INDUCTIVE attributes of the type's graph entity (categorical
+    alarm/device attributes plus a small persisted set of node/site structural
+    scalars) — deliberately NOT the type's own historical event count, which
+    wouldn't generalize and would reintroduce per-entity memorization.
     """
 
-    def __init__(self, at_vocab, ne_type_vocab, vendor_vocab, domain_vocab):
+    def __init__(self, at_vocab, ne_type_vocab, vendor_vocab, domain_vocab,
+                 numeric_feature_names=()):
         self.at_vocab = list(at_vocab)
         self.ne_type_vocab = list(ne_type_vocab)
         self.vendor_vocab = list(vendor_vocab)
         self.domain_vocab = list(domain_vocab)
+        self.numeric_feature_names = list(numeric_feature_names)
         self._at = {v: i for i, v in enumerate(self.at_vocab)}
         self._ne = {v: i for i, v in enumerate(self.ne_type_vocab)}
         self._ve = {v: i for i, v in enumerate(self.vendor_vocab)}
@@ -200,14 +488,15 @@ class MuFeatureSpec:
             + [f"ne_type={v}" for v in self.ne_type_vocab]
             + [f"vendor={v}" for v in self.vendor_vocab]
             + [f"domain={v}" for v in self.domain_vocab]
+            + self.numeric_feature_names
         )
 
     @property
     def n_features(self):
         return len(self.feature_names)
 
-    def build_matrix(self, ats, ne_types, vendors, domains):
-        """Per-type attribute arrays (object/str) → (n, F) one-hot matrix."""
+    def build_matrix(self, ats, ne_types, vendors, domains, numeric_features=None):
+        """Per-type categorical + structural attributes → (n, F) matrix."""
         n = len(ats)
         blocks = [np.ones((n, 1))]
         for vocab_map, vals in (
@@ -222,10 +511,22 @@ class MuFeatureSpec:
                 if j is not None:
                     blk[i, j] = 1.0
             blocks.append(blk)
+        numeric_features = numeric_features or {}
+        for name in self.numeric_feature_names:
+            arr = np.asarray(numeric_features.get(name, 0.0), dtype=np.float64)
+            if arr.ndim == 0:
+                arr = np.full(n, float(arr), dtype=np.float64)
+            if len(arr) != n:
+                raise ValueError(
+                    f"μ numeric feature {name!r} has length {len(arr)}, expected {n}"
+                )
+            blocks.append(arr.reshape(n, 1))
         return np.column_stack(blocks)
 
-    def build_row(self, at, ne_type, vendor, domain):
-        return self.build_matrix([at], [ne_type], [vendor], [domain])[0]
+    def build_row(self, at, ne_type, vendor, domain, numeric_features=None):
+        return self.build_matrix(
+            [at], [ne_type], [vendor], [domain], numeric_features=numeric_features
+        )[0]
 
     def to_dict(self):
         return {
@@ -233,6 +534,7 @@ class MuFeatureSpec:
             "ne_type_vocab": self.ne_type_vocab,
             "vendor_vocab": self.vendor_vocab,
             "domain_vocab": self.domain_vocab,
+            "numeric_feature_names": self.numeric_feature_names,
         }
 
     @classmethod
@@ -243,6 +545,7 @@ class MuFeatureSpec:
             payload.get("ne_type_vocab", []),
             payload.get("vendor_vocab", []),
             payload.get("domain_vocab", []),
+            payload.get("numeric_feature_names", []),
         )
 
 
@@ -259,9 +562,13 @@ class _NodeContext:
     keyed by topology node, plus ``node_domains`` (node → domains present, used
     for site×domain missing-parent candidate enumeration)."""
 
-    def __init__(self, node_infos, node_domains=None):
+    def __init__(self, node_infos, node_domains=None, site_coords=None,
+                 device_node_infos=None, device_undirected_neighbors=None):
         self.node_infos = node_infos
         self.node_domains = dict(node_domains or {})
+        self.site_coords = dict(site_coords or {})
+        self.device_node_infos = device_node_infos
+        self.device_undirected_neighbors = device_undirected_neighbors
 
 
 def _dominant(counter):
@@ -285,11 +592,18 @@ def build_node_context(ne_graph_data, node_field="alarm_source"):
     site's set of present device domains is exposed via ``node_domains``.
     """
     from alarm_flow_isahp.event_domain import MODELED_DOMAINS
+    from alarm_flow_isahp.ne_topology import build_undirected_neighbors
     from ne_link_learning.core import NodeInfo, build_graph_context
 
     gc = build_graph_context(ne_graph_data)
+    device_neighbors = build_undirected_neighbors(ne_graph_data)
     if node_field != "site_id":
-        return gc
+        return _NodeContext(
+            gc.node_infos,
+            site_coords=gc.site_coords,
+            device_node_infos=gc.node_infos,
+            device_undirected_neighbors=device_neighbors,
+        )
 
     node_infos = {}
     node_domains = {}
@@ -313,16 +627,54 @@ def build_node_context(ne_graph_data, node_field="alarm_source"):
             latitude=(lat_lon[0] if lat_lon else None),
             longitude=(lat_lon[1] if lat_lon else None),
         )
-    return _NodeContext(node_infos, node_domains)
+    return _NodeContext(
+        node_infos,
+        node_domains,
+        gc.site_coords,
+        device_node_infos=gc.node_infos,
+        # Use the same non-empty-direction rule as NETopologyIndex instead of
+        # ne_link_learning's arrow-only adjacency, so device/site feature modes
+        # have identical NE-link counts and ratios.
+        device_undirected_neighbors=device_neighbors,
+    )
+
+
+def _graph_site_stats(graph_context):
+    """Build the shared NE/site summary once for μ train or runtime setup."""
+    if graph_context is None:
+        return None
+    cached = getattr(graph_context, "_mhp_site_stats", None)
+    if cached is not None:
+        return cached
+    node_infos = getattr(graph_context, "device_node_infos", None)
+    neighbors = getattr(graph_context, "device_undirected_neighbors", None)
+    if node_infos is None or neighbors is None:
+        return None
+    stats = SiteStats(node_infos, None, undirected_neighbors=neighbors)
+    graph_context._mhp_site_stats = stats
+    return stats
+
+
+def _mu_numeric_values(feature_names, stats, node, site, domain):
+    """One entity's persisted-order μ structural feature mapping."""
+    if stats is None:
+        return {name: 0.0 for name in feature_names}
+    values = {
+        "site_size": stats.size_feat(site),
+        "undirected_degree": stats.degree_feat(node),
+        "site_link_load": stats.site_link_load(site),
+        "domain_share_in_site": stats.domain_share(site, domain),
+    }
+    return {name: values[name] for name in feature_names}
 
 
 def build_mu_features(vocabs, type_fields, graph_context, *, cap=50, node_field="alarm_source"):
     """Per-type μ feature matrix ψ (M, Fμ) + the MuFeatureSpec (for inference).
 
-    Attributes per type: alarm_type (from label) + ne_type/vendor (from the node
-    graph) + domain. The domain is the type's own device_domain when that is a
-    type field (site×domain mode), else the node's NE-graph domain_bucket (so
-    device-mode μ is unchanged). Returns (psi, spec).
+    Categorical attributes are alarm_type + ne_type/vendor/domain. Structural
+    scalars are site_size + undirected_degree in device mode, or site_size +
+    site_link_load (+ domain_share_in_site for site×domain) in site mode.
+    Returns (psi, spec).
     """
     labels = vocabs.type_vocab.labels
     M = len(labels)
@@ -330,8 +682,16 @@ def build_mu_features(vocabs, type_fields, graph_context, *, cap=50, node_field=
     src_idx, at_idx = _type_field_indices(type_fields, node_field)
     dom_idx = type_fields.index("device_domain") if "device_domain" in type_fields else None
     node_infos = getattr(graph_context, "node_infos", {}) if graph_context is not None else {}
+    stats = _graph_site_stats(graph_context)
+    if node_field == "site_id":
+        numeric_names = ["site_size", "site_link_load"]
+        if dom_idx is not None:
+            numeric_names.append("domain_share_in_site")
+    else:
+        numeric_names = ["site_size", "undirected_degree"]
 
     ats, ne_types, vendors, domains = [], [], [], []
+    numeric = {name: [] for name in numeric_names}
     for label in labels:
         node_id, at = parse_label_ne_at(label, src_idx, at_idx)
         ats.append(at)
@@ -341,23 +701,31 @@ def build_mu_features(vocabs, type_fields, graph_context, *, cap=50, node_field=
         if dom_idx is not None:
             parts = str(label).split(" | ")
             dom_val = parts[dom_idx] if len(parts) > dom_idx else ""
-            domains.append("" if dom_val == "<empty>" else dom_val)
+            domain = "" if dom_val == "<empty>" else dom_val
         else:
-            domains.append((getattr(info, "domain_bucket", "") or "") if info is not None else "")
+            # device mode: merged 4-bucket node domain (OTHER+MISSING+unknown → OTHER),
+            # same view as φ so train/inference agree on one domain vocabulary.
+            domain = phi_node_domain(info)
+        domains.append(domain)
+        site = (info.site_id or "") if info is not None else ""
+        values = _mu_numeric_values(numeric_names, stats, node_id, site, domain)
+        for name in numeric_names:
+            numeric[name].append(values[name])
 
     spec = MuFeatureSpec(
         at_vocab=sorted({a for a in ats if a}),
         ne_type_vocab=_capped_vocab(ne_types, cap),
         vendor_vocab=_capped_vocab(vendors, cap),
         domain_vocab=_capped_vocab(domains, cap),
+        numeric_feature_names=numeric_names,
     )
-    psi = spec.build_matrix(ats, ne_types, vendors, domains)
+    psi = spec.build_matrix(ats, ne_types, vendors, domains, numeric_features=numeric)
     return psi, spec
 
 
 class RuntimeMuScorer:
     """Inference-time live μ(u) = softplus(w_μ · ψ(u)) for ANY type, including
-    new devices — ψ built from the event's alarm_type + NE-graph attributes.
+    new devices — ψ built from alarm/device attributes + cached graph summaries.
     """
 
     def __init__(self, mu_kernel, mu_spec: MuFeatureSpec, graph_context):
@@ -367,6 +735,7 @@ class RuntimeMuScorer:
         self.spec = mu_spec
         self._softplus = softplus
         self.node_infos = getattr(graph_context, "node_infos", {}) if graph_context is not None else {}
+        self.stats = _graph_site_stats(graph_context)
         if mu_spec.n_features != mu_kernel.n_features:
             raise ValueError(
                 f"μ feature layout ({mu_spec.n_features}) != μ kernel ({mu_kernel.n_features})"
@@ -375,12 +744,23 @@ class RuntimeMuScorer:
     def mu_for(self, alarm_type, ne):
         # ne is the feature ENTITY (topo node, optionally + domain). Node
         # attributes come from the topo node; domain from the entity (embedded
-        # domain in site×domain mode, else the node's NE-graph domain_bucket).
+        # domain in site×domain mode, else the node's merged 4-bucket domain —
+        # the same phi_domain_of view build_mu_features trained on).
         info = self.node_infos.get(topo_node_of(ne))
         ne_type = (info.ne_type or "") if info is not None else ""
         vendor = (info.manufacturer or "") if info is not None else ""
-        domain = domain_of(ne, self.node_infos)
-        row = self.spec.build_row(alarm_type, ne_type, vendor, domain)
+        domain = phi_domain_of(ne, self.node_infos)
+        site = (info.site_id or "") if info is not None else ""
+        numeric = _mu_numeric_values(
+            self.spec.numeric_feature_names,
+            self.stats,
+            topo_node_of(ne),
+            site,
+            domain,
+        )
+        row = self.spec.build_row(
+            alarm_type, ne_type, vendor, domain, numeric_features=numeric
+        )
         return float(self.kernel.alpha(row[None, :])[0])
 
 
@@ -449,31 +829,16 @@ def runtime_ne_at(alarm_event, type_fields, node_field="alarm_source"):
 
 
 def _topo_score(source_ne, target_ne, topology_index, cache):
-    """Directed topology relation score (source → target), cached per NE pair."""
+    """Symmetric undirected topology proximity, cached per node pair."""
     if topology_index is None or not source_ne or not target_ne:
         return 0.0
-    key = (source_ne, target_ne)
+    key = (source_ne, target_ne) if source_ne < target_ne else (target_ne, source_ne)
     hit = cache.get(key)
     if hit is not None:
         return hit
-    if source_ne == target_ne:
-        score = 1.0
-    else:
-        feats = topology_index.pair_features(source_ne, target_ne)
-        if not feats:
-            score = 0.0
-        elif feats[1] > 0:
-            score = 1.0
-        elif feats[2] > 0 or feats[3] > 0:
-            score = 0.85
-        elif feats[4] > 0:
-            score = 0.75
-        elif feats[5] > 0:
-            score = 0.6
-        elif feats[6] > 0:
-            score = 0.45
-        else:
-            score = 0.0
+    from alarm_flow_isahp.ne_topology import undirected_topology_score
+
+    score = undirected_topology_score(topology_index, source_ne, target_ne)
     cache[key] = score
     return score
 
@@ -506,9 +871,14 @@ def _build_type_attributes(vocabs, type_fields, graph_context, node_field="alarm
     Returns a dict of arrays indexed by type_id:
       at_id (int, alarm-type index, -1 unknown), ne (object — the feature
       *entity*, i.e. topology node optionally folded with device_domain),
-      site/vendor/netype (object), domain (object — label-sourced device_domain,
-      empty unless device_domain ∈ type_fields), plus the alarm-type vocabulary
-      and the φ domain vocabulary (empty in device mode → no domain φ columns).
+      site/vendor/netype (object), domain (object — the φ domain), plus the
+      alarm-type vocabulary and the φ domain vocabulary.
+
+    φ domain: label-sourced device_domain when it is a type field (site×domain
+    mode); otherwise the node's merged 4-bucket domain via
+    :func:`phi_node_domain` — activating the same_domain + dom-pair φ columns
+    in device mode too. The feature ENTITY stays the bare node in device mode
+    (identity is unchanged; only φ gains columns).
     """
     labels = vocabs.type_vocab.labels
     M = len(labels)
@@ -533,8 +903,11 @@ def _build_type_attributes(vocabs, type_fields, graph_context, node_field="alarm
                 dom_val = ""
         ne[tid] = make_entity(node_id, dom_val)   # entity == node when domain empty
         at_raw[tid] = at_val
-        domain[tid] = dom_val
         info = node_infos.get(node_id)            # node graph keyed by topo node
+        if dom_idx is None:
+            domain[tid] = phi_node_domain(info)   # φ-only; entity stays bare
+        else:
+            domain[tid] = dom_val
         if info is not None:
             site[tid] = info.site_id or ""
             vendor[tid] = info.manufacturer or ""
@@ -548,8 +921,9 @@ def _build_type_attributes(vocabs, type_fields, graph_context, node_field="alarm
     at_vocab = sorted({str(a) for a in at_raw if a})
     at_to_id = {a: i for i, a in enumerate(at_vocab)}
     at_id = np.array([at_to_id.get(str(at_raw[t]), -1) for t in range(M)], dtype=np.int64)
-    # φ domain vocab: only the label-sourced domains → empty when device_domain is
-    # not a type field, so device/NE-mode φ keeps the legacy (no-domain) layout.
+    # φ domain vocab: label-sourced domains in site×domain mode, merged 4-bucket
+    # node domains (phi_node_domain) in device mode — device φ carries the
+    # same_domain + dom-pair block too.
     domain_vocab = sorted({str(d) for d in domain if d})
     return {
         "ne": ne,
@@ -627,6 +1001,10 @@ def build_candidate_features(
     domain_vocab = attrs["domain_vocab"]
     layout = FeatureLayout(attrs["at_vocab"], domain_vocab)
     dom_layout_id = layout.domain_ids(attrs["domain"])    # per-type domain φ id
+    node_infos = getattr(graph_context, "node_infos", {}) if graph_context is not None else {}
+    graph_stats = _graph_site_stats(graph_context)
+    site_stats = graph_stats if node_field != "site_id" else None
+    link_stats = graph_stats
 
     # --- candidate pair set ---
     # Flat keys (target*M + source) accumulated as numpy arrays, deduped once at
@@ -693,6 +1071,7 @@ def build_candidate_features(
     del pair_key
     topo_cache = {}
     uniq_scores = np.empty(len(uniq), dtype=np.float64)
+    uniq_device_link_ratio = np.empty(len(uniq), dtype=np.float32)
     for j in range(len(uniq)):
         pk = int(uniq[j])
         s_code = pk // base - 1
@@ -700,14 +1079,29 @@ def build_candidate_features(
         s_node = node_vals[s_code] if s_code >= 0 else ""
         t_node = node_vals[t_code] if t_code >= 0 else ""
         uniq_scores[j] = _topo_score(s_node, t_node, topology_index, topo_cache)
+        uniq_device_link_ratio[j] = (
+            site_stats.device_link_ratio(s_node, t_node) if site_stats is not None else 0.0
+        )
     topo_vec = uniq_scores[inv]                      # float64 (also returned as the topo prior)
-    del uniq, inv, uniq_scores
+    device_link_ratio_vec = uniq_device_link_ratio[inv]
+    del uniq, inv, uniq_scores, uniq_device_link_ratio
+
+    tgt_degree_vec = src_degree_vec = None
+    if site_stats is not None and node_vals:
+        degree_by_code = np.array(
+            [site_stats.degree_feat(v) for v in node_vals], dtype=np.float32
+        )
+        degree_by_type = np.where(
+            node_codes >= 0, degree_by_code[np.maximum(node_codes, 0)], 0.0
+        )
+        tgt_degree_vec = degree_by_type[cand_t]
+        src_degree_vec = degree_by_type[cand_s]
 
     # Vectorized same-* : compare gathered integer codes (−1 = empty), reproducing
     # the old "a is truthy AND a == b" semantics as (code_t >= 0) & (code_t == code_s).
     # The per-type code arrays are length M (small); the gathered (C,) compares are
     # transient inside build_matrix.
-    site_codes, _ = _factorize_attr(site)
+    site_codes, site_vals = _factorize_attr(site)
     vendor_codes, _ = _factorize_attr(vendor)
     netype_codes, _ = _factorize_attr(netype)
 
@@ -715,6 +1109,66 @@ def build_candidate_features(
         a = codes[cand_t]
         b = codes[cand_s]
         return ((a >= 0) & (a == b)).astype(np.float32)
+
+    # Site/geo columns: evaluate pair features once per UNIQUE site-code pair,
+    # then gather to candidates. Haversine is therefore O(unique site pairs),
+    # not O(candidate pairs). Individual site-size/device-degree columns remain
+    # device-mode only; pair-level site and geographic columns work in both modes.
+    tgt_size_vec = src_size_vec = site_link_vec = None
+    if site_stats is not None and site_vals:
+        size_by_code = np.array(
+            [site_stats.size_feat(v) for v in site_vals], dtype=np.float64
+        )
+        size_by_type = np.where(site_codes >= 0, size_by_code[np.maximum(site_codes, 0)], 0.0)
+        tgt_size_vec = size_by_type[cand_t]
+        src_size_vec = size_by_type[cand_s]
+    geo_stats = GeoStats(
+        node_infos,
+        getattr(graph_context, "site_coords", {}) if graph_context is not None else {},
+    )
+    base_site = len(site_vals) + 2
+    spair_key = (site_codes[cand_s] + 1) * base_site + (site_codes[cand_t] + 1)
+    uniq_sp, inv_sp = np.unique(spair_key, return_inverse=True)
+    del spair_key
+    uniq_geo = np.empty(len(uniq_sp), dtype=np.float32)
+    uniq_geo_missing = np.empty(len(uniq_sp), dtype=np.float32)
+    uniq_link = np.empty(len(uniq_sp), dtype=np.float64) if site_stats is not None else None
+    uniq_site_link_ratio = np.empty(len(uniq_sp), dtype=np.float32)
+    uniq_site_link_density = np.empty(len(uniq_sp), dtype=np.float32)
+    uniq_site_size_balance = np.empty(len(uniq_sp), dtype=np.float32)
+    uniq_site_domain_cosine = np.empty(len(uniq_sp), dtype=np.float32)
+    for j in range(len(uniq_sp)):
+        pk = int(uniq_sp[j])
+        s_code = pk // base_site - 1
+        t_code = pk % base_site - 1
+        s_site = site_vals[s_code] if s_code >= 0 else ""
+        t_site = site_vals[t_code] if t_code >= 0 else ""
+        if uniq_link is not None:
+            uniq_link[j] = site_stats.link_feat(s_site, t_site)
+        uniq_site_link_ratio[j] = (
+            link_stats.site_link_ratio(s_site, t_site) if link_stats is not None else 0.0
+        )
+        uniq_site_link_density[j] = (
+            link_stats.site_link_density(s_site, t_site) if link_stats is not None else 0.0
+        )
+        uniq_site_size_balance[j] = (
+            link_stats.site_size_balance(s_site, t_site) if link_stats is not None else 0.0
+        )
+        uniq_site_domain_cosine[j] = (
+            link_stats.site_domain_cosine(s_site, t_site) if link_stats is not None else 0.0
+        )
+        uniq_geo[j], uniq_geo_missing[j] = geo_stats.pair_features(s_site, t_site)
+    if uniq_link is not None:
+        site_link_vec = uniq_link[inv_sp]
+    geo_proximity_vec = uniq_geo[inv_sp]
+    geo_missing_vec = uniq_geo_missing[inv_sp]
+    site_link_ratio_vec = uniq_site_link_ratio[inv_sp]
+    site_link_density_vec = uniq_site_link_density[inv_sp]
+    site_size_balance_vec = uniq_site_size_balance[inv_sp]
+    site_domain_cosine_vec = uniq_site_domain_cosine[inv_sp]
+    del (uniq_sp, inv_sp, uniq_geo, uniq_geo_missing, uniq_link,
+         uniq_site_link_ratio, uniq_site_link_density, uniq_site_size_balance,
+         uniq_site_domain_cosine)
 
     phi = layout.build_matrix(
         at_u=at_id[cand_t],
@@ -726,6 +1180,18 @@ def build_candidate_features(
         same_netype=_same(netype_codes),
         dom_u=dom_layout_id[cand_t] if layout.n_dom else None,
         dom_v=dom_layout_id[cand_s] if layout.n_dom else None,
+        tgt_site_size=tgt_size_vec,
+        src_site_size=src_size_vec,
+        site_link=site_link_vec,
+        site_link_ratio=site_link_ratio_vec,
+        site_link_density=site_link_density_vec,
+        site_size_balance=site_size_balance_vec,
+        site_domain_cosine=site_domain_cosine_vec,
+        tgt_undirected_degree=tgt_degree_vec,
+        src_undirected_degree=src_degree_vec,
+        device_link_ratio=device_link_ratio_vec,
+        geo_proximity=geo_proximity_vec,
+        geo_missing=geo_missing_vec,
     )
     # topo_vec (C,) = per-candidate topology score, returned so the feature-mode
     # fit can apply it as a pseudo-count topology prior (device-parity).
@@ -746,7 +1212,7 @@ class RuntimeFeatureScorer:
 
     def __init__(self, kernel, at_vocab, graph_context, topology_index, beta: float,
                  n_dynamic: int = 0, domain_vocab=(), node_domains=None,
-                 dynamic_mode: str | None = None):
+                 dynamic_mode: str | None = None, node_field: str = "alarm_source"):
         from mhp.feature_kernel import softplus
 
         self.kernel = kernel
@@ -757,6 +1223,20 @@ class RuntimeFeatureScorer:
         self.topology_index = topology_index
         self.beta = float(beta)
         self._topo_cache = {}
+        # Device mode derives all SiteStats from the graph. Site mode keeps a
+        # separate NE-level link_stats summary for pair-level site features;
+        # individual device size/degree columns remain zero there.
+        graph_stats = _graph_site_stats(graph_context)
+        self.site_stats = graph_stats if str(node_field) != "site_id" else None
+        self.link_stats = graph_stats
+        self.geo_stats = GeoStats(
+            self.node_infos,
+            getattr(graph_context, "site_coords", {}) if graph_context is not None else {},
+        )
+        # One cache lookup returns every pairwise site feature; Haversine and
+        # link-count lookup are each performed at most once per unique site pair.
+        self._site_pair_cache = {}
+        self._device_link_ratio_cache = {}
         # topo node -> domains present (for site×domain missing-parent candidate
         # enumeration). Empty → device mode (entity == node, single implicit domain).
         self.node_domains = dict(node_domains or {})
@@ -796,6 +1276,50 @@ class RuntimeFeatureScorer:
         if info is None:
             return ("", "", "")
         return (info.site_id or "", info.manufacturer or "", info.ne_type or "")
+
+    def _site_pair_features(self, site_a, site_b) -> tuple[float, ...]:
+        """Cached structural/domain/geographic features for one site pair."""
+        key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
+        hit = self._site_pair_cache.get(key)
+        if hit is None:
+            link = self.site_stats.link_feat(site_a, site_b) if self.site_stats is not None else 0.0
+            link_ratio = (
+                self.link_stats.site_link_ratio(site_a, site_b)
+                if self.link_stats is not None else 0.0
+            )
+            link_density = (
+                self.link_stats.site_link_density(site_a, site_b)
+                if self.link_stats is not None else 0.0
+            )
+            size_balance = (
+                self.link_stats.site_size_balance(site_a, site_b)
+                if self.link_stats is not None else 0.0
+            )
+            domain_cosine = (
+                self.link_stats.site_domain_cosine(site_a, site_b)
+                if self.link_stats is not None else 0.0
+            )
+            proximity, missing = self.geo_stats.pair_features(site_a, site_b)
+            hit = (link, link_ratio, link_density, size_balance,
+                   domain_cosine, proximity, missing)
+            self._site_pair_cache[key] = hit
+        return hit
+
+    def _device_link_ratio(self, node_a, node_b) -> float:
+        if self.site_stats is None:
+            return 0.0
+        key = (node_a, node_b) if node_a < node_b else (node_b, node_a)
+        hit = self._device_link_ratio_cache.get(key)
+        if hit is None:
+            hit = self.site_stats.device_link_ratio(node_a, node_b)
+            self._device_link_ratio_cache[key] = hit
+        return hit
+
+    def _site_size(self, site) -> float:
+        return self.site_stats.size_feat(site) if self.site_stats is not None else 0.0
+
+    def _device_degree(self, node) -> float:
+        return self.site_stats.degree_feat(node) if self.site_stats is not None else 0.0
 
     def _dynamic_mark_matrix(self, n: int, src_marks=None, tgt_marks=None) -> np.ndarray:
         if self.n_dynamic <= 0:
@@ -840,18 +1364,45 @@ class RuntimeFeatureScorer:
         same_site = np.empty(n, dtype=np.float64)
         same_vendor = np.empty(n, dtype=np.float64)
         same_netype = np.empty(n, dtype=np.float64)
+        src_size = np.empty(n, dtype=np.float64)
+        site_link = np.empty(n, dtype=np.float64)
+        site_link_ratio = np.empty(n, dtype=np.float64)
+        site_link_density = np.empty(n, dtype=np.float64)
+        site_size_balance = np.empty(n, dtype=np.float64)
+        site_domain_cosine = np.empty(n, dtype=np.float64)
+        src_degree = np.empty(n, dtype=np.float64)
+        device_link_ratio = np.empty(n, dtype=np.float64)
+        geo_proximity = np.empty(n, dtype=np.float64)
+        geo_missing = np.empty(n, dtype=np.float64)
         for i, sne in enumerate(src_nes):
-            topo[i] = _topo_score(topo_node_of(sne), t_node, self.topology_index, self._topo_cache)
+            s_node = topo_node_of(sne)
+            topo[i] = _topo_score(s_node, t_node, self.topology_index, self._topo_cache)
             is_same_ne[i] = 1.0 if sne == target_ne else 0.0
             s_site, s_vendor, s_netype = self._attr(sne)
             same_site[i] = 1.0 if (t_site and t_site == s_site) else 0.0
             same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
             same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
+            src_size[i] = self._site_size(s_site)
+            (site_link[i], site_link_ratio[i], site_link_density[i],
+             site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
+             geo_missing[i]) = self._site_pair_features(s_site, t_site)
+            src_degree[i] = self._device_degree(s_node)
+            device_link_ratio[i] = self._device_link_ratio(s_node, t_node)
+        tgt_size = np.full(n, self._site_size(t_site), dtype=np.float64)
+        tgt_degree = np.full(n, self._device_degree(t_node), dtype=np.float64)
         dom_u = dom_v = None
         if self.layout.n_dom:
-            dom_u = np.full(n, self.layout._dom_to_id.get(domain_of(target_ne, self.node_infos), -1), dtype=np.int64)
-            dom_v = self.layout.domain_ids([domain_of(s, self.node_infos) for s in src_nes])
-        phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype, dom_u, dom_v)
+            dom_u = np.full(n, self.layout.dom_id(phi_domain_of(target_ne, self.node_infos)), dtype=np.int64)
+            dom_v = self.layout.domain_ids([phi_domain_of(s, self.node_infos) for s in src_nes])
+        phi = self.layout.build_matrix(
+            at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
+            dom_u, dom_v, tgt_size, src_size, site_link,
+            site_link_ratio=site_link_ratio, site_link_density=site_link_density,
+            site_size_balance=site_size_balance, site_domain_cosine=site_domain_cosine,
+            tgt_undirected_degree=tgt_degree, src_undirected_degree=src_degree,
+            device_link_ratio=device_link_ratio,
+            geo_proximity=geo_proximity, geo_missing=geo_missing,
+        )
         if self.n_dynamic > 0:
             if self.source_dynamic_dim and src_marks is None:
                 raise ValueError("src_marks is required for source dynamic mode")
@@ -888,18 +1439,45 @@ class RuntimeFeatureScorer:
         same_site = np.empty(n, dtype=np.float64)
         same_vendor = np.empty(n, dtype=np.float64)
         same_netype = np.empty(n, dtype=np.float64)
+        tgt_size = np.empty(n, dtype=np.float64)
+        site_link = np.empty(n, dtype=np.float64)
+        site_link_ratio = np.empty(n, dtype=np.float64)
+        site_link_density = np.empty(n, dtype=np.float64)
+        site_size_balance = np.empty(n, dtype=np.float64)
+        site_domain_cosine = np.empty(n, dtype=np.float64)
+        tgt_degree = np.empty(n, dtype=np.float64)
+        device_link_ratio = np.empty(n, dtype=np.float64)
+        geo_proximity = np.empty(n, dtype=np.float64)
+        geo_missing = np.empty(n, dtype=np.float64)
         for i, tne in enumerate(tgt_nes):
-            topo[i] = _topo_score(s_node, topo_node_of(tne), self.topology_index, self._topo_cache)
+            t_node = topo_node_of(tne)
+            topo[i] = _topo_score(s_node, t_node, self.topology_index, self._topo_cache)
             is_same_ne[i] = 1.0 if source_ne == tne else 0.0
             t_site, t_vendor, t_netype = self._attr(tne)
             same_site[i] = 1.0 if (t_site and t_site == s_site) else 0.0
             same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
             same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
+            tgt_size[i] = self._site_size(t_site)
+            (site_link[i], site_link_ratio[i], site_link_density[i],
+             site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
+             geo_missing[i]) = self._site_pair_features(s_site, t_site)
+            tgt_degree[i] = self._device_degree(t_node)
+            device_link_ratio[i] = self._device_link_ratio(s_node, t_node)
+        src_size = np.full(n, self._site_size(s_site), dtype=np.float64)
+        src_degree = np.full(n, self._device_degree(s_node), dtype=np.float64)
         dom_u = dom_v = None
         if self.layout.n_dom:
-            dom_v = np.full(n, self.layout._dom_to_id.get(domain_of(source_ne, self.node_infos), -1), dtype=np.int64)
-            dom_u = self.layout.domain_ids([domain_of(t, self.node_infos) for t in tgt_nes])
-        phi = self.layout.build_matrix(at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype, dom_u, dom_v)
+            dom_v = np.full(n, self.layout.dom_id(phi_domain_of(source_ne, self.node_infos)), dtype=np.int64)
+            dom_u = self.layout.domain_ids([phi_domain_of(t, self.node_infos) for t in tgt_nes])
+        phi = self.layout.build_matrix(
+            at_u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
+            dom_u, dom_v, tgt_size, src_size, site_link,
+            site_link_ratio=site_link_ratio, site_link_density=site_link_density,
+            site_size_balance=site_size_balance, site_domain_cosine=site_domain_cosine,
+            tgt_undirected_degree=tgt_degree, src_undirected_degree=src_degree,
+            device_link_ratio=device_link_ratio,
+            geo_proximity=geo_proximity, geo_missing=geo_missing,
+        )
         if self.n_dynamic > 0:
             if self.source_dynamic_dim and src_mark is None:
                 raise ValueError("src_mark is required for source dynamic mode")
@@ -914,13 +1492,19 @@ class DecomposedFeatureScorer:
     """φ-decomposed live α — numerically equal to RuntimeFeatureScorer but with
     NO (C, F) feature-matrix construction.
 
-    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 8
+    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 20
     scalars + optional domain one-hot + dynamic mark bits), so w·φ collapses to
     table lookups + a handful of scalar terms:
 
         z = w_bias + W_at[at_u, at_v] + w_same_at·[at_u==at_v]
           + (w_topo + w_txa·same_at + w_txs·same_site)·topo
           + w_same_ne·b + w_same_site·b + w_same_vendor·b + w_same_netype·b
+          + w_tgt_size·tgt_site_size + w_src_size·src_site_size + w_link·site_link
+          + w_site_ratio·site_link_ratio + w_density·site_link_density
+          + w_balance·site_size_balance + w_domain_cos·site_domain_cosine
+          + w_tgt_degree·tgt_undirected_degree + w_src_degree·src_undirected_degree
+          + w_device_ratio·device_link_ratio
+          + w_geo·geo_proximity + w_geo_missing·geo_distance_missing
           + W_dom'[dom_u, dom_v]                       (same_domain folded in)
           + SRC_TABLE[mark_combo] + tgt_term           (dynamic bits)
         α = alpha_scale · softplus(z)
@@ -947,8 +1531,15 @@ class DecomposedFeatureScorer:
         self.W_at = w[j:j + n_at * n_at].reshape(n_at, n_at).copy(); j += n_at * n_at
         (self.w_same_at, self.w_topo, self.w_same_ne, self.w_same_site,
          self.w_same_vendor, self.w_same_netype,
-         self.w_topo_x_same_at, self.w_topo_x_same_site) = (float(x) for x in w[j:j + 8])
-        j += 8
+         self.w_topo_x_same_at, self.w_topo_x_same_site,
+         self.w_tgt_site_size, self.w_src_site_size,
+         self.w_site_link, self.w_site_link_ratio,
+         self.w_site_link_density, self.w_site_size_balance,
+         self.w_site_domain_cosine, self.w_tgt_undirected_degree,
+         self.w_src_undirected_degree,
+         self.w_device_link_ratio, self.w_geo_proximity,
+         self.w_geo_missing) = (float(x) for x in w[j:j + 20])
+        j += 20
         self.n_dom = layout.n_dom
         if layout.n_dom:
             self.w_same_dom = float(w[j]); j += 1
@@ -1005,13 +1596,25 @@ class DecomposedFeatureScorer:
         src_dom_ids: np.ndarray,
         src_mark_idx: np.ndarray,
         tgt_term: float,
+        tgt_site_size: float = 0.0,
+        src_site_size: np.ndarray = None,
+        site_link: np.ndarray = None,
+        site_link_ratio: np.ndarray = None,
+        site_link_density: np.ndarray = None,
+        site_size_balance: np.ndarray = None,
+        site_domain_cosine: np.ndarray = None,
+        tgt_undirected_degree: float = 0.0,
+        src_undirected_degree: np.ndarray = None,
+        device_link_ratio: np.ndarray = None,
+        geo_proximity: np.ndarray = None,
+        geo_missing: np.ndarray = None,
     ) -> np.ndarray:
         """w·φ for a batch of source candidates against one target, from
         precomputed per-candidate parts. All boolean arrays are 0/1 float."""
         u = int(tgt_at_id)
         at_v = np.asarray(src_at_ids, dtype=np.int64)
-        # Match build_matrix: φ stores topo (and its interaction columns) as
-        # float32; round through float32 so w·φ is numerically identical.
+        # Match build_matrix: φ stores topo / site columns as float32; round
+        # through float32 so w·φ is numerically identical.
         topo_r = np.asarray(topo, dtype=np.float32).astype(np.float64)
         same_at = ((at_v == u) & (u >= 0) & (at_v >= 0)).astype(np.float64)
         z = (
@@ -1025,7 +1628,29 @@ class DecomposedFeatureScorer:
             + self.w_same_netype * np.asarray(same_netype, dtype=np.float64)
             + self.w_topo_x_same_at * (topo_r * same_at)
             + self.w_topo_x_same_site * (topo_r * np.asarray(same_site, dtype=np.float64))
+            + self.w_tgt_site_size * float(np.float32(tgt_site_size))
         )
+        if src_site_size is not None:
+            z = z + self.w_src_site_size * np.asarray(src_site_size, dtype=np.float32).astype(np.float64)
+        if site_link is not None:
+            z = z + self.w_site_link * np.asarray(site_link, dtype=np.float32).astype(np.float64)
+        if site_link_ratio is not None:
+            z = z + self.w_site_link_ratio * np.asarray(site_link_ratio, dtype=np.float32).astype(np.float64)
+        if site_link_density is not None:
+            z = z + self.w_site_link_density * np.asarray(site_link_density, dtype=np.float32).astype(np.float64)
+        if site_size_balance is not None:
+            z = z + self.w_site_size_balance * np.asarray(site_size_balance, dtype=np.float32).astype(np.float64)
+        if site_domain_cosine is not None:
+            z = z + self.w_site_domain_cosine * np.asarray(site_domain_cosine, dtype=np.float32).astype(np.float64)
+        z = z + self.w_tgt_undirected_degree * float(np.float32(tgt_undirected_degree))
+        if src_undirected_degree is not None:
+            z = z + self.w_src_undirected_degree * np.asarray(src_undirected_degree, dtype=np.float32).astype(np.float64)
+        if device_link_ratio is not None:
+            z = z + self.w_device_link_ratio * np.asarray(device_link_ratio, dtype=np.float32).astype(np.float64)
+        if geo_proximity is not None:
+            z = z + self.w_geo_proximity * np.asarray(geo_proximity, dtype=np.float32).astype(np.float64)
+        if geo_missing is not None:
+            z = z + self.w_geo_missing * np.asarray(geo_missing, dtype=np.float32).astype(np.float64)
         if self.n_dom:
             dv = np.asarray(src_dom_ids, dtype=np.int64)
             z = z + self.W_dom_pad[int(tgt_dom_id) + 1, dv + 1]
@@ -1063,18 +1688,35 @@ class DecomposedFeatureScorer:
         same_site = np.empty(n, dtype=np.float64)
         same_vendor = np.empty(n, dtype=np.float64)
         same_netype = np.empty(n, dtype=np.float64)
+        src_size = np.empty(n, dtype=np.float64)
+        site_link = np.empty(n, dtype=np.float64)
+        site_link_ratio = np.empty(n, dtype=np.float64)
+        site_link_density = np.empty(n, dtype=np.float64)
+        site_size_balance = np.empty(n, dtype=np.float64)
+        site_domain_cosine = np.empty(n, dtype=np.float64)
+        src_degree = np.empty(n, dtype=np.float64)
+        device_link_ratio = np.empty(n, dtype=np.float64)
+        geo_proximity = np.empty(n, dtype=np.float64)
+        geo_missing = np.empty(n, dtype=np.float64)
         for i, sne in enumerate(src_nes):
-            topo[i] = _topo_score(topo_node_of(sne), t_node, s.topology_index, s._topo_cache)
+            s_node = topo_node_of(sne)
+            topo[i] = _topo_score(s_node, t_node, s.topology_index, s._topo_cache)
             is_same_ne[i] = 1.0 if sne == target_ne else 0.0
             s_site, s_vendor, s_netype = s._attr(sne)
             same_site[i] = 1.0 if (t_site and t_site == s_site) else 0.0
             same_vendor[i] = 1.0 if (t_vendor and t_vendor == s_vendor) else 0.0
             same_netype[i] = 1.0 if (t_netype and t_netype == s_netype) else 0.0
+            src_size[i] = s._site_size(s_site)
+            (site_link[i], site_link_ratio[i], site_link_density[i],
+             site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
+             geo_missing[i]) = s._site_pair_features(s_site, t_site)
+            src_degree[i] = s._device_degree(s_node)
+            device_link_ratio[i] = s._device_link_ratio(s_node, t_node)
         tgt_dom_id = -1
         src_dom_ids = np.full(n, -1, dtype=np.int64)
         if self.n_dom:
-            tgt_dom_id = self.layout._dom_to_id.get(domain_of(target_ne, s.node_infos), -1)
-            src_dom_ids = self.layout.domain_ids([domain_of(x, s.node_infos) for x in src_nes])
+            tgt_dom_id = self.layout.dom_id(phi_domain_of(target_ne, s.node_infos))
+            src_dom_ids = self.layout.domain_ids([phi_domain_of(x, s.node_infos) for x in src_nes])
         # dynamic marks: mirror _dynamic_mark_matrix semantics for the common
         # streaming shapes — per-candidate (n,3) src marks + one target mark row.
         src_mark_idx = np.zeros(n, dtype=np.int64)
@@ -1092,6 +1734,14 @@ class DecomposedFeatureScorer:
         return self.logits_from_parts(
             u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
             tgt_dom_id, src_dom_ids, src_mark_idx, 0.0,
+            tgt_site_size=s._site_size(t_site), src_site_size=src_size,
+            site_link=site_link, site_link_ratio=site_link_ratio,
+            site_link_density=site_link_density, site_size_balance=site_size_balance,
+            site_domain_cosine=site_domain_cosine,
+            tgt_undirected_degree=s._device_degree(t_node),
+            src_undirected_degree=src_degree,
+            device_link_ratio=device_link_ratio, geo_proximity=geo_proximity,
+            geo_missing=geo_missing,
         )
 
     def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):

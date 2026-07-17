@@ -1829,8 +1829,8 @@ def train_alarm_mhp(
             node_field=config.topology_node_field,
         )
         feat_node_domains = dict(getattr(feature_graph_context, "node_domains", {}) or {})
-        # Parameterized inductive μ: ψ(u) single-type features (alarm_type +
-        # ne_type/vendor/domain from the NE graph), μ=softplus(w_μ·ψ).
+        # Parameterized inductive μ: categorical type/node attributes + cached
+        # unary graph summaries (site size, degree/load, optional domain share).
         mu_phi, mu_spec = build_mu_features(
             vocabs, config.type_fields, feature_graph_context, node_field=config.topology_node_field
         )
@@ -2436,29 +2436,10 @@ def _build_feature_runtime(result, vocabs, config, at_vocab, mu_spec=None,
 
 
 def _ne_pair_topo_score(source_ne: str, target_ne: str, topology_index) -> float:
-    """Directed topology relation score (source → target), NE-level.
+    """Symmetric undirected topology proximity used by the sparse prior."""
+    from alarm_flow_isahp.ne_topology import undirected_topology_score
 
-    Mirrors the cross-NE branch of _topology_relation_score (same buckets), but
-    works on NE strings only (no site_id). Returns 0 if unrelated.
-    """
-    if source_ne == target_ne:
-        return 1.0
-    features = topology_index.pair_features(source_ne, target_ne)
-    if not features:
-        return 0.0
-    # features: [same, direct_fwd, direct_rev, direct_bi, reach_fwd, reach_rev,
-    #            undirected_reach, ...]
-    if features[1] > 0:
-        return 1.0
-    if features[2] > 0 or features[3] > 0:
-        return 0.85
-    if features[4] > 0:
-        return 0.75
-    if features[5] > 0:
-        return 0.6
-    if features[6] > 0:
-        return 0.45
-    return 0.0
+    return undirected_topology_score(topology_index, source_ne, target_ne)
 
 
 def build_topology_pairs(vocabs, type_fields, topology_index, *, max_hops, min_score, node_field="alarm_source"):
@@ -2587,13 +2568,11 @@ def _topology_consistency_report(
         elif topology_index is None:
             relation = "unknown"
         else:
-            features = topology_index.pair_features(s_ne, t_ne)
-            # features layout (PAIR_FEATURE_NAMES order):
-            # 0:same_alarm_source, 1:direct_fwd, 2:direct_rev, 3:direct_bi,
-            # 4:reachable_fwd, 5:reachable_rev, 6:undirected_reachable, ...
-            if features and (features[1] > 0 or features[2] > 0 or features[3] > 0):
+            hops = getattr(topology_index, "undirected_hops", {}) or {}
+            hop = int(hops.get(s_ne, {}).get(t_ne, 0) or 0)
+            if hop == 1:
                 relation = "direct_link"
-            elif features and (features[4] > 0 or features[5] > 0 or features[6] > 0):
+            elif hop > 1:
                 relation = "indirect_link"
             else:
                 relation = "no_topology"

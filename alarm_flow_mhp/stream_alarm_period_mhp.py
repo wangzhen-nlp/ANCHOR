@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """AlarmPeriod-oriented online inference for feature-mode alarm-flow MHP.
 
-This is intentionally a separate engine from ``stream_alarm_mhp.py``.  The
-legacy/fast engines assign one parent to every alarm occurrence; this engine
-uses an AlarmPeriod as the matching and grouping unit:
+This is intentionally a separate engine from ``stream_alarm_mhp.py``. The
+occurrence-oriented engine assigns one parent to every alarm occurrence; this
+engine uses an AlarmPeriod as the matching and grouping unit:
 
 * repeated ``(feature entity, alarm type)`` raises share one open period;
 * a period freezes the dynamic source/target state seen before its first raise;
@@ -1844,7 +1844,9 @@ def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False
     graph_ctx = build_node_context(ne_graph_data, node_field)
     topo_graph = load_ne_graph(site_graph_path) if node_field == "site_id" else ne_graph_data
     infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
-    topo_idx = NETopologyIndex.from_graph(topo_graph, max_hops=infer_hops)
+    topo_idx = NETopologyIndex.from_graph(
+        topo_graph, max_hops=infer_hops, undirected_only=True
+    )
     dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
     n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
     scorer = RuntimeFeatureScorer(
@@ -1857,6 +1859,7 @@ def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False
         dynamic_mode=dyn_mode,
         domain_vocab=rt.get("domain_vocab", []),
         node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
+        node_field=node_field,
     )
     mu_scorer = None
     if rt.get("mu_kernel") is not None and rt.get("mu_spec") is not None:

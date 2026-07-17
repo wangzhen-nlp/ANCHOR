@@ -11,7 +11,7 @@ alarm to an existing cascade (most-likely parent) or starts a new cascade
 Differences from alarm_flow_brunch.stream_alarm_brunch:
 
   - No MCMC at inference time. The trained Θ is applied directly via a
-    single per-event argmax — fast and deterministic.
+    single efficient, deterministic per-event argmax.
   - No virtual events / latent missing mode (v1 omission; can layer on
     later once the core path is validated).
   - Output schema is identical so downstream visualizers and report
@@ -501,10 +501,6 @@ class StreamMHPAssigner:
         # α floor: treat too-weak edges as non-edges (inference analog of
         # device-mode edge_threshold) — guards the soft model against linking
         # unrelated pairs whose baseline α is small but positive.
-        # PARITY: the fast engine re-implements this floor + the relation-prior
-        # multiplier below (fast_stream._alpha_for_keys and
-        # _probe_global_signatures) — any semantic change here must be mirrored
-        # there, and test_fast_stream_parity pins the equivalence.
         if self._feat_alpha_floor > 0:
             alpha = np.where(alpha >= self._feat_alpha_floor, alpha, 0.0)
         b = self._feat_beta
@@ -1649,28 +1645,6 @@ def main():
         help="Print stream progress every N events. 0 = silent. Default: 50000.",
     )
     parser.add_argument(
-        "--engine",
-        choices=("auto", "legacy", "fast"),
-        default="auto",
-        help=(
-            "Assigner engine. 'fast' = indexed candidate gathering + decomposed "
-            "α (feature mode only; same grouping semantics, see fast_stream.py). "
-            "'legacy' = the original sliding-window scan. 'auto' (default) picks "
-            "fast for feature-mode artifacts, legacy otherwise."
-        ),
-    )
-    parser.add_argument(
-        "--fast-candidate-cap",
-        type=int,
-        default=0,
-        help=(
-            "Fast engine only: approximate the legacy max_history_events "
-            "truncation with a |Δt| radius containing ~this many live events. "
-            "0 (default) scores all relevant in-window events — usually "
-            "strictly better in storms; set >0 only for legacy A/B parity."
-        ),
-    )
-    parser.add_argument(
         "--profile",
         action="store_true",
         help="Print per-phase timing (gather/score/assign/close/snapshot) at the end.",
@@ -2054,7 +2028,9 @@ def main():
         # Build the index with the SAME reach training used for feature
         # candidate generation — otherwise pairs beyond this many hops would get
         # topo_score=0 at inference, diverging from the trained φ.
-        topo_idx = NETopologyIndex.from_graph(topo_graph_data, max_hops=infer_hops)
+        topo_idx = NETopologyIndex.from_graph(
+            topo_graph_data, max_hops=infer_hops, undirected_only=True
+        )
         if not args.quiet:
             print(f"[stream] topology index max_hops={infer_hops}, node_field={node_field}", flush=True)
         # Dynamic α: source = 3 bits; source_target = source 3 + target 3.
@@ -2070,6 +2046,7 @@ def main():
             dynamic_mode=dyn_mode,
             domain_vocab=rt.get("domain_vocab", []),
             node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
+            node_field=node_field,
         )
         if not args.quiet:
             print(
@@ -2096,27 +2073,9 @@ def main():
         elif not args.quiet:
             print("[stream] μ: per-alarm-type table (no parameterized μ in artifact)", flush=True)
 
-    engine = args.engine
-    if engine == "auto":
-        engine = "fast" if feature_scorer is not None else "legacy"
-    if engine == "fast" and feature_scorer is None:
-        parser.error("--engine fast requires a feature-mode artifact (device mode uses legacy)")
-    if engine == "fast":
-        from alarm_flow_mhp.fast_stream import FastStreamMHPAssigner
-
-        assigner = FastStreamMHPAssigner(
-            artifact,
-            stream_config,
-            feature_scorer=feature_scorer,
-            mu_scorer=mu_scorer,
-            candidate_cap=args.fast_candidate_cap,
-        )
-    else:
-        assigner = StreamMHPAssigner(
-            artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
-        )
-    if not args.quiet:
-        print(f"[stream] engine: {engine}", flush=True)
+    assigner = StreamMHPAssigner(
+        artifact, stream_config, feature_scorer=feature_scorer, mu_scorer=mu_scorer
+    )
 
     timer = None
     if args.profile:
@@ -2129,13 +2088,10 @@ def main():
         timer.wrap_method(assigner, "_close_inactive", "stream.close_scan")
         timer.wrap_method(assigner, "snapshot_ready_groups", "stream.snapshot_scan")
         timer.wrap_method(assigner, "_immigrant_mu", "stream.mu")
-        if engine == "fast":
-            timer.wrap_method(assigner, "_best_parent", "stream.score")
-        else:
-            score_attr = (
-                "_candidate_scores_feature" if feature_scorer is not None else "_candidate_scores"
-            )
-            timer.wrap_method(assigner, score_attr, "stream.score")
+        score_attr = (
+            "_candidate_scores_feature" if feature_scorer is not None else "_candidate_scores"
+        )
+        timer.wrap_method(assigner, score_attr, "stream.score")
     visual_output = None
     visual_group_cursor = 0
     visual_snapshot_age_sec = float(args.visual_snapshot_age_sec or 0.0)

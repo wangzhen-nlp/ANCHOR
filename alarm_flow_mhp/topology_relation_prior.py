@@ -100,27 +100,25 @@ def _site_id(node_infos, ne: str) -> str:
 
 
 def classify_topology_relation(source_ne: str, target_ne: str, topology_index=None, node_infos=None) -> str:
-    """Classify a source→target NE pair for inference-time relation weighting."""
+    """Classify an NE pair using symmetric undirected topology."""
     source_ne = str(source_ne or "").strip()
     target_ne = str(target_ne or "").strip()
     if source_ne and target_ne and source_ne == target_ne:
         return "same_device"
 
-    direct_edges = getattr(topology_index, "direct_edges", None) if topology_index is not None else None
-    if source_ne and target_ne and direct_edges:
-        if (source_ne, target_ne) in direct_edges or (target_ne, source_ne) in direct_edges:
+    hop = 0
+    if source_ne and target_ne and topology_index is not None:
+        undirected = getattr(topology_index, "undirected_hops", {}) or {}
+        hop = int(undirected.get(source_ne, {}).get(target_ne, 0) or 0)
+        if hop == 1:
             return "direct"
 
     source_site = _site_id(node_infos, source_ne)
     target_site = _site_id(node_infos, target_ne)
     if source_site and target_site and source_site == target_site:
         return "same_site"
-
-    if source_ne and target_ne and topology_index is not None:
-        undirected = getattr(topology_index, "undirected_hops", {}) or {}
-        hop = int(undirected.get(source_ne, {}).get(target_ne, 0) or 0)
-        if hop > 0:
-            return "direct" if hop == 1 else "indirect"
+    if hop > 1:
+        return "indirect"
 
     if source_site and target_site and source_site != target_site:
         return "cross_site"

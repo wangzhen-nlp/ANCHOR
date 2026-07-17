@@ -1964,7 +1964,9 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
     infer_hops = max(int(getattr(artifact.config, "feature_topo_max_hops", 2)), 1)
     # Site-node models score topology over the site graph (same structure).
     topo_graph_data = load_ne_graph(topology_graph_path) if topology_graph_path else ne_graph_data
-    topo_idx = NETopologyIndex.from_graph(topo_graph_data, max_hops=infer_hops)
+    topo_idx = NETopologyIndex.from_graph(
+        topo_graph_data, max_hops=infer_hops, undirected_only=True
+    )
     dyn_mode = getattr(artifact.config, "dynamic_alpha", "off")
     n_dynamic = 6 if dyn_mode == "source_target" else (3 if dyn_mode != "off" else 0)
     feature_scorer = RuntimeFeatureScorer(
@@ -1977,6 +1979,7 @@ def feature_adapter_from_artifact(artifact, ne_graph_path, *, alpha_floor=None,
         dynamic_mode=dyn_mode,
         domain_vocab=rt.get("domain_vocab", []),
         node_domains=rt.get("node_domains", {}) or getattr(graph_ctx, "node_domains", {}),
+        node_field=getattr(artifact.config, "topology_node_field", "alarm_source"),
     )
     mu_scorer = None
     mu_fk = rt.get("mu_kernel")

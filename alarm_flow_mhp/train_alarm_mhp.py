@@ -602,6 +602,7 @@ def main():
         topology_index = NETopologyIndex.from_graph(
             topology_graph_data,
             max_hops=index_hops,
+            undirected_only=True,
         )
 
     best_output = None if args.no_best_checkpoint else (args.best_output or _default_best_output(args.output))
