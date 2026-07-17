@@ -111,6 +111,7 @@ class SiteStats:
     LINK_K = 4.0    # 4 inter-site NE links → 0.5
     DEGREE_K = 4.0  # device with 4 undirected neighbors → 0.5
     SITE_LOAD_K = 8.0  # site with 8 total NE-link endpoints → 0.5
+    EXTERNAL_NEIGHBOR_K = 4.0  # site connected to 4 distinct other sites → 0.5
 
     def __init__(self, node_infos, topology_index, undirected_neighbors=None):
         node_site = {}
@@ -125,6 +126,7 @@ class SiteStats:
         pair_links = Counter()
         site_link_ends = Counter()
         site_all_link_ends = Counter()
+        site_external_neighbors = defaultdict(set)
         node_degrees = Counter()
         undirected = (
             undirected_neighbors
@@ -160,10 +162,17 @@ class SiteStats:
                     continue
                 key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
                 pair_links[key] += 1
+                # Count distinct EXTERNAL sites, not NE edges: parallel NE links
+                # between the same two sites still contribute one neighbour.
+                site_external_neighbors[site_a].add(site_b)
+                site_external_neighbors[site_b].add(site_a)
         self.sizes = sizes
         self.pair_links = pair_links
         self.site_link_ends = site_link_ends
         self.site_all_link_ends = site_all_link_ends
+        self.site_external_neighbor_counts = Counter({
+            site: len(neighbors) for site, neighbors in site_external_neighbors.items()
+        })
         self.node_degrees = node_degrees
         self.site_domain_counts = site_domain_counts
         self.site_domain_norms = {
@@ -235,6 +244,15 @@ class SiteStats:
         """Saturating number of all undirected NE-link endpoints at a site."""
         n = self.site_all_link_ends.get(site, 0) if site else 0
         return n / (n + self.SITE_LOAD_K)
+
+    def site_external_neighbor_count(self, site) -> float:
+        """Saturating count of distinct other sites joined by a direct NE edge.
+
+        A site with no cross-site edge maps to 0 even when it has intra-site NE
+        links. Multiple NE edges to the same external site count only once.
+        """
+        n = self.site_external_neighbor_counts.get(site, 0) if site else 0
+        return n / (n + self.EXTERNAL_NEIGHBOR_K)
 
     def domain_share(self, site, domain) -> float:
         """Share of a site's devices in one merged domain bucket."""
@@ -359,6 +377,8 @@ class FeatureLayout:
             "device_link_ratio",   # share of the two devices' link endpoints
             "geo_proximity",       # 10 / (distance_km + 10); 0 when coordinates are missing
             "geo_distance_missing",
+            "tgt_site_external_neighbor_count",  # distinct external sites, saturating count
+            "src_site_external_neighbor_count",
         ]
         if self.n_dom:
             names.append("same_domain")
@@ -404,6 +424,8 @@ class FeatureLayout:
         device_link_ratio: np.ndarray = None,
         geo_proximity: np.ndarray = None,
         geo_missing: np.ndarray = None,
+        tgt_site_external_neighbor_count: np.ndarray = None,
+        src_site_external_neighbor_count: np.ndarray = None,
     ) -> np.ndarray:
         """All inputs are length-C arrays (at_*/dom_* int, rest float/bool).
 
@@ -449,6 +471,10 @@ class FeatureLayout:
         phi[:, j] = 0.0 if device_link_ratio is None else np.asarray(device_link_ratio, dtype=_F); j += 1
         phi[:, j] = 0.0 if geo_proximity is None else np.asarray(geo_proximity, dtype=_F); j += 1
         phi[:, j] = 0.0 if geo_missing is None else np.asarray(geo_missing, dtype=_F); j += 1
+        phi[:, j] = (0.0 if tgt_site_external_neighbor_count is None
+                     else np.asarray(tgt_site_external_neighbor_count, dtype=_F)); j += 1
+        phi[:, j] = (0.0 if src_site_external_neighbor_count is None
+                     else np.asarray(src_site_external_neighbor_count, dtype=_F)); j += 1
         if self.n_dom:
             if dom_u is None or dom_v is None:
                 raise ValueError("domain ids required: this FeatureLayout has a domain vocab")
@@ -663,6 +689,7 @@ def _mu_numeric_values(feature_names, stats, node, site, domain):
         "site_size": stats.size_feat(site),
         "undirected_degree": stats.degree_feat(node),
         "site_link_load": stats.site_link_load(site),
+        "site_external_neighbor_count": stats.site_external_neighbor_count(site),
         "domain_share_in_site": stats.domain_share(site, domain),
     }
     return {name: values[name] for name in feature_names}
@@ -672,8 +699,9 @@ def build_mu_features(vocabs, type_fields, graph_context, *, cap=50, node_field=
     """Per-type μ feature matrix ψ (M, Fμ) + the MuFeatureSpec (for inference).
 
     Categorical attributes are alarm_type + ne_type/vendor/domain. Structural
-    scalars are site_size + undirected_degree in device mode, or site_size +
-    site_link_load (+ domain_share_in_site for site×domain) in site mode.
+    scalars are site_size + undirected_degree + external-site-neighbour count in
+    device mode, or site_size + site_link_load + external-site-neighbour count
+    (+ domain_share_in_site for site×domain) in site mode.
     Returns (psi, spec).
     """
     labels = vocabs.type_vocab.labels
@@ -684,11 +712,11 @@ def build_mu_features(vocabs, type_fields, graph_context, *, cap=50, node_field=
     node_infos = getattr(graph_context, "node_infos", {}) if graph_context is not None else {}
     stats = _graph_site_stats(graph_context)
     if node_field == "site_id":
-        numeric_names = ["site_size", "site_link_load"]
+        numeric_names = ["site_size", "site_link_load", "site_external_neighbor_count"]
         if dom_idx is not None:
             numeric_names.append("domain_share_in_site")
     else:
-        numeric_names = ["site_size", "undirected_degree"]
+        numeric_names = ["site_size", "undirected_degree", "site_external_neighbor_count"]
 
     ats, ne_types, vendors, domains = [], [], [], []
     numeric = {name: [] for name in numeric_names}
@@ -1115,6 +1143,7 @@ def build_candidate_features(
     # not O(candidate pairs). Individual site-size/device-degree columns remain
     # device-mode only; pair-level site and geographic columns work in both modes.
     tgt_size_vec = src_size_vec = site_link_vec = None
+    tgt_external_neighbor_vec = src_external_neighbor_vec = None
     if site_stats is not None and site_vals:
         size_by_code = np.array(
             [site_stats.size_feat(v) for v in site_vals], dtype=np.float64
@@ -1122,6 +1151,18 @@ def build_candidate_features(
         size_by_type = np.where(site_codes >= 0, size_by_code[np.maximum(site_codes, 0)], 0.0)
         tgt_size_vec = size_by_type[cand_t]
         src_size_vec = size_by_type[cand_s]
+    if link_stats is not None and site_vals:
+        external_neighbor_by_code = np.array(
+            [link_stats.site_external_neighbor_count(v) for v in site_vals],
+            dtype=np.float32,
+        )
+        external_neighbor_by_type = np.where(
+            site_codes >= 0,
+            external_neighbor_by_code[np.maximum(site_codes, 0)],
+            0.0,
+        )
+        tgt_external_neighbor_vec = external_neighbor_by_type[cand_t]
+        src_external_neighbor_vec = external_neighbor_by_type[cand_s]
     geo_stats = GeoStats(
         node_infos,
         getattr(graph_context, "site_coords", {}) if graph_context is not None else {},
@@ -1192,6 +1233,8 @@ def build_candidate_features(
         device_link_ratio=device_link_ratio_vec,
         geo_proximity=geo_proximity_vec,
         geo_missing=geo_missing_vec,
+        tgt_site_external_neighbor_count=tgt_external_neighbor_vec,
+        src_site_external_neighbor_count=src_external_neighbor_vec,
     )
     # topo_vec (C,) = per-candidate topology score, returned so the feature-mode
     # fit can apply it as a pseudo-count topology prior (device-parity).
@@ -1318,6 +1361,12 @@ class RuntimeFeatureScorer:
     def _site_size(self, site) -> float:
         return self.site_stats.size_feat(site) if self.site_stats is not None else 0.0
 
+    def _site_external_neighbor_count(self, site) -> float:
+        return (
+            self.link_stats.site_external_neighbor_count(site)
+            if self.link_stats is not None else 0.0
+        )
+
     def _device_degree(self, node) -> float:
         return self.site_stats.degree_feat(node) if self.site_stats is not None else 0.0
 
@@ -1371,6 +1420,7 @@ class RuntimeFeatureScorer:
         site_size_balance = np.empty(n, dtype=np.float64)
         site_domain_cosine = np.empty(n, dtype=np.float64)
         src_degree = np.empty(n, dtype=np.float64)
+        src_external_neighbors = np.empty(n, dtype=np.float64)
         device_link_ratio = np.empty(n, dtype=np.float64)
         geo_proximity = np.empty(n, dtype=np.float64)
         geo_missing = np.empty(n, dtype=np.float64)
@@ -1387,9 +1437,13 @@ class RuntimeFeatureScorer:
              site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
              geo_missing[i]) = self._site_pair_features(s_site, t_site)
             src_degree[i] = self._device_degree(s_node)
+            src_external_neighbors[i] = self._site_external_neighbor_count(s_site)
             device_link_ratio[i] = self._device_link_ratio(s_node, t_node)
         tgt_size = np.full(n, self._site_size(t_site), dtype=np.float64)
         tgt_degree = np.full(n, self._device_degree(t_node), dtype=np.float64)
+        tgt_external_neighbors = np.full(
+            n, self._site_external_neighbor_count(t_site), dtype=np.float64
+        )
         dom_u = dom_v = None
         if self.layout.n_dom:
             dom_u = np.full(n, self.layout.dom_id(phi_domain_of(target_ne, self.node_infos)), dtype=np.int64)
@@ -1402,6 +1456,8 @@ class RuntimeFeatureScorer:
             tgt_undirected_degree=tgt_degree, src_undirected_degree=src_degree,
             device_link_ratio=device_link_ratio,
             geo_proximity=geo_proximity, geo_missing=geo_missing,
+            tgt_site_external_neighbor_count=tgt_external_neighbors,
+            src_site_external_neighbor_count=src_external_neighbors,
         )
         if self.n_dynamic > 0:
             if self.source_dynamic_dim and src_marks is None:
@@ -1446,6 +1502,7 @@ class RuntimeFeatureScorer:
         site_size_balance = np.empty(n, dtype=np.float64)
         site_domain_cosine = np.empty(n, dtype=np.float64)
         tgt_degree = np.empty(n, dtype=np.float64)
+        tgt_external_neighbors = np.empty(n, dtype=np.float64)
         device_link_ratio = np.empty(n, dtype=np.float64)
         geo_proximity = np.empty(n, dtype=np.float64)
         geo_missing = np.empty(n, dtype=np.float64)
@@ -1462,9 +1519,13 @@ class RuntimeFeatureScorer:
              site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
              geo_missing[i]) = self._site_pair_features(s_site, t_site)
             tgt_degree[i] = self._device_degree(t_node)
+            tgt_external_neighbors[i] = self._site_external_neighbor_count(t_site)
             device_link_ratio[i] = self._device_link_ratio(s_node, t_node)
         src_size = np.full(n, self._site_size(s_site), dtype=np.float64)
         src_degree = np.full(n, self._device_degree(s_node), dtype=np.float64)
+        src_external_neighbors = np.full(
+            n, self._site_external_neighbor_count(s_site), dtype=np.float64
+        )
         dom_u = dom_v = None
         if self.layout.n_dom:
             dom_v = np.full(n, self.layout.dom_id(phi_domain_of(source_ne, self.node_infos)), dtype=np.int64)
@@ -1477,6 +1538,8 @@ class RuntimeFeatureScorer:
             tgt_undirected_degree=tgt_degree, src_undirected_degree=src_degree,
             device_link_ratio=device_link_ratio,
             geo_proximity=geo_proximity, geo_missing=geo_missing,
+            tgt_site_external_neighbor_count=tgt_external_neighbors,
+            src_site_external_neighbor_count=src_external_neighbors,
         )
         if self.n_dynamic > 0:
             if self.source_dynamic_dim and src_mark is None:
@@ -1492,7 +1555,7 @@ class DecomposedFeatureScorer:
     """φ-decomposed live α — numerically equal to RuntimeFeatureScorer but with
     NO (C, F) feature-matrix construction.
 
-    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 20
+    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 22
     scalars + optional domain one-hot + dynamic mark bits), so w·φ collapses to
     table lookups + a handful of scalar terms:
 
@@ -1505,6 +1568,8 @@ class DecomposedFeatureScorer:
           + w_tgt_degree·tgt_undirected_degree + w_src_degree·src_undirected_degree
           + w_device_ratio·device_link_ratio
           + w_geo·geo_proximity + w_geo_missing·geo_distance_missing
+          + w_tgt_external·tgt_site_external_neighbor_count
+          + w_src_external·src_site_external_neighbor_count
           + W_dom'[dom_u, dom_v]                       (same_domain folded in)
           + SRC_TABLE[mark_combo] + tgt_term           (dynamic bits)
         α = alpha_scale · softplus(z)
@@ -1538,8 +1603,9 @@ class DecomposedFeatureScorer:
          self.w_site_domain_cosine, self.w_tgt_undirected_degree,
          self.w_src_undirected_degree,
          self.w_device_link_ratio, self.w_geo_proximity,
-         self.w_geo_missing) = (float(x) for x in w[j:j + 20])
-        j += 20
+         self.w_geo_missing, self.w_tgt_site_external_neighbor_count,
+         self.w_src_site_external_neighbor_count) = (float(x) for x in w[j:j + 22])
+        j += 22
         self.n_dom = layout.n_dom
         if layout.n_dom:
             self.w_same_dom = float(w[j]); j += 1
@@ -1608,6 +1674,8 @@ class DecomposedFeatureScorer:
         device_link_ratio: np.ndarray = None,
         geo_proximity: np.ndarray = None,
         geo_missing: np.ndarray = None,
+        tgt_site_external_neighbor_count: float = 0.0,
+        src_site_external_neighbor_count: np.ndarray = None,
     ) -> np.ndarray:
         """w·φ for a batch of source candidates against one target, from
         precomputed per-candidate parts. All boolean arrays are 0/1 float."""
@@ -1651,6 +1719,17 @@ class DecomposedFeatureScorer:
             z = z + self.w_geo_proximity * np.asarray(geo_proximity, dtype=np.float32).astype(np.float64)
         if geo_missing is not None:
             z = z + self.w_geo_missing * np.asarray(geo_missing, dtype=np.float32).astype(np.float64)
+        z = (
+            z
+            + self.w_tgt_site_external_neighbor_count
+            * float(np.float32(tgt_site_external_neighbor_count))
+        )
+        if src_site_external_neighbor_count is not None:
+            z = (
+                z
+                + self.w_src_site_external_neighbor_count
+                * np.asarray(src_site_external_neighbor_count, dtype=np.float32).astype(np.float64)
+            )
         if self.n_dom:
             dv = np.asarray(src_dom_ids, dtype=np.int64)
             z = z + self.W_dom_pad[int(tgt_dom_id) + 1, dv + 1]
@@ -1695,6 +1774,7 @@ class DecomposedFeatureScorer:
         site_size_balance = np.empty(n, dtype=np.float64)
         site_domain_cosine = np.empty(n, dtype=np.float64)
         src_degree = np.empty(n, dtype=np.float64)
+        src_external_neighbors = np.empty(n, dtype=np.float64)
         device_link_ratio = np.empty(n, dtype=np.float64)
         geo_proximity = np.empty(n, dtype=np.float64)
         geo_missing = np.empty(n, dtype=np.float64)
@@ -1711,6 +1791,7 @@ class DecomposedFeatureScorer:
              site_size_balance[i], site_domain_cosine[i], geo_proximity[i],
              geo_missing[i]) = s._site_pair_features(s_site, t_site)
             src_degree[i] = s._device_degree(s_node)
+            src_external_neighbors[i] = s._site_external_neighbor_count(s_site)
             device_link_ratio[i] = s._device_link_ratio(s_node, t_node)
         tgt_dom_id = -1
         src_dom_ids = np.full(n, -1, dtype=np.int64)
@@ -1742,6 +1823,8 @@ class DecomposedFeatureScorer:
             src_undirected_degree=src_degree,
             device_link_ratio=device_link_ratio, geo_proximity=geo_proximity,
             geo_missing=geo_missing,
+            tgt_site_external_neighbor_count=s._site_external_neighbor_count(t_site),
+            src_site_external_neighbor_count=src_external_neighbors,
         )
 
     def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):

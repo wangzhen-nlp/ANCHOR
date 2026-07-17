@@ -145,6 +145,30 @@ def test_geo_stats_proximity_and_missing():
     assert both_sites_unknown == (0.0, 1.0)
 
 
+def test_site_external_neighbor_count_is_distinct_and_cross_site_only():
+    graph = {
+        "A1": {"site_id": "A", "link": {"B1": {"L": "<->"}, "C1": {"L": "<->"}}},
+        "A2": {"site_id": "A", "link": {"B2": {"L": "<->"}}},
+        "B1": {"site_id": "B", "link": {"A1": {"L": "<->"}}},
+        "B2": {"site_id": "B", "link": {"A2": {"L": "<->"}}},
+        "C1": {"site_id": "C", "link": {"A1": {"L": "<->"}}},
+        # Site D has a real NE edge, but it is intra-site and must not make D
+        # externally connected.
+        "D1": {"site_id": "D", "link": {"D2": {"L": "<->"}}},
+        "D2": {"site_id": "D", "link": {"D1": {"L": "<->"}}},
+    }
+    ctx = build_node_context(graph, "alarm_source")
+    stats = SiteStats(
+        ctx.device_node_infos,
+        None,
+        undirected_neighbors=ctx.device_undirected_neighbors,
+    )
+    assert stats.site_external_neighbor_counts == {"A": 2, "B": 1, "C": 1}
+    assert abs(stats.site_external_neighbor_count("A") - 2.0 / 6.0) < 1e-12
+    assert abs(stats.site_external_neighbor_count("B") - 1.0 / 5.0) < 1e-12
+    assert stats.site_external_neighbor_count("D") == 0.0
+
+
 def test_site_and_device_structural_features():
     ctx = build_node_context(NE_GRAPH, "alarm_source")
     topo = NETopologyIndex.from_graph(NE_GRAPH, max_hops=2)
@@ -300,6 +324,10 @@ def test_site_domain_phi_alpha_parity():
     assert float(np.max(phi[:, names.index("tgt_undirected_degree")])) == 0.0
     assert float(np.max(phi[:, names.index("src_undirected_degree")])) == 0.0
     assert float(np.max(phi[:, names.index("device_link_ratio")])) == 0.0
+    assert abs(float(np.max(phi[:, names.index("tgt_site_external_neighbor_count")]))
+               - 1.0 / 5.0) < 1e-6
+    assert abs(float(np.max(phi[:, names.index("src_site_external_neighbor_count")]))
+               - 1.0 / 5.0) < 1e-6
 
     # Trained kernel α on training φ.
     kernel = FeatureKernel.from_dict(art.training_metadata["feature_kernel"])
@@ -339,13 +367,16 @@ def test_site_domain_phi_alpha_parity():
         mu_spec=MuFeatureSpec.from_dict(rt["mu_spec"]), graph_context=node_ctx)
     mu_phi, mu_spec = build_mu_features(vocabs, tf, node_ctx, node_field="site_id")
     assert mu_spec.numeric_feature_names == [
-        "site_size", "site_link_load", "domain_share_in_site"
+        "site_size", "site_link_load", "site_external_neighbor_count",
+        "domain_share_in_site"
     ]
     j_mu_size = mu_spec.feature_names.index("site_size")
     j_mu_load = mu_spec.feature_names.index("site_link_load")
+    j_mu_external = mu_spec.feature_names.index("site_external_neighbor_count")
     j_mu_share = mu_spec.feature_names.index("domain_share_in_site")
     assert abs(float(np.max(mu_phi[:, j_mu_size])) - 2.0 / 10.0) < 1e-12
     assert abs(float(np.max(mu_phi[:, j_mu_load])) - 1.0 / 9.0) < 1e-12
+    assert abs(float(np.max(mu_phi[:, j_mu_external])) - 1.0 / 5.0) < 1e-12
     assert float(np.max(mu_phi[:, j_mu_share])) == 1.0
     mu_kernel = FeatureKernel.from_dict(rt["mu_kernel"])
     mu_train = mu_kernel.alpha(mu_phi)
@@ -417,6 +448,7 @@ def test_device_node_domain_phi_alpha_parity():
         "site_domain_cosine", "tgt_undirected_degree", "src_undirected_degree",
         "device_link_ratio",
         "geo_proximity", "geo_distance_missing",
+        "tgt_site_external_neighbor_count", "src_site_external_neighbor_count",
     ):
         assert col in layout.feature_names, col
     assert layout.n_features == kernel.n_features
@@ -495,6 +527,8 @@ def test_device_node_domain_phi_alpha_parity():
     j_device_ratio = names.index("device_link_ratio")
     j_geo = names.index("geo_proximity")
     j_geo_missing = names.index("geo_distance_missing")
+    j_tgt_external = names.index("tgt_site_external_neighbor_count")
+    j_src_external = names.index("src_site_external_neighbor_count")
     assert abs(float(np.max(phi[:, j_link])) - 1.0 / 5.0) < 1e-6
     assert abs(float(np.max(phi[:, j_tsize])) - 2.0 / 10.0) < 1e-6
     assert abs(float(np.max(phi[:, j_site_ratio])) - 1.0) < 1e-6
@@ -506,6 +540,8 @@ def test_device_node_domain_phi_alpha_parity():
     assert abs(float(np.max(phi[:, j_device_ratio])) - 1.0) < 1e-6
     assert abs(float(np.max(phi[:, j_geo])) - 1.0) < 1e-6
     assert float(np.max(phi[:, j_geo_missing])) == 0.0
+    assert abs(float(np.max(phi[:, j_tgt_external])) - 1.0 / 5.0) < 1e-6
+    assert abs(float(np.max(phi[:, j_src_external])) - 1.0 / 5.0) < 1e-6
 
     # μ parity under the merged 4-bucket ψ domain (CORE/unknown devices → OTHER).
     mu_scorer = RuntimeMuScorer(
@@ -514,11 +550,15 @@ def test_device_node_domain_phi_alpha_parity():
     mu_phi, mu_spec = build_mu_features(vocabs, tf, node_ctx, node_field="alarm_source")
     assert "OTHER" in mu_spec.domain_vocab, mu_spec.domain_vocab
     assert "MISSING" not in mu_spec.domain_vocab
-    assert mu_spec.numeric_feature_names == ["site_size", "undirected_degree"]
+    assert mu_spec.numeric_feature_names == [
+        "site_size", "undirected_degree", "site_external_neighbor_count"
+    ]
     j_mu_size = mu_spec.feature_names.index("site_size")
     j_mu_degree = mu_spec.feature_names.index("undirected_degree")
+    j_mu_external = mu_spec.feature_names.index("site_external_neighbor_count")
     assert abs(float(np.max(mu_phi[:, j_mu_size])) - 2.0 / 10.0) < 1e-12
     assert abs(float(np.max(mu_phi[:, j_mu_degree])) - 1.0 / 5.0) < 1e-12
+    assert abs(float(np.max(mu_phi[:, j_mu_external])) - 1.0 / 5.0) < 1e-12
     mu_train = FeatureKernel.from_dict(rt["mu_kernel"]).alpha(mu_phi)
     mu_err = 0.0
     for tid in range(len(labels)):
@@ -812,7 +852,13 @@ def test_clear_teacher_alarm_adapter_aligns_and_records_metadata():
 
 
 def load_tests(_loader, _tests, _pattern):
+    # Keep the cache-blocked M-step formula / low-memory checks in the normal
+    # alarm_flow_mhp discovery suite even though their support module is named
+    # as a regression helper (the repository ignores new *test*.py files).
+    from mhp.feature_kernel_cpu_regression import FeatureKernelCpuOptimizationTest
+
     suite = unittest.TestSuite()
+    suite.addTests(_loader.loadTestsFromTestCase(FeatureKernelCpuOptimizationTest))
     for name, test_func in sorted(globals().items()):
         if name.startswith("test_") and callable(test_func):
             suite.addTest(unittest.FunctionTestCase(test_func, description=name))
