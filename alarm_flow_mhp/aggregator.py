@@ -104,7 +104,6 @@ class AlarmMHPConfig:
     time_slack_sec: float = 0.0
     late_penalty_half_life_sec: float = 1.0
     max_history_events: int = 128
-    min_events: int = 2
     time_scale_sec: float = 60.0
     include_clear: bool = False
     # Training-only privileged signal from alarm clear timestamps.  A positive
@@ -323,7 +322,7 @@ class AlarmMHPConfig:
             type_fields=tuple(self.type_fields),
             history_window_sec=self.history_window_sec,
             max_history_events=self.max_history_events,
-            min_events=self.min_events,
+            min_events=None,
             time_scale_sec=self.time_scale_sec,
             include_clear=self.include_clear,
         )
@@ -483,7 +482,9 @@ def _build_sequences(sorted_alarm_events, vocabs, sequence_config):
         build_target_windows=False,
     )
     if not sequences:
-        raise ValueError("no global alarm flow survived preprocessing; relax min-events or inspect inputs")
+        raise ValueError(
+            "no modeled alarm events survived preprocessing"
+        )
     return sequences, sequence_stats
 
 

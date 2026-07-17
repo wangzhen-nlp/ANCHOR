@@ -23,7 +23,11 @@ from alarm_flow_isahp.event_domain import (
     filter_and_annotate_device_domain,
 )
 from alarm_flow_isahp.ne_topology import NETopologyIndex
-from alarm_flow_isahp.sequences import event_type_label, build_alarm_vocabs
+from alarm_flow_isahp.sequences import (
+    build_alarm_sequences,
+    build_alarm_vocabs,
+    event_type_label,
+)
 from alarm_flow_mhp.aggregator import AlarmMHPConfig, train_alarm_mhp
 from alarm_flow_mhp.feature_spec import (
     FeatureLayout,
@@ -90,12 +94,28 @@ def _train(type_fields, node_field, topo_index, ne_graph, dynamic_alpha="off"):
     cfg = AlarmMHPConfig(
         type_fields=type_fields, topology_node_field=node_field,
         edge_mode="feature", history_window_sec=60.0, time_scale_sec=60.0,
-        max_iters=5, min_events=2, beta_shared_value=1.0, feature_topo_max_hops=2,
+        max_iters=5, beta_shared_value=1.0, feature_topo_max_hops=2,
         dynamic_alpha=dynamic_alpha,
     )
     art = train_alarm_mhp(events, cfg, topology_index=topo_index,
                           ne_graph_data=ne_graph, verbose=False)
     return art, events, cfg
+
+
+def test_mhp_sequence_does_not_filter_single_event_flow():
+    event = _events()[0]
+    config = AlarmMHPConfig().sequence_config()
+    assert config.min_events is None
+    vocabs, _ = build_alarm_vocabs([event], config)
+    sequences, _ = build_alarm_sequences(
+        [event], vocabs, config, build_target_windows=False
+    )
+    assert len(sequences) == 1
+    assert len(sequences[0].events) == 1
+    artifact = train_alarm_mhp(
+        [event], AlarmMHPConfig(max_iters=1, edge_mode="device"), verbose=False
+    )
+    assert artifact.params.M == 1
 
 
 def test_geo_stats_proximity_and_missing():
@@ -382,7 +402,7 @@ def test_device_node_domain_phi_alpha_parity():
     cfg = AlarmMHPConfig(
         type_fields=tf, topology_node_field="alarm_source",
         edge_mode="feature", history_window_sec=60.0, time_scale_sec=60.0,
-        max_iters=5, min_events=2, beta_shared_value=1.0, feature_topo_max_hops=2,
+        max_iters=5, beta_shared_value=1.0, feature_topo_max_hops=2,
     )
     art = train_alarm_mhp(events, cfg, topology_index=topo, ne_graph_data=graph, verbose=False)
     rt = art.training_metadata["feature_runtime"]
@@ -779,7 +799,6 @@ def test_clear_teacher_alarm_adapter_aligns_and_records_metadata():
             history_window_sec=60.0,
             time_scale_sec=60.0,
             max_iters=2,
-            min_events=2,
             clear_time_teacher_boost=0.5,
             clear_time_teacher_tau_sec=60.0,
             clear_time_teacher_mode="redistribute",

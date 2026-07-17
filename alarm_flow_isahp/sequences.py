@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from typing import Optional
 
 from alarm_tools.alarm_types import LINK_ALARMS, OFFLINE_ALARMS, POWER_ALARMS
 from fault_grouping.alarm_events.io import is_clear_alarm
@@ -14,7 +15,7 @@ class AlarmSequenceConfig:
     type_fields: tuple = ("alarm_source", "alarm_type")
     history_window_sec: float = 900.0
     max_history_events: int = 128
-    min_events: int = 2
+    min_events: Optional[int] = 2
     time_scale_sec: float = 60.0
     include_clear: bool = False
 
@@ -28,7 +29,7 @@ class AlarmSequenceConfig:
             raise ValueError("history_window_sec must be > 0")
         if self.max_history_events < 1:
             raise ValueError("max_history_events must be >= 1")
-        if self.min_events < 2:
+        if self.min_events is not None and self.min_events < 2:
             raise ValueError("min_events must be >= 2")
         if self.time_scale_sec <= 0:
             raise ValueError("time_scale_sec must be > 0")
@@ -312,7 +313,9 @@ def _emit_sequence(
         alarm_type_ids.append(alarm_type_id)
         events.append(item)
 
-    if len(events) < config.min_events:
+    if not events:
+        return None
+    if config.min_events is not None and len(events) < config.min_events:
         return None
 
     start_ts = float(events[0]["ts"])

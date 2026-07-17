@@ -123,7 +123,6 @@ def _build_config(args):
         time_slack_sec=args.time_slack_sec,
         late_penalty_half_life_sec=args.late_penalty_half_life_sec,
         max_history_events=args.max_history_events,
-        min_events=args.min_events,
         time_scale_sec=args.time_scale_sec,
         include_clear=args.include_clear,
         clear_time_teacher_boost=args.clear_time_teacher_boost,
@@ -278,7 +277,6 @@ def main():
         ),
     )
     parser.add_argument("--max-history-events", type=int, default=128)
-    parser.add_argument("--min-events", type=int, default=2)
     parser.add_argument("--time-scale-sec", type=float, default=60.0)
     parser.add_argument("--include-clear", action="store_true")
     parser.add_argument(

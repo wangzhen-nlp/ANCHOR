@@ -2319,11 +2319,12 @@ def main():
         if args.feature_alpha_floor is not None
         else float(getattr(artifact.config, "edge_threshold", 0.0))
     )
-    min_events = int(args.min_group_events)
-    if int(artifact.config.min_group_events) != min_events:
+    min_group_events = int(args.min_group_events)
+    if int(artifact.config.min_group_events) != min_group_events:
         print(
             f"[period] note: artifact min_group_events={int(artifact.config.min_group_events)} "
-            f"is no longer inherited; using {min_events} (override with --min-group-events).",
+            f"is no longer inherited; using {min_group_events} "
+            "(override with --min-group-events).",
             flush=True,
         )
     config = PeriodStreamConfig(
@@ -2334,7 +2335,7 @@ def main():
         late_penalty_half_life_sec=late_half_life,
         time_scale_sec=float(artifact.config.time_scale_sec),
         close_inactive_sec=args.close_inactive_sec,
-        min_group_events=min_events,
+        min_group_events=min_group_events,
         immigrant_bias=args.immigrant_bias,
         feature_alpha_floor=floor,
         attach_threshold_ratio=args.attach_threshold_ratio,

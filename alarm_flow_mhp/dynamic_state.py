@@ -54,7 +54,7 @@ def build_event_states(
     which still contains clears), so uncleared-alarm state is tracked correctly;
     each NON-CLEAR event's snapshot (excl self) is keyed by id(event). The
     modeled events (`sequence.events`) are the SAME dict objects (a clear- and
-    min-events-filtered subset), so we gather their snapshots by id — robust to
+    model-filtered subset), so we gather their snapshots by id — robust to
     whatever filtering produced the modeled subset (no index alignment).
 
     Returns (len(modeled_events), 3) uint8 in modeled-event order.
