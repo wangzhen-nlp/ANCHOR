@@ -30,6 +30,121 @@ import numpy as np
 
 _EPS = 1e-12
 
+# Keep mixed-precision BLAS work cache-sized.  Candidate features are normally
+# float32 while weights / sufficient statistics are float64.  On NumPy builds
+# backed by Accelerate (and several OpenBLAS builds), one giant mixed-dtype GEMV
+# falls back to a much slower path.  Fixed-order row blocks both bound temporary
+# memory and turn Hessian construction into efficient GEMM calls.
+_MATMUL_BLOCK_ROWS = 4096
+_MATMUL_WORK_BYTES = 8 * 1024 * 1024
+# A dense (candidate, dynamic-feature) cross-curvature buffer is much faster
+# than D separate feature reductions, but must not grow without bound on very
+# large candidate sets.  Above this cap the code takes an algebraically
+# equivalent low-memory path.
+_DYNAMIC_CROSS_WORK_BYTES = 128 * 1024 * 1024
+
+
+def _matmul_block_rows(*matrices, extra_bytes_per_row=0) -> int:
+    """Choose a deterministic cache-sized row block for aligned matrices."""
+    if not matrices:
+        return 1
+    n_rows = int(matrices[0].shape[0])
+    bytes_per_row = int(extra_bytes_per_row)
+    for matrix in matrices:
+        if int(matrix.shape[0]) != n_rows:
+            raise ValueError("matmul inputs must have the same row count")
+        width = 1 if matrix.ndim == 1 else int(matrix.shape[1])
+        bytes_per_row += width * int(matrix.dtype.itemsize)
+    memory_rows = max(1, _MATMUL_WORK_BYTES // max(bytes_per_row, 1))
+    return max(1, min(n_rows, _MATMUL_BLOCK_ROWS, memory_rows))
+
+
+def _row_matvec(matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """Compute matrix @ vector, blocking the slow mixed-dtype case."""
+    matrix = np.asarray(matrix)
+    vector = np.asarray(vector)
+    if matrix.dtype == vector.dtype or matrix.shape[0] <= _MATMUL_BLOCK_ROWS:
+        return matrix @ vector
+    out = np.empty(matrix.shape[0], dtype=np.result_type(matrix, vector))
+    block_rows = _matmul_block_rows(matrix)
+    for start in range(0, matrix.shape[0], block_rows):
+        stop = min(start + block_rows, matrix.shape[0])
+        out[start:stop] = matrix[start:stop] @ vector
+    return out
+
+
+def _transpose_matvec(matrix: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    """Compute matrix.T @ vector with cache-sized mixed-dtype reductions."""
+    matrix = np.asarray(matrix)
+    vector = np.asarray(vector)
+    if matrix.dtype == vector.dtype or matrix.shape[0] <= _MATMUL_BLOCK_ROWS:
+        return matrix.T @ vector
+    out = np.zeros(matrix.shape[1], dtype=np.result_type(matrix, vector))
+    block_rows = _matmul_block_rows(matrix, vector)
+    for start in range(0, matrix.shape[0], block_rows):
+        stop = min(start + block_rows, matrix.shape[0])
+        out += matrix[start:stop].T @ vector[start:stop]
+    return out
+
+
+def _transpose_matmul(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Compute left.T @ right without a slow giant mixed-dtype GEMM."""
+    left = np.asarray(left)
+    right = np.asarray(right)
+    if right.ndim != 2:
+        raise ValueError("right must be a matrix")
+    if left.dtype == right.dtype or left.shape[0] <= _MATMUL_BLOCK_ROWS:
+        return left.T @ right
+    out = np.zeros(
+        (left.shape[1], right.shape[1]), dtype=np.result_type(left, right)
+    )
+    block_rows = _matmul_block_rows(left, right)
+    for start in range(0, left.shape[0], block_rows):
+        stop = min(start + block_rows, left.shape[0])
+        out += left[start:stop].T @ right[start:stop]
+    return out
+
+
+def _weighted_gram(matrix: np.ndarray, row_weights: np.ndarray) -> np.ndarray:
+    """Return matrix.T @ diag(row_weights) @ matrix via bounded GEMMs.
+
+    The former implementation issued one full candidate-length GEMV per
+    feature.  This reads the feature matrix F times.  Row blocking reads each
+    block once and uses a level-3 BLAS operation, while keeping the temporary
+    weighted block under ``_MATMUL_WORK_BYTES`` where possible.
+    """
+    matrix = np.asarray(matrix)
+    row_weights = np.asarray(row_weights)
+    n_rows, n_features = matrix.shape
+    out_dtype = np.result_type(matrix, row_weights, np.float64)
+    out = np.zeros((n_features, n_features), dtype=out_dtype)
+    if n_rows == 0:
+        return out
+    weighted_itemsize = int(np.dtype(np.result_type(matrix, row_weights)).itemsize)
+    block_rows = _matmul_block_rows(
+        matrix,
+        row_weights,
+        extra_bytes_per_row=n_features * weighted_itemsize,
+    )
+    for start in range(0, n_rows, block_rows):
+        stop = min(start + block_rows, n_rows)
+        block = matrix[start:stop]
+        weighted = block * row_weights[start:stop, None]
+        out += block.T @ weighted
+    return out
+
+
+def _zeroed_workspace_array(workspace, key, shape) -> np.ndarray:
+    """Get a reusable float64 work array, zeroing it before each evaluation."""
+    if workspace is None:
+        return np.zeros(shape, dtype=np.float64)
+    array = workspace.get(key)
+    if array is None or array.shape != shape or array.dtype != np.float64:
+        array = np.empty(shape, dtype=np.float64)
+        workspace[key] = array
+    array.fill(0.0)
+    return array
+
 
 def softplus(z: np.ndarray) -> np.ndarray:
     """Numerically stable softplus: log(1 + exp(z))."""
@@ -45,6 +160,17 @@ def sigmoid(z: np.ndarray) -> np.ndarray:
     ez = np.exp(z[~pos])
     out[~pos] = ez / (1.0 + ez)
     return out
+
+
+def softplus_sigmoid(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return softplus(z) and its sigmoid derivative with one activation pass.
+
+    ``sigmoid(z) = 1 - exp(-softplus(z))``.  ``-expm1(-a)`` preserves accuracy
+    when ``a`` is tiny, so this identity is stable at both tails and avoids the
+    second exponential plus sign-mask temporaries in :func:`sigmoid`.
+    """
+    a = softplus(z)
+    return a, -np.expm1(-a)
 
 
 @dataclass
@@ -131,7 +257,7 @@ def _newton_direction(H, grad, eye):
 
 def _q_only(w, phi, n_resp, exposure, l2, w0, reg_mask):
     """Objective Q(w) only — for the Armijo line search (skips the phiᵀ·coef matmul)."""
-    z = phi @ w
+    z = _row_matvec(phi, w)
     a = softplus(z)
     a_safe = np.maximum(a, _EPS)
     return float(np.sum(n_resp * np.log(a_safe) - exposure * a) - l2 * np.sum(reg_mask * (w - w0) ** 2))
@@ -141,12 +267,12 @@ def _q_and_grad(w, phi, n_resp, exposure, l2, w0, reg_mask):
     """Objective Q(w) = Σ_c [N_c·log α_c − E_c·α_c] − λ·Σ reg·(w−w0)² and its
     gradient (to be MAXIMIZED).
     """
-    z = phi @ w
-    a = softplus(z)
+    z = _row_matvec(phi, w)
+    a, s = softplus_sigmoid(z)
     a_safe = np.maximum(a, _EPS)
     q = float(np.sum(n_resp * np.log(a_safe) - exposure * a) - l2 * np.sum(reg_mask * (w - w0) ** 2))
-    coef = (n_resp / a_safe - exposure) * sigmoid(z)
-    grad = phi.T @ coef - 2.0 * l2 * reg_mask * (w - w0)
+    coef = (n_resp / a_safe - exposure) * s
+    grad = _transpose_matvec(phi, coef) - 2.0 * l2 * reg_mask * (w - w0)
     return q, grad
 
 
@@ -154,17 +280,14 @@ def _q_grad_hess(w, phi, n_resp, exposure, l2, w0, reg_mask):
     """_q_and_grad plus the full F×F Hessian (for Newton): H = phiᵀ·diag(h)·phi
     − 2λ·reg, h = (N/α−E)·σ(1−σ) − N·σ²/α²."""
     F = phi.shape[1]
-    z = phi @ w
-    a = softplus(z)
+    z = _row_matvec(phi, w)
+    a, s = softplus_sigmoid(z)
     a_safe = np.maximum(a, _EPS)
-    s = sigmoid(z)
     q = float(np.sum(n_resp * np.log(a_safe) - exposure * a) - l2 * np.sum(reg_mask * (w - w0) ** 2))
     coef = (n_resp / a_safe - exposure) * s
-    grad = phi.T @ coef - 2.0 * l2 * reg_mask * (w - w0)
+    grad = _transpose_matvec(phi, coef) - 2.0 * l2 * reg_mask * (w - w0)
     h = (n_resp / a_safe - exposure) * s * (1.0 - s) - n_resp * (s * s) / (a_safe * a_safe)
-    H = np.empty((F, F))
-    for i in range(F):
-        H[:, i] = phi.T @ (phi[:, i] * h)
+    H = _weighted_gram(phi, h)
     H[np.arange(F), np.arange(F)] -= 2.0 * l2 * reg_mask
     return q, grad, H
 
@@ -188,7 +311,7 @@ def _q_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
     F = cand_phi.shape[1]
     K = combo_bits.shape[0]
     ws, wd = w[:F], w[F:]
-    z_s = cand_phi @ ws                     # (C,) one matmul
+    z_s = _row_matvec(cand_phi, ws)         # (C,) one blocked matmul
     z_d = combo_bits @ wd                   # (K,)
     q = 0.0
     for k in range(K):
@@ -227,38 +350,38 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
     F = cand_phi.shape[1]
     K, D = combo_bits.shape
     ws, wd = w[:F], w[F:]
-    z_s = cand_phi @ ws                     # (C,) one matmul
+    z_s = _row_matvec(cand_phi, ws)         # (C,) one blocked matmul
     z_d = combo_bits @ wd                   # (K,)
     q = 0.0
     coef_total = np.zeros(cand_phi.shape[0])   # Σ_k coef[:,k]  (C,)
     coef_sum_per_combo = np.zeros(K)           # Σ_c coef[:,k]
     for k in range(K):
         z = z_s + z_d[k]
-        a = softplus(z)
+        a, s = softplus_sigmoid(z)
         a_safe = np.maximum(a, _EPS)
         ek = e2d[:, k]
-        coef = -ek * sigmoid(z)
+        coef = -ek * s
         q -= float(np.sum(ek * a))
         sp = _sparse_column(n2d, k)
         if sp is None:
             nk = n2d[:, k]
             q += float(np.sum(nk * np.log(a_safe)))
-            coef += (nk / a_safe) * sigmoid(z)
+            coef += (nk / a_safe) * s
         else:
             idx, val = sp
             if len(idx):
                 q += float(np.sum(val * np.log(a_safe[idx])))
-                np.add.at(coef, idx, (val / a_safe[idx]) * sigmoid(z[idx]))
+                np.add.at(coef, idx, (val / a_safe[idx]) * s[idx])
         if k == 0:
             if n0_extra is not None:
                 q += float(np.sum(n0_extra * np.log(a_safe)))
-                coef += (n0_extra / a_safe) * sigmoid(z)
+                coef += (n0_extra / a_safe) * s
             if e0_extra is not None:
                 q -= float(np.sum(e0_extra * a))
-                coef -= e0_extra * sigmoid(z)
+                coef -= e0_extra * s
         coef_total += coef
         coef_sum_per_combo[k] = float(coef.sum())
-    grad_s = cand_phi.T @ coef_total             # ONE (F×C) matmul instead of K
+    grad_s = _transpose_matvec(cand_phi, coef_total)  # ONE reduction instead of K
     grad_d = combo_bits.T @ coef_sum_per_combo   # (D,)
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
     grad = np.concatenate([grad_s, grad_d]) - 2.0 * l2 * reg_mask * (w - w0)
@@ -266,11 +389,11 @@ def _q_and_grad_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
 
 
 def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
-                         n0_extra=None, e0_extra=None):
+                         n0_extra=None, e0_extra=None, workspace=None):
     """_q_and_grad_dynamic plus the FULL (F+D)×(F+D) Hessian, for Newton steps.
     Per-(c,k) 2nd derivative w.r.t. z:  h = (N/α−E)·σ(1−σ) − N·σ²/α².
     Hessian blocks (no (C,K) materialization):
-        H_ss = cand_phiᵀ·diag(Σ_k h)·cand_phi      (via F column matmuls)
+        H_ss = cand_phiᵀ·diag(Σ_k h)·cand_phi      (via blocked GEMM)
         H_dd = combo_bitsᵀ·diag(Σ_c h)·combo_bits
         H_sd = Σ_k (cand_phiᵀ·h[:,k]) ⊗ combo_bits[k]
     minus the ridge curvature 2λ·reg on the diagonal.
@@ -279,19 +402,30 @@ def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
     K, D = combo_bits.shape
     nw = F + D
     ws, wd = w[:F], w[F:]
-    z_s = cand_phi @ ws
+    z_s = _row_matvec(cand_phi, ws)
     z_d = combo_bits @ wd
     q = 0.0
-    coef_total = np.zeros(C)
-    coef_sum_per_combo = np.zeros(K)
-    h_total = np.zeros(C)
-    h_per_combo = np.zeros(K)
-    Hsd = np.zeros((F, D))
+    coef_total = _zeroed_workspace_array(workspace, "dense_coef_total", (C,))
+    coef_sum_per_combo = _zeroed_workspace_array(
+        workspace, "dense_coef_per_combo", (K,)
+    )
+    h_total = _zeroed_workspace_array(workspace, "dense_h_total", (C,))
+    h_per_combo = _zeroed_workspace_array(workspace, "dense_h_per_combo", (K,))
+    # Accumulate the static×dynamic curvature by candidate, then issue one
+    # blocked GEMM.  The old path performed one candidate-length GEMV per combo.
+    use_cross_buffer = C * D * np.dtype(np.float64).itemsize <= _DYNAMIC_CROSS_WORK_BYTES
+    if use_cross_buffer:
+        hsd_by_candidate = _zeroed_workspace_array(
+            workspace, "dense_hsd_by_candidate", (C, D)
+        )
+        Hsd = None
+    else:
+        hsd_by_candidate = None
+        Hsd = np.zeros((F, D), dtype=np.float64)
     for k in range(K):
         z = z_s + z_d[k]
-        a = softplus(z)
+        a, s = softplus_sigmoid(z)
         a_safe = np.maximum(a, _EPS)
-        s = sigmoid(z)
         ek = e2d[:, k]
         q -= float(np.sum(ek * a))
         coef = -ek * s
@@ -328,14 +462,20 @@ def _q_grad_hess_dynamic(w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
         coef_sum_per_combo[k] = float(coef.sum())
         h_total += h
         h_per_combo[k] = float(h.sum())
-        Hsd += np.outer(cand_phi.T @ h, combo_bits[k])
-    grad_s = cand_phi.T @ coef_total
+        if use_cross_buffer:
+            for d in np.flatnonzero(combo_bits[k]):
+                hsd_by_candidate[:, d] += h * combo_bits[k, d]
+        elif np.any(combo_bits[k]):
+            # Low-memory fallback: reduce this combo immediately instead of
+            # retaining C×D curvature.  K is only 8 on this dense path.
+            Hsd += np.outer(_transpose_matvec(cand_phi, h), combo_bits[k])
+    grad_s = _transpose_matvec(cand_phi, coef_total)
     grad_d = combo_bits.T @ coef_sum_per_combo
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
     grad = np.concatenate([grad_s, grad_d]) - 2.0 * l2 * reg_mask * (w - w0)
-    Hss = np.empty((F, F))
-    for i in range(F):                                     # avoid a (C,F) temp
-        Hss[:, i] = cand_phi.T @ (cand_phi[:, i] * h_total)
+    Hss = _weighted_gram(cand_phi, h_total)
+    if use_cross_buffer:
+        Hsd = _transpose_matmul(cand_phi, hsd_by_candidate)
     Hdd = combo_bits.T @ (combo_bits * h_per_combo[:, None])
     H = np.empty((nw, nw))
     H[:F, :F] = Hss
@@ -390,9 +530,10 @@ def fit_dynamic_weights_mstep(
     # Newton converges in a handful of iters to the SAME optimum. Levenberg
     # damping (−H + μI) keeps the step an ascent direction when the (non-canonical
     # softplus link) objective is locally non-concave.
+    workspace = {}
     q, grad, H = _q_grad_hess_dynamic(
         w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
-        n0_extra=n0_extra, e0_extra=e0_extra,
+        n0_extra=n0_extra, e0_extra=e0_extra, workspace=workspace,
     )
     eye = np.eye(F + D)
     for _it in range(max_iter):
@@ -415,7 +556,7 @@ def fit_dynamic_weights_mstep(
                 w, q = w_new, q_new
                 q, grad, H = _q_grad_hess_dynamic(
                     w, cand_phi, combo_bits, n2d, e2d, l2, w0, reg_mask,
-                    n0_extra=n0_extra, e0_extra=e0_extra,
+                    n0_extra=n0_extra, e0_extra=e0_extra, workspace=workspace,
                 )
                 improved = True
                 break
@@ -438,7 +579,7 @@ def fit_dynamic_weights_mstep(
 def _q_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
     """Objective Q only (line search) over flat-COO N and E entries."""
     F = cand_phi.shape[1]
-    z_s = cand_phi @ w[:F]
+    z_s = _row_matvec(cand_phi, w[:F])
     z_d = combo_bits @ w[F:]
     nr, nc, nv = n_coo
     er, ec, ev = e_coo
@@ -453,7 +594,9 @@ def _q_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
     return q
 
 
-def _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
+def _q_grad_hess_dynamic_coo(
+    w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask, workspace=None
+):
     """Q, gradient, and full Hessian over flat-COO N and E. Per-entry 2nd
     derivative decomposes: h_N = (N/α)σ(1−σ) − Nσ²/α² (N-entries),
     h_E = −E·σ(1−σ) (E-entries). Aggregated to per-candidate / per-combo via
@@ -461,20 +604,28 @@ def _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_
     C, F = cand_phi.shape
     K, D = combo_bits.shape
     nw = F + D
-    z_s = cand_phi @ w[:F]
+    z_s = _row_matvec(cand_phi, w[:F])
     z_d = combo_bits @ w[F:]
     nr, nc, nv = n_coo
     er, ec, ev = e_coo
-    coef_c = np.zeros(C)
-    coef_k = np.zeros(K)
-    h_c = np.zeros(C)
-    h_k = np.zeros(K)
-    Hsd = np.zeros((F, D))
+    coef_c = _zeroed_workspace_array(workspace, "coo_coef_c", (C,))
+    coef_k = _zeroed_workspace_array(workspace, "coo_coef_k", (K,))
+    h_c = _zeroed_workspace_array(workspace, "coo_h_c", (C,))
+    h_k = _zeroed_workspace_array(workspace, "coo_h_k", (K,))
+    use_cross_buffer = C * D * np.dtype(np.float64).itemsize <= _DYNAMIC_CROSS_WORK_BYTES
+    if use_cross_buffer:
+        hsd_by_candidate = _zeroed_workspace_array(
+            workspace, "coo_hsd_by_candidate", (C, D)
+        )
+        Hsd = None
+    else:
+        hsd_by_candidate = None
+        Hsd = np.zeros((F, D), dtype=np.float64)
     q = 0.0
     if nr.size:
         zN = z_s[nr] + z_d[nc]
-        aN = np.maximum(softplus(zN), _EPS)
-        sN = sigmoid(zN)
+        aN, sN = softplus_sigmoid(zN)
+        aN = np.maximum(aN, _EPS)
         q += float(np.sum(nv * np.log(aN)))
         cN = (nv / aN) * sN
         hN = (nv / aN) * sN * (1.0 - sN) - nv * (sN * sN) / (aN * aN)
@@ -485,11 +636,14 @@ def _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_
         for d in range(D):
             # Avoid materializing combo_bits[nc] as (nnz, D), which is huge for
             # source_target exposure. Build one weighted column at a time.
-            Hsd[:, d] += cand_phi.T @ np.bincount(nr, hN * combo_bits[nc, d], C)
+            hsd_col = np.bincount(nr, hN * combo_bits[nc, d], C)
+            if use_cross_buffer:
+                hsd_by_candidate[:, d] += hsd_col
+            else:
+                Hsd[:, d] += _transpose_matvec(cand_phi, hsd_col)
     if er.size:
         zE = z_s[er] + z_d[ec]
-        aE = softplus(zE)
-        sE = sigmoid(zE)
+        aE, sE = softplus_sigmoid(zE)
         q -= float(np.sum(ev * aE))
         cE = -ev * sE
         hE = -ev * sE * (1.0 - sE)
@@ -498,12 +652,18 @@ def _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_
         h_c += np.bincount(er, hE, C)
         h_k += np.bincount(ec, hE, K)
         for d in range(D):
-            Hsd[:, d] += cand_phi.T @ np.bincount(er, hE * combo_bits[ec, d], C)
+            hsd_col = np.bincount(er, hE * combo_bits[ec, d], C)
+            if use_cross_buffer:
+                hsd_by_candidate[:, d] += hsd_col
+            else:
+                Hsd[:, d] += _transpose_matvec(cand_phi, hsd_col)
     q -= l2 * float(np.sum(reg_mask * (w - w0) ** 2))
-    grad = np.concatenate([cand_phi.T @ coef_c, combo_bits.T @ coef_k]) - 2.0 * l2 * reg_mask * (w - w0)
-    Hss = np.empty((F, F))
-    for i in range(F):
-        Hss[:, i] = cand_phi.T @ (cand_phi[:, i] * h_c)
+    grad = np.concatenate(
+        [_transpose_matvec(cand_phi, coef_c), combo_bits.T @ coef_k]
+    ) - 2.0 * l2 * reg_mask * (w - w0)
+    Hss = _weighted_gram(cand_phi, h_c)
+    if use_cross_buffer:
+        Hsd = _transpose_matmul(cand_phi, hsd_by_candidate)
     Hdd = combo_bits.T @ (combo_bits * h_k[:, None])
     H = np.empty((nw, nw))
     H[:F, :F] = Hss
@@ -553,7 +713,11 @@ def fit_dynamic_weights_mstep_coo(
 
     n_coo = _coo(n_coo)
     e_coo = _coo(e_coo)
-    q, grad, H = _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
+    workspace = {}
+    q, grad, H = _q_grad_hess_dynamic_coo(
+        w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask,
+        workspace=workspace,
+    )
     eye = np.eye(n_w)
     for _it in range(max_iter):
         if progress is not None:
@@ -570,7 +734,10 @@ def fit_dynamic_weights_mstep_coo(
             q_new = _q_dynamic_coo(w_new, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
             if q_new >= q + c * t * dderiv:
                 w, q = w_new, q_new
-                q, grad, H = _q_grad_hess_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
+                q, grad, H = _q_grad_hess_dynamic_coo(
+                    w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask,
+                    workspace=workspace,
+                )
                 improved = True
                 break
             t *= 0.5
