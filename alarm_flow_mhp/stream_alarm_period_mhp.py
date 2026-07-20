@@ -29,6 +29,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import heapq
 import hashlib
+from itertools import groupby
 import json
 import math
 import os
@@ -70,7 +71,9 @@ from alarm_flow_mhp.feature_spec import (
 )
 from alarm_flow_mhp.stream_alarm_mhp import OnlineEvent, _summary_of
 from alarm_flow_mhp.topology_relation_prior import (
+    RELATION_KEYS,
     parse_topology_relation_prior,
+    relation_weight,
     topology_relation_weights,
 )
 from alarm_tools.progress_utils import ProgressBar
@@ -93,6 +96,21 @@ from topology_tools.region_utils import (
 
 
 EPS = 1e-12
+
+# Slack subtracted from the separable-logit prescreen threshold so float
+# reassociation (z_at + z_ent vs the exact left-to-right sum) can never drop a
+# candidate that exact scoring would keep. Logit magnitudes are O(10²), so the
+# reassociation error is bounded well below 1e-9.
+PRESCREEN_LOGIT_MARGIN = 1e-6
+
+
+def _softplus_lower_logit(y: float) -> float:
+    """Smallest logit z with softplus(z) >= y (softplus inverse, -inf if y<=0)."""
+    if y <= 0.0:
+        return -math.inf
+    if y > 30.0:
+        return float(y)
+    return math.log(math.expm1(y))
 ASSOCIATION_CACHE_FORMAT = "alarm_flow_mhp.period_association_cache"
 ASSOCIATION_CACHE_VERSION = 4
 CACHE_STATE_LAYOUT_FULL = "target_source_state"
@@ -641,6 +659,9 @@ class CompiledAssociationPlan:
         self._mu_cache: dict[PeriodType, float] = {}
         self.compiled_pair_count = 0
         self.pruned_pair_count = 0
+        # Offline-compile telemetry: directed type pairs (not ×8 states)
+        # rejected by the separable-logit prescreen before exact scoring.
+        self.prescreen_dropped_pair_count = 0
         self.preloaded_signature_count = 0
         self.preloaded_edge_count = 0
 
@@ -861,85 +882,264 @@ class CompiledAssociationPlan:
             for source in self._candidate_sources(target, prepared):
                 yield target, source
 
+    def _candidate_arrays(self, source_types):
+        """Candidate list indexes for the separable prescreen.
+
+        Returns alarm-type ids, the unique-entity inverse map, the unique
+        entity list, an (at_id+1, entity_index) -> candidate position grid
+        (-1 where the combo is absent), and the distinct at ids present.
+        """
+        at_to_id = self.scorer.at_to_id
+        src_at_ids = np.fromiter(
+            (at_to_id.get(str(value.alarm_type), -1) for value in source_types),
+            dtype=np.int64,
+            count=len(source_types),
+        )
+        index_of = {}
+        ent_inverse = np.empty(len(source_types), dtype=np.int64)
+        unique_entities = []
+        for i, value in enumerate(source_types):
+            j = index_of.get(value.entity)
+            if j is None:
+                j = index_of[value.entity] = len(unique_entities)
+                unique_entities.append(value.entity)
+            ent_inverse[i] = j
+        grid_index = np.full(
+            (self.decomposed.W_at_pad.shape[0], len(unique_entities)),
+            -1,
+            dtype=np.int64,
+        )
+        grid_index[src_at_ids + 1, ent_inverse] = np.arange(
+            len(source_types), dtype=np.int64
+        )
+        distinct_at_ids = np.unique(src_at_ids)
+        return src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids
+
     def _precompile_target_only_batches(self, prepared, progress, edge_batch_sink):
         """Vectorized offline compiler for target-dynamic cache rows.
 
-        Static pair features are evaluated once per PeriodType pair. The eight
-        target-state terms are then broadcast over that vector, avoiding eight
-        repeated topology/attribute passes and one Python call per state edge.
+        Targets are grouped by entity so the expensive entity-pair feature
+        parts are computed once per (target entity, source entity) instead of
+        once per candidate. Fixing the target, the logit is additively
+        separable: z(v, f) = z_entity(f) + W_at[u, v], plus a same-alarm-type
+        correction on the v == u row (same_alarm_type and its cross columns
+        depend only on the source entity once v == u holds). A conservative
+        threshold prescreen on that separable form finds survivors via one
+        binary search per source alarm type over the entity terms sorted once
+        per group, so per-target prescreen work scales with alarm types plus
+        survivors rather than with the full candidate list. Survivors are
+        rescored through the exact per-candidate path, so emitted edges are
+        bit-identical to the unpruned scan.
         """
         type_pair_count = 0
+        d = self.decomposed
         target_terms = np.asarray(
-            [self.decomposed.tgt_term(_combo_state(state)) for state in range(8)],
+            [d.tgt_term(_combo_state(state)) for state in range(8)],
             dtype=np.float64,
         )
-        for target_type in prepared["period_types"]:
-            source_types = self._candidate_sources(target_type, prepared)
+        max_tgt_term = float(target_terms.max())
+        rel_max = 1.0
+        if self.config.topology_relation_prior:
+            rel_max = max(
+                relation_weight(self.config.topology_relation_prior, key)
+                for key in RELATION_KEYS
+            )
+        shared = (
+            self._candidate_arrays(prepared["period_types"])
+            if prepared["global"]
+            else None
+        )
+        # Global scope scores one fixed entity universe against every target:
+        # precompute its target-independent columns once and assemble parts per
+        # group vectorized. Related scope keeps the per-group loop — its
+        # candidate sets are small and differ per target entity.
+        static_table = (
+            d.entity_static_table(shared[2]) if shared is not None else None
+        )
+        for entity, group in groupby(
+            prepared["period_types"], key=lambda value: value.entity
+        ):
+            targets = tuple(group)
+            source_types = self._candidate_sources(targets[0], prepared)
             source_count = len(source_types)
             if source_count:
-                source_alarm_types = [value.alarm_type for value in source_types]
-                source_entities = [value.entity for value in source_types]
-                logits = self.decomposed.logits_for_target(
-                    target_type.alarm_type,
-                    target_type.entity,
-                    source_alarm_types,
-                    source_entities,
+                src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids = (
+                    shared if shared is not None else self._candidate_arrays(source_types)
                 )
-                alpha = self.decomposed._softplus(
-                    logits.reshape(1, -1) + target_terms.reshape(-1, 1)
+                parts = (
+                    d.entity_parts_from_table(entity, static_table)
+                    if static_table is not None
+                    else d.entity_parts_for_target(entity, unique_entities)
                 )
-                if self.decomposed.alpha_scale != 1.0:
-                    alpha = alpha * self.decomposed.alpha_scale
-                if self.config.topology_relation_prior:
-                    relation_weights = topology_relation_weights(
-                        [topo_node_of(value) for value in source_entities],
-                        topo_node_of(target_type.entity),
-                        self.scorer.topology_index,
-                        self.scorer.node_infos,
-                        self.config.topology_relation_prior,
-                    )
-                else:
-                    relation_weights = np.ones(source_count, dtype=np.float64)
-                base_scores = alpha * self.beta * relation_weights.reshape(1, -1)
-                threshold = self._mu(target_type)
-                keep = ~(
-                    (alpha < self.config.feature_alpha_floor)
-                    | (base_scores + EPS < threshold)
-                    | (base_scores <= 0)
+                n_unique = len(unique_entities)
+                zero_marks = np.zeros(n_unique, dtype=np.int64)
+                # z_entity: the exact logit with the at-pair block muted
+                # (id -1 hits the zero-padded W_at row and disables same_at).
+                z_entity = d.logits_from_parts(
+                    -1,
+                    np.full(n_unique, -1, dtype=np.int64),
+                    src_mark_idx=zero_marks,
+                    tgt_term=0.0,
+                    **parts,
                 )
-                kept_count = int(np.count_nonzero(keep))
-                self.compiled_pair_count += kept_count
-                self.pruned_pair_count += int(keep.size) - kept_count
-                if kept_count:
-                    target_states, source_indices = np.nonzero(keep)
-                    kept_scores = base_scores[target_states, source_indices]
-                    log_margins = np.maximum(
-                        0.0, np.log(kept_scores / threshold)
-                    )
-                    past_windows = np.minimum(
-                        self.config.history_window_sec,
-                        log_margins / self.beta * self.config.time_scale_sec,
-                    )
-                    if self.config.time_slack_sec > 0:
-                        future_windows = np.minimum(
-                            self.config.time_slack_sec,
-                            log_margins / self.late_lambda * self.config.time_scale_sec,
+                # delta_same: contribution of same_alarm_type and its cross
+                # columns on any v == u row.
+                delta_same = d.same_at_delta_from_parts(parts)
+                # Ascending sorts turn the per-target prescreen into one
+                # binary-search cutoff per source alarm type instead of a
+                # compare over every candidate; the v == u row gets its own
+                # sort because delta_same shifts each entity differently.
+                z_order = np.argsort(z_entity)
+                z_sorted = z_entity[z_order]
+                z_same = z_entity + delta_same
+                z_same_order = np.argsort(z_same)
+                z_same_sorted = z_same[z_same_order]
+            for target_type in targets:
+                kept_count = 0
+                if source_count:
+                    threshold = self._mu(target_type)
+                    denom = self.beta * rel_max
+                    alpha_required = (
+                        math.inf
+                        if denom <= 0
+                        else max(
+                            self.config.feature_alpha_floor,
+                            (threshold - EPS) / denom,
                         )
-                    else:
-                        future_windows = np.zeros(kept_count, dtype=np.float64)
-                    edge_batch_sink(
-                        target_type,
-                        target_states,
-                        source_types,
-                        source_indices,
-                        kept_scores,
-                        threshold,
-                        past_windows,
-                        future_windows,
                     )
-            type_pair_count += source_count
-            if progress is not None:
-                progress(type_pair_count, self.compiled_pair_count, self.pruned_pair_count)
+                    z_required = (
+                        _softplus_lower_logit(alpha_required / d.alpha_scale)
+                        - max_tgt_term
+                        - PRESCREEN_LOGIT_MARGIN
+                        if d.alpha_scale > 0
+                        else -math.inf
+                    )
+                    target_at_id = self.scorer.at_to_id.get(
+                        str(target_type.alarm_type), -1
+                    )
+                    if z_required == -math.inf:
+                        survivors = np.arange(source_count, dtype=np.int64)
+                    else:
+                        # Keep (v, f) iff z_entity(f) >= z_required - W_at[u, v]
+                        # (or the delta_same-shifted variant on the v == u
+                        # row): one searchsorted per source alarm type, then a
+                        # gather of only the passing tail. Survivors are
+                        # re-sorted into candidate order so exact scoring and
+                        # edge emission stay byte-identical.
+                        w_row = d.W_at_pad[target_at_id + 1]
+                        cutoffs = np.searchsorted(
+                            z_sorted, z_required - w_row[distinct_at_ids + 1], side="left"
+                        )
+                        pieces = []
+                        for j in np.nonzero(cutoffs < n_unique)[0]:
+                            v = int(distinct_at_ids[j])
+                            if v == -1:
+                                # Every OOV alarm type has zero W_at and never
+                                # activates same_alarm_type. Keep candidate
+                                # positions directly so multiple OOV types on
+                                # one entity do not collide in grid row zero.
+                                oov = np.flatnonzero(
+                                    (src_at_ids == -1)
+                                    & (z_entity[ent_inverse] >= z_required)
+                                )
+                                if len(oov):
+                                    pieces.append(oov)
+                                continue
+                            if v == target_at_id and v >= 0:
+                                continue
+                            candidates = grid_index[v + 1, z_order[cutoffs[j]:]]
+                            pieces.append(candidates[candidates >= 0])
+                        if target_at_id >= 0:
+                            start = np.searchsorted(
+                                z_same_sorted,
+                                z_required - d.W_at_pad[target_at_id + 1, target_at_id + 1],
+                                side="left",
+                            )
+                            if start < n_unique:
+                                candidates = grid_index[
+                                    target_at_id + 1, z_same_order[start:]
+                                ]
+                                pieces.append(candidates[candidates >= 0])
+                        survivors = (
+                            np.sort(np.concatenate(pieces))
+                            if pieces
+                            else np.empty(0, dtype=np.int64)
+                        )
+                    self.prescreen_dropped_pair_count += source_count - len(survivors)
+                    if len(survivors):
+                        surv_types = [source_types[i] for i in survivors]
+                        surv_inverse = ent_inverse[survivors]
+                        # Exact rescoring reuses the group's entity parts by
+                        # gather; logits_from_parts is elementwise, so this is
+                        # bit-identical to rebuilding features per candidate.
+                        logits = d.logits_from_parts(
+                            target_at_id,
+                            src_at_ids[survivors],
+                            src_mark_idx=np.zeros(len(survivors), dtype=np.int64),
+                            tgt_term=0.0,
+                            **{
+                                key: value[surv_inverse]
+                                if isinstance(value, np.ndarray)
+                                else value
+                                for key, value in parts.items()
+                            },
+                        )
+                        alpha = d._softplus(
+                            logits.reshape(1, -1) + target_terms.reshape(-1, 1)
+                        )
+                        if d.alpha_scale != 1.0:
+                            alpha = alpha * d.alpha_scale
+                        if self.config.topology_relation_prior:
+                            relation_weights = topology_relation_weights(
+                                [topo_node_of(value.entity) for value in surv_types],
+                                topo_node_of(target_type.entity),
+                                self.scorer.topology_index,
+                                self.scorer.node_infos,
+                                self.config.topology_relation_prior,
+                            )
+                        else:
+                            relation_weights = np.ones(len(surv_types), dtype=np.float64)
+                        base_scores = alpha * self.beta * relation_weights.reshape(1, -1)
+                        keep = ~(
+                            (alpha < self.config.feature_alpha_floor)
+                            | (base_scores + EPS < threshold)
+                            | (base_scores <= 0)
+                        )
+                        kept_count = int(np.count_nonzero(keep))
+                        if kept_count:
+                            target_states, source_indices = np.nonzero(keep)
+                            kept_scores = base_scores[target_states, source_indices]
+                            log_margins = np.maximum(
+                                0.0, np.log(kept_scores / threshold)
+                            )
+                            past_windows = np.minimum(
+                                self.config.history_window_sec,
+                                log_margins / self.beta * self.config.time_scale_sec,
+                            )
+                            if self.config.time_slack_sec > 0:
+                                future_windows = np.minimum(
+                                    self.config.time_slack_sec,
+                                    log_margins / self.late_lambda * self.config.time_scale_sec,
+                                )
+                            else:
+                                future_windows = np.zeros(kept_count, dtype=np.float64)
+                            edge_batch_sink(
+                                target_type,
+                                target_states,
+                                surv_types,
+                                source_indices,
+                                kept_scores,
+                                threshold,
+                                past_windows,
+                                future_windows,
+                            )
+                    self.compiled_pair_count += kept_count
+                    self.pruned_pair_count += source_count * 8 - kept_count
+                type_pair_count += source_count
+                if progress is not None:
+                    progress(
+                        type_pair_count, self.compiled_pair_count, self.pruned_pair_count
+                    )
         return type_pair_count
 
     def precompile_period_types(

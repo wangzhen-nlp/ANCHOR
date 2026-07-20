@@ -451,6 +451,14 @@ def test_device_node_domain_phi_alpha_parity():
         "tgt_site_external_neighbor_count", "src_site_external_neighbor_count",
     ):
         assert col in layout.feature_names, col
+    # Second-order cross block: full pairwise products of CROSS_FEATURES; the
+    # old hand-crafted topo interactions are subsumed by it.
+    assert "topo_x_same_at" not in layout.feature_names
+    cross_names = [n for n in layout.feature_names if n.startswith("x[")]
+    assert len(cross_names) == len(FeatureLayout.CROSS_PAIRS) == 78
+    assert "x[same_alarm_type*topo_score]" in cross_names
+    assert "x[topo_score*same_site]" in cross_names
+    assert "x[geo_proximity*tgt_site_external_neighbor_count]" in cross_names
     assert layout.n_features == kernel.n_features
 
     # Re-derive the exact training candidate φ and compare per-candidate α.
@@ -472,6 +480,12 @@ def test_device_node_domain_phi_alpha_parity():
         topo_max_hops=2, node_field="alarm_source",
     )
     assert domain_vocab == rt["domain_vocab"]
+    # Cross columns must be the exact float32 products of their base columns.
+    name_idx = {n: i for i, n in enumerate(names)}
+    for a, b in FeatureLayout.CROSS_PAIRS:
+        j_ab = name_idx[f"x[{a}*{b}]"]
+        expect = phi[:, name_idx[a]] * phi[:, name_idx[b]]
+        assert np.array_equal(phi[:, j_ab], expect), (a, b)
     alpha_train = kernel.alpha(phi)
 
     scorer = RuntimeFeatureScorer(

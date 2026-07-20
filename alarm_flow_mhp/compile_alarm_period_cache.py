@@ -448,6 +448,7 @@ def main():
         print(
             f"[period-cache] done: signatures={payload['metadata']['signature_count']}, "
             f"edges={payload['metadata']['edge_count']}, pruned={plan.pruned_pair_count}, "
+            f"prescreen_dropped_pairs={plan.prescreen_dropped_pair_count}, "
             f"size={os.path.getsize(args.output) / (1024 * 1024):.1f}MiB, "
             f"elapsed={elapsed:.2f}s; output={os.path.abspath(args.output)}",
             flush=True,

@@ -17,6 +17,7 @@ outside this set have no edge (α=0); the candidate set is what the kernel score
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from itertools import combinations
 
 import numpy as np
 
@@ -278,6 +279,20 @@ class SiteStats:
         total_degree = self.node_degrees.get(node_a, 0) + self.node_degrees.get(node_b, 0)
         return (2.0 / total_degree) if total_degree else 0.0
 
+    def undirected_neighbor_map(self) -> dict:
+        """Symmetric node adjacency covering every stored neighbor relation.
+
+        A superset of the pairs where ``device_link_ratio`` can be nonzero
+        (dict-mode entries beyond hop 1 are included but score 0), so sparse
+        consumers can enumerate candidates instead of probing every pair.
+        """
+        symmetric = defaultdict(set)
+        for node, neighbors in self._undirected.items():
+            for neighbor in neighbors:
+                symmetric[node].add(neighbor)
+                symmetric[neighbor].add(node)
+        return dict(symmetric)
+
 
 class GeoStats:
     """Cached-input geographic features for a pair of sites.
@@ -341,6 +356,36 @@ class FeatureLayout:
     The layout is fully determined by the alarm-type vocabulary size n_at.
     """
 
+    # Systematic second-order cross block: EVERY pairwise product of the scalar
+    # columns below becomes a φ column (x[a*b]) — the linear-in-parameters way
+    # to learn feature interactions (e.g. geo×same_alarm_type, isolation×geo)
+    # without hand-picking them. Excluded by rule, not by hypothesis:
+    #   - alternate normalizations of an included column (site_link_ratio/
+    #     density share site_link_score's interaction role; size_balance and
+    #     degrees share the size/ext-count role; device_link_ratio ≈ topo),
+    #   - complements (geo_distance_missing = 1 - known(geo_proximity)).
+    # Degenerate products (identically 0, or duplicating a base column, e.g.
+    # same_site×site_link_score ≡ 0) are tolerated: the ridge absorbs them.
+    # The old hand-crafted topo_x_same_at / topo_x_same_site columns are
+    # subsumed by this block (topo_score × same_alarm_type / same_site).
+    CROSS_FEATURES = (
+        "same_alarm_type",
+        "topo_score",
+        "is_same_ne",
+        "same_site",
+        "same_vendor",
+        "same_ne_type",
+        "site_link_score",
+        "site_domain_cosine",
+        "geo_proximity",
+        "tgt_site_size",
+        "src_site_size",
+        "tgt_site_external_neighbor_count",
+        "src_site_external_neighbor_count",
+    )
+    CROSS_PAIRS = tuple(combinations(CROSS_FEATURES, 2))
+    _CROSS_SET = frozenset(CROSS_FEATURES)
+
     def __init__(self, at_vocab, domain_vocab=()):
         self.at_vocab = list(at_vocab)
         self.n_at = max(len(self.at_vocab), 1)
@@ -363,8 +408,6 @@ class FeatureLayout:
             "same_site",
             "same_vendor",
             "same_ne_type",
-            "topo_x_same_at",
-            "topo_x_same_site",
             "tgt_site_size",       # saturating site NE-count of the target's site
             "src_site_size",       # ... of the source's site
             "site_link_score",     # saturating inter-site NE-link count (0 = same/unknown site)
@@ -380,6 +423,7 @@ class FeatureLayout:
             "tgt_site_external_neighbor_count",  # distinct external sites, saturating count
             "src_site_external_neighbor_count",
         ]
+        names += [f"x[{a}*{b}]" for a, b in self.CROSS_PAIRS]
         if self.n_dom:
             names.append("same_domain")
             for a in range(self.n_dom):
@@ -449,32 +493,42 @@ class FeatureLayout:
             for b in range(self.n_at):
                 phi[:, j] = (at_u == a) & (at_v == b); j += 1
         same_at = ((at_u == at_v) & (at_u >= 0)).astype(_F)
-        topo = np.asarray(topo, dtype=_F)
-        same_site = np.asarray(same_site, dtype=_F)
-        phi[:, j] = same_at; j += 1
-        phi[:, j] = topo; j += 1
-        phi[:, j] = np.asarray(is_same_ne, dtype=_F); j += 1
-        phi[:, j] = same_site; j += 1
-        phi[:, j] = np.asarray(same_vendor, dtype=_F); j += 1
-        phi[:, j] = np.asarray(same_netype, dtype=_F); j += 1
-        phi[:, j] = topo * same_at; j += 1
-        phi[:, j] = topo * same_site; j += 1
-        phi[:, j] = 0.0 if tgt_site_size is None else np.asarray(tgt_site_size, dtype=_F); j += 1
-        phi[:, j] = 0.0 if src_site_size is None else np.asarray(src_site_size, dtype=_F); j += 1
-        phi[:, j] = 0.0 if site_link is None else np.asarray(site_link, dtype=_F); j += 1
-        phi[:, j] = 0.0 if site_link_ratio is None else np.asarray(site_link_ratio, dtype=_F); j += 1
-        phi[:, j] = 0.0 if site_link_density is None else np.asarray(site_link_density, dtype=_F); j += 1
-        phi[:, j] = 0.0 if site_size_balance is None else np.asarray(site_size_balance, dtype=_F); j += 1
-        phi[:, j] = 0.0 if site_domain_cosine is None else np.asarray(site_domain_cosine, dtype=_F); j += 1
-        phi[:, j] = 0.0 if tgt_undirected_degree is None else np.asarray(tgt_undirected_degree, dtype=_F); j += 1
-        phi[:, j] = 0.0 if src_undirected_degree is None else np.asarray(src_undirected_degree, dtype=_F); j += 1
-        phi[:, j] = 0.0 if device_link_ratio is None else np.asarray(device_link_ratio, dtype=_F); j += 1
-        phi[:, j] = 0.0 if geo_proximity is None else np.asarray(geo_proximity, dtype=_F); j += 1
-        phi[:, j] = 0.0 if geo_missing is None else np.asarray(geo_missing, dtype=_F); j += 1
-        phi[:, j] = (0.0 if tgt_site_external_neighbor_count is None
-                     else np.asarray(tgt_site_external_neighbor_count, dtype=_F)); j += 1
-        phi[:, j] = (0.0 if src_site_external_neighbor_count is None
-                     else np.asarray(src_site_external_neighbor_count, dtype=_F)); j += 1
+
+        def _col(x):
+            return 0.0 if x is None else np.asarray(x, dtype=_F)
+
+        # Scalar columns in _names order; the cross block below multiplies the
+        # SAME float32 columns, so training φ and the decomposed scorer agree
+        # bit-for-bit (f32×f32 = round(exact product)).
+        scalar_cols = (
+            ("same_alarm_type", same_at),
+            ("topo_score", np.asarray(topo, dtype=_F)),
+            ("is_same_ne", np.asarray(is_same_ne, dtype=_F)),
+            ("same_site", np.asarray(same_site, dtype=_F)),
+            ("same_vendor", np.asarray(same_vendor, dtype=_F)),
+            ("same_ne_type", np.asarray(same_netype, dtype=_F)),
+            ("tgt_site_size", _col(tgt_site_size)),
+            ("src_site_size", _col(src_site_size)),
+            ("site_link_score", _col(site_link)),
+            ("site_link_ratio", _col(site_link_ratio)),
+            ("site_link_density", _col(site_link_density)),
+            ("site_size_balance", _col(site_size_balance)),
+            ("site_domain_cosine", _col(site_domain_cosine)),
+            ("tgt_undirected_degree", _col(tgt_undirected_degree)),
+            ("src_undirected_degree", _col(src_undirected_degree)),
+            ("device_link_ratio", _col(device_link_ratio)),
+            ("geo_proximity", _col(geo_proximity)),
+            ("geo_distance_missing", _col(geo_missing)),
+            ("tgt_site_external_neighbor_count", _col(tgt_site_external_neighbor_count)),
+            ("src_site_external_neighbor_count", _col(src_site_external_neighbor_count)),
+        )
+        cross_base = {}
+        for name, col in scalar_cols:
+            phi[:, j] = col; j += 1
+            if name in self._CROSS_SET:
+                cross_base[name] = col
+        for a, b in self.CROSS_PAIRS:
+            phi[:, j] = cross_base[a] * cross_base[b]; j += 1
         if self.n_dom:
             if dom_u is None or dom_v is None:
                 raise ValueError("domain ids required: this FeatureLayout has a domain vocab")
@@ -1551,34 +1605,35 @@ class RuntimeFeatureScorer:
         return self.kernel.alpha(phi)
 
 
+class EntityStaticTable:
+    """Target-independent per-entity columns plus sparse adjacency indexes.
+
+    Built by ``DecomposedFeatureScorer.entity_static_table`` and consumed by
+    ``entity_parts_from_table``; also caches per-target-site site-pair feature
+    rows across targets. Attributes are assigned by the builder.
+    """
+
+
 class DecomposedFeatureScorer:
     """φ-decomposed live α — numerically equal to RuntimeFeatureScorer but with
     NO (C, F) feature-matrix construction.
 
-    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 22
-    scalars + optional domain one-hot + dynamic mark bits), so w·φ collapses to
-    table lookups + a handful of scalar terms:
+    The FeatureLayout is a fixed linear layout (bias + at-pair one-hot + 20
+    scalars + the second-order cross block + optional domain one-hot + dynamic
+    mark bits), so w·φ collapses to table lookups + scalar terms:
 
-        z = w_bias + W_at[at_u, at_v] + w_same_at·[at_u==at_v]
-          + (w_topo + w_txa·same_at + w_txs·same_site)·topo
-          + w_same_ne·b + w_same_site·b + w_same_vendor·b + w_same_netype·b
-          + w_tgt_size·tgt_site_size + w_src_size·src_site_size + w_link·site_link
-          + w_site_ratio·site_link_ratio + w_density·site_link_density
-          + w_balance·site_size_balance + w_domain_cos·site_domain_cosine
-          + w_tgt_degree·tgt_undirected_degree + w_src_degree·src_undirected_degree
-          + w_device_ratio·device_link_ratio
-          + w_geo·geo_proximity + w_geo_missing·geo_distance_missing
-          + w_tgt_external·tgt_site_external_neighbor_count
-          + w_src_external·src_site_external_neighbor_count
-          + W_dom'[dom_u, dom_v]                       (same_domain folded in)
-          + SRC_TABLE[mark_combo] + tgt_term           (dynamic bits)
+        z = w_bias + W_at[at_u, at_v]
+          + Σ_s w_s · scalar_s                          (the 20 scalar columns)
+          + Σ_{(a,b) ∈ CROSS_PAIRS} w_ab · scalar_a·scalar_b
+          + W_dom'[dom_u, dom_v]                        (same_domain folded in)
+          + SRC_TABLE[mark_combo] + tgt_term            (dynamic bits)
         α = alpha_scale · softplus(z)
 
     The one-hot blocks become the precomputed W_at / W_dom' tables; the 8
     possible source-mark combos become an 8-entry table; the target-side
-    dynamic term is a per-target constant. To match the legacy path bit-for-bit
-    on the topo interaction columns, the topo score is rounded through float32
-    exactly like FeatureLayout.build_matrix stores it.
+    dynamic term is a per-target constant. To match φ bit-for-bit, every scalar
+    (and every cross product) is rounded through float32 exactly like
+    FeatureLayout.build_matrix stores it.
     """
 
     def __init__(self, scorer: RuntimeFeatureScorer):
@@ -1596,7 +1651,6 @@ class DecomposedFeatureScorer:
         self.W_at = w[j:j + n_at * n_at].reshape(n_at, n_at).copy(); j += n_at * n_at
         (self.w_same_at, self.w_topo, self.w_same_ne, self.w_same_site,
          self.w_same_vendor, self.w_same_netype,
-         self.w_topo_x_same_at, self.w_topo_x_same_site,
          self.w_tgt_site_size, self.w_src_site_size,
          self.w_site_link, self.w_site_link_ratio,
          self.w_site_link_density, self.w_site_size_balance,
@@ -1604,8 +1658,11 @@ class DecomposedFeatureScorer:
          self.w_src_undirected_degree,
          self.w_device_link_ratio, self.w_geo_proximity,
          self.w_geo_missing, self.w_tgt_site_external_neighbor_count,
-         self.w_src_site_external_neighbor_count) = (float(x) for x in w[j:j + 22])
-        j += 22
+         self.w_src_site_external_neighbor_count) = (float(x) for x in w[j:j + 20])
+        j += 20
+        n_cross = len(layout.CROSS_PAIRS)
+        self.w_cross = w[j:j + n_cross].copy()
+        j += n_cross
         self.n_dom = layout.n_dom
         if layout.n_dom:
             self.w_same_dom = float(w[j]); j += 1
@@ -1681,55 +1738,76 @@ class DecomposedFeatureScorer:
         precomputed per-candidate parts. All boolean arrays are 0/1 float."""
         u = int(tgt_at_id)
         at_v = np.asarray(src_at_ids, dtype=np.int64)
-        # Match build_matrix: φ stores topo / site columns as float32; round
-        # through float32 so w·φ is numerically identical.
-        topo_r = np.asarray(topo, dtype=np.float32).astype(np.float64)
+
+        # Match build_matrix: φ stores every scalar column as float32; round
+        # through float32 so w·φ is numerically identical. ``None`` inputs are
+        # zero columns (0.0 scalars) exactly like build_matrix's _col.
+        def _f32a(x):
+            return 0.0 if x is None else np.asarray(x, dtype=np.float32).astype(np.float64)
+
+        def _f32s(x):
+            return float(np.float32(x))
+
         same_at = ((at_v == u) & (u >= 0) & (at_v >= 0)).astype(np.float64)
+        vals = {
+            "same_alarm_type": same_at,
+            "topo_score": _f32a(topo),
+            "is_same_ne": _f32a(is_same_ne),
+            "same_site": _f32a(same_site),
+            "same_vendor": _f32a(same_vendor),
+            "same_ne_type": _f32a(same_netype),
+            "tgt_site_size": _f32s(tgt_site_size),
+            "src_site_size": _f32a(src_site_size),
+            "site_link_score": _f32a(site_link),
+            "site_link_ratio": _f32a(site_link_ratio),
+            "site_link_density": _f32a(site_link_density),
+            "site_size_balance": _f32a(site_size_balance),
+            "site_domain_cosine": _f32a(site_domain_cosine),
+            "tgt_undirected_degree": _f32s(tgt_undirected_degree),
+            "src_undirected_degree": _f32a(src_undirected_degree),
+            "device_link_ratio": _f32a(device_link_ratio),
+            "geo_proximity": _f32a(geo_proximity),
+            "geo_distance_missing": _f32a(geo_missing),
+            "tgt_site_external_neighbor_count": _f32s(tgt_site_external_neighbor_count),
+            "src_site_external_neighbor_count": _f32a(src_site_external_neighbor_count),
+        }
         z = (
             self.w_bias
             + self.W_at_pad[u + 1, at_v + 1]
             + self.w_same_at * same_at
-            + self.w_topo * topo_r
-            + self.w_same_ne * np.asarray(is_same_ne, dtype=np.float64)
-            + self.w_same_site * np.asarray(same_site, dtype=np.float64)
-            + self.w_same_vendor * np.asarray(same_vendor, dtype=np.float64)
-            + self.w_same_netype * np.asarray(same_netype, dtype=np.float64)
-            + self.w_topo_x_same_at * (topo_r * same_at)
-            + self.w_topo_x_same_site * (topo_r * np.asarray(same_site, dtype=np.float64))
-            + self.w_tgt_site_size * float(np.float32(tgt_site_size))
+            + self.w_topo * vals["topo_score"]
+            + self.w_same_ne * vals["is_same_ne"]
+            + self.w_same_site * vals["same_site"]
+            + self.w_same_vendor * vals["same_vendor"]
+            + self.w_same_netype * vals["same_ne_type"]
+            + self.w_tgt_site_size * vals["tgt_site_size"]
+            + self.w_src_site_size * vals["src_site_size"]
+            + self.w_site_link * vals["site_link_score"]
+            + self.w_site_link_ratio * vals["site_link_ratio"]
+            + self.w_site_link_density * vals["site_link_density"]
+            + self.w_site_size_balance * vals["site_size_balance"]
+            + self.w_site_domain_cosine * vals["site_domain_cosine"]
+            + self.w_tgt_undirected_degree * vals["tgt_undirected_degree"]
+            + self.w_src_undirected_degree * vals["src_undirected_degree"]
+            + self.w_device_link_ratio * vals["device_link_ratio"]
+            + self.w_geo_proximity * vals["geo_proximity"]
+            + self.w_geo_missing * vals["geo_distance_missing"]
+            + self.w_tgt_site_external_neighbor_count * vals["tgt_site_external_neighbor_count"]
+            + self.w_src_site_external_neighbor_count * vals["src_site_external_neighbor_count"]
         )
-        if src_site_size is not None:
-            z = z + self.w_src_site_size * np.asarray(src_site_size, dtype=np.float32).astype(np.float64)
-        if site_link is not None:
-            z = z + self.w_site_link * np.asarray(site_link, dtype=np.float32).astype(np.float64)
-        if site_link_ratio is not None:
-            z = z + self.w_site_link_ratio * np.asarray(site_link_ratio, dtype=np.float32).astype(np.float64)
-        if site_link_density is not None:
-            z = z + self.w_site_link_density * np.asarray(site_link_density, dtype=np.float32).astype(np.float64)
-        if site_size_balance is not None:
-            z = z + self.w_site_size_balance * np.asarray(site_size_balance, dtype=np.float32).astype(np.float64)
-        if site_domain_cosine is not None:
-            z = z + self.w_site_domain_cosine * np.asarray(site_domain_cosine, dtype=np.float32).astype(np.float64)
-        z = z + self.w_tgt_undirected_degree * float(np.float32(tgt_undirected_degree))
-        if src_undirected_degree is not None:
-            z = z + self.w_src_undirected_degree * np.asarray(src_undirected_degree, dtype=np.float32).astype(np.float64)
-        if device_link_ratio is not None:
-            z = z + self.w_device_link_ratio * np.asarray(device_link_ratio, dtype=np.float32).astype(np.float64)
-        if geo_proximity is not None:
-            z = z + self.w_geo_proximity * np.asarray(geo_proximity, dtype=np.float32).astype(np.float64)
-        if geo_missing is not None:
-            z = z + self.w_geo_missing * np.asarray(geo_missing, dtype=np.float32).astype(np.float64)
-        z = (
-            z
-            + self.w_tgt_site_external_neighbor_count
-            * float(np.float32(tgt_site_external_neighbor_count))
-        )
-        if src_site_external_neighbor_count is not None:
-            z = (
-                z
-                + self.w_src_site_external_neighbor_count
-                * np.asarray(src_site_external_neighbor_count, dtype=np.float32).astype(np.float64)
-            )
+        # Cross block: products of the SAME float32-rounded bases, re-rounded
+        # like φ stores them (f32×f32 = round(exact product)). Zero-weight
+        # crosses are skipped — after ridge most stay tiny but nonzero, so this
+        # mainly saves work for hand-zeroed kernels.
+        for w_k, (na, nb) in zip(self.w_cross, self.layout.CROSS_PAIRS):
+            if w_k == 0.0:
+                continue
+            prod = vals[na] * vals[nb]
+            if isinstance(prod, np.ndarray):
+                prod = prod.astype(np.float32).astype(np.float64)
+            else:
+                prod = float(np.float32(prod))
+            z = z + w_k * prod
         if self.n_dom:
             dv = np.asarray(src_dom_ids, dtype=np.int64)
             z = z + self.W_dom_pad[int(tgt_dom_id) + 1, dv + 1]
@@ -1747,20 +1825,18 @@ class DecomposedFeatureScorer:
             a = a * self.alpha_scale
         return a
 
-    def logits_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
-        """Static/source-state logits for one target against many sources.
+    def entity_parts_for_target(self, target_ne, src_nes):
+        """Entity-pair feature parts for one target against many source entities.
 
-        The target-state contribution is deliberately omitted so callers that
-        need all eight target states can compute the relatively expensive
-        topology/attribute parts once, then add eight scalar target terms.
+        Returns keyword arguments for ``logits_from_parts`` covering every
+        input that depends only on the (source entity, target entity) pair —
+        topology, attribute, site, geo, and domain columns. Alarm-type ids and
+        dynamic mark terms stay with the caller, so one parts dict can be
+        shared across every alarm type of the same entity pair.
         """
         s = self.scorer
         n = len(src_nes)
-        if n == 0:
-            return np.zeros(0, dtype=np.float64)
         t_node = topo_node_of(target_ne)
-        u = s.at_to_id.get(str(target_at), -1)
-        at_v = np.array([s.at_to_id.get(str(a), -1) for a in src_ats], dtype=np.int64)
         t_site, t_vendor, t_netype = s._attr(target_ne)
         topo = np.empty(n, dtype=np.float64)
         is_same_ne = np.empty(n, dtype=np.float64)
@@ -1798,6 +1874,244 @@ class DecomposedFeatureScorer:
         if self.n_dom:
             tgt_dom_id = self.layout.dom_id(phi_domain_of(target_ne, s.node_infos))
             src_dom_ids = self.layout.domain_ids([phi_domain_of(x, s.node_infos) for x in src_nes])
+        return {
+            "topo": topo, "is_same_ne": is_same_ne, "same_site": same_site,
+            "same_vendor": same_vendor, "same_netype": same_netype,
+            "tgt_dom_id": tgt_dom_id, "src_dom_ids": src_dom_ids,
+            "tgt_site_size": s._site_size(t_site), "src_site_size": src_size,
+            "site_link": site_link, "site_link_ratio": site_link_ratio,
+            "site_link_density": site_link_density,
+            "site_size_balance": site_size_balance,
+            "site_domain_cosine": site_domain_cosine,
+            "tgt_undirected_degree": s._device_degree(t_node),
+            "src_undirected_degree": src_degree,
+            "device_link_ratio": device_link_ratio, "geo_proximity": geo_proximity,
+            "geo_missing": geo_missing,
+            "tgt_site_external_neighbor_count": s._site_external_neighbor_count(t_site),
+            "src_site_external_neighbor_count": src_external_neighbors,
+        }
+
+    # CROSS_FEATURES column name -> entity-parts dict key (identity omitted).
+    _CROSS_NAME_TO_PART = {
+        "topo_score": "topo",
+        "same_ne_type": "same_netype",
+        "site_link_score": "site_link",
+    }
+
+    def same_at_delta_from_parts(self, parts):
+        """Per-entity logit shift of the v == u (same alarm type) row.
+
+        Equals w_same_at plus every cross column involving same_alarm_type:
+        with same_alarm_type exactly 1.0 the stored f32 product collapses to
+        the f32-rounded partner scalar, so twelve fused ops replace a full
+        ``logits_from_parts`` pass. Real-arithmetic equal to
+        lfp(0, 0) - lfp(-1, -1) - W_at[0, 0]; consumed only by the prescreen,
+        whose margin absorbs the float reassociation difference.
+        """
+        delta = np.full(len(parts["topo"]), self.w_same_at, dtype=np.float64)
+        for w_k, (a, b) in zip(self.w_cross, self.layout.CROSS_PAIRS):
+            if w_k == 0.0 or "same_alarm_type" not in (a, b):
+                continue
+            partner = b if a == "same_alarm_type" else a
+            value = parts[self._CROSS_NAME_TO_PART.get(partner, partner)]
+            if isinstance(value, np.ndarray):
+                delta += w_k * np.asarray(value, dtype=np.float32).astype(np.float64)
+            else:
+                delta += w_k * float(np.float32(value))
+        return delta
+
+    def entity_static_table(self, entities):
+        """Precompute target-independent entity columns for the offline compiler.
+
+        One pass over the entity universe captures attribute codes, structural
+        scalars, domain ids, and sparse adjacency indexes. Together with
+        ``entity_parts_from_table`` this replaces the per-target Python loop of
+        ``entity_parts_for_target`` when the same entity universe is scored
+        against many targets (global candidate scope).
+        """
+        from alarm_flow_isahp.ne_topology import _normalize_ne_id
+
+        s = self.scorer
+        n = len(entities)
+        table = EntityStaticTable()
+        table.n = n
+        table.entities = list(entities)
+        table.row_of = {entity: i for i, entity in enumerate(table.entities)}
+        table.nodes = []
+        table.site_code_of = {}
+        table.vendor_code_of = {}
+        table.netype_code_of = {}
+        table.site_list = []
+        table.site_codes = np.empty(n, dtype=np.int64)
+        table.vendor_codes = np.empty(n, dtype=np.int64)
+        table.netype_codes = np.empty(n, dtype=np.int64)
+        table.src_site_size = np.empty(n, dtype=np.float64)
+        table.src_degree = np.empty(n, dtype=np.float64)
+        table.src_external = np.empty(n, dtype=np.float64)
+        node_rows = defaultdict(list)
+        norm_rows = defaultdict(list)
+
+        def _code(mapping, value, values=None):
+            code = mapping.get(value)
+            if code is None:
+                code = mapping[value] = len(mapping)
+                if values is not None:
+                    values.append(value)
+            return code
+
+        for i, entity in enumerate(table.entities):
+            node = topo_node_of(entity)
+            table.nodes.append(node)
+            node_rows[node].append(i)
+            norm_rows[_normalize_ne_id(node)].append(i)
+            site, vendor, netype = s._attr(entity)
+            table.site_codes[i] = _code(table.site_code_of, site, table.site_list)
+            table.vendor_codes[i] = _code(table.vendor_code_of, vendor)
+            table.netype_codes[i] = _code(table.netype_code_of, netype)
+            table.src_site_size[i] = s._site_size(site)
+            table.src_degree[i] = s._device_degree(node)
+            table.src_external[i] = s._site_external_neighbor_count(site)
+        table.node_rows = {key: np.asarray(value, dtype=np.int64) for key, value in node_rows.items()}
+        table.norm_rows = {key: np.asarray(value, dtype=np.int64) for key, value in norm_rows.items()}
+        table.src_dom_ids = (
+            self.layout.domain_ids([phi_domain_of(x, s.node_infos) for x in table.entities])
+            if self.n_dom
+            else np.full(n, -1, dtype=np.int64)
+        )
+        # topo_score(src, tgt) is nonzero only when the normalized nodes match
+        # or tgt appears in src's undirected-hop row; invert that row lookup so
+        # each target enumerates its possible sources directly.
+        hops = (
+            (getattr(s.topology_index, "undirected_hops", {}) or {})
+            if s.topology_index is not None
+            else {}
+        )
+        topo_sources = defaultdict(set)
+        for source_norm, row in hops.items():
+            for target_norm, hop in (row or {}).items():
+                if hop:
+                    topo_sources[target_norm].add(source_norm)
+        table.topo_sources = dict(topo_sources)
+        table.link_neighbors = (
+            s.site_stats.undirected_neighbor_map() if s.site_stats is not None else {}
+        )
+        table.site_pair_rows = {}
+        return table
+
+    def entity_parts_from_table(self, target_ne, table):
+        """``entity_parts_for_target`` over a static table, elementwise equal.
+
+        Dense columns come from vectorized code comparisons and per-site
+        gathers; the two node-pair columns (topo score, device link ratio) are
+        filled sparsely from the target node's adjacency and are exactly zero
+        elsewhere. All values are produced by the same underlying feature
+        functions as the loop path, so downstream logits are bit-identical.
+        """
+        from alarm_flow_isahp.ne_topology import _normalize_ne_id
+
+        s = self.scorer
+        n = table.n
+        t_node = topo_node_of(target_ne)
+        t_site, t_vendor, t_netype = s._attr(target_ne)
+
+        topo = np.zeros(n, dtype=np.float64)
+        if s.topology_index is not None and t_node:
+            t_norm = _normalize_ne_id(t_node)
+            candidate_norms = {t_norm}
+            candidate_norms.update(table.topo_sources.get(t_norm, ()))
+            for source_norm in candidate_norms:
+                for row in table.norm_rows.get(source_norm, ()):
+                    topo[row] = _topo_score(
+                        table.nodes[row], t_node, s.topology_index, s._topo_cache
+                    )
+
+        is_same_ne = np.zeros(n, dtype=np.float64)
+        own_row = table.row_of.get(target_ne)
+        if own_row is not None:
+            is_same_ne[own_row] = 1.0
+
+        def _same(codes, code_of, value):
+            if not value:
+                return np.zeros(n, dtype=np.float64)
+            code = code_of.get(value)
+            if code is None:
+                return np.zeros(n, dtype=np.float64)
+            return (codes == code).astype(np.float64)
+
+        same_site = _same(table.site_codes, table.site_code_of, t_site)
+        same_vendor = _same(table.vendor_codes, table.vendor_code_of, t_vendor)
+        same_netype = _same(table.netype_codes, table.netype_code_of, t_netype)
+
+        pair_rows = table.site_pair_rows.get(t_site)
+        if pair_rows is None:
+            pair_rows = np.asarray(
+                [s._site_pair_features(site, t_site) for site in table.site_list],
+                dtype=np.float64,
+            )
+            table.site_pair_rows[t_site] = pair_rows
+        pair_cols = pair_rows[table.site_codes]
+
+        device_link_ratio = np.zeros(n, dtype=np.float64)
+        if s.site_stats is not None and t_node:
+            for neighbor in table.link_neighbors.get(t_node, ()):
+                rows = table.node_rows.get(neighbor)
+                if rows is not None:
+                    device_link_ratio[rows] = s._device_link_ratio(neighbor, t_node)
+
+        tgt_dom_id = (
+            self.layout.dom_id(phi_domain_of(target_ne, s.node_infos))
+            if self.n_dom
+            else -1
+        )
+        return {
+            "topo": topo, "is_same_ne": is_same_ne, "same_site": same_site,
+            "same_vendor": same_vendor, "same_netype": same_netype,
+            "tgt_dom_id": tgt_dom_id, "src_dom_ids": table.src_dom_ids,
+            "tgt_site_size": s._site_size(t_site), "src_site_size": table.src_site_size,
+            "site_link": pair_cols[:, 0], "site_link_ratio": pair_cols[:, 1],
+            "site_link_density": pair_cols[:, 2],
+            "site_size_balance": pair_cols[:, 3],
+            "site_domain_cosine": pair_cols[:, 4],
+            "tgt_undirected_degree": s._device_degree(t_node),
+            "src_undirected_degree": table.src_degree,
+            "device_link_ratio": device_link_ratio,
+            "geo_proximity": pair_cols[:, 5],
+            "geo_missing": pair_cols[:, 6],
+            "tgt_site_external_neighbor_count": s._site_external_neighbor_count(t_site),
+            "src_site_external_neighbor_count": table.src_external,
+        }
+
+    def logits_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):
+        """Static/source-state logits for one target against many sources.
+
+        The target-state contribution is deliberately omitted so callers that
+        need all eight target states can compute the relatively expensive
+        topology/attribute parts once, then add eight scalar target terms.
+        Entity parts are evaluated once per unique source entity and expanded
+        by gather, which keeps candidate lists that repeat each entity once per
+        alarm type (the offline compiler universe) off the slow Python path.
+        """
+        s = self.scorer
+        n = len(src_nes)
+        if n == 0:
+            return np.zeros(0, dtype=np.float64)
+        u = s.at_to_id.get(str(target_at), -1)
+        at_v = np.array([s.at_to_id.get(str(a), -1) for a in src_ats], dtype=np.int64)
+        index_of = {}
+        inverse = np.empty(n, dtype=np.int64)
+        unique_nes = []
+        for i, sne in enumerate(src_nes):
+            j = index_of.get(sne)
+            if j is None:
+                j = index_of[sne] = len(unique_nes)
+                unique_nes.append(sne)
+            inverse[i] = j
+        parts = self.entity_parts_for_target(target_ne, unique_nes)
+        if len(unique_nes) != n:
+            parts = {
+                key: value[inverse] if isinstance(value, np.ndarray) else value
+                for key, value in parts.items()
+            }
         # dynamic marks: mirror _dynamic_mark_matrix semantics for the common
         # streaming shapes — per-candidate (n,3) src marks + one target mark row.
         src_mark_idx = np.zeros(n, dtype=np.int64)
@@ -1813,18 +2127,7 @@ class DecomposedFeatureScorer:
                     + 4 * (sm[:, 2].astype(np.int64) if sm.shape[1] > 2 else 0)
                 )
         return self.logits_from_parts(
-            u, at_v, topo, is_same_ne, same_site, same_vendor, same_netype,
-            tgt_dom_id, src_dom_ids, src_mark_idx, 0.0,
-            tgt_site_size=s._site_size(t_site), src_site_size=src_size,
-            site_link=site_link, site_link_ratio=site_link_ratio,
-            site_link_density=site_link_density, site_size_balance=site_size_balance,
-            site_domain_cosine=site_domain_cosine,
-            tgt_undirected_degree=s._device_degree(t_node),
-            src_undirected_degree=src_degree,
-            device_link_ratio=device_link_ratio, geo_proximity=geo_proximity,
-            geo_missing=geo_missing,
-            tgt_site_external_neighbor_count=s._site_external_neighbor_count(t_site),
-            src_site_external_neighbor_count=src_external_neighbors,
+            u, at_v, src_mark_idx=src_mark_idx, tgt_term=0.0, **parts
         )
 
     def alpha_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None, tgt_marks=None):
