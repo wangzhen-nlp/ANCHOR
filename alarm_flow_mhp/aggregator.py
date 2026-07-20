@@ -168,6 +168,10 @@ class AlarmMHPConfig:
     # E-step worker threads (1 = serial; 0 = auto: min(8, cpu count)). Chunk
     # results merge in chunk order, so the trained model does not depend on it.
     estep_workers: int = 1
+    # Sparse source_target M-step workers. 0 = auto (up to 6); reductions are
+    # merged in fixed row order. Small/very large candidate sets automatically
+    # use the bounded-memory serial path.
+    mstep_workers: int = 0
     # GPU offload of the E-step chunk math ("auto" = CUDA else CPU; needs
     # torch — silently stays on CPU without it). "cpu" pins the exactly
     # reproducible CPU path; "cuda" requires that device.
@@ -291,6 +295,8 @@ class AlarmMHPConfig:
             raise ValueError("chunk_size must be >= 1")
         if self.estep_workers < 0:
             raise ValueError("estep_workers must be >= 0 (0 = auto)")
+        if self.mstep_workers < 0:
+            raise ValueError("mstep_workers must be >= 0 (0 = auto)")
         if self.estep_device not in ("auto", "cpu", "cuda"):
             raise ValueError("estep_device must be one of auto|cpu|cuda")
         if self.kernel_type not in KERNEL_TYPES:
@@ -358,6 +364,7 @@ class AlarmMHPConfig:
             stability_radius=self.stability_radius,
             chunk_size=self.chunk_size,
             estep_workers=self.estep_workers,
+            mstep_workers=self.mstep_workers,
             estep_device=self.estep_device,
             kernel_type=self.kernel_type,
             # Convert real-second bucket edges to model time (same scale as window)

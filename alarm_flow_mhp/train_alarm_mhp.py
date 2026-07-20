@@ -156,6 +156,7 @@ def _build_config(args):
         feature_spectral_cap=args.feature_spectral_cap,
         chunk_size=args.chunk_size,
         estep_workers=args.estep_workers,
+        mstep_workers=args.mstep_workers,
         estep_device=args.estep_device,
         kernel_type=args.kernel_type,
         bucket_edges_sec=_parse_bucket_edges(args.bucket_edges_sec),
@@ -492,6 +493,16 @@ def main():
             "torch installed. GPU results are statistically equivalent but "
             "not bit-identical to CPU; use 'cpu' for exact reproducibility. "
             "Default: cpu."
+        ),
+    )
+    parser.add_argument(
+        "--mstep-workers",
+        type=int,
+        default=0,
+        help=(
+            "Worker threads for the sparse source_target feature M-step. "
+            "0 = auto (up to 6), 1 = serial. Small or memory-heavy candidate "
+            "sets automatically use the serial path. Default: 0."
         ),
     )
     # Held-out validation (the thing that makes training meaningful):

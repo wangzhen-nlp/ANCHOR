@@ -42,6 +42,11 @@ from .params import MHPParams, bucket_index_vec, bucket_widths
 
 
 _EPS = 1e-12
+_CANDIDATE_BLOOM_MIN_KEYS = 4_096
+_CANDIDATE_BLOOM_BITS_PER_KEY = 8
+_CANDIDATE_BLOOM_MAX_BYTES = 64 * 1024 * 1024
+_ESTEP_PAIR_CACHE_WORK_BYTES = 256 * 1024 * 1024
+_BLOOM_HASH_MULTIPLIER = np.uint64(0xFF51AFD7ED558CCD)
 
 
 def _fmt_secs(seconds: float) -> str:
@@ -96,6 +101,10 @@ class MHPConfig:
     # so the outcome is deterministic and independent of the thread count.
     # Peak memory grows by ~(workers + 2) in-flight chunks.
     estep_workers: int = 1
+    # Sparse source_target M-step workers. 0 = auto (up to 6), 1 = serial.
+    # Candidate/block reductions merge in a fixed order. Core API keeps the
+    # serial default; the alarm training layer opts into auto mode.
+    mstep_workers: int = 1
     # GPU offload of the E-step chunk math (needs PyTorch). "auto" = CUDA if
     # available, else pure CPU — safe default everywhere. "cpu" forces CPU;
     # "cuda" requires that device. CUDA results are statistically equivalent
@@ -301,6 +310,68 @@ def _segment_sum(values: np.ndarray, segment_ids: np.ndarray, n_segments: int) -
     out = np.zeros(n_segments, dtype=np.float64)
     np.add.at(out, segment_ids, values)
     return out
+
+
+def _candidate_bloom_indices(keys: np.ndarray, mask: np.uint64) -> np.ndarray:
+    """Deterministic uint64 hash indices for the candidate Bloom prefilter."""
+    hashed = np.asarray(keys, dtype=np.uint64).copy()
+    hashed ^= hashed >> np.uint64(33)
+    hashed *= _BLOOM_HASH_MULTIPLIER
+    hashed ^= hashed >> np.uint64(33)
+    return (hashed & mask).astype(np.intp, copy=False)
+
+
+def _build_candidate_bloom(cand_keys: np.ndarray):
+    """Build a compact no-false-negative prefilter for exact key lookup."""
+    cand_keys = np.asarray(cand_keys, dtype=np.int64)
+    if cand_keys.size < _CANDIDATE_BLOOM_MIN_KEYS:
+        return None
+    wanted = max(
+        1_024, int(cand_keys.size) * _CANDIDATE_BLOOM_BITS_PER_KEY
+    )
+    max_size = _CANDIDATE_BLOOM_MAX_BYTES
+    size = 1 << (wanted - 1).bit_length()
+    size = min(size, max_size)
+    if size < 1_024:
+        return None
+    try:
+        bloom = np.zeros(size, dtype=np.bool_)
+        mask = np.uint64(size - 1)
+        bloom[_candidate_bloom_indices(cand_keys, mask)] = True
+    except MemoryError:
+        return None
+    return bloom, mask
+
+
+def _lookup_candidate_rows(pair_keys, cand_keys, bloom=None):
+    """Return exact ``(pair_rows, candidate_indices)`` for modeled pairs.
+
+    Bloom filtering only removes definite misses. Every possible hit still goes
+    through the sorted-key binary search, so this is mathematically identical
+    to searching all pair keys.
+    """
+    pair_keys = np.asarray(pair_keys, dtype=np.int64)
+    cand_keys = np.asarray(cand_keys, dtype=np.int64)
+    if pair_keys.size == 0 or cand_keys.size == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    if bloom is None:
+        candidate_idx = np.minimum(
+            np.searchsorted(cand_keys, pair_keys), cand_keys.size - 1
+        )
+        valid = cand_keys[candidate_idx] == pair_keys
+        rows = np.flatnonzero(valid)
+        return rows, candidate_idx[rows]
+    bloom_bits, bloom_mask = bloom
+    maybe = bloom_bits[_candidate_bloom_indices(pair_keys, bloom_mask)]
+    maybe_rows = np.flatnonzero(maybe)
+    if maybe_rows.size == 0:
+        return maybe_rows, np.zeros(0, dtype=np.int64)
+    probe_keys = pair_keys[maybe_rows]
+    probe_idx = np.minimum(
+        np.searchsorted(cand_keys, probe_keys), cand_keys.size - 1
+    )
+    exact = cand_keys[probe_idx] == probe_keys
+    return maybe_rows[exact], probe_idx[exact]
 
 
 def _resolve_estep_workers(config: MHPConfig, n_chunks: int) -> int:
@@ -1975,6 +2046,7 @@ def fit_mhp_feature(
     # read-before-write state (time-slack safe), while the compensator/exposure
     # is precomputed with the target state sampled at source_ts.
     use_dynamic = src_combo is not None and dynamic_combo_bits is not None
+    use_target_dynamic = False
     if use_dynamic:
         dynamic_combo_bits = np.asarray(dynamic_combo_bits, dtype=np.float64)  # (K, D)
         K_combo, D_dyn = dynamic_combo_bits.shape
@@ -1983,9 +2055,21 @@ def fit_mhp_feature(
             raise ValueError("src_combo must be aligned to events")
         use_target_dynamic = tgt_combo is not None
         if use_target_dynamic:
+            if src_combo.size and (
+                int(src_combo.min()) < 0 or int(src_combo.max()) >= 8
+            ):
+                raise ValueError(
+                    "target-aware src_combo values must be in [0, 7]"
+                )
             tgt_combo = np.asarray(tgt_combo, dtype=np.int64).reshape(-1)
             if len(tgt_combo) != N:
                 raise ValueError("tgt_combo must be aligned to events")
+            if tgt_combo.size and (
+                int(tgt_combo.min()) < 0 or int(tgt_combo.max()) >= 8
+            ):
+                raise ValueError(
+                    "target-aware tgt_combo values must be in [0, 7]"
+                )
             if K_combo != 64:
                 raise ValueError("target-aware dynamic mode requires 64 combo rows")
             if dynamic_exposure_2d is None:
@@ -2000,8 +2084,10 @@ def fit_mhp_feature(
                 raise ValueError("COO dynamic_exposure_2d is only supported for target-aware dynamic mode")
             _er, _ec, _ev = _normalize_dynamic_exposure_coo(dynamic_exposure_2d, C, K_combo)
             if config.time_slack > 0:
-                _ev = _ev.astype(np.float32, copy=False)
-                _ev *= slack_scale
+                # Out-of-place: astype(copy=False) can alias the caller's
+                # exposure["values"] when it is already float32, and an in-place
+                # `*= slack_scale` would corrupt it for any later reuse.
+                _ev = _ev.astype(np.float32, copy=False) * slack_scale
             exposure_combo_idx = np.unique(_ec) if _ec.size else np.zeros(0, dtype=np.int64)
             e_coo_real = (_er, _ec, _ev)
             dynamic_exposure_2d = None
@@ -2017,11 +2103,12 @@ def fit_mhp_feature(
             np.add.at(n_src_by_combo, (events.dims, src_combo), 1.0)
             exposure_2d = n_src_by_combo[cand_sources]            # (C, K) E_{c,k}
         if exposure_2d is not None and config.time_slack > 0:
-            if np.issubdtype(exposure_2d.dtype, np.floating):
-                exposure_2d *= slack_scale
-            else:
+            # Out-of-place: exposure_2d can alias a caller-provided dense array
+            # (via np.asarray above), so scale into a fresh buffer rather than
+            # mutating it. Freshly built exposures are unaffected either way.
+            if not np.issubdtype(exposure_2d.dtype, np.floating):
                 exposure_2d = exposure_2d.astype(np.float32, copy=False)
-                exposure_2d *= slack_scale
+            exposure_2d = exposure_2d * slack_scale
         if exposure_combo_idx is None:
             exposure_combo_idx = np.flatnonzero(exposure_2d.sum(axis=0) > 0.0)
         dynamic_n0_extra = None
@@ -2097,17 +2184,32 @@ def fit_mhp_feature(
 
     gpu = resolve_estep_backend(config)
     has_slack = getattr(config, "time_slack", 0.0) > 0.0
+    n_chunks = (N + chunk_size - 1) // chunk_size
+    chunk_bounds = [
+        (cs, min(cs + chunk_size, N)) for cs in range(0, N, chunk_size)
+    ]
+    n_workers = _resolve_estep_workers(config, n_chunks)
+    candidate_bloom = _build_candidate_bloom(cand_keys)
+    # The target-aware pair mapping is immutable across EM iterations. On CPU,
+    # cache only exact candidate hits (not all history pairs), with a hard cap
+    # and a streaming fallback. Teacher mode also needs source/target event ids,
+    # so retain its existing streaming path.
+    pair_cache = None
+    pair_cache_attempted = False
+    pair_cache_eligible = bool(
+        use_target_dynamic and gpu is None and not teacher_enabled
+    )
 
     t_total_start = time.monotonic()
     if config.verbose:
         chunk_msg = f"chunk_size={chunk_size}"
         if chunk_size != requested_chunk_size:
             chunk_msg += f" (auto-reduced from {requested_chunk_size} for time_slack)"
-        _n_chunks = (N + chunk_size - 1) // chunk_size
         print(
             f"[mhp-feat] events={N}, candidate pairs={C}, features={F}, "
             f"mu_features={(mu_phi.shape[1] if use_mu_features else 0)}, "
-            f"{chunk_msg}, estep_workers={_resolve_estep_workers(config, _n_chunks)}, "
+            f"{chunk_msg}, estep_workers={n_workers}, "
+            f"mstep_workers={config.mstep_workers}, "
             f"backend={gpu.name if gpu is not None else 'cpu'}",
             flush=True,
         )
@@ -2162,6 +2264,63 @@ def fit_mhp_feature(
         mu_num = np.zeros(M, dtype=np.float64)
         ll_term1 = 0.0
 
+        def _feature_pair_cache_worker(chunk_start: int, chunk_end: int):
+            """Build immutable exact-hit arrays for one target-aware chunk."""
+            (
+                _,
+                pair_source,
+                pair_dt,
+                pair_tdim,
+                pair_sdim,
+                pair_tlocal,
+                _,
+            ) = _build_chunk_pair_arrays(
+                events.times,
+                events.dims,
+                chunk_start,
+                chunk_end,
+                history_window,
+                max_history_events,
+                getattr(config, "time_slack", 0.0),
+            )
+            if pair_dt.size == 0:
+                return (
+                    np.zeros(0, dtype=np.int32),
+                    np.zeros(0, dtype=np.int32),
+                    np.zeros(0, dtype=np.uint8),
+                    np.zeros(0, dtype=np.float32),
+                    None,
+                )
+            pair_keys = (
+                pair_tdim.astype(np.int64) * M
+                + pair_sdim.astype(np.int64)
+            )
+            valid_rows, vi = _lookup_candidate_rows(
+                pair_keys, cand_keys, candidate_bloom
+            )
+            pair_tlocal_valid = pair_tlocal[valid_rows]
+            target_global = chunk_start + pair_tlocal_valid
+            combo_v = (
+                src_combo[pair_source[valid_rows]] * 8
+                + tgt_combo[target_global]
+            )
+            pair_dt_eff, late_weight = _apply_time_slack(
+                pair_dt[valid_rows], config
+            )
+            decay = np.exp(
+                -float(beta_scalar) * pair_dt_eff
+            ).astype(np.float32, copy=False)
+            row_dtype = (
+                np.int64 if C > np.iinfo(np.int32).max else np.int32
+            )
+            return (
+                vi.astype(row_dtype, copy=False),
+                pair_tlocal_valid.astype(np.int32, copy=False),
+                combo_v.astype(np.uint8, copy=False),
+                decay,
+                late_weight.astype(np.float32, copy=False) if has_slack else None,
+            )
+
         def _feature_chunk_worker(chunk_start: int, chunk_end: int):
             """Feature-mode E-step on one chunk. Reads only shared immutable
             inputs (events, μ, current z/α tables); responsibilities come back
@@ -2169,6 +2328,58 @@ def fit_mhp_feature(
             csize = chunk_end - chunk_start
             tdims_chunk = events.dims[chunk_start:chunk_end]
             mu_chunk = mu[tdims_chunk]
+
+            if pair_cache is not None:
+                (
+                    vi,
+                    pair_tlocal_valid,
+                    combo_v,
+                    decay,
+                    late_weight,
+                ) = pair_cache[chunk_start]
+                has_valid = bool(vi.size)
+                if has_valid:
+                    b = float(beta_scalar)
+                    a_pair = softplus(z_static_c[vi] + z_dyn_k[combo_v])
+                    score_valid = (
+                        a_pair
+                        * b
+                        * decay
+                    )
+                    if late_weight is not None:
+                        score_valid *= late_weight
+                    sum_score = np.bincount(
+                        pair_tlocal_valid,
+                        weights=score_valid,
+                        minlength=csize,
+                    )
+                else:
+                    score_valid = np.zeros(0, dtype=np.float64)
+                    sum_score = np.zeros(csize, dtype=np.float64)
+                rate = np.maximum(mu_chunk + sum_score, _EPS)
+                p_self_chunk = mu_chunk / rate
+                p_ij_valid = (
+                    score_valid / rate[pair_tlocal_valid]
+                    if has_valid
+                    else None
+                )
+                resp_payload = (
+                    _compress_sparse_dynamic_resp(
+                        vi, combo_v, p_ij_valid, K_combo
+                    )
+                    if has_valid
+                    else None
+                )
+                mu_num_chunk = _segment_sum(
+                    p_self_chunk, tdims_chunk, M
+                )
+                return (
+                    p_self_chunk,
+                    resp_payload,
+                    mu_num_chunk,
+                    float(np.log(rate).sum()),
+                )
+
             (
                 pair_target,
                 pair_source,
@@ -2187,29 +2398,40 @@ def fit_mhp_feature(
                 p_self_chunk = np.ones(csize, dtype=np.float64)
                 mu_num_chunk = _segment_sum(p_self_chunk, tdims_chunk, M)
                 return p_self_chunk, None, mu_num_chunk, float(np.log(rate).sum())
-            # Map each pair to its candidate index (binary search). Negative dt
-            # candidates are possible only within time_slack and are discounted.
-            pk = pair_tdim.astype(np.int64) * M + pair_sdim.astype(np.int64)
-            idx = np.minimum(np.searchsorted(cand_keys, pk), C - 1)
-            valid = cand_keys[idx] == pk
-            has_valid = bool(valid.any())
-            vi = combo_v = None
+            # Bloom removes definite misses, then binary search verifies every
+            # possible hit exactly. Negative dt pairs are discounted below.
+            pair_keys = (
+                pair_tdim.astype(np.int64) * M
+                + pair_sdim.astype(np.int64)
+            )
+            valid_rows, matched_vi = _lookup_candidate_rows(
+                pair_keys, cand_keys, candidate_bloom
+            )
+            has_valid = bool(valid_rows.size)
+            vi = matched_vi if has_valid else None
+            combo_v = None
             a_in = pair_dt_eff = late_weight = None
+            pair_tlocal_valid = np.zeros(0, dtype=np.int64)
             apply_softplus = False
             if has_valid:
-                vi = idx[valid]
-                pair_dt_eff, late_weight = _apply_time_slack(pair_dt[valid], config)
+                pair_tlocal_valid = pair_tlocal[valid_rows]
+                pair_dt_eff, late_weight = _apply_time_slack(
+                    pair_dt[valid_rows], config
+                )
                 if use_dynamic:
                     if use_target_dynamic:
                         # B-fast + time-slack-safe: target mark is the target
                         # event's pre-state, so a late parent never sees the
                         # target event's own raise.
-                        target_global = chunk_start + pair_tlocal[valid]
-                        combo_v = src_combo[pair_source[valid]] * 8 + tgt_combo[target_global]
+                        target_global = chunk_start + pair_tlocal_valid
+                        combo_v = (
+                            src_combo[pair_source[valid_rows]] * 8
+                            + tgt_combo[target_global]
+                        )
                     else:
                         # Source-only: per-pair α uses the source event's mark
                         # combo at fire time.
-                        combo_v = src_combo[pair_source[valid]]
+                        combo_v = src_combo[pair_source[valid_rows]]
                     # α = softplus(z_static + z_dyn); gathers on CPU, softplus
                     # on the GPU when one is active.
                     a_in = z_static_c[vi] + z_dyn_k[combo_v]
@@ -2223,28 +2445,40 @@ def fit_mhp_feature(
                     beta=float(beta_scalar),
                     dt=pair_dt_eff if has_valid else np.zeros(0, dtype=np.float32),
                     late_weight=late_weight if (has_valid and has_slack) else None,
-                    tlocal=pair_tlocal[valid] if has_valid else np.zeros(0, dtype=np.int64),
+                    tlocal=pair_tlocal_valid,
                     mu_chunk=mu_chunk,
                     csize=csize,
                 )
             else:
-                score_pair = np.zeros(pair_dt.shape, dtype=np.float64)
                 if has_valid:
                     b = float(beta_scalar)
                     a_pair = softplus(a_in) if apply_softplus else a_in
-                    score_pair[valid] = a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
-                sum_score = _segment_sum(score_pair, pair_tlocal, csize)
+                    score_valid = (
+                        a_pair * b * np.exp(-b * pair_dt_eff) * late_weight
+                    )
+                    sum_score = np.bincount(
+                        pair_tlocal_valid,
+                        weights=score_valid,
+                        minlength=csize,
+                    )
+                else:
+                    score_valid = np.zeros(0, dtype=np.float64)
+                    sum_score = np.zeros(csize, dtype=np.float64)
                 rate = np.maximum(mu_chunk + sum_score, _EPS)
                 p_self_chunk = mu_chunk / rate
-                p_ij_valid = (score_pair / rate[pair_tlocal])[valid] if has_valid else None
+                p_ij_valid = (
+                    score_valid / rate[pair_tlocal_valid]
+                    if has_valid
+                    else None
+                )
                 ll_chunk = float(np.log(rate).sum())
             if has_valid:
                 p_self_chunk, p_ij_valid = _apply_clear_time_teacher(
                     p_self_chunk,
                     p_ij_valid,
-                    pair_tlocal[valid],
-                    pair_target[valid],
-                    pair_source[valid],
+                    pair_tlocal_valid,
+                    pair_target[valid_rows],
+                    pair_source[valid_rows],
                     clear_times,
                     boost=clear_time_teacher_boost,
                     tau=clear_time_teacher_tau,
@@ -2268,11 +2502,56 @@ def fit_mhp_feature(
         # Chunks run on estep_workers threads; results are merged here in chunk
         # order, so accumulation is deterministic regardless of the thread count.
         # The heartbeat keeps a long E-step from looking hung.
-        n_chunks = (N + chunk_size - 1) // chunk_size
-        chunk_bounds = [(cs, min(cs + chunk_size, N)) for cs in range(0, N, chunk_size)]
-        n_workers = _resolve_estep_workers(config, n_chunks)
         _estep_t0 = time.monotonic()
         _last_beat = _estep_t0
+        if pair_cache_eligible and not pair_cache_attempted:
+            pair_cache_attempted = True
+            cache_candidate = {}
+            cache_bytes = 0
+            cache_overflow = False
+            cache_outputs = _iter_chunks_ordered(
+                _feature_pair_cache_worker, chunk_bounds, n_workers
+            )
+            try:
+                for (cache_start, _), cache_item in zip(
+                    chunk_bounds, cache_outputs
+                ):
+                    cache_bytes += sum(
+                        array.nbytes
+                        for array in cache_item
+                        if array is not None
+                    )
+                    if cache_bytes > _ESTEP_PAIR_CACHE_WORK_BYTES:
+                        cache_overflow = True
+                        break
+                    cache_candidate[cache_start] = cache_item
+            except MemoryError:
+                cache_overflow = True
+            finally:
+                close_cache_outputs = getattr(cache_outputs, "close", None)
+                if close_cache_outputs is not None:
+                    close_cache_outputs()
+            if not cache_overflow and len(cache_candidate) == len(chunk_bounds):
+                pair_cache = cache_candidate
+                if config.verbose:
+                    print(
+                        f"[mhp-feat] target pair cache: "
+                        f"{cache_bytes / (1024 * 1024):.1f} MiB across "
+                        f"{len(pair_cache)} chunks",
+                        flush=True,
+                    )
+            else:
+                # Do not retain a cap-sized partial cache after falling back.
+                cache_candidate.clear()
+                cache_candidate = None
+                cache_item = None
+                if config.verbose:
+                    print(
+                        f"[mhp-feat] target pair cache exceeded "
+                        f"{_ESTEP_PAIR_CACHE_WORK_BYTES / (1024 * 1024):.0f} MiB; "
+                        "using Bloom-filtered streaming E-step",
+                        flush=True,
+                    )
         for ci, ((chunk_start, chunk_end), out) in enumerate(
             zip(chunk_bounds, _iter_chunks_ordered(_feature_chunk_worker, chunk_bounds, n_workers))
         ):
@@ -2452,6 +2731,7 @@ def fit_mhp_feature(
                     cand_phi, dynamic_combo_bits, n_coo, e_coo_fixed, w,
                     l2=l2_alpha, w_prior_mean=w_prior_mean, max_iter=_MSTEP_MAX,
                     progress=_mstep_progress,
+                    mstep_workers=config.mstep_workers,
                 )
             else:
                 w_new = fit_dynamic_weights_mstep(

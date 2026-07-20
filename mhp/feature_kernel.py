@@ -23,7 +23,9 @@ its gradient is the logistic sigmoid, so Q is smooth and L-BFGS-friendly.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import os
 
 import numpy as np
 
@@ -42,6 +44,13 @@ _MATMUL_WORK_BYTES = 8 * 1024 * 1024
 # large candidate sets.  Above this cap the code takes an algebraically
 # equivalent low-memory path.
 _DYNAMIC_CROSS_WORK_BYTES = 128 * 1024 * 1024
+# Parallel COO reductions retain one result per independent statistic until a
+# deterministic merge.  Keep that extra workspace bounded, and skip thread
+# startup for small candidate sets where the serial path is already cheap.
+_MSTEP_PARALLEL_WORK_BYTES = 128 * 1024 * 1024
+_MSTEP_PARALLEL_MIN_CANDIDATES = 50_000
+_MSTEP_AUTO_WORKERS = 6
+_MSTEP_CROSS_DIMS_PER_BATCH = 2
 
 
 def _matmul_block_rows(*matrices, extra_bytes_per_row=0) -> int:
@@ -594,6 +603,269 @@ def _q_dynamic_coo(w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask):
     return q
 
 
+def _resolve_mstep_workers(
+    requested,
+    candidates,
+    dynamic_features,
+    static_features=0,
+    numerator_entries=0,
+    exposure_entries=0,
+    cross_value_itemsize=8,
+):
+    """Resolve the bounded worker count for the sparse COO M-step."""
+    requested = int(requested)
+    if requested < 0:
+        raise ValueError("mstep_workers must be >= 0 (0 = auto)")
+    if requested == 0:
+        if candidates < _MSTEP_PARALLEL_MIN_CANDIDATES:
+            return 1
+        requested = min(_MSTEP_AUTO_WORKERS, os.cpu_count() or 1)
+    # The parallel path retains N/E candidate reductions at the same time.
+    # Fall back to the existing bounded-memory implementation for very large C.
+    # The batched cross reductions retain one merged C×D buffer plus the
+    # candidate gradient/curvature vectors. Their temporary memory also scales
+    # with COO nnz, not just candidate count, so include both sides here.
+    candidates = int(candidates)
+    dynamic_features = int(dynamic_features)
+    static_features = int(static_features)
+    numerator_entries = int(numerator_entries)
+    exposure_entries = int(exposure_entries)
+    cross_value_itemsize = int(cross_value_itemsize)
+    retained_candidate_bytes = (
+        max(dynamic_features + 2, 4) * candidates * 8
+    )
+    # Futures can finish out of order while their results wait for the fixed
+    # row-order merge. Include every block result plus the weighted feature
+    # temporary held by each active worker in the parallel workspace budget.
+    if candidates and static_features:
+        conservative_bytes_per_row = 16 * static_features + 8
+        block_rows = max(
+            1,
+            min(
+                candidates,
+                _MATMUL_BLOCK_ROWS,
+                _MATMUL_WORK_BYTES // conservative_bytes_per_row,
+            ),
+        )
+        n_blocks = (candidates + block_rows - 1) // block_rows
+        result_values_per_block = (
+            static_features * static_features
+            + static_features * dynamic_features
+            + static_features
+        )
+        block_result_bytes = n_blocks * result_values_per_block * 8
+        active_block_bytes = (
+            min(requested, n_blocks) * block_rows * static_features * 8
+        )
+    else:
+        block_result_bytes = 0
+        active_block_bytes = 0
+    feature_stage_bytes = (
+        retained_candidate_bytes + block_result_bytes + active_block_bytes
+    )
+    cross_batch_dims = min(
+        dynamic_features,
+        _MSTEP_CROSS_DIMS_PER_BATCH,
+        max(1, requested // 2),
+    )
+    # Each cross task holds one combo-value gather plus a float64 product and a
+    # C-length bincount result. A batch runs N and E for each dimension.
+    cross_bytes_per_dim = (
+        (cross_value_itemsize + 8) * (numerator_entries + exposure_entries)
+        + 2 * candidates * 8
+    )
+    cross_stage_bytes = (
+        retained_candidate_bytes + cross_batch_dims * cross_bytes_per_dim
+    )
+    work_bytes = max(feature_stage_bytes, cross_stage_bytes)
+    if work_bytes > _MSTEP_PARALLEL_WORK_BYTES:
+        return 1
+    return max(1, requested)
+
+
+def _coo_activation_stats(z_s, z_d, coo, *, numerator):
+    """Return one COO side's objective, gradient coefficient, and curvature."""
+    rows, combos, values = coo
+    z = z_s[rows] + z_d[combos]
+    alpha, sig = softplus_sigmoid(z)
+    if numerator:
+        alpha = np.maximum(alpha, _EPS)
+        q = float(np.sum(values * np.log(alpha)))
+        coef = (values / alpha) * sig
+        hess = (
+            (values / alpha) * sig * (1.0 - sig)
+            - values * (sig * sig) / (alpha * alpha)
+        )
+    else:
+        q = -float(np.sum(values * alpha))
+        coef = -values * sig
+        hess = -values * sig * (1.0 - sig)
+    return q, coef, hess
+
+
+def _coo_cross_bincount(rows, combos, hess, combo_values, dim, candidates):
+    return np.bincount(
+        rows, hess * combo_values[combos, dim], minlength=candidates
+    )
+
+
+def _coo_feature_reduction_block(cand_phi, coef_c, h_c, hsd, start, stop):
+    """Compute all three feature reductions over one deterministic row block."""
+    block = cand_phi[start:stop]
+    return (
+        block.T @ coef_c[start:stop],
+        block.T @ (block * h_c[start:stop, None]),
+        block.T @ hsd[start:stop],
+    )
+
+
+def _parallel_coo_feature_reductions(executor, cand_phi, coef_c, h_c, hsd):
+    """Parallel block reduction with results merged in original row order."""
+    candidates, features = cand_phi.shape
+    dynamic_features = hsd.shape[1]
+    weighted_itemsize = int(
+        np.dtype(np.result_type(cand_phi, h_c)).itemsize
+    )
+    block_rows = _matmul_block_rows(
+        cand_phi,
+        h_c,
+        extra_bytes_per_row=features * weighted_itemsize,
+    )
+    futures = [
+        executor.submit(
+            _coo_feature_reduction_block,
+            cand_phi,
+            coef_c,
+            h_c,
+            hsd,
+            start,
+            min(start + block_rows, candidates),
+        )
+        for start in range(0, candidates, block_rows)
+    ]
+    grad_s = np.zeros(features, dtype=np.float64)
+    hss = np.zeros((features, features), dtype=np.float64)
+    hsd_reduced = np.zeros((features, dynamic_features), dtype=np.float64)
+    for future in futures:
+        grad_part, hss_part, hsd_part = future.result()
+        grad_s += grad_part
+        hss += hss_part
+        hsd_reduced += hsd_part
+    return grad_s, hss, hsd_reduced
+
+
+def _q_grad_hess_dynamic_coo_parallel(
+    w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask, executor
+):
+    """Parallel float64 COO objective/gradient/Hessian evaluation.
+
+    Activation work for N/E, the independent bincount reductions, and the
+    feature matrix reductions run concurrently.  Every result is merged in a
+    fixed order, so a worker count never changes run-to-run ordering.
+    """
+    C, F = cand_phi.shape
+    K, D = combo_bits.shape
+    nw = F + D
+    z_s = _row_matvec(cand_phi, w[:F])
+    z_d = combo_bits @ w[F:]
+    nr, nc, _ = n_coo
+    er, ec, _ = e_coo
+
+    n_stats_future = executor.submit(
+        _coo_activation_stats, z_s, z_d, n_coo, numerator=True
+    )
+    e_stats_future = executor.submit(
+        _coo_activation_stats, z_s, z_d, e_coo, numerator=False
+    )
+    q_n, coef_n, h_n = n_stats_future.result()
+    q_e, coef_e, h_e = e_stats_future.result()
+
+    n_jobs = (
+        executor.submit(np.bincount, nr, weights=coef_n, minlength=C),
+        executor.submit(np.bincount, nc, weights=coef_n, minlength=K),
+        executor.submit(np.bincount, nr, weights=h_n, minlength=C),
+        executor.submit(np.bincount, nc, weights=h_n, minlength=K),
+    )
+    e_jobs = (
+        executor.submit(np.bincount, er, weights=coef_e, minlength=C),
+        executor.submit(np.bincount, ec, weights=coef_e, minlength=K),
+        executor.submit(np.bincount, er, weights=h_e, minlength=C),
+        executor.submit(np.bincount, ec, weights=h_e, minlength=K),
+    )
+    n_reduced = [job.result() for job in n_jobs]
+    e_reduced = [job.result() for job in e_jobs]
+    # np.bincount returns int64 for an empty input even when ``weights`` is a
+    # float array. Cast before in-place merging so a valid empty-N/nonempty-E
+    # M-step stays on the float64 path instead of raising a casting error.
+    coef_c = n_reduced[0].astype(np.float64, copy=False)
+    coef_c += e_reduced[0]
+    coef_k = n_reduced[1].astype(np.float64, copy=False)
+    coef_k += e_reduced[1]
+    h_c = n_reduced[2].astype(np.float64, copy=False)
+    h_c += e_reduced[2]
+    h_k = n_reduced[3].astype(np.float64, copy=False)
+    h_k += e_reduced[3]
+    # The merged arrays above retain the N-side storage. Drop futures and the
+    # now-redundant E-side C-length results before allocating cross curvature;
+    # otherwise those hidden references defeat the parallel memory budget.
+    del n_stats_future, e_stats_future, coef_n, coef_e
+    del n_jobs, e_jobs, n_reduced, e_reduced
+    hsd_by_candidate = np.empty((C, D), dtype=np.float64)
+    combo_is_binary = bool(
+        np.all((combo_bits == 0.0) | (combo_bits == 1.0))
+    )
+    combo_cross_values = (
+        np.asarray(combo_bits, dtype=np.bool_)
+        if combo_is_binary
+        else np.asarray(combo_bits)
+    )
+    # Bound COO-sized temporaries: run at most two dynamic dimensions at once,
+    # with N/E paired inside each batch. This retains useful parallelism without
+    # materializing all 2×D weighted entry vectors simultaneously.
+    cross_dims_per_batch = min(
+        _MSTEP_CROSS_DIMS_PER_BATCH,
+        max(1, getattr(executor, "_max_workers", 1) // 2),
+    )
+    for dim_start in range(0, D, cross_dims_per_batch):
+        dims = range(dim_start, min(dim_start + cross_dims_per_batch, D))
+        n_cross_jobs = {
+            d: executor.submit(
+                _coo_cross_bincount, nr, nc, h_n, combo_cross_values, d, C
+            )
+            for d in dims
+        }
+        e_cross_jobs = {
+            d: executor.submit(
+                _coo_cross_bincount, er, ec, h_e, combo_cross_values, d, C
+            )
+            for d in dims
+        }
+        for d in dims:
+            column = n_cross_jobs[d].result().astype(np.float64, copy=False)
+            column += e_cross_jobs[d].result()
+            hsd_by_candidate[:, d] = column
+        # Do not retain the completed batch while the next dimensions run.
+        del n_cross_jobs, e_cross_jobs, column
+
+    # Only the candidate-level reductions are needed by the feature blocks.
+    del h_n, h_e, combo_cross_values
+
+    q = q_n + q_e - l2 * float(np.sum(reg_mask * (w - w0) ** 2))
+    grad_s, Hss, Hsd = _parallel_coo_feature_reductions(
+        executor, cand_phi, coef_c, h_c, hsd_by_candidate
+    )
+    grad = np.concatenate([grad_s, combo_bits.T @ coef_k])
+    grad -= 2.0 * l2 * reg_mask * (w - w0)
+    Hdd = combo_bits.T @ (combo_bits * h_k[:, None])
+    H = np.empty((nw, nw))
+    H[:F, :F] = Hss
+    H[:F, F:] = Hsd
+    H[F:, :F] = Hsd.T
+    H[F:, F:] = Hdd
+    H[np.arange(nw), np.arange(nw)] -= 2.0 * l2 * reg_mask
+    return q, grad, H
+
+
 def _q_grad_hess_dynamic_coo(
     w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask, workspace=None
 ):
@@ -685,6 +957,7 @@ def fit_dynamic_weights_mstep_coo(
     w_prior_mean: np.ndarray | None = None,
     max_iter: int = 50,
     progress=None,
+    mstep_workers: int = 1,
 ) -> np.ndarray:
     """Damped-Newton dynamic M-step over flat-COO N/E (see fit_dynamic_weights_mstep).
     n_coo / e_coo : (rows int, combos int, vals float) — any combo-0 pseudo-counts
@@ -713,37 +986,100 @@ def fit_dynamic_weights_mstep_coo(
 
     n_coo = _coo(n_coo)
     e_coo = _coo(e_coo)
-    workspace = {}
-    q, grad, H = _q_grad_hess_dynamic_coo(
-        w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask,
-        workspace=workspace,
+    combo_is_binary = bool(
+        np.all((combo_bits == 0.0) | (combo_bits == 1.0))
     )
-    eye = np.eye(n_w)
-    for _it in range(max_iter):
-        if progress is not None:
-            progress(_it, q, float(np.linalg.norm(grad)))
-        direction = _newton_direction(H, grad, eye)
-        dderiv = float(grad @ direction)
-        if dderiv <= 1e-9 * max(abs(q), 1.0):
-            break
-        t = 1.0
-        c = 1e-4
-        improved = False
-        for _bt in range(40):
-            w_new = w + t * direction
-            q_new = _q_dynamic_coo(w_new, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask)
-            if q_new >= q + c * t * dderiv:
-                w, q = w_new, q_new
-                q, grad, H = _q_grad_hess_dynamic_coo(
-                    w, cand_phi, combo_bits, n_coo, e_coo, l2, w0, reg_mask,
+    cross_value_itemsize = (
+        1 if combo_is_binary else np.asarray(combo_bits).dtype.itemsize
+    )
+    worker_count = _resolve_mstep_workers(
+        mstep_workers,
+        cand_phi.shape[0],
+        D,
+        F,
+        len(n_coo[0]),
+        len(e_coo[0]),
+        cross_value_itemsize,
+    )
+    workspace = {}
+    executor = (
+        ThreadPoolExecutor(max_workers=worker_count)
+        if worker_count > 1
+        else None
+    )
+    try:
+        def evaluate(w_eval):
+            if executor is None:
+                return _q_grad_hess_dynamic_coo(
+                    w_eval,
+                    cand_phi,
+                    combo_bits,
+                    n_coo,
+                    e_coo,
+                    l2,
+                    w0,
+                    reg_mask,
                     workspace=workspace,
                 )
-                improved = True
+            return _q_grad_hess_dynamic_coo_parallel(
+                w_eval,
+                cand_phi,
+                combo_bits,
+                n_coo,
+                e_coo,
+                l2,
+                w0,
+                reg_mask,
+                executor,
+            )
+
+        q, grad, H = evaluate(w)
+        eye = np.eye(n_w)
+        for _it in range(max_iter):
+            if progress is not None:
+                progress(_it, q, float(np.linalg.norm(grad)))
+            direction = _newton_direction(H, grad, eye)
+            dderiv = float(grad @ direction)
+            if dderiv <= 1e-9 * max(abs(q), 1.0):
                 break
-            t *= 0.5
-        if not improved:
-            break
-    return w
+            c = 1e-4
+            improved = False
+            if executor is not None:
+                # A full Newton step is normally accepted.  Evaluate Q/g/H once
+                # and reuse it instead of doing an extra objective-only scan.
+                w_new = w + direction
+                trial = evaluate(w_new)
+                if trial[0] >= q + c * dderiv:
+                    w = w_new
+                    q, grad, H = trial
+                    continue
+                t = 0.5
+            else:
+                t = 1.0
+            for _bt in range(40):
+                w_new = w + t * direction
+                q_new = _q_dynamic_coo(
+                    w_new,
+                    cand_phi,
+                    combo_bits,
+                    n_coo,
+                    e_coo,
+                    l2,
+                    w0,
+                    reg_mask,
+                )
+                if q_new >= q + c * t * dderiv:
+                    w = w_new
+                    q, grad, H = evaluate(w)
+                    improved = True
+                    break
+                t *= 0.5
+            if not improved:
+                break
+        return w
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
 
 def fit_weights_mstep(
