@@ -924,10 +924,9 @@ class CompiledAssociationPlan:
         separable: z(v, f) = z_entity(f) + W_at[u, v], plus a same-alarm-type
         correction on the v == u row (same_alarm_type and its cross columns
         depend only on the source entity once v == u holds). A conservative
-        threshold prescreen on that separable form finds survivors via one
-        binary search per source alarm type over the entity terms sorted once
-        per group, so per-target prescreen work scales with alarm types plus
-        survivors rather than with the full candidate list. Survivors are
+        threshold prescreen on that separable form finds survivors with direct
+        vector masks over the small alarm-type vocabulary (link/power/offline),
+        avoiding two entity-array sorts per target entity. Survivors are
         rescored through the exact per-candidate path, so emitted edges are
         bit-identical to the unpruned scan.
         """
@@ -971,13 +970,12 @@ class CompiledAssociationPlan:
                     if static_table is not None
                     else d.entity_parts_for_target(entity, unique_entities)
                 )
-                n_unique = len(unique_entities)
-                zero_marks = np.zeros(n_unique, dtype=np.int64)
+                zero_marks = np.zeros(len(unique_entities), dtype=np.int64)
                 # z_entity: the exact logit with the at-pair block muted
                 # (id -1 hits the zero-padded W_at row and disables same_at).
                 z_entity = d.logits_from_parts(
                     -1,
-                    np.full(n_unique, -1, dtype=np.int64),
+                    np.full(len(unique_entities), -1, dtype=np.int64),
                     src_mark_idx=zero_marks,
                     tgt_term=0.0,
                     **parts,
@@ -985,15 +983,8 @@ class CompiledAssociationPlan:
                 # delta_same: contribution of same_alarm_type and its cross
                 # columns on any v == u row.
                 delta_same = d.same_at_delta_from_parts(parts)
-                # Ascending sorts turn the per-target prescreen into one
-                # binary-search cutoff per source alarm type instead of a
-                # compare over every candidate; the v == u row gets its own
-                # sort because delta_same shifts each entity differently.
-                z_order = np.argsort(z_entity)
-                z_sorted = z_entity[z_order]
                 z_same = z_entity + delta_same
-                z_same_order = np.argsort(z_same)
-                z_same_sorted = z_same[z_same_order]
+                oov_source_indices = np.flatnonzero(src_at_ids == -1)
             for target_type in targets:
                 kept_count = 0
                 if source_count:
@@ -1022,49 +1013,40 @@ class CompiledAssociationPlan:
                     else:
                         # Keep (v, f) iff z_entity(f) >= z_required - W_at[u, v]
                         # (or the delta_same-shifted variant on the v == u
-                        # row): one searchsorted per source alarm type, then a
-                        # gather of only the passing tail. Survivors are
-                        # re-sorted into candidate order so exact scoring and
-                        # edge emission stay byte-identical.
+                        # row). With at most link/power/offline in the modeled
+                        # vocabulary, direct vector masks are cheaper than two
+                        # O(E log E) sorts per target entity. One candidate mask
+                        # preserves source order without sorting the survivors.
                         w_row = d.W_at_pad[target_at_id + 1]
-                        cutoffs = np.searchsorted(
-                            z_sorted, z_required - w_row[distinct_at_ids + 1], side="left"
-                        )
-                        pieces = []
-                        for j in np.nonzero(cutoffs < n_unique)[0]:
-                            v = int(distinct_at_ids[j])
+                        survivor_mask = np.zeros(source_count, dtype=np.bool_)
+                        for v in distinct_at_ids:
+                            v = int(v)
                             if v == -1:
                                 # Every OOV alarm type has zero W_at and never
                                 # activates same_alarm_type. Keep candidate
                                 # positions directly so multiple OOV types on
                                 # one entity do not collide in grid row zero.
-                                oov = np.flatnonzero(
-                                    (src_at_ids == -1)
-                                    & (z_entity[ent_inverse] >= z_required)
+                                keep_oov = (
+                                    z_entity[ent_inverse[oov_source_indices]]
+                                    >= z_required
                                 )
-                                if len(oov):
-                                    pieces.append(oov)
+                                if np.any(keep_oov):
+                                    survivor_mask[oov_source_indices[keep_oov]] = True
                                 continue
-                            if v == target_at_id and v >= 0:
-                                continue
-                            candidates = grid_index[v + 1, z_order[cutoffs[j]:]]
-                            pieces.append(candidates[candidates >= 0])
-                        if target_at_id >= 0:
-                            start = np.searchsorted(
-                                z_same_sorted,
-                                z_required - d.W_at_pad[target_at_id + 1, target_at_id + 1],
-                                side="left",
+                            entity_logits = (
+                                z_same if v == target_at_id else z_entity
                             )
-                            if start < n_unique:
-                                candidates = grid_index[
-                                    target_at_id + 1, z_same_order[start:]
-                                ]
-                                pieces.append(candidates[candidates >= 0])
-                        survivors = (
-                            np.sort(np.concatenate(pieces))
-                            if pieces
-                            else np.empty(0, dtype=np.int64)
-                        )
+                            rows = np.flatnonzero(
+                                entity_logits >= z_required - w_row[v + 1]
+                            )
+                            if len(rows):
+                                candidates = grid_index[v + 1, rows]
+                                candidates = candidates[candidates >= 0]
+                            else:
+                                candidates = ()
+                            if len(candidates):
+                                survivor_mask[candidates] = True
+                        survivors = np.flatnonzero(survivor_mask)
                     self.prescreen_dropped_pair_count += source_count - len(survivors)
                     if len(survivors):
                         surv_types = [source_types[i] for i in survivors]
