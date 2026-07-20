@@ -490,13 +490,18 @@ class BatchFaultGroupMatcher:
         # 本批组之间的直接关联边（每个匹配组/每条共享告警一条超边）。附着
         # 失败拆分时用它重算子图：只有直接关联的成员才保持连通。
         current_group_edges = []
-        # 跨组共享告警：同一告警编码 ID 出现在多个本批原始组时，这些组
-        # 直接连到一起。输出成员条目按组内告警全集展开，若共享告警的组
-        # 落进不同汇聚组，外置累积 old_agg 后回灌会报「外置历史冲突」。
+        # 共享告警刚性边（current_group_edges 的子集，单独维护）：同一告警
+        # 编码 ID 属于多个本批原始组时，这些组被视为不可分割的刚性簇，必须
+        # 落进同一汇聚组，可突破 max_group_member。区别于症状匹配边——后者
+        # 只提供“可同组”资格、允许按上限切分，共享告警边则是硬约束。若共享
+        # 告警的组落进不同汇聚组，外置累积 old_agg 后回灌会报「外置历史冲突」。
+        shared_alarm_edges = []
         for owner_group_ids in batch.local_alarm_owners.values():
             if len(owner_group_ids) >= 2:
                 local_union.union_all(owner_group_ids)
-                current_group_edges.append(list(owner_group_ids))
+                edge = list(owner_group_ids)
+                current_group_edges.append(edge)
+                shared_alarm_edges.append(edge)
 
         def link_group_to_agg(group_id, agg_id):
             # 急切改写保证指针直指存活汇聚组，这里只需做存在性防御。
@@ -542,7 +547,12 @@ class BatchFaultGroupMatcher:
                 alarm_entry = session["alarm_registry"].get(alarm_id)
                 if alarm_entry is not None and alarm_id not in conflicted_alarm_ids:
                     link_group_to_agg(group_id, alarm_entry[1])
-        return local_union, linked_agg_ids_by_group, current_group_edges
+        return (
+            local_union,
+            linked_agg_ids_by_group,
+            current_group_edges,
+            shared_alarm_edges,
+        )
 
     def _assign_components(self, session, alarm_groups, batch, links, max_member_count):
         """按本批连通分量分配稳定的汇聚组 ID（上限按原始组个数计）：
@@ -551,7 +561,20 @@ class BatchFaultGroupMatcher:
         直接关联组按上限切分；无关联时按上限切分，至少两个成员的包才分配
         新 ID。返回 (本批各汇聚组成员条目, 本批发生变化的汇聚组 ID 集合)。
         """
-        local_union, linked_agg_ids_by_group, current_group_edges = links
+        (
+            local_union,
+            linked_agg_ids_by_group,
+            current_group_edges,
+            shared_alarm_edges,
+        ) = links
+        # 共享告警刚性并查集：只并合“共享同一条告警”的原始组，得到必须
+        # 整体同组的最小不可分单元（症状匹配边不参与），供归属分配/切分
+        # 以刚性簇为单位处理。
+        rigid_union = _GroupUnionFind()
+        for group_id in alarm_groups:
+            rigid_union.add(group_id)
+        for edge_group_ids in shared_alarm_edges:
+            rigid_union.union_all(edge_group_ids)
         member_order_key = _batch_member_order_key(batch)
         # changed_agg_ids 记录本批真正变化的汇聚组：新增原始组成员，或已有
         # 成员组内新增告警；新建汇聚组必然带来新成员，天然纳入。
@@ -564,35 +587,36 @@ class BatchFaultGroupMatcher:
         for members in components:
             self._assign_component(
                 session, batch, members, linked_agg_ids_by_group,
-                current_group_edges, max_member_count,
+                current_group_edges, rigid_union, max_member_count,
                 batch_member_entries_by_agg, changed_agg_ids,
             )
         return batch_member_entries_by_agg, changed_agg_ids
 
     def _assign_component(
         self, session, batch, members, linked_agg_ids_by_group,
-        current_group_edges, max_member_count,
+        current_group_edges, rigid_union, max_member_count,
         batch_member_entries_by_agg, changed_agg_ids,
     ):
-        """单个连通分量的归属分配：沿用既有归属 → 附着历史组 → 新建。"""
+        """单个连通分量的归属分配：沿用既有归属 → 附着历史组 → 新建。
+
+        以共享告警刚性簇为单位处理：同簇原始组必须进同一汇聚组（见
+        _assign_rigid_cluster），簇内若有既有归属则整簇跟随、可突破
+        max_group_member。
+        """
         linked_agg_ids = []
         for group_id in members:
             for agg_id in linked_agg_ids_by_group[group_id]:
                 if agg_id in session["agg_registry"] and agg_id not in linked_agg_ids:
                     linked_agg_ids.append(agg_id)
         # 已有归属一旦落定就不改挂；其余成员仅在能附着到既有汇聚组或
-        # 与至少一个其他成员形成新汇聚时才分配 ID。
+        # 与至少一个其他成员形成新汇聚时才分配 ID。刚性簇内若已有归属，
+        # 整簇跟随（可突破上限）；全未归属的簇整体进入下面的附着/新建。
         unassigned_members = []
-        for group_id in members:
-            existing_agg_id = session["group_registry"][group_id][1]
-            if existing_agg_id in session["agg_registry"]:
-                self._assign_members_to_agg(
-                    session, existing_agg_id, [group_id], batch,
-                    batch_member_entries_by_agg, changed_agg_ids,
-                )
-            else:
-                _set_group_owner(session, group_id, None)
-                unassigned_members.append(group_id)
+        for cluster_members in _group_by_rigid_cluster(members, rigid_union):
+            self._assign_rigid_cluster(
+                session, batch, cluster_members, unassigned_members,
+                batch_member_entries_by_agg, changed_agg_ids,
+            )
         if not unassigned_members:
             return
         # 新成员同时关联多个历史汇聚组时，只选一个能整体容纳本子分量
@@ -613,18 +637,83 @@ class BatchFaultGroupMatcher:
             return
         self._assign_split_components(
             session, batch, unassigned_members, current_group_edges,
-            max_member_count, batch_member_entries_by_agg, changed_agg_ids,
+            rigid_union, max_member_count, batch_member_entries_by_agg,
+            changed_agg_ids,
         )
+
+    def _assign_rigid_cluster(
+        self, session, batch, cluster_members, unassigned_members,
+        batch_member_entries_by_agg, changed_agg_ids,
+    ):
+        """处理单个共享告警刚性簇：同簇原始组必须进同一汇聚组。
+
+        既有归属同时来自两个层面（都视为刚性）：
+        - 组级：簇内原始组自身已归属的汇聚组；
+        - 告警级：簇内告警已归属的历史汇聚组——共享告警若已属某历史
+          汇聚组，认领它的新组必须并入该组，否则会出现“组归新汇聚组、
+          共享告警仍归旧汇聚组”的分裂（成员非空但告警计数为 0，回灌
+          还会形成同一告警跨汇聚组冲突）。冲突告警（continuity 已挂起）
+          不计入，与连边阶段口径一致。
+
+        - 簇内全部未归属：整簇作为未归属成员进入后续附着/新建流程，
+          切分阶段按簇不可分处理，不会被上限切开。
+        - 簇内恰有一个既有汇聚组：整簇并入该组，未归属成员跟随
+          （共享告警是硬约束，可突破 max_group_member；已归属该组的
+          成员/告警不重复计数）。
+        - 簇内跨多个既有汇聚组：满足“共享必同组”需合并既有汇聚组，
+          该决策未落地——此处退回逐组沿用既有归属（等价旧行为，不
+          强制同簇），既有汇聚组之间仍不合并。
+        """
+        conflicted_alarm_ids = session.get("conflicted_alarm_ids") or frozenset()
+        existing_aggs = []
+
+        def _note_existing_agg(agg_id):
+            if agg_id in session["agg_registry"] and agg_id not in existing_aggs:
+                existing_aggs.append(agg_id)
+
+        for group_id in cluster_members:
+            _note_existing_agg(session["group_registry"][group_id][1])
+            for alarm_id in batch.local_group_alarm_ids[group_id]:
+                if alarm_id in conflicted_alarm_ids:
+                    continue
+                alarm_entry = session["alarm_registry"].get(alarm_id)
+                if alarm_entry is not None:
+                    _note_existing_agg(alarm_entry[1])
+        if len(existing_aggs) == 1:
+            self._assign_members_to_agg(
+                session, existing_aggs[0], cluster_members, batch,
+                batch_member_entries_by_agg, changed_agg_ids,
+            )
+            return
+        if len(existing_aggs) >= 2:
+            # ③ 未覆盖：逐组沿用既有归属，未归属组按普通未归属成员处理。
+            for group_id in cluster_members:
+                existing_agg_id = session["group_registry"][group_id][1]
+                if existing_agg_id in session["agg_registry"]:
+                    self._assign_members_to_agg(
+                        session, existing_agg_id, [group_id], batch,
+                        batch_member_entries_by_agg, changed_agg_ids,
+                    )
+                else:
+                    _set_group_owner(session, group_id, None)
+                    unassigned_members.append(group_id)
+            return
+        for group_id in cluster_members:
+            _set_group_owner(session, group_id, None)
+            unassigned_members.append(group_id)
 
     def _assign_split_components(
         self, session, batch, unassigned_members, current_group_edges,
-        max_member_count, batch_member_entries_by_agg, changed_agg_ids,
+        rigid_union, max_member_count, batch_member_entries_by_agg,
+        changed_agg_ids,
     ):
         """无历史目标可容纳时的新建分配。
 
         只保留未归属成员彼此间的直接匹配边重算连通子图（仅通过已落定
-        成员传递连通的新组自然拆开），按上限切分后为 >=2 成员的包分配
-        全新汇聚组 ID。
+        成员传递连通的新组自然拆开）；子图内以共享告警刚性簇为不可分
+        物品，按最早告警时间做 next-fit 装箱（上限对能装下的物品严格
+        生效，单个刚性簇超过上限时独占一个超限包、不被拆开），为 >=2
+        成员的包分配全新汇聚组 ID。
         """
         member_order_key = _batch_member_order_key(batch)
         unassigned_set = set(unassigned_members)
@@ -638,7 +727,11 @@ class BatchFaultGroupMatcher:
             sub_members.sort(key=member_order_key)
         sub_components.sort(key=lambda sub: member_order_key(sub[0]))
         for sub_members in sub_components:
-            for pack_members in _split_members_by_cap(sub_members, max_member_count):
+            clusters = _group_by_rigid_cluster(sub_members, rigid_union)
+            for cluster in clusters:
+                cluster.sort(key=member_order_key)
+            clusters.sort(key=lambda cluster: member_order_key(cluster[0]))
+            for pack_members in _pack_clusters_by_cap(clusters, max_member_count):
                 if len(pack_members) < 2:
                     continue
                 self._assign_members_to_agg(
@@ -652,6 +745,7 @@ class BatchFaultGroupMatcher:
     ):
         """成员组划入汇聚组：登记归属/计数/告警映射与本批条目。"""
         new_alarm_ids = []
+        seen_new_alarm_ids = set()
         new_group_count = 0
         for group_id in member_group_ids:
             group_entry = session["group_registry"][group_id]
@@ -663,10 +757,17 @@ class BatchFaultGroupMatcher:
             if group_entry[1] is None:
                 new_group_count += 1
             _set_group_owner(session, group_id, agg_id)
-            new_alarm_ids.extend(
-                alarm_id for alarm_id in batch.local_group_alarm_ids[group_id]
-                if session["alarm_registry"][alarm_id][1] is None
-            )
+            # 跨组去重：同一条新告警被簇内多个成员组共同包含时只登记一次。
+            # 告警归属在本方法末尾（_attach_alarms_to_agg）才统一写入，遍历
+            # 期间共享告警始终显示未归属，不去重会被每个组各收一次，导致
+            # 汇聚组告警计数按重复次数虚增。
+            for alarm_id in batch.local_group_alarm_ids[group_id]:
+                if alarm_id in seen_new_alarm_ids:
+                    continue
+                if session["alarm_registry"][alarm_id][1] is not None:
+                    continue
+                seen_new_alarm_ids.add(alarm_id)
+                new_alarm_ids.append(alarm_id)
         session["agg_registry"][agg_id][0] += new_group_count
         _attach_alarms_to_agg(session, agg_id, new_alarm_ids)
         if new_group_count or new_alarm_ids:
@@ -1657,13 +1758,41 @@ def _batch_member_order_key(batch):
     return member_order_key
 
 
-def _split_members_by_cap(members, max_member_count):
-    """把分量成员按原始组个数上限切分，返回成员列表的列表。
+def _group_by_rigid_cluster(members, rigid_union):
+    """按共享告警刚性簇给成员分组：同簇的原始组必须进同一汇聚组。
 
-    成员需已按时间排序；上限按组个数计，单个原始组恒为 1，不会被拆开。
+    rigid_union 只并合“共享同一条告警”的原始组（不含症状匹配边），因此
+    返回的每个簇是必须整体同组的最小不可分单元。按成员首次出现顺序聚簇，
+    簇内保持传入顺序（调用方需要时另行排序）。
+    """
+    clusters_by_root = {}
+    for group_id in members:
+        clusters_by_root.setdefault(
+            rigid_union.find(group_id), []
+        ).append(group_id)
+    return list(clusters_by_root.values())
+
+
+def _pack_clusters_by_cap(clusters, max_member_count):
+    """把刚性簇按原始组个数上限做 next-fit 装箱，返回成员列表的列表。
+
+    clusters 需已按时间排序，每个簇不可分。上限对能装下的簇严格生效
+    （多个小簇可拼进同一个包）；单个簇的组数超过上限时独占一个超限包、
+    不被拆开——这是“共享告警必同组”对 max_group_member 的唯一破例。
+    next-fit（按时间顺序、不回头填空）保证同包内的组发生时间连续，且
+    历史前缀不因后来的簇而重排。
     """
     cap = max(1, max_member_count)
-    return [members[i:i + cap] for i in range(0, len(members), cap)]
+    packs = []
+    current = []
+    for cluster in clusters:
+        if current and len(current) + len(cluster) > cap:
+            packs.append(current)
+            current = []
+        current.extend(cluster)
+    if current:
+        packs.append(current)
+    return packs
 
 
 def _collect_symptom_alarm_ids(match):

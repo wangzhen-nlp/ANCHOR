@@ -857,10 +857,18 @@ def report_linking(debug, alarm_groups):
     if debug.links is None:
         return
     print("=" * 72)
-    local_union, linked_agg_ids_by_group, current_group_edges = debug.links
+    (
+        local_union,
+        linked_agg_ids_by_group,
+        current_group_edges,
+        shared_alarm_edges,
+    ) = debug.links
     print(f"[10] 组间关联: 匹配产生的组间超边 {len(current_group_edges)} 条")
     for edge in current_group_edges[:10]:
         print(f"  - 边: {edge}")
+    print(f"  其中共享告警刚性边 {len(shared_alarm_edges)} 条（同簇必进同一汇聚组）")
+    for edge in shared_alarm_edges[:10]:
+        print(f"  - 刚性边: {edge}")
     linked_any = {g: aggs for g, aggs in linked_agg_ids_by_group.items() if aggs}
     if linked_any:
         print(f"  关联到历史汇聚组的原始组: { {k: v for k, v in list(linked_any.items())[:10]} }")
