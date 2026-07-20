@@ -240,7 +240,46 @@ def association_cache_fingerprint(
     }
 
 
-def load_association_cache(path, expected_fingerprint=None) -> dict:
+def _fingerprint_allows_related_to_global(actual, expected) -> bool:
+    """Whether two fingerprints differ only by related-cache → global-runtime.
+
+    A related cache completely covers pairs selected by the deterministic
+    related predicate. Global inference may therefore reuse it as a base and
+    compile only observed pairs outside that predicate.
+    """
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    if set(actual) != set(expected):
+        return False
+    if any(
+        actual.get(key) != expected.get(key)
+        for key in actual
+        if key != "plan_config"
+    ):
+        return False
+    actual_plan = actual.get("plan_config") or {}
+    expected_plan = expected.get("plan_config") or {}
+    if not isinstance(actual_plan, dict) or not isinstance(expected_plan, dict):
+        return False
+    if set(actual_plan) != set(expected_plan):
+        return False
+    if any(
+        actual_plan.get(key) != expected_plan.get(key)
+        for key in actual_plan
+        if key != "candidate_scope"
+    ):
+        return False
+    return (
+        actual_plan.get("candidate_scope") == "related"
+        and expected_plan.get("candidate_scope") == "global"
+    )
+
+
+def load_association_cache(
+    path,
+    expected_fingerprint=None,
+    allow_related_to_global=False,
+) -> dict:
     try:
         with np.load(path, allow_pickle=False) as archive:
             header = json.loads(str(archive["metadata_json"].item()))
@@ -266,7 +305,13 @@ def load_association_cache(path, expected_fingerprint=None) -> dict:
         )
     if expected_fingerprint is not None:
         actual = header.get("fingerprint") or {}
-        if actual != expected_fingerprint:
+        compatible_scope_upgrade = (
+            allow_related_to_global
+            and _fingerprint_allows_related_to_global(
+                actual, expected_fingerprint
+            )
+        )
+        if actual != expected_fingerprint and not compatible_scope_upgrade:
             changed = sorted(
                 key
                 for key in set(actual) | set(expected_fingerprint)
@@ -664,6 +709,10 @@ class CompiledAssociationPlan:
         self.prescreen_dropped_pair_count = 0
         self.preloaded_signature_count = 0
         self.preloaded_edge_count = 0
+        # Scope whose candidate pairs are completely covered by the preloaded
+        # or in-memory compiled universe. A related cache may be reused by a
+        # global runtime as an authoritative base for related pairs only.
+        self.precompiled_candidate_scope = None
 
     def iter_edges_by_target(self, signature):
         if self.precompiled_index is not None:
@@ -688,9 +737,8 @@ class CompiledAssociationPlan:
         self._mu_cache[period_type] = value
         return value
 
-    def _related(self, a: PeriodSignature, b: PeriodSignature) -> bool:
-        if self.config.candidate_scope == "global":
-            return True
+    def _is_related_pair(self, a: PeriodSignature, b: PeriodSignature) -> bool:
+        """Deterministic related-scope predicate, independent of runtime scope."""
         ae = a.period_type.entity
         be = b.period_type.entity
         if ae == be:
@@ -712,29 +760,69 @@ class CompiledAssociationPlan:
         hops = (getattr(topo, "undirected_hops", {}) or {}) if topo is not None else {}
         return bool(hops.get(an, {}).get(bn, 0) or hops.get(bn, {}).get(an, 0))
 
-    def register_signature(self, signature: PeriodSignature):
+    def _related(self, a: PeriodSignature, b: PeriodSignature) -> bool:
+        return (
+            self.config.candidate_scope == "global"
+            or self._is_related_pair(a, b)
+        )
+
+    def _precompiled_pair_covered(self, a, b) -> bool:
+        """Whether the loaded/compiled base has an authoritative result for a pair."""
         if (
-            signature.period_type in self.covered_period_types
-            or signature in self.signatures
+            self.precompiled_candidate_scope is None
+            or a.period_type not in self.covered_period_types
+            or b.period_type not in self.covered_period_types
         ):
+            return False
+        if self.precompiled_candidate_scope == "global":
+            return True
+        return self._is_related_pair(a, b)
+
+    def register_signature(self, signature: PeriodSignature):
+        if signature in self.signatures:
+            return
+        covered_type = signature.period_type in self.covered_period_types
+        partial_related_base = (
+            covered_type
+            and self.precompiled_candidate_scope == "related"
+            and self.config.candidate_scope == "global"
+        )
+        if covered_type and not partial_related_base:
             return
         existing = list(self.signatures)
         self.signatures.add(signature)
         for other in existing:
             if not self._related(signature, other):
                 continue
+            # An uncovered signature is compiled against every candidate state
+            # in the base universe below; avoid scoring an already-observed
+            # covered state twice on this path.
+            if (
+                not covered_type
+                and self._covered_candidate_index is not None
+                and other.period_type in self.covered_period_types
+            ):
+                continue
+            if self._precompiled_pair_covered(signature, other):
+                continue
             self._compile(signature, other)
             if signature != other:
                 self._compile(other, signature)
-        if self._covered_candidate_index is not None:
+        # A known signature from a related base only needs delta edges against
+        # other observed signatures. Unseen types retain the legacy eager
+        # behavior against the full precompiled universe.
+        if not covered_type and self._covered_candidate_index is not None:
             for other_type in self._candidate_sources(
                 signature.period_type, self._covered_candidate_index
             ):
                 for state in range(8):
                     other = PeriodSignature(other_type, state)
+                    if self._precompiled_pair_covered(signature, other):
+                        continue
                     self._compile(signature, other)
                     self._compile(other, signature)
-        self._compile(signature, signature)
+        if not self._precompiled_pair_covered(signature, signature):
+            self._compile(signature, signature)
 
     def _compile(self, target: PeriodSignature, source: PeriodSignature):
         if source in self.edges_by_target.get(target, {}):
@@ -1152,6 +1240,7 @@ class CompiledAssociationPlan:
         if edge_sink is None:
             self.covered_period_types.update(period_types)
             self._covered_candidate_index = prepared
+            self.precompiled_candidate_scope = self.config.candidate_scope
 
         type_pair_count = 0
         for target_type in prepared["period_types"]:
@@ -1256,6 +1345,29 @@ class CompiledAssociationPlan:
         declared_signature_count = int(metadata.get("signature_count", -1))
         declared_source_key_count = int(metadata.get("source_key_count", -1))
         declared_state_layout = str(metadata.get("state_layout", ""))
+        cached_plan_config = (payload.get("fingerprint") or {}).get(
+            "plan_config"
+        ) or {}
+        cached_candidate_scope = str(
+            cached_plan_config.get("candidate_scope", self.config.candidate_scope)
+        )
+        if cached_candidate_scope not in {"related", "global"}:
+            raise ValueError(
+                "association-cache has invalid candidate_scope: "
+                f"{cached_candidate_scope!r}"
+            )
+        if (
+            cached_candidate_scope != self.config.candidate_scope
+            and not (
+                cached_candidate_scope == "related"
+                and self.config.candidate_scope == "global"
+            )
+        ):
+            raise ValueError(
+                "association-cache candidate_scope is incompatible with runtime: "
+                f"cache={cached_candidate_scope}, "
+                f"runtime={self.config.candidate_scope}"
+            )
         expected_source_key_count = (
             len(covered)
             if self.cache_state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
@@ -1284,6 +1396,7 @@ class CompiledAssociationPlan:
             payload["arrays"],
             state_layout=declared_state_layout,
         )
+        self.precompiled_candidate_scope = cached_candidate_scope
         self.preloaded_signature_count += len(covered) * 8
         self.preloaded_edge_count += int(metadata["edge_count"])
 
@@ -2545,7 +2658,9 @@ def main():
                 artifact.config.topology_node_field,
             )
             association_cache = load_association_cache(
-                args.association_cache, expected_fingerprint=fingerprint
+                args.association_cache,
+                expected_fingerprint=fingerprint,
+                allow_related_to_global=(config.candidate_scope == "global"),
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             parser.error(f"cannot load --association-cache: {exc}")
