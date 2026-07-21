@@ -57,6 +57,13 @@ from alarm_flow_isahp.sequences import (
     event_type_label,
 )
 from alarm_flow_mhp.aggregator import load_alarm_mhp_artifact
+from alarm_flow_mhp.candidate_policy import (
+    adaptive_candidate_sources,
+    candidate_policy_fingerprint,
+    load_candidate_policy,
+    prepare_adaptive_candidates,
+    unrelated_pair_allowed,
+)
 from alarm_flow_mhp.dynamic_state import DeviceStateTracker
 from alarm_flow_mhp.feature_spec import (
     DecomposedFeatureScorer,
@@ -188,8 +195,10 @@ class PeriodStreamConfig:
             raise ValueError("merge_strength_ratio must be > 0")
         if self.merge_min_evidence < 1:
             raise ValueError("merge_min_evidence must be >= 1")
-        if self.candidate_scope not in {"related", "global"}:
-            raise ValueError("candidate_scope must be 'related' or 'global'")
+        if self.candidate_scope not in {"related", "global", "unrelated"}:
+            raise ValueError(
+                "candidate_scope must be 'related', 'global', or 'unrelated'"
+            )
 
 
 def _association_plan_config(config: PeriodStreamConfig) -> dict:
@@ -227,58 +236,60 @@ def association_cache_fingerprint(
     site_graph_path,
     config,
     topology_node_field="alarm_source",
+    candidate_policy_path="",
 ) -> dict:
     """Fingerprint every input that can change the sparse association plan."""
     node_field = str(topology_node_field or "alarm_source")
     topology_graph_path = site_graph_path if node_field == "site_id" else ne_graph_path
-    return {
+    fingerprint = {
         "model_sha256": _sha256_file(model_path),
         "ne_graph_sha256": _sha256_file(ne_graph_path),
         "topology_graph_sha256": _sha256_file(topology_graph_path),
         "topology_node_field": node_field,
         "plan_config": _association_plan_config(config),
     }
+    if candidate_policy_path:
+        fingerprint["candidate_policy_sha256"] = _sha256_file(
+            candidate_policy_path
+        )
+    return fingerprint
 
 
-def _fingerprint_allows_related_to_global(actual, expected) -> bool:
-    """Whether two fingerprints differ only by related-cache → global-runtime.
+_FINGERPRINT_SCOPE_AGNOSTIC_KEYS = frozenset({"candidate_policy_sha256"})
 
-    A related cache completely covers pairs selected by the deterministic
-    related predicate. Global inference may therefore reuse it as a base and
-    compile only observed pairs outside that predicate.
+
+def _fingerprint_compatible_ignoring_scope(actual, expected) -> bool:
+    """Whether two fingerprints agree once candidate scope/policy is ignored.
+
+    Separately compiled caches (e.g. a ``related`` cache and an ``unrelated``
+    cache built from the same model and graphs) differ only in
+    ``plan_config.candidate_scope`` and the optional policy digest. They stay
+    co-loadable as long as everything else — model, graphs, node field and the
+    remaining plan config — is identical.
     """
     if not isinstance(actual, dict) or not isinstance(expected, dict):
         return False
-    if set(actual) != set(expected):
-        return False
+    keys = (set(actual) | set(expected)) - _FINGERPRINT_SCOPE_AGNOSTIC_KEYS
     if any(
-        actual.get(key) != expected.get(key)
-        for key in actual
-        if key != "plan_config"
+        key != "plan_config" and actual.get(key) != expected.get(key)
+        for key in keys
     ):
         return False
     actual_plan = actual.get("plan_config") or {}
     expected_plan = expected.get("plan_config") or {}
     if not isinstance(actual_plan, dict) or not isinstance(expected_plan, dict):
         return False
-    if set(actual_plan) != set(expected_plan):
-        return False
-    if any(
-        actual_plan.get(key) != expected_plan.get(key)
-        for key in actual_plan
-        if key != "candidate_scope"
-    ):
-        return False
-    return (
-        actual_plan.get("candidate_scope") == "related"
-        and expected_plan.get("candidate_scope") == "global"
+    plan_keys = set(actual_plan) | set(expected_plan)
+    return not any(
+        key != "candidate_scope" and actual_plan.get(key) != expected_plan.get(key)
+        for key in plan_keys
     )
 
 
 def load_association_cache(
     path,
     expected_fingerprint=None,
-    allow_related_to_global=False,
+    allow_scope_mismatch=False,
 ) -> dict:
     try:
         with np.load(path, allow_pickle=False) as archive:
@@ -306,8 +317,8 @@ def load_association_cache(
     if expected_fingerprint is not None:
         actual = header.get("fingerprint") or {}
         compatible_scope_upgrade = (
-            allow_related_to_global
-            and _fingerprint_allows_related_to_global(
+            allow_scope_mismatch
+            and _fingerprint_compatible_ignoring_scope(
                 actual, expected_fingerprint
             )
         )
@@ -405,10 +416,12 @@ class PeriodSignature:
     initial_state: int
 
 
-def graph_period_types(artifact, scorer):
-    """Full inductive universe: graph entities × model alarm-type vocabulary."""
+def graph_period_universe(artifact, scorer):
+    """Graph entities and model alarm types underlying the inductive universe."""
     rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
-    alarm_types = sorted({str(value) for value in (rt.get("at_vocab") or []) if str(value)})
+    alarm_types = tuple(
+        sorted({str(value) for value in (rt.get("at_vocab") or []) if str(value)})
+    )
     if not alarm_types:
         raise ValueError("feature artifact has an empty training.feature_runtime.at_vocab")
 
@@ -427,6 +440,12 @@ def graph_period_types(artifact, scorer):
             domains = [domain] if domain else []
         entities.extend(make_entity(node, domain) for domain in domains)
 
+    return tuple(entities), alarm_types
+
+
+def graph_period_types(artifact, scorer):
+    """Full inductive universe: graph entities × model alarm-type vocabulary."""
+    entities, alarm_types = graph_period_universe(artifact, scorer)
     period_types = [
         PeriodType(entity, alarm_type)
         for entity in entities
@@ -672,15 +691,27 @@ class CompiledAssociationPlan:
     The first period of a new signature compiles its edges against already
     observed signatures.  Later periods reuse the same edge and horizon tables.
     ``related`` scope materializes only same-entity, same-site, or topology-hop
-    pairs; ``global`` evaluates every observed signature pair.
+    pairs; ``unrelated`` uses a validated indexable candidate policy restricted
+    to pairs the related predicate does *not* cover; ``global`` evaluates every
+    observed signature pair.
     """
 
-    def __init__(self, scorer, mu_scorer, artifact, config: PeriodStreamConfig):
+    def __init__(
+        self,
+        scorer,
+        mu_scorer,
+        artifact,
+        config: PeriodStreamConfig,
+        candidate_policy=None,
+    ):
         self.scorer = scorer
         self.decomposed = DecomposedFeatureScorer(scorer)
         self.mu_scorer = mu_scorer
         self.artifact = artifact
         self.config = config
+        self.candidate_policy = candidate_policy
+        if config.candidate_scope == "unrelated" and candidate_policy is None:
+            raise ValueError("unrelated candidate scope requires a candidate policy")
         self.dynamic_mode = str(getattr(artifact.config, "dynamic_alpha", "off"))
         self.cache_state_layout = association_cache_state_layout(self.dynamic_mode)
         rt = (artifact.training_metadata or {}).get("feature_runtime") or {}
@@ -698,7 +729,9 @@ class CompiledAssociationPlan:
         self.signatures: set[PeriodSignature] = set()
         self.covered_period_types: set[PeriodType] = set()
         self._covered_candidate_index = None
-        self.precompiled_index: Optional[CompactAssociationIndex] = None
+        # One index per loaded association cache; runtime unions them (e.g. a
+        # ``related`` cache plus a disjoint ``unrelated`` cache).
+        self.precompiled_indexes: list[CompactAssociationIndex] = []
         self.edges_by_target: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
         self.edges_by_source: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
         self._mu_cache: dict[PeriodType, float] = {}
@@ -714,14 +747,19 @@ class CompiledAssociationPlan:
         # global runtime as an authoritative base for related pairs only.
         self.precompiled_candidate_scope = None
 
+    @property
+    def precompiled_index(self):
+        """First loaded index, or ``None`` — back-compat for single-cache uses."""
+        return self.precompiled_indexes[0] if self.precompiled_indexes else None
+
     def iter_edges_by_target(self, signature):
-        if self.precompiled_index is not None:
-            yield from self.precompiled_index.iter_target(signature)
+        for index in self.precompiled_indexes:
+            yield from index.iter_target(signature)
         yield from self.edges_by_target.get(signature, {}).items()
 
     def iter_edges_by_source(self, signature):
-        if self.precompiled_index is not None:
-            yield from self.precompiled_index.iter_source(signature)
+        for index in self.precompiled_indexes:
+            yield from index.iter_source(signature)
         yield from self.edges_by_source.get(signature, {}).items()
 
     def _mu(self, period_type: PeriodType) -> float:
@@ -761,10 +799,16 @@ class CompiledAssociationPlan:
         return bool(hops.get(an, {}).get(bn, 0) or hops.get(bn, {}).get(an, 0))
 
     def _related(self, a: PeriodSignature, b: PeriodSignature) -> bool:
-        return (
-            self.config.candidate_scope == "global"
-            or self._is_related_pair(a, b)
-        )
+        if self.config.candidate_scope == "global":
+            return True
+        if self.config.candidate_scope == "unrelated":
+            return unrelated_pair_allowed(
+                self.candidate_policy,
+                a.period_type,
+                b.period_type,
+                self.scorer,
+            )
+        return self._is_related_pair(a, b)
 
     def _precompiled_pair_covered(self, a, b) -> bool:
         """Whether the loaded/compiled base has an authoritative result for a pair."""
@@ -776,6 +820,13 @@ class CompiledAssociationPlan:
             return False
         if self.precompiled_candidate_scope == "global":
             return True
+        if self.precompiled_candidate_scope == "unrelated":
+            return unrelated_pair_allowed(
+                self.candidate_policy,
+                a.period_type,
+                b.period_type,
+                self.scorer,
+            )
         return self._is_related_pair(a, b)
 
     def register_signature(self, signature: PeriodSignature):
@@ -897,6 +948,14 @@ class CompiledAssociationPlan:
         can contain millions of directed pairs.
         """
         period_types = tuple(sorted(period_types, key=lambda x: (x.entity, x.alarm_type)))
+        if self.config.candidate_scope == "unrelated":
+            return prepare_adaptive_candidates(
+                period_types,
+                self.scorer,
+                self.candidate_policy,
+                count_pairs=count_pairs,
+                exclude_related=True,
+            )
         if self.config.candidate_scope == "global":
             return {
                 "period_types": period_types,
@@ -947,6 +1006,13 @@ class CompiledAssociationPlan:
 
     def _candidate_sources(self, target, prepared):
         period_types = prepared["period_types"]
+        if prepared.get("adaptive"):
+            return adaptive_candidate_sources(
+                target,
+                prepared["policy"],
+                prepared,
+                exclude_related=prepared.get("exclude_related", False),
+            )
         if prepared["global"]:
             return period_types
         by_entity = prepared["by_entity"]
@@ -1003,6 +1069,49 @@ class CompiledAssociationPlan:
         distinct_at_ids = np.unique(src_at_ids)
         return src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids
 
+    def _prescreen_source_state(self, entity, source_types, shared, static_table):
+        """Vectorized prescreen tables for one target entity's candidate set.
+
+        Returns ``None`` for an empty candidate set. ``shared``/``static_table``
+        let the ``global`` scope reuse its one fixed source universe; ``related``
+        and ``adaptive`` rebuild the tables per candidate set (``adaptive``'s set
+        depends on the target alarm type, so it is rebuilt per target row).
+        """
+        if not source_types:
+            return None
+        d = self.decomposed
+        src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids = (
+            shared if shared is not None else self._candidate_arrays(source_types)
+        )
+        parts = (
+            d.entity_parts_from_table(entity, static_table)
+            if static_table is not None
+            else d.entity_parts_for_target(entity, unique_entities)
+        )
+        # z_entity: the exact logit with the at-pair block muted (id -1 hits the
+        # zero-padded W_at row and disables same_at).
+        z_entity = d.logits_from_parts(
+            -1,
+            np.full(len(unique_entities), -1, dtype=np.int64),
+            src_mark_idx=np.zeros(len(unique_entities), dtype=np.int64),
+            tgt_term=0.0,
+            **parts,
+        )
+        # delta_same: contribution of same_alarm_type and its cross columns on
+        # any v == u row.
+        z_same = z_entity + d.same_at_delta_from_parts(parts)
+        oov_source_indices = np.flatnonzero(src_at_ids == -1)
+        return (
+            src_at_ids,
+            ent_inverse,
+            grid_index,
+            distinct_at_ids,
+            parts,
+            z_entity,
+            z_same,
+            oov_source_indices,
+        )
+
     def _precompile_target_only_batches(self, prepared, progress, edge_batch_sink):
         """Vectorized offline compiler for target-dynamic cache rows.
 
@@ -1043,39 +1152,48 @@ class CompiledAssociationPlan:
         static_table = (
             d.entity_static_table(shared[2]) if shared is not None else None
         )
+        # ``adaptive`` candidate sets depend on the target alarm type, so the
+        # prescreen tables cannot be shared across a target entity's rows the
+        # way ``related``/``global`` sets can; rebuild them per target instead.
+        per_target_sources = bool(prepared.get("adaptive"))
         for entity, group in groupby(
             prepared["period_types"], key=lambda value: value.entity
         ):
             targets = tuple(group)
-            source_types = self._candidate_sources(targets[0], prepared)
-            source_count = len(source_types)
-            if source_count:
-                src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids = (
-                    shared if shared is not None else self._candidate_arrays(source_types)
+            if not per_target_sources:
+                group_source_types = self._candidate_sources(targets[0], prepared)
+                group_state = self._prescreen_source_state(
+                    entity, group_source_types, shared, static_table
                 )
-                parts = (
-                    d.entity_parts_from_table(entity, static_table)
-                    if static_table is not None
-                    else d.entity_parts_for_target(entity, unique_entities)
-                )
-                zero_marks = np.zeros(len(unique_entities), dtype=np.int64)
-                # z_entity: the exact logit with the at-pair block muted
-                # (id -1 hits the zero-padded W_at row and disables same_at).
-                z_entity = d.logits_from_parts(
-                    -1,
-                    np.full(len(unique_entities), -1, dtype=np.int64),
-                    src_mark_idx=zero_marks,
-                    tgt_term=0.0,
-                    **parts,
-                )
-                # delta_same: contribution of same_alarm_type and its cross
-                # columns on any v == u row.
-                delta_same = d.same_at_delta_from_parts(parts)
-                z_same = z_entity + delta_same
-                oov_source_indices = np.flatnonzero(src_at_ids == -1)
+            else:
+                # Adaptive rebuilds per target alarm type, but target types
+                # whose policy rules resolve to the same candidate set still
+                # reuse the prescreen tables — keyed by that resolved set.
+                state_by_sources = {}
             for target_type in targets:
+                if per_target_sources:
+                    source_types = self._candidate_sources(target_type, prepared)
+                    if source_types not in state_by_sources:
+                        state_by_sources[source_types] = self._prescreen_source_state(
+                            entity, source_types, shared, static_table
+                        )
+                    state = state_by_sources[source_types]
+                else:
+                    source_types = group_source_types
+                    state = group_state
+                source_count = len(source_types)
                 kept_count = 0
                 if source_count:
+                    (
+                        src_at_ids,
+                        ent_inverse,
+                        grid_index,
+                        distinct_at_ids,
+                        parts,
+                        z_entity,
+                        z_same,
+                        oov_source_indices,
+                    ) = state
                     threshold = self._mu(target_type)
                     denom = self.beta * rel_max
                     alpha_required = (
@@ -1351,22 +1469,14 @@ class CompiledAssociationPlan:
         cached_candidate_scope = str(
             cached_plan_config.get("candidate_scope", self.config.candidate_scope)
         )
-        if cached_candidate_scope not in {"related", "global"}:
+        # Each cache is authoritative for whatever pairs it was compiled with;
+        # heterogeneous scopes (e.g. a related cache plus a disjoint unrelated
+        # cache) are co-loaded and unioned at lookup, so scope is validated as a
+        # known value rather than pinned to a single runtime scope.
+        if cached_candidate_scope not in {"related", "global", "unrelated"}:
             raise ValueError(
                 "association-cache has invalid candidate_scope: "
                 f"{cached_candidate_scope!r}"
-            )
-        if (
-            cached_candidate_scope != self.config.candidate_scope
-            and not (
-                cached_candidate_scope == "related"
-                and self.config.candidate_scope == "global"
-            )
-        ):
-            raise ValueError(
-                "association-cache candidate_scope is incompatible with runtime: "
-                f"cache={cached_candidate_scope}, "
-                f"runtime={self.config.candidate_scope}"
             )
         expected_source_key_count = (
             len(covered)
@@ -1388,16 +1498,24 @@ class CompiledAssociationPlan:
                 f"expected_state_layout={self.cache_state_layout!r}"
             )
         self.covered_period_types.update(covered)
-        self._covered_candidate_index = self.prepare_candidate_period_types(
-            covered, count_pairs=False
+        if self._covered_candidate_index is None:
+            self._covered_candidate_index = self.prepare_candidate_period_types(
+                covered, count_pairs=False
+            )
+        self.precompiled_indexes.append(
+            CompactAssociationIndex(
+                period_types,
+                payload["arrays"],
+                state_layout=declared_state_layout,
+            )
         )
-        self.precompiled_index = CompactAssociationIndex(
-            period_types,
-            payload["arrays"],
-            state_layout=declared_state_layout,
+        # A single loaded cache can serve as an incremental base; once several
+        # heterogeneous caches are unioned there is no single base scope, and
+        # full coverage makes register_signature a no-op anyway.
+        self.precompiled_candidate_scope = (
+            cached_candidate_scope if len(self.precompiled_indexes) == 1 else None
         )
-        self.precompiled_candidate_scope = cached_candidate_scope
-        self.preloaded_signature_count += len(covered) * 8
+        self.preloaded_signature_count = len(covered) * 8
         self.preloaded_edge_count += int(metadata["edge_count"])
 
 
@@ -1411,6 +1529,7 @@ class AlarmPeriodMHPAssigner:
         feature_scorer,
         mu_scorer=None,
         association_cache=None,
+        candidate_policy=None,
         closed_group_sink=None,
     ):
         config.validate()
@@ -1422,9 +1541,21 @@ class AlarmPeriodMHPAssigner:
         self.config = config
         self.feature_scorer = feature_scorer
         self.mu_scorer = mu_scorer
-        self.plan = CompiledAssociationPlan(feature_scorer, mu_scorer, artifact, config)
+        self.plan = CompiledAssociationPlan(
+            feature_scorer,
+            mu_scorer,
+            artifact,
+            config,
+            candidate_policy=candidate_policy,
+        )
         if association_cache is not None:
-            self.plan.load_cache_payload(association_cache)
+            payloads = (
+                association_cache
+                if isinstance(association_cache, (list, tuple))
+                else [association_cache]
+            )
+            for payload in payloads:
+                self.plan.load_cache_payload(payload)
         self.state_tracker = DeviceStateTracker()
         self.periods: dict[int, AlarmPeriod] = {}
         self.open_period_by_type: dict[PeriodType, int] = {}
@@ -2116,10 +2247,8 @@ class AlarmPeriodMHPAssigner:
             ),
             "preloaded_signature_count": self.plan.preloaded_signature_count,
             "preloaded_edge_count": self.plan.preloaded_edge_count,
-            "preloaded_array_bytes": (
-                self.plan.precompiled_index.memory_bytes
-                if self.plan.precompiled_index is not None
-                else 0
+            "preloaded_array_bytes": sum(
+                index.memory_bytes for index in self.plan.precompiled_indexes
             ),
             "active_group_count": len(self.groups),
             "closed_group_count": self.closed_group_count,
@@ -2448,11 +2577,22 @@ def _build_parser():
     )
     parser.add_argument(
         "--association-cache",
+        action="append",
+        default=[],
+        metavar="NPZ",
+        help=(
+            "Compact binary association cache (.npz). Repeatable: pass once per "
+            "cache (e.g. a related cache and a disjoint unrelated cache) and the "
+            "runtime unions their edges. Unseen online devices are compiled "
+            "incrementally in memory only."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-policy",
         default="",
         help=(
-            "Optional version-4 compact binary association cache (.npz). "
-            "Known signatures are loaded from it; unseen online devices are "
-            "compiled incrementally in memory only."
+            "Approved candidate policy JSON; required for "
+            "--candidate-scope unrelated."
         ),
     )
     parser.add_argument("--ne-graph", default=NE_GRAPH_JSON, help=resource_display("ne_graph.json"))
@@ -2503,7 +2643,11 @@ def _build_parser():
     parser.add_argument("--max-core-periods", type=int, default=4)
     parser.add_argument("--merge-strength-ratio", type=float, default=2.0)
     parser.add_argument("--merge-min-evidence", type=int, default=2)
-    parser.add_argument("--candidate-scope", choices=("related", "global"), default="related")
+    parser.add_argument(
+        "--candidate-scope",
+        choices=("related", "global", "unrelated"),
+        default="related",
+    )
     parser.add_argument(
         "--topology-relation-prior",
         default="",
@@ -2647,8 +2791,32 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
-    association_cache = None
+    if config.candidate_scope == "unrelated" and not args.candidate_policy:
+        parser.error("--candidate-policy is required for --candidate-scope unrelated")
+    if args.candidate_policy and config.candidate_scope != "unrelated":
+        parser.error("--candidate-policy requires --candidate-scope unrelated")
+    candidate_policy = None
+    if args.candidate_policy:
+        try:
+            policy_fingerprint = candidate_policy_fingerprint(
+                args.model,
+                args.ne_graph,
+                args.site_graph,
+                _association_plan_config(config),
+                artifact.config.topology_node_field,
+            )
+            candidate_policy = load_candidate_policy(
+                args.candidate_policy,
+                expected_fingerprint=policy_fingerprint,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot load --candidate-policy: {exc}")
+
+    association_caches = []
     if args.association_cache:
+        # One expected fingerprint pins model/graphs/plan-config; per-cache scope
+        # and policy digest are ignored so a related cache and a disjoint
+        # unrelated cache (built from the same model/graphs) both validate.
         try:
             fingerprint = association_cache_fingerprint(
                 args.model,
@@ -2657,41 +2825,50 @@ def main():
                 config,
                 artifact.config.topology_node_field,
             )
-            association_cache = load_association_cache(
-                args.association_cache,
-                expected_fingerprint=fingerprint,
-                allow_related_to_global=(config.candidate_scope == "global"),
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            parser.error(f"cannot load --association-cache: {exc}")
-        if not args.quiet:
-            cache_md = association_cache.get("metadata") or {}
-            array_mib = sum(
-                array.nbytes for array in association_cache.get("arrays", {}).values()
-            ) / (1024 * 1024)
-            print(
-                f"[period] association cache loaded: "
-                f"signatures={cache_md.get('signature_count', 0)}, "
-                f"edges={cache_md.get('edge_count', 0)}, arrays={array_mib:.1f}MiB",
-                flush=True,
-            )
+        except OSError as exc:
+            parser.error(f"cannot fingerprint association cache inputs: {exc}")
+        for cache_path in args.association_cache:
+            try:
+                payload = load_association_cache(
+                    cache_path,
+                    expected_fingerprint=fingerprint,
+                    allow_scope_mismatch=True,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                parser.error(f"cannot load --association-cache {cache_path}: {exc}")
+            association_caches.append(payload)
+            if not args.quiet:
+                cache_md = payload.get("metadata") or {}
+                array_mib = sum(
+                    array.nbytes for array in payload.get("arrays", {}).values()
+                ) / (1024 * 1024)
+                print(
+                    f"[period] association cache loaded ({os.path.basename(cache_path)}): "
+                    f"scope={((payload.get('fingerprint') or {}).get('plan_config') or {}).get('candidate_scope', '?')}, "
+                    f"edges={cache_md.get('edge_count', 0)}, arrays={array_mib:.1f}MiB",
+                    flush=True,
+                )
 
     engine = AlarmPeriodMHPAssigner(
         artifact,
         config,
         feature_scorer=scorer,
         mu_scorer=mu_scorer,
-        association_cache=association_cache,
+        association_cache=association_caches or None,
+        candidate_policy=candidate_policy,
     )
     # The plan owns decoded edge objects now; release the JSON row arrays before
     # processing a potentially large alarm stream.
-    association_cache = None
+    association_caches = None
     run_metadata = {
         "algorithm": "alarm_flow_mhp.alarm_period_stream",
         "model": os.path.abspath(args.model),
         "input": os.path.abspath(args.alarms),
-        "association_cache": (
-            os.path.abspath(args.association_cache) if args.association_cache else ""
+        "association_cache": [
+            os.path.abspath(path) for path in args.association_cache
+        ],
+        "candidate_policy": (
+            os.path.abspath(args.candidate_policy) if args.candidate_policy else ""
         ),
         "groups_output": os.path.abspath(args.groups_output),
         "edges_output": os.path.abspath(args.edges_output) if args.edges_output else "",

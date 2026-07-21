@@ -29,12 +29,17 @@ if __package__ in (None, ""):
     ensure_repo_root(1)
 
 from alarm_flow_mhp.aggregator import load_alarm_mhp_artifact
+from alarm_flow_mhp.candidate_policy import (
+    candidate_policy_fingerprint,
+    load_candidate_policy,
+)
 from alarm_flow_mhp.stream_alarm_period_mhp import (
     ASSOCIATION_CACHE_FORMAT,
     ASSOCIATION_CACHE_VERSION,
     CACHE_STATE_LAYOUT_TARGET_ONLY,
     CompiledAssociationPlan,
     PeriodStreamConfig,
+    _association_plan_config,
     _build_runtime_scorers,
     association_cache_fingerprint,
     association_cache_state_layout,
@@ -236,7 +241,19 @@ def _build_parser():
     parser.add_argument("--immigrant-bias", type=float, default=1.0)
     parser.add_argument("--feature-alpha-floor", type=float, default=None)
     parser.add_argument("--attach-threshold-ratio", type=float, default=1.0)
-    parser.add_argument("--candidate-scope", choices=("related", "global"), default="related")
+    parser.add_argument(
+        "--candidate-scope",
+        choices=("related", "global", "unrelated"),
+        default="related",
+    )
+    parser.add_argument(
+        "--candidate-policy",
+        default="",
+        help=(
+            "Approved candidate policy JSON; required for "
+            "--candidate-scope unrelated."
+        ),
+    )
     parser.add_argument(
         "--topology-relation-prior",
         default="",
@@ -307,6 +324,27 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    if config.candidate_scope == "unrelated" and not args.candidate_policy:
+        parser.error("--candidate-policy is required for --candidate-scope unrelated")
+    if args.candidate_policy and config.candidate_scope != "unrelated":
+        parser.error("--candidate-policy requires --candidate-scope unrelated")
+    candidate_policy = None
+    if args.candidate_policy:
+        try:
+            expected_policy_fingerprint = candidate_policy_fingerprint(
+                args.model,
+                args.ne_graph,
+                args.site_graph,
+                _association_plan_config(config),
+                artifact.config.topology_node_field,
+            )
+            candidate_policy = load_candidate_policy(
+                args.candidate_policy,
+                expected_fingerprint=expected_policy_fingerprint,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot load --candidate-policy: {exc}")
+
     period_types, graph_entity_count, alarm_type_count = graph_period_types(
         artifact, scorer
     )
@@ -321,7 +359,13 @@ def main():
             flush=True,
         )
 
-    plan = CompiledAssociationPlan(scorer, mu_scorer, artifact, config)
+    plan = CompiledAssociationPlan(
+        scorer,
+        mu_scorer,
+        artifact,
+        config,
+        candidate_policy=candidate_policy,
+    )
     state_layout = association_cache_state_layout(
         getattr(artifact.config, "dynamic_alpha", "off")
     )
@@ -413,6 +457,7 @@ def main():
                 args.site_graph,
                 config,
                 artifact.config.topology_node_field,
+                candidate_policy_path=args.candidate_policy,
             )
             payload = {
                 "format": ASSOCIATION_CACHE_FORMAT,
@@ -430,6 +475,11 @@ def main():
                     "graph_entity_count": graph_entity_count,
                     "model_alarm_type_count": alarm_type_count,
                     "directed_period_type_pair_count": type_pair_count,
+                    "candidate_policy_validation": (
+                        dict(candidate_policy.validation or {})
+                        if candidate_policy is not None
+                        else {}
+                    ),
                 },
             }
             write_association_cache(args.output, payload)
