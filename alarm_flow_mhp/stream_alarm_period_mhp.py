@@ -570,6 +570,99 @@ class PeriodSignature:
     initial_state: int
 
 
+class RelatedPeriodKeyIndex:
+    """Incremental exact index for the runtime ``related`` predicate.
+
+    Keys may be PeriodType or PeriodSignature. The index mirrors
+    ``_is_related_period_type_pair`` using entity/node/site/topology buckets, so
+    callers can enumerate only related live/runtime keys instead of scanning
+    the complete historical set.
+    """
+
+    def __init__(self, scorer, neighbor_nodes=None):
+        self.scorer = scorer
+        self.keys = set()
+        self.by_entity = defaultdict(set)
+        self.by_node = defaultdict(set)
+        self.by_site = defaultdict(set)
+        if neighbor_nodes is None:
+            topo = scorer.topology_index
+            hops = (
+                (getattr(topo, "undirected_hops", {}) or {})
+                if topo is not None
+                else {}
+            )
+            neighbors = defaultdict(set)
+            for left, row in hops.items():
+                for right, distance in (row or {}).items():
+                    if distance:
+                        neighbors[left].add(right)
+                        neighbors[right].add(left)
+            self.neighbor_nodes = neighbors
+        else:
+            self.neighbor_nodes = neighbor_nodes
+
+    @staticmethod
+    def _period_type(key):
+        return key.period_type if isinstance(key, PeriodSignature) else key
+
+    def _parts(self, key):
+        period_type = self._period_type(key)
+        node = topo_node_of(period_type.entity)
+        site = ""
+        if node:
+            info = self.scorer.node_infos.get(node)
+            site = str(getattr(info, "site_id", "") or "")
+        return period_type, node, site
+
+    def add(self, key):
+        if key in self.keys:
+            return False
+        self.keys.add(key)
+        period_type, node, site = self._parts(key)
+        self.by_entity[period_type.entity].add(key)
+        if node:
+            self.by_node[node].add(key)
+        if site:
+            self.by_site[site].add(key)
+        return True
+
+    @staticmethod
+    def _discard_from(mapping, bucket_key, value):
+        if not bucket_key:
+            return
+        bucket = mapping.get(bucket_key)
+        if bucket is None:
+            return
+        bucket.discard(value)
+        if not bucket:
+            mapping.pop(bucket_key, None)
+
+    def discard(self, key):
+        if key not in self.keys:
+            return False
+        self.keys.discard(key)
+        period_type, node, site = self._parts(key)
+        self._discard_from(self.by_entity, period_type.entity, key)
+        self._discard_from(self.by_node, node, key)
+        self._discard_from(self.by_site, site, key)
+        return True
+
+    def related_keys(self, period_type):
+        candidates = set(self.by_entity.get(period_type.entity, ()))
+        node = topo_node_of(period_type.entity)
+        if not node:
+            return candidates
+        candidates.update(self.by_node.get(node, ()))
+        info = self.scorer.node_infos.get(node)
+        site = str(getattr(info, "site_id", "") or "")
+        if site:
+            candidates.update(self.by_site.get(site, ()))
+        for neighbor in self.neighbor_nodes.get(node, ()):
+            candidates.update(self.by_node.get(neighbor, ()))
+        return candidates
+
+
 def _source_key_order(source_key):
     """Canonical order for deterministic incoming-edge tie breaking."""
     if isinstance(source_key, PeriodSignature):
@@ -736,10 +829,17 @@ class CompiledEdge:
 class CompactAssociationIndex:
     """Read-only bidirectional CSR index over precompiled numeric edges."""
 
-    def __init__(self, period_types, arrays, state_layout=CACHE_STATE_LAYOUT_FULL):
+    def __init__(
+        self,
+        period_types,
+        arrays,
+        state_layout=CACHE_STATE_LAYOUT_FULL,
+        candidate_scope="global",
+    ):
         self.period_types = tuple(period_types)
         self.type_to_id = {value: index for index, value in enumerate(self.period_types)}
         self.state_layout = str(state_layout)
+        self.candidate_scope = str(candidate_scope)
         if self.state_layout not in {
             CACHE_STATE_LAYOUT_FULL,
             CACHE_STATE_LAYOUT_TARGET_ONLY,
@@ -792,6 +892,100 @@ class CompactAssociationIndex:
 
     def edge_at(self, index):
         return self._edge(index)
+
+    def target_edge_count(self, target):
+        signature_id = self._target_signature_id(target)
+        if signature_id is None:
+            return 0
+        return int(
+            self.target_offsets[signature_id + 1]
+            - self.target_offsets[signature_id]
+        )
+
+    def source_edge_count(self, source):
+        source_key_id = self._source_key_id(source)
+        if source_key_id is None:
+            return 0
+        return int(
+            self.source_offsets[source_key_id + 1]
+            - self.source_offsets[source_key_id]
+        )
+
+    def _source_id_for_key(self, source_key):
+        period_type = (
+            source_key.period_type
+            if isinstance(source_key, PeriodSignature)
+            else source_key
+        )
+        type_id = self.type_to_id.get(period_type)
+        if type_id is None:
+            return None
+        if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY:
+            return int(type_id)
+        if not isinstance(source_key, PeriodSignature):
+            return None
+        return int(type_id) * 8 + int(source_key.initial_state)
+
+    def lookup_target_ids(self, target, source_keys):
+        """Return row-ordered active ``(source_key, edge_index)`` matches."""
+        signature_id = self._target_signature_id(target)
+        if signature_id is None:
+            return ()
+        start = int(self.target_offsets[signature_id])
+        end = int(self.target_offsets[signature_id + 1])
+        if start >= end:
+            return ()
+        encoded = []
+        for source_key in source_keys:
+            source_id = self._source_id_for_key(source_key)
+            if source_id is not None:
+                encoded.append((source_id, source_key))
+        if not encoded:
+            return ()
+        encoded.sort(key=lambda item: item[0])
+        candidate_ids = np.fromiter(
+            (item[0] for item in encoded),
+            dtype=self.source_signature_ids.dtype,
+            count=len(encoded),
+        )
+        row = self.source_signature_ids[start:end]
+        positions = np.searchsorted(row, candidate_ids)
+        out = []
+        for position, (source_id, source_key) in zip(positions.tolist(), encoded):
+            if position < len(row) and int(row[position]) == source_id:
+                out.append((source_key, start + int(position)))
+        return tuple(out)
+
+    def lookup_source_ids(self, source, target_signatures):
+        """Return row-ordered active ``(target_signature, edge_index)`` matches."""
+        source_key_id = self._source_key_id(source)
+        if source_key_id is None:
+            return ()
+        start = int(self.source_offsets[source_key_id])
+        end = int(self.source_offsets[source_key_id + 1])
+        if start >= end:
+            return ()
+        encoded = []
+        for target in target_signatures:
+            target_id = self._target_signature_id(target)
+            if target_id is not None:
+                encoded.append((target_id, target))
+        if not encoded:
+            return ()
+        encoded.sort(key=lambda item: item[0])
+        order = self.source_order[start:end]
+        row = self.target_signature_ids[order]
+        candidate_ids = np.fromiter(
+            (item[0] for item in encoded),
+            dtype=self.target_signature_ids.dtype,
+            count=len(encoded),
+        )
+        positions = np.searchsorted(row, candidate_ids)
+        out = []
+        for position, (target_id, target) in zip(positions.tolist(), encoded):
+            if position < len(row) and int(row[position]) == target_id:
+                out.append((target, int(order[position])))
+        return tuple(out)
 
     def iter_target_ids(self, target):
         """Yield ``(source_key, edge_index)`` without building the edge.
@@ -1009,6 +1203,7 @@ class CompiledAssociationPlan:
         self._signatures_by_type: dict[PeriodType, set[PeriodSignature]] = (
             defaultdict(set)
         )
+        self._runtime_signature_index = RelatedPeriodKeyIndex(scorer)
         self.covered_period_types: set[PeriodType] = set()
         self._covered_candidate_index = None
         # One index per loaded association cache; runtime unions them (e.g. a
@@ -1026,6 +1221,8 @@ class CompiledAssociationPlan:
         self.prescreen_dropped_pair_count = 0
         self.preloaded_signature_count = 0
         self.preloaded_edge_count = 0
+        self.runtime_signature_candidate_probe_count = 0
+        self.runtime_signature_full_scan_avoided_count = 0
         # Scope whose candidate pairs are completely covered by the preloaded
         # or in-memory compiled universe. A related cache may be reused by a
         # global runtime as an authoritative base for related pairs only.
@@ -1207,9 +1404,21 @@ class CompiledAssociationPlan:
         )
         if covered_type and not partial_related_base:
             return
-        existing = list(self.signatures)
+        related_runtime = self.config.candidate_scope == "related"
+        historical_signature_count = len(self.signatures)
+        existing = (
+            list(self._runtime_signature_index.related_keys(signature.period_type))
+            if related_runtime
+            else list(self.signatures)
+        )
+        self.runtime_signature_candidate_probe_count += len(existing)
+        if related_runtime:
+            self.runtime_signature_full_scan_avoided_count += (
+                historical_signature_count - len(existing)
+            )
         self.signatures.add(signature)
         self._signatures_by_type[signature.period_type].add(signature)
+        self._runtime_signature_index.add(signature)
 
         # A related cache already authoritatively covers every state pair for
         # related graph types.  When that cache is used as the base of a global
@@ -1231,7 +1440,7 @@ class CompiledAssociationPlan:
             return
 
         for other in existing:
-            if not self._related(signature, other):
+            if not related_runtime and not self._related(signature, other):
                 continue
             # An uncovered signature is compiled against every candidate state
             # in the base universe below; avoid scoring an already-observed
@@ -1368,22 +1577,13 @@ class CompiledAssociationPlan:
                 if site:
                     by_site[site].add(period_type)
 
-        topo = self.scorer.topology_index
-        hops = (getattr(topo, "undirected_hops", {}) or {}) if topo is not None else {}
-        neighbor_nodes = defaultdict(set)
-        for left, row in hops.items():
-            for right, distance in (row or {}).items():
-                if distance:
-                    neighbor_nodes[left].add(right)
-                    neighbor_nodes[right].add(left)
-
         prepared = {
             "period_types": period_types,
             "global": False,
             "by_entity": by_entity,
             "by_node": by_node,
             "by_site": by_site,
-            "neighbor_nodes": neighbor_nodes,
+            "neighbor_nodes": self._runtime_signature_index.neighbor_nodes,
         }
         total_pair_count = None
         if count_pairs:
@@ -1896,6 +2096,7 @@ class CompiledAssociationPlan:
                 period_types,
                 payload["arrays"],
                 state_layout=declared_state_layout,
+                candidate_scope=cached_candidate_scope,
             )
         )
         # A single loaded cache can serve as an incremental base; once several
@@ -1951,6 +2152,13 @@ class AlarmPeriodMHPAssigner:
         self.open_period_by_type: dict[PeriodType, int] = {}
         self.period_ids_by_signature: dict[PeriodSignature, set] = defaultdict(set)
         self.period_ids_by_type: dict[PeriodType, set] = defaultdict(set)
+        neighbor_nodes = self.plan._runtime_signature_index.neighbor_nodes
+        self._active_signature_index = RelatedPeriodKeyIndex(
+            feature_scorer, neighbor_nodes=neighbor_nodes
+        )
+        self._active_period_type_index = RelatedPeriodKeyIndex(
+            feature_scorer, neighbor_nodes=neighbor_nodes
+        )
         self.period_by_occurrence: dict[tuple, int] = {}
         self._idle_heap: list = []
         self._pending_heap: list = []
@@ -1985,13 +2193,16 @@ class AlarmPeriodMHPAssigner:
         self.clear_closed_periods = 0
         self.harvest_count = 0
         self.relation_count = 0
-        # collect_relations enumeration telemetry (drives the lazy-edge / empty
-        # bucket-skip decision): edges iterated, edges whose candidate bucket was
-        # empty, candidate periods actually scored, and evidence hits.
+        # collect_relations telemetry. collect_edge_count remains the logical
+        # cache/dynamic row-edge total for comparison with older runs; active
+        # lookups may skip materializing most of those edges in Python.
         self.collect_edge_count = 0
         self.collect_empty_bucket_count = 0
         self.collect_candidate_count = 0
         self.collect_match_count = 0
+        self.collect_active_index_lookup_count = 0
+        self.collect_active_key_probe_count = 0
+        self.collect_skipped_empty_edge_count = 0
         self.period_attach_count = 0
         self.group_merge_count = 0
         self.evicted_period_count = 0
@@ -2082,9 +2293,15 @@ class AlarmPeriodMHPAssigner:
             self.created_periods += 1
             self.periods[period.period_id] = period
             self.open_period_by_type[period_type] = period.period_id
-            self.period_ids_by_signature[period.signature].add(period.period_id)
-            self.period_ids_by_type[period.period_type].add(period.period_id)
             signature = period.signature
+            signature_ids = self.period_ids_by_signature[signature]
+            if not signature_ids:
+                self._active_signature_index.add(signature)
+            signature_ids.add(period.period_id)
+            type_ids = self.period_ids_by_type[period.period_type]
+            if not type_ids:
+                self._active_period_type_index.add(period.period_type)
+            type_ids.add(period.period_id)
             if signature not in self._seen_period_signatures:
                 self._seen_period_signatures.add(signature)
                 self.plan.register_signature(signature)
@@ -2289,6 +2506,14 @@ class AlarmPeriodMHPAssigner:
         plan = self.plan
         by_type = self.period_ids_by_type
         by_signature = self.period_ids_by_signature
+        related_source_types = self._active_period_type_index.related_keys(
+            period.period_type
+        )
+        related_source_signatures = self._active_signature_index.related_keys(
+            period.period_type
+        )
+        all_source_types = self._active_period_type_index.keys
+        all_source_signatures = self._active_signature_index.keys
 
         # Current period acts as target; only its newly mature times are probed.
         # The candidate bucket is fetched before the edge is built, so a source
@@ -2297,8 +2522,29 @@ class AlarmPeriodMHPAssigner:
         # Buckets are read directly (not copied) because nothing mutates them
         # within a harvest.
         for index_obj in plan.precompiled_indexes:
-            for source_key, edge_index in index_obj.iter_target_ids(sig):
-                self.collect_edge_count += 1
+            related_cache = index_obj.candidate_scope == "related"
+            if index_obj.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY:
+                cache_source_keys = (
+                    related_source_types if related_cache else all_source_types
+                )
+            else:
+                cache_source_keys = (
+                    related_source_signatures
+                    if related_cache
+                    else all_source_signatures
+                )
+            row_edge_count = index_obj.target_edge_count(sig)
+            self.collect_edge_count += row_edge_count
+            if len(cache_source_keys) < row_edge_count:
+                cache_edges = index_obj.lookup_target_ids(sig, cache_source_keys)
+                self.collect_active_index_lookup_count += 1
+                self.collect_active_key_probe_count += len(cache_source_keys)
+                skipped = row_edge_count - len(cache_edges)
+                self.collect_empty_bucket_count += skipped
+                self.collect_skipped_empty_edge_count += skipped
+            else:
+                cache_edges = index_obj.iter_target_ids(sig)
+            for source_key, edge_index in cache_edges:
                 bucket = (
                     by_type.get(source_key)
                     if isinstance(source_key, PeriodType)
@@ -2326,8 +2572,27 @@ class AlarmPeriodMHPAssigner:
         # Current period acts as source; reverse index catches relationships to
         # older target periods without rescanning every historical occurrence.
         for index_obj in plan.precompiled_indexes:
-            for target_sig, edge_index in index_obj.iter_source_ids(sig):
-                self.collect_edge_count += 1
+            active_target_signatures = (
+                related_source_signatures
+                if index_obj.candidate_scope == "related"
+                else all_source_signatures
+            )
+            row_edge_count = index_obj.source_edge_count(sig)
+            self.collect_edge_count += row_edge_count
+            if len(active_target_signatures) < row_edge_count:
+                cache_edges = index_obj.lookup_source_ids(
+                    sig, active_target_signatures
+                )
+                self.collect_active_index_lookup_count += 1
+                self.collect_active_key_probe_count += len(
+                    active_target_signatures
+                )
+                skipped = row_edge_count - len(cache_edges)
+                self.collect_empty_bucket_count += skipped
+                self.collect_skipped_empty_edge_count += skipped
+            else:
+                cache_edges = index_obj.iter_source_ids(sig)
+            for target_sig, edge_index in cache_edges:
                 bucket = by_signature.get(target_sig)
                 if not bucket:
                     self.collect_empty_bucket_count += 1
@@ -2867,11 +3132,13 @@ class AlarmPeriodMHPAssigner:
             ids.discard(pid)
             if not ids:
                 self.period_ids_by_signature.pop(period.signature, None)
+                self._active_signature_index.discard(period.signature)
         type_ids = self.period_ids_by_type.get(period.period_type)
         if type_ids is not None:
             type_ids.discard(pid)
             if not type_ids:
                 self.period_ids_by_type.pop(period.period_type, None)
+                self._active_period_type_index.discard(period.period_type)
         # Once a group's in-bucket members have all aged out it can no longer
         # grow or gain merge evidence (both require a member in the candidate
         # buckets), so finalize it now instead of idling until close_inactive_sec
@@ -3014,6 +3281,9 @@ class AlarmPeriodMHPAssigner:
             "collect_empty_bucket_count": self.collect_empty_bucket_count,
             "collect_candidate_count": self.collect_candidate_count,
             "collect_match_count": self.collect_match_count,
+            "collect_active_index_lookup_count": self.collect_active_index_lookup_count,
+            "collect_active_key_probe_count": self.collect_active_key_probe_count,
+            "collect_skipped_empty_edge_count": self.collect_skipped_empty_edge_count,
             "period_attach_count": self.period_attach_count,
             "group_merge_count": self.group_merge_count,
             "pending_merge_proposal_count": len(self.merge_proposals),
@@ -3031,6 +3301,13 @@ class AlarmPeriodMHPAssigner:
             ),
             "preloaded_signature_count": self.plan.preloaded_signature_count,
             "preloaded_edge_count": self.plan.preloaded_edge_count,
+            "runtime_signature_count": len(self.plan.signatures),
+            "runtime_signature_candidate_probe_count": (
+                self.plan.runtime_signature_candidate_probe_count
+            ),
+            "runtime_signature_full_scan_avoided_count": (
+                self.plan.runtime_signature_full_scan_avoided_count
+            ),
             "preloaded_array_bytes": sum(
                 index.memory_bytes for index in self.plan.precompiled_indexes
             ),
@@ -3851,7 +4128,15 @@ def main():
             f"[period] collect: edges_iter={edges_iter}, "
             f"empty_bucket={empty} ({empty_pct:.1f}%), "
             f"candidates={stats['collect_candidate_count']}, "
-            f"matches={stats['collect_match_count']}",
+            f"matches={stats['collect_match_count']}, "
+            f"active_lookups={stats['collect_active_index_lookup_count']}, "
+            f"skipped_empty_edges={stats['collect_skipped_empty_edge_count']}",
+            flush=True,
+        )
+        print(
+            f"[period] runtime signatures: count={stats['runtime_signature_count']}, "
+            f"candidate_probes={stats['runtime_signature_candidate_probe_count']}, "
+            f"avoided_full_scan={stats['runtime_signature_full_scan_avoided_count']}",
             flush=True,
         )
 

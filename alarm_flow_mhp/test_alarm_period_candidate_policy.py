@@ -36,6 +36,7 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
     PeriodSignature,
     PeriodStreamConfig,
     PeriodType,
+    RelatedPeriodKeyIndex,
     RelationEvidence,
     _enable_period_profiling,
     _iter_profiled_events,
@@ -466,6 +467,8 @@ def _eviction_engine():
     engine.periods = {}
     engine.period_ids_by_signature = {}
     engine.period_ids_by_type = {}
+    engine._active_signature_index = SimpleNamespace(discard=lambda _key: None)
+    engine._active_period_type_index = SimpleNamespace(discard=lambda _key: None)
     engine._group_redirect = {}
     engine.groups = {}
     engine.merge_proposals = {}
@@ -636,6 +639,8 @@ class AlarmPeriodSignatureRegistrationTest(unittest.TestCase):
         engine.open_period_by_type = {}
         engine.period_ids_by_signature = defaultdict(set)
         engine.period_ids_by_type = defaultdict(set)
+        engine._active_signature_index = SimpleNamespace(add=lambda _key: None)
+        engine._active_period_type_index = SimpleNamespace(add=lambda _key: None)
         engine._seen_period_signatures = set()
         registered = []
         engine.plan = SimpleNamespace(register_signature=registered.append)
@@ -660,6 +665,160 @@ class AlarmPeriodSignatureRegistrationTest(unittest.TestCase):
                 PeriodSignature(period_type, 1),
             ],
         )
+
+
+class RelatedPeriodKeyIndexTest(unittest.TestCase):
+    def test_related_keys_match_entity_site_and_topology_predicate(self):
+        plan = _plan()
+        plan.scorer.topology_index = SimpleNamespace(
+            undirected_hops={"B": {"C": 1}}
+        )
+        index = RelatedPeriodKeyIndex(plan.scorer)
+        keys = {
+            node: PeriodSignature(PeriodType(node, "X"), 0)
+            for node in NODES
+        }
+        for key in keys.values():
+            index.add(key)
+
+        expected = {
+            key
+            for key in keys.values()
+            if plan._is_related_period_type_pair(
+                keys["B"].period_type, key.period_type
+            )
+        }
+        self.assertEqual(index.related_keys(keys["B"].period_type), expected)
+
+        index.discard(keys["A"])
+        expected.discard(keys["A"])
+        self.assertEqual(index.related_keys(keys["B"].period_type), expected)
+
+    def test_compact_active_lookup_matches_full_row_filter(self):
+        period_types = [
+            PeriodType("A", "X"),
+            PeriodType("B", "X"),
+            PeriodType("C", "X"),
+        ]
+        arrays = build_compact_csr_arrays(
+            target_signature_ids=np.asarray([0, 0, 0, 9, 9]),
+            source_signature_ids=np.asarray([0, 3, 9, 0, 3]),
+            base_scores=np.ones(5),
+            thresholds=np.ones(5),
+            past_windows=np.ones(5),
+            future_windows=np.zeros(5),
+            signature_count=len(period_types) * 8,
+        )
+        index = CompactAssociationIndex(period_types, arrays)
+        target = PeriodSignature(period_types[0], 0)
+        active_sources = {
+            PeriodSignature(period_types[0], 0),
+            PeriodSignature(period_types[1], 1),
+        }
+        expected_target = tuple(
+            item
+            for item in index.iter_target_ids(target)
+            if item[0] in active_sources
+        )
+        self.assertEqual(
+            index.lookup_target_ids(target, active_sources), expected_target
+        )
+
+        source = PeriodSignature(period_types[0], 0)
+        active_targets = {
+            PeriodSignature(period_types[0], 0),
+            PeriodSignature(period_types[1], 1),
+        }
+        expected_source = tuple(
+            item
+            for item in index.iter_source_ids(source)
+            if item[0] in active_targets
+        )
+        self.assertEqual(
+            index.lookup_source_ids(source, active_targets), expected_source
+        )
+
+    def test_collect_relations_skips_inactive_cache_edges(self):
+        period_types = [
+            PeriodType(node, alarm_type)
+            for node in ("A", "B")
+            for alarm_type in ("X", "Y", "Z")
+        ]
+        # AX has six incoming cache edges. AX is also the source of six reverse
+        # edges, but only AX/BX currently have live candidate buckets.
+        target_ids = [0] * 6 + [8, 16, 24, 32, 40]
+        source_ids = list(range(6)) + [0] * 5
+        edge_count = len(target_ids)
+        arrays = build_compact_csr_arrays(
+            np.asarray(target_ids),
+            np.asarray(source_ids),
+            np.arange(1, edge_count + 1, dtype=np.float64),
+            np.ones(edge_count),
+            np.ones(edge_count),
+            np.zeros(edge_count),
+            len(period_types) * 8,
+            source_key_count=len(period_types),
+        )
+        index = CompactAssociationIndex(
+            period_types,
+            arrays,
+            state_layout=CACHE_STATE_LAYOUT_TARGET_ONLY,
+            candidate_scope="related",
+        )
+        scorer = _plan().scorer
+        engine = object.__new__(AlarmPeriodMHPAssigner)
+        engine.config = SimpleNamespace(candidate_scope="related")
+        engine.plan = SimpleNamespace(
+            precompiled_indexes=[index],
+            edges_by_target={},
+            edges_by_source={},
+            cache_state_layout=CACHE_STATE_LAYOUT_TARGET_ONLY,
+        )
+        engine._active_period_type_index = RelatedPeriodKeyIndex(scorer)
+        engine._active_signature_index = RelatedPeriodKeyIndex(scorer)
+        active_types = (period_types[0], period_types[3])
+        active_signatures = tuple(PeriodSignature(value, 0) for value in active_types)
+        for value in active_types:
+            engine._active_period_type_index.add(value)
+        for value in active_signatures:
+            engine._active_signature_index.add(value)
+        engine.period_ids_by_type = {
+            value: {index + 1} for index, value in enumerate(active_types)
+        }
+        engine.period_ids_by_signature = {
+            value: {index + 1} for index, value in enumerate(active_signatures)
+        }
+        engine.collect_edge_count = 0
+        engine.collect_empty_bucket_count = 0
+        engine.collect_candidate_count = 0
+        engine.collect_match_count = 0
+        engine.collect_active_index_lookup_count = 0
+        engine.collect_active_key_probe_count = 0
+        engine.collect_skipped_empty_edge_count = 0
+        engine.relation_count = 0
+        target_scores = []
+        source_scores = []
+        engine._score_new_targets = (
+            lambda edge, _period, _events, _bucket, _best:
+            target_scores.append(edge.base_score)
+        )
+        engine._score_new_sources = (
+            lambda edge, _period, _events, _bucket, _best:
+            source_scores.append(edge.base_score)
+        )
+        period = SimpleNamespace(
+            period_type=period_types[0],
+            signature=active_signatures[0],
+        )
+
+        engine._collect_relations(period, [])
+
+        self.assertEqual(target_scores, [1.0, 4.0])
+        self.assertEqual(source_scores, [1.0, 9.0])
+        self.assertEqual(engine.collect_edge_count, 12)
+        self.assertEqual(engine.collect_empty_bucket_count, 8)
+        self.assertEqual(engine.collect_skipped_empty_edge_count, 8)
+        self.assertEqual(engine.collect_active_index_lookup_count, 2)
 
 
 class PeriodSourceImputationRegressionTest(unittest.TestCase):
