@@ -515,7 +515,7 @@ class AlarmPeriodEvictionHeapTest(unittest.TestCase):
             anchor_period_id=period.period_id,
             period_ids={period.period_id},
         )
-        engine._group_record = lambda _group: {"event_count": 0}
+        engine._group_record = lambda _group: {"event_count": 0, "real_event_count": 0}
         engine._schedule_period_eviction(period)
 
         engine._evict_expired_periods(30.0)

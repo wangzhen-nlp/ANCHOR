@@ -666,6 +666,12 @@ class AlarmPeriod:
     harvested_version: int = 0
     primary_group_id: Optional[int] = None
     eviction_generation: int = 0
+    is_virtual: bool = False
+    # Whether this period is still present in the candidate buckets. Cleared once
+    # it ages past the matching window (or for inert virtual sources that never
+    # enter the buckets), which is what lets an owning group know it can no
+    # longer grow.
+    in_candidate_buckets: bool = True
 
     @property
     def signature(self) -> PeriodSignature:
@@ -842,6 +848,10 @@ class PeriodFaultGroup:
     start_ts: float = math.inf
     last_ts: float = -math.inf
     close_generation: int = 0
+    # Number of member periods still present in the candidate buckets. When it
+    # reaches zero the group can no longer grow or gain merge evidence, so it is
+    # finalized immediately rather than idling until close_inactive_sec.
+    active_member_count: int = 0
 
 
 def _state_combo(mark) -> int:
@@ -1704,6 +1714,7 @@ class AlarmPeriodMHPAssigner:
         association_cache=None,
         candidate_policy=None,
         closed_group_sink=None,
+        impute_config=None,
     ):
         config.validate()
         if getattr(artifact.config, "edge_mode", "device") != "feature":
@@ -1776,6 +1787,14 @@ class AlarmPeriodMHPAssigner:
         self.eviction_heap_pop_count = 0
         self.eviction_stale_entry_count = 0
         self.eviction_group_deferred_count = 0
+        # One-hop virtual source-period imputation (native approach B). Policy
+        # lives in the companion module; the engine only holds the hook and a
+        # couple of plumbing helpers. Disabled unless an enabled config is given.
+        self.source_imputer = None
+        if impute_config is not None and getattr(impute_config, "enabled", False):
+            from alarm_flow_mhp.period_source_imputer import PeriodSourceImputer
+
+            self.source_imputer = PeriodSourceImputer(self, impute_config)
 
     # ---- ingest and period lifecycle ---------------------------------
 
@@ -1856,6 +1875,64 @@ class AlarmPeriodMHPAssigner:
             self.period_ids_by_type[period.period_type].add(period.period_id)
             self.plan.register_signature(period.signature)
         period.append(event)
+        return period
+
+    def create_virtual_source_period(self, source_signature, ts):
+        """Allocate and register a one-hop virtual source period (imputation).
+
+        Plumbing for :mod:`period_source_imputer`: builds a synthetic virtual
+        occurrence and its already-closed period.  The period is registered in
+        ``self.periods`` (so group output, core-gating and eviction see it) but
+        deliberately NOT in the candidate buckets — a virtual source stays inert
+        to normal period matching and only serves the group it explains.
+        """
+        import uuid as _uuid
+
+        period_type = source_signature.period_type
+        alarm_type = str(period_type.alarm_type)
+        ne = str(period_type.entity)
+        ts = float(ts)
+        pid = self._next_period_id
+        self._next_period_id += 1
+        synthetic_alarm = {
+            "eid": f"virtual-src-{pid}",
+            "occurrence_uuid": str(_uuid.uuid4()),
+            "ts": ts,
+            "alarm_source": ne,
+            "alarm_title": alarm_type,
+            "is_virtual": True,
+            "alarm": {"is_virtual": True},
+        }
+        event = OnlineEvent(
+            index=self._next_event_index,
+            ts=ts,
+            type_id=-1,
+            type_label=alarm_type,
+            alarm=synthetic_alarm,
+            alarm_type=alarm_type,
+            ne=ne,
+            src_mark=(0, 0, 0),
+        )
+        self._next_event_index += 1
+        period = AlarmPeriod(
+            period_id=pid,
+            period_type=period_type,
+            initial_state=_combo_state(source_signature.initial_state),
+            initial_state_combo=int(source_signature.initial_state),
+            first_ts=ts,
+            last_raise_ts=ts,
+            is_virtual=True,
+            in_candidate_buckets=False,
+        )
+        period.append(event)
+        # Mark fully harvested so is_dirty stays False: a virtual source must be
+        # inert to the matcher (never re-harvested at flush, where _collect_
+        # relations would otherwise treat it as a live participant) and must be
+        # evictable (the eviction path re-defers any dirty period forever).
+        period.harvested_version = period.version
+        period.close(ts, "virtual")
+        self.periods[pid] = period
+        self._schedule_period_eviction(period)
         return period
 
     def _identity_of(self, alarm_event):
@@ -1964,6 +2041,8 @@ class AlarmPeriodMHPAssigner:
             return
         relations = self._collect_relations(period, new_events)
         self._apply_relations(period, relations)
+        if self.source_imputer is not None:
+            self.source_imputer.maybe_impute(period)
         period.harvested_version = mature_version
         self.harvest_count += 1
         if period.is_dirty:
@@ -2266,6 +2345,8 @@ class AlarmPeriodMHPAssigner:
         if core and len(group.core_period_ids) < self.config.max_core_periods:
             group.core_period_ids.append(period.period_id)
         self.period_attach_count += 1
+        if period.in_candidate_buckets:
+            group.active_member_count += 1
         self._schedule_group_close(group)
         return True
 
@@ -2328,6 +2409,7 @@ class AlarmPeriodMHPAssigner:
         keep.core_period_ids = core_candidates[: self.config.max_core_periods]
         keep.start_ts = min(keep.start_ts, drop.start_ts)
         keep.last_ts = max(keep.last_ts, drop.last_ts)
+        keep.active_member_count += drop.active_member_count
         self._schedule_group_close(keep)
         for pair, rel in drop.evidence_by_pair.items():
             old = keep.evidence_by_pair.get(pair)
@@ -2418,7 +2500,10 @@ class AlarmPeriodMHPAssigner:
         if group is None:
             return
         record = self._group_record(group)
-        if record["event_count"] >= self.config.min_group_events:
+        # Gate on REAL events only: an imputed (virtual) source must not push a
+        # group past min_group_events on its own. Without imputation
+        # real_event_count == event_count, so this is a no-op for that path.
+        if record["real_event_count"] >= self.config.min_group_events:
             if self.closed_group_sink is None:
                 raise RuntimeError("incremental closed-group sink is not configured")
             self.closed_group_sink(record)
@@ -2468,13 +2553,6 @@ class AlarmPeriodMHPAssigner:
                 self.eviction_stale_entry_count += 1
                 continue
 
-            # Active groups own their periods until group finalization; output,
-            # core-gating, and merge proposals all need the period metadata even
-            # after it has aged out of the candidate window. _finalize_group()
-            # re-arms these entries once ownership ends.
-            if self._resolve_group_id(period.primary_group_id) is not None:
-                self.eviction_group_deferred_count += 1
-                continue
             if period.status != "closed":
                 continue
             if period.pending_ready_ts is not None or period.is_dirty:
@@ -2488,18 +2566,55 @@ class AlarmPeriodMHPAssigner:
                 )
                 continue
 
+            # Past retention, closed, and fully harvested: this period can no
+            # longer produce a relation. Any target event that could reach it
+            # (t <= last_raise_ts + past_window <= last_raise_ts + history_window)
+            # matures at t + aggregation_wait <= last_raise_ts + retention, i.e.
+            # was harvested before this eviction deadline. So drop it from the
+            # candidate buckets now — even while an active group still owns it —
+            # to keep collect_relations from rescanning an ever-growing set. This
+            # is match-neutral; without it, groups that outlive the stream (e.g.
+            # close_inactive_sec >= stream span) pin every period in the buckets
+            # and make matching degrade to O(periods^2).
+            self._drop_from_candidate_buckets(period)
+
+            # The period object itself is retained for group output / core-gating
+            # / merge proposals until the owning group finalizes; _finalize_group
+            # re-arms this eviction entry, and the re-pop drops it from
+            # self.periods (the bucket drop above is idempotent).
+            if self._resolve_group_id(period.primary_group_id) is not None:
+                self.eviction_group_deferred_count += 1
+                continue
+
             self.periods.pop(pid, None)
             self.evicted_period_count += 1
-            ids = self.period_ids_by_signature.get(period.signature)
-            if ids is not None:
-                ids.discard(pid)
-                if not ids:
-                    self.period_ids_by_signature.pop(period.signature, None)
-            type_ids = self.period_ids_by_type.get(period.period_type)
-            if type_ids is not None:
-                type_ids.discard(pid)
-                if not type_ids:
-                    self.period_ids_by_type.pop(period.period_type, None)
+
+    def _drop_from_candidate_buckets(self, period):
+        if not period.in_candidate_buckets:
+            return
+        period.in_candidate_buckets = False
+        pid = period.period_id
+        ids = self.period_ids_by_signature.get(period.signature)
+        if ids is not None:
+            ids.discard(pid)
+            if not ids:
+                self.period_ids_by_signature.pop(period.signature, None)
+        type_ids = self.period_ids_by_type.get(period.period_type)
+        if type_ids is not None:
+            type_ids.discard(pid)
+            if not type_ids:
+                self.period_ids_by_type.pop(period.period_type, None)
+        # Once a group's in-bucket members have all aged out it can no longer
+        # grow or gain merge evidence (both require a member in the candidate
+        # buckets), so finalize it now instead of idling until close_inactive_sec
+        # — whichever trigger fires first wins, and _finalize_group is idempotent
+        # so the surviving close-heap entry becomes a no-op.
+        gid = self._resolve_group_id(period.primary_group_id)
+        if gid is not None:
+            group = self.groups[gid]
+            group.active_member_count -= 1
+            if group.active_member_count <= 0:
+                self._finalize_group(gid)
 
     def flush(self):
         for period in list(self.periods.values()):
@@ -2526,6 +2641,14 @@ class AlarmPeriodMHPAssigner:
                     events.append(event)
         events.sort(key=lambda e: (e.ts, e.index))
         summaries = [_summary_of(event) for event in events]
+        # Tag imputed (virtual) occurrences so downstream consumers can filter or
+        # count them; the marker rides on the synthetic alarm dict.
+        virtual_event_count = 0
+        for event, summary in zip(events, summaries):
+            if isinstance(event.alarm, dict) and event.alarm.get("is_virtual"):
+                summary["is_virtual"] = True
+                virtual_event_count += 1
+        virtual_period_count = sum(1 for p in periods if getattr(p, "is_virtual", False))
         summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
         anchor = self.periods.get(group.anchor_period_id)
         root_event = anchor.events[0] if anchor is not None and anchor.events else events[0]
@@ -2554,7 +2677,10 @@ class AlarmPeriodMHPAssigner:
             "cascade_id": group.group_id,
             "rule": "alarm_flow_mhp_period",
             "event_count": len(events),
+            "real_event_count": len(events) - virtual_event_count,
+            "virtual_event_count": virtual_event_count,
             "alarm_period_count": len(periods),
+            "virtual_period_count": virtual_period_count,
             "start_ts": min(timestamps),
             "end_ts": max(timestamps),
             "duration_sec": max(timestamps) - min(timestamps),
@@ -2577,6 +2703,7 @@ class AlarmPeriodMHPAssigner:
 
     def stats(self):
         open_periods = sum(1 for p in self.periods.values() if p.status == "open")
+        impute_stats = self.source_imputer.stats() if self.source_imputer is not None else {}
         return {
             "total_input_events": self.total_input_events,
             "total_raise_events": self.total_raise_events,
@@ -2611,6 +2738,7 @@ class AlarmPeriodMHPAssigner:
             ),
             "active_group_count": len(self.groups),
             "closed_group_count": self.closed_group_count,
+            **impute_stats,
         }
 
 
@@ -3027,6 +3155,50 @@ def _build_parser():
         ),
     )
     parser.add_argument("--quiet", action="store_true")
+    # ---- one-hop virtual source-period imputation (native approach B) -----
+    parser.add_argument(
+        "--impute",
+        action="store_true",
+        help=(
+            "Enable one-hop virtual source-period imputation: when a period "
+            "anchors its own solo group with no observed source, hypothesise a "
+            "single virtual source period of a known type (κ-penalised) that "
+            "explains it. Logic lives in period_source_imputer.py."
+        ),
+    )
+    parser.add_argument(
+        "--impute-kappa",
+        type=float,
+        default=-2.0,
+        help=(
+            "Log-prior penalty per imputed virtual source period (κ). More "
+            "negative ⇒ fewer / stricter births. Default: -2.0."
+        ),
+    )
+    parser.add_argument(
+        "--impute-max-candidates",
+        type=int,
+        default=16,
+        help="Max incoming edges examined per orphan target. Default: 16.",
+    )
+    parser.add_argument(
+        "--impute-lag-sec",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds to place the virtual source before the target's first "
+            "occurrence. 0 ⇒ fall back to --time-slack-sec (MAP placement)."
+        ),
+    )
+    parser.add_argument(
+        "--impute-min-score-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra guard: accept a birth only if its decayed score ≥ ratio·μ "
+            "(before the κ penalty). Default: 1.0."
+        ),
+    )
     return parser
 
 
@@ -3224,6 +3396,17 @@ def main():
                         flush=True,
                     )
 
+    impute_config = None
+    if getattr(args, "impute", False):
+        from alarm_flow_mhp.period_source_imputer import PeriodImputeConfig
+
+        impute_config = PeriodImputeConfig(
+            enabled=True,
+            kappa=float(args.impute_kappa),
+            max_candidates=int(args.impute_max_candidates),
+            lag_sec=float(args.impute_lag_sec),
+            min_score_ratio=float(args.impute_min_score_ratio),
+        )
     with _profile_phase(timer, "init.build_engine"):
         engine = AlarmPeriodMHPAssigner(
             artifact,
@@ -3232,6 +3415,7 @@ def main():
             mu_scorer=mu_scorer,
             association_cache=association_caches or None,
             candidate_policy=candidate_policy,
+            impute_config=impute_config,
         )
     # The plan owns decoded edge objects now; release the JSON row arrays before
     # processing a potentially large alarm stream.
