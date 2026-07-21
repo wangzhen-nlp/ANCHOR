@@ -163,6 +163,51 @@ def _load_groups(visual_jsonl, *, verbose=False, progress_every=0):
     return groups, alarms, skipped
 
 
+def _load_grouped_symptoms(group_to_symptoms):
+    """Build clear-metric inputs from an already grouped alarm mapping.
+
+    This is the in-memory counterpart of :func:`_load_groups`.  It lets other
+    evaluators score an arbitrary label assignment (for example, native alarm
+    group ids) without writing a synthetic visual JSONL first.
+    """
+    groups = []
+    seen_uids = {}
+    alarms = []
+    for line_num, (gid, symptoms) in enumerate(group_to_symptoms.items(), 1):
+        dedup = {}
+        for idx, symptom in enumerate(symptoms or []):
+            if not isinstance(symptom, dict) or is_virtual_symptom(symptom):
+                continue
+            uid = _symptom_uid(symptom, line_num, idx)
+            if uid not in dedup:
+                dedup[uid] = symptom
+
+        members = []
+        group_name = str(gid)
+        for uid, symptom in dedup.items():
+            clear_ts = _symptom_clear_ts(symptom)
+            occur_ts = _symptom_ts(symptom)
+            members.append((uid, occur_ts, clear_ts))
+            if clear_ts is not None and occur_ts is not None and uid not in seen_uids:
+                alarm = ClearedAlarm(
+                    uid=uid,
+                    group=group_name,
+                    occur_ts=occur_ts,
+                    clear_ts=clear_ts,
+                )
+                seen_uids[uid] = alarm
+                alarms.append(alarm)
+        groups.append(
+            {
+                "line_num": line_num,
+                "uuid": group_name,
+                "rule": "",
+                "members": members,
+            }
+        )
+    return groups, alarms
+
+
 def _mark_bulk_windows(alarms, *, bulk_window_sec, bulk_min_count):
     """Flag alarms whose clear falls into a global bulk-clear window.
 
@@ -266,10 +311,12 @@ def _sample_null_pairs(alarms, *, occ_window_sec, max_null_pairs, draws_per_alar
     """Cross-group pairs matched on occurrence proximity: |Δclear| values.
 
     Alarms are non-bulk, deduped, sorted by occurrence ts. For each alarm we
-    draw a few random partners among the following alarms within
-    occ_window_sec that belong to a DIFFERENT group — the null answers "two
-    alarms that occurred close together but were grouped apart: how close are
-    their clear times?".
+    draw at most ``draws_per_alarm`` distinct random partners among the
+    following alarms within occ_window_sec that belong to a DIFFERENT group.
+    We allow up to three attempts per requested partner so same-group or
+    duplicate draws do not immediately exhaust the budget. The null answers
+    "two alarms that occurred close together but were grouped apart: how close
+    are their clear times?".
     """
     pool = sorted((a for a in alarms if not a.bulk), key=lambda a: a.occur_ts)
     n = len(pool)
@@ -285,12 +332,18 @@ def _sample_null_pairs(alarms, *, occ_window_sec, max_null_pairs, draws_per_alar
             hi += 1
         if hi <= lo:
             continue
-        for _ in range(draws_per_alarm * 3):
-            if len(deltas) >= max_null_pairs:
+        selected = set()
+        for _ in range(max(0, draws_per_alarm) * 3):
+            if (
+                len(deltas) >= max_null_pairs
+                or len(selected) >= draws_per_alarm
+            ):
                 break
             j = rng.randrange(lo, hi)
-            if pool[j].group != pool[i].group:
-                deltas.append(abs(pool[i].clear_ts - pool[j].clear_ts))
+            if pool[j].group == pool[i].group or j in selected:
+                continue
+            selected.add(j)
+            deltas.append(abs(pool[i].clear_ts - pool[j].clear_ts))
     return deltas
 
 
@@ -398,9 +451,12 @@ def _detail_payload(m: GroupClearMetrics):
     }
 
 
-def analyze(
-    visual_jsonl,
+def _analyze_loaded_groups(
+    groups_raw,
+    alarms,
     *,
+    source_file="<in-memory groups>",
+    skipped=0,
     bulk_window_sec=60.0,
     bulk_min_count=10,
     null_occ_window_sec=0.0,
@@ -415,13 +471,8 @@ def analyze(
     health_target_span_sec=3600.0,
     health_target_bulk_ratio=0.2,
     include_details=True,
-    progress_every=0,
-    verbose=False,
 ):
     rng = random.Random(seed)
-    groups_raw, alarms, skipped = _load_groups(
-        visual_jsonl, verbose=verbose, progress_every=progress_every
-    )
     bulk_info = _mark_bulk_windows(
         alarms, bulk_window_sec=bulk_window_sec, bulk_min_count=bulk_min_count
     )
@@ -473,7 +524,7 @@ def analyze(
 
     result = {
         "meta": {
-            "source_file": str(visual_jsonl),
+            "source_file": str(source_file),
             "skipped_records": skipped,
             "seed": int(seed),
             "metric_notes": [
@@ -540,6 +591,58 @@ def analyze(
         result["detail"] = [_detail_payload(g) for g in groups]
 
     return result
+
+
+def analyze(
+    visual_jsonl,
+    *,
+    bulk_window_sec=60.0,
+    bulk_min_count=10,
+    null_occ_window_sec=0.0,
+    max_pairs_per_group=500,
+    max_null_pairs=200000,
+    null_draws_per_alarm=3,
+    seed=0,
+    risk_span_sec=2 * 3600.0,
+    risk_low_coverage=0.3,
+    risk_bulk_ratio=0.8,
+    health_target_coverage=0.5,
+    health_target_span_sec=3600.0,
+    health_target_bulk_ratio=0.2,
+    include_details=True,
+    progress_every=0,
+    verbose=False,
+):
+    """Analyze the grouping stored in a visual JSONL file."""
+    groups_raw, alarms, skipped = _load_groups(
+        visual_jsonl, verbose=verbose, progress_every=progress_every
+    )
+    return _analyze_loaded_groups(
+        groups_raw,
+        alarms,
+        source_file=visual_jsonl,
+        skipped=skipped,
+        bulk_window_sec=bulk_window_sec,
+        bulk_min_count=bulk_min_count,
+        null_occ_window_sec=null_occ_window_sec,
+        max_pairs_per_group=max_pairs_per_group,
+        max_null_pairs=max_null_pairs,
+        null_draws_per_alarm=null_draws_per_alarm,
+        seed=seed,
+        risk_span_sec=risk_span_sec,
+        risk_low_coverage=risk_low_coverage,
+        risk_bulk_ratio=risk_bulk_ratio,
+        health_target_coverage=health_target_coverage,
+        health_target_span_sec=health_target_span_sec,
+        health_target_bulk_ratio=health_target_bulk_ratio,
+        include_details=include_details,
+    )
+
+
+def analyze_grouped_symptoms(group_to_symptoms, **kwargs):
+    """Analyze clear-time consistency for an in-memory group-to-alarm map."""
+    groups_raw, alarms = _load_grouped_symptoms(group_to_symptoms)
+    return _analyze_loaded_groups(groups_raw, alarms, **kwargs)
 
 
 def print_summary(result):

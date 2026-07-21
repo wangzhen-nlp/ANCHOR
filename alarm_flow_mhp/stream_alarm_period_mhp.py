@@ -75,6 +75,7 @@ from alarm_flow_mhp.feature_spec import (
     domain_of,
     make_entity,
     runtime_ne_at,
+    split_entity,
     topo_node_of,
 )
 from alarm_flow_mhp.stream_alarm_mhp import OnlineEvent, _summary_of
@@ -299,6 +300,7 @@ class PeriodStreamConfig:
     time_scale_sec: float = 60.0
     close_inactive_sec: float = 7200.0
     min_group_events: int = 1
+    min_site_num: int = 1
     immigrant_bias: float = 1.0
     feature_alpha_floor: float = 0.0
     attach_threshold_ratio: float = 1.0
@@ -329,6 +331,8 @@ class PeriodStreamConfig:
             raise ValueError("close_inactive_sec must be >= 0")
         if self.min_group_events < 1:
             raise ValueError("min_group_events must be >= 1")
+        if self.min_site_num < 1:
+            raise ValueError("min_site_num must be >= 1")
         if self.immigrant_bias <= 0:
             raise ValueError("immigrant_bias must be > 0")
         if self.feature_alpha_floor < 0:
@@ -564,6 +568,24 @@ class PeriodType:
 class PeriodSignature:
     period_type: PeriodType
     initial_state: int
+
+
+def _source_key_order(source_key):
+    """Canonical order for deterministic incoming-edge tie breaking."""
+    if isinstance(source_key, PeriodSignature):
+        period_type = source_key.period_type
+        state = int(source_key.initial_state)
+        key_kind = 1
+    else:
+        period_type = source_key
+        state = -1
+        key_kind = 0
+    return (
+        str(period_type.entity),
+        str(period_type.alarm_type),
+        key_kind,
+        state,
+    )
 
 
 def graph_period_universe(artifact, scorer):
@@ -810,6 +832,80 @@ class CompactAssociationIndex:
         for source_key, index in self.iter_target_ids(target):
             yield source_key, self._edge(index)
 
+    def top_target(self, target, limit, min_past_window=0.0):
+        """Return at most ``limit`` strongest eligible incoming cache edges.
+
+        Cache rows are source-id ordered, so use the numeric score arrays to
+        select Top-K without materializing/scoring every CompiledEdge in Python.
+        """
+        signature_id = self._target_signature_id(target)
+        if signature_id is None or limit < 1:
+            return []
+        start = int(self.target_offsets[signature_id])
+        end = int(self.target_offsets[signature_id + 1])
+        if start >= end:
+            return []
+        local_scores = self.base_scores[start:end]
+        source_ids = self.source_signature_ids[start:end]
+        target_type_id = self.type_to_id[target.period_type]
+        source_type_ids = (
+            source_ids
+            if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+            else source_ids // 8
+        )
+        eligible = np.flatnonzero(
+            (self.past_windows[start:end] + EPS >= float(min_past_window))
+            & (source_type_ids != target_type_id)
+        )
+        if eligible.size == 0:
+            return []
+        limit = min(int(limit), int(eligible.size))
+        if eligible.size > limit:
+            eligible_scores = local_scores[eligible]
+            cutoff = np.partition(
+                eligible_scores, int(eligible.size) - limit
+            )[int(eligible.size) - limit]
+            stronger = eligible[eligible_scores > cutoff]
+            tied = eligible[eligible_scores == cutoff]
+            # ``partition`` deliberately leaves equal values unordered. Select
+            # the boundary ties by source id so cache row order cannot change
+            # which virtual source survives the Top-K cutoff.
+            needed = limit - int(stronger.size)
+            if tied.size > needed:
+                tied_source_ids = source_ids[tied]
+                source_cutoff = np.partition(
+                    tied_source_ids, needed - 1
+                )[needed - 1]
+                lower_source = tied[tied_source_ids < source_cutoff]
+                boundary_source = np.sort(
+                    tied[tied_source_ids == source_cutoff]
+                )
+                tied = np.concatenate(
+                    (
+                        lower_source,
+                        boundary_source[: needed - int(lower_source.size)],
+                    )
+                )
+            selected = np.concatenate((stronger, tied[:needed]))
+        else:
+            selected = eligible
+        selected = selected[
+            np.lexsort(
+                (selected, source_ids[selected], -local_scores[selected])
+            )
+        ]
+        out = []
+        for local_index in selected.tolist():
+            edge_index = start + int(local_index)
+            source_id = int(self.source_signature_ids[edge_index])
+            source_key = (
+                self.period_types[source_id]
+                if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+                else self._signature(source_id)
+            )
+            out.append((source_key, self._edge(edge_index)))
+        return out
+
     def iter_source(self, source):
         for target_key, index in self.iter_source_ids(source):
             yield target_key, self._edge(index)
@@ -917,6 +1013,8 @@ class CompiledAssociationPlan:
         self.precompiled_indexes: list[CompactAssociationIndex] = []
         self.edges_by_target: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
         self.edges_by_source: dict[PeriodSignature, dict[PeriodSignature, CompiledEdge]] = defaultdict(dict)
+        self._target_edge_versions: dict[PeriodSignature, int] = defaultdict(int)
+        self._top_edges_by_target_cache: dict[tuple, tuple] = {}
         self._mu_cache: dict[PeriodType, float] = {}
         self.compiled_pair_count = 0
         self.pruned_pair_count = 0
@@ -939,6 +1037,85 @@ class CompiledAssociationPlan:
         for index in self.precompiled_indexes:
             yield from index.iter_target(signature)
         yield from self.edges_by_target.get(signature, {}).items()
+
+    def top_edges_by_target(self, signature, limit, min_past_window=0.0):
+        """Return the strongest eligible incoming edges with precise caching.
+
+        Precompiled indexes select Top-K through NumPy; dynamic rows are rescanned
+        only when this target gains an edge. This keeps imputation bounded on the
+        hot path without depending on source-id or insertion ordering.
+        """
+        limit = int(limit)
+        if limit < 1:
+            return ()
+        cache_key = (
+            signature,
+            limit,
+            float(min_past_window),
+            len(self.precompiled_indexes),
+        )
+        version = self._target_edge_versions.get(signature, 0)
+        cached = self._top_edges_by_target_cache.get(cache_key)
+        if cached is not None and cached[0] == version:
+            return cached[1]
+
+        candidates = []
+        for index in self.precompiled_indexes:
+            candidates.extend(
+                index.top_target(signature, limit, min_past_window)
+            )
+        dynamic = self.edges_by_target.get(signature, {})
+        if dynamic:
+            eligible = (
+                (source_key, edge)
+                for source_key, edge in dynamic.items()
+                if edge.past_window_sec + EPS >= float(min_past_window)
+                and source_key.period_type != signature.period_type
+            )
+            candidates.extend(
+                heapq.nsmallest(
+                    limit,
+                    eligible,
+                    key=lambda item: (
+                        -item[1].base_score,
+                        _source_key_order(item[0]),
+                    ),
+                )
+            )
+        # Repeated cache arguments may overlap (for example a global cache plus
+        # a related cache). Do not let the same source consume several Top-K
+        # slots; retain its strongest deterministic edge representation.
+        candidates_by_source = {}
+        for source_key, edge in candidates:
+            previous = candidates_by_source.get(source_key)
+            edge_rank = (
+                edge.base_score,
+                -edge.threshold,
+                edge.past_window_sec,
+                edge.future_window_sec,
+            )
+            if previous is None:
+                candidates_by_source[source_key] = edge
+                continue
+            previous_rank = (
+                previous.base_score,
+                -previous.threshold,
+                previous.past_window_sec,
+                previous.future_window_sec,
+            )
+            if edge_rank > previous_rank:
+                candidates_by_source[source_key] = edge
+        result = tuple(
+            sorted(
+                candidates_by_source.items(),
+                key=lambda item: (
+                    -item[1].base_score,
+                    _source_key_order(item[0]),
+                ),
+            )[:limit]
+        )
+        self._top_edges_by_target_cache[cache_key] = (version, result)
+        return result
 
     def iter_edges_by_source(self, signature):
         for index in self.precompiled_indexes:
@@ -1066,6 +1243,7 @@ class CompiledAssociationPlan:
             return
         self.edges_by_target[target][source] = edge
         self.edges_by_source[source][target] = edge
+        self._target_edge_versions[target] += 1
 
     def _compute_edge(self, target: PeriodSignature, source: PeriodSignature):
         t = target.period_type
@@ -1891,6 +2069,15 @@ class AlarmPeriodMHPAssigner:
         period_type = source_signature.period_type
         alarm_type = str(period_type.alarm_type)
         ne = str(period_type.entity)
+        node, domain = split_entity(ne)
+        node_field = str(self.artifact.config.topology_node_field or "alarm_source")
+        node_info = self.feature_scorer.node_infos.get(node)
+        site_id = (
+            node
+            if node_field == "site_id"
+            else str(getattr(node_info, "site_id", "") or "")
+        )
+        alarm_source = node if node_field == "alarm_source" else ""
         ts = float(ts)
         pid = self._next_period_id
         self._next_period_id += 1
@@ -1898,8 +2085,15 @@ class AlarmPeriodMHPAssigner:
             "eid": f"virtual-src-{pid}",
             "occurrence_uuid": str(_uuid.uuid4()),
             "ts": ts,
-            "alarm_source": ne,
-            "alarm_title": alarm_type,
+            "site_id": site_id,
+            "alarm_source": alarm_source,
+            # ``alarm_type`` is the model category (link/power/offline), not a
+            # raw alarm title.  Keep the raw title empty and restore the model
+            # category from OnlineEvent while building the group summary.
+            "alarm_title": "",
+            "alarm_type": alarm_type,
+            "device_domain": domain,
+            "virtual": True,
             "is_virtual": True,
             "alarm": {"is_virtual": True},
         }
@@ -2503,7 +2697,10 @@ class AlarmPeriodMHPAssigner:
         # Gate on REAL events only: an imputed (virtual) source must not push a
         # group past min_group_events on its own. Without imputation
         # real_event_count == event_count, so this is a no-op for that path.
-        if record["real_event_count"] >= self.config.min_group_events:
+        if (
+            record["real_event_count"] >= self.config.min_group_events
+            and len(record["real_site_list"]) >= self.config.min_site_num
+        ):
             if self.closed_group_sink is None:
                 raise RuntimeError("incremental closed-group sink is not configured")
             self.closed_group_sink(record)
@@ -2644,10 +2841,29 @@ class AlarmPeriodMHPAssigner:
         # Tag imputed (virtual) occurrences so downstream consumers can filter or
         # count them; the marker rides on the synthetic alarm dict.
         virtual_event_count = 0
+        real_site_ids = set()
+        node_field = str(self.artifact.config.topology_node_field or "alarm_source")
         for event, summary in zip(events, summaries):
-            if isinstance(event.alarm, dict) and event.alarm.get("is_virtual"):
+            node, _domain = split_entity(event.ne) if event.ne else ("", "")
+            if not summary.get("site_id") and node:
+                if node_field == "site_id":
+                    summary["site_id"] = node
+                else:
+                    node_info = self.feature_scorer.node_infos.get(node)
+                    summary["site_id"] = str(
+                        getattr(node_info, "site_id", "") or ""
+                    )
+            is_virtual = bool(
+                isinstance(event.alarm, dict)
+                and (event.alarm.get("virtual") or event.alarm.get("is_virtual"))
+            )
+            if is_virtual:
+                summary["virtual"] = True
                 summary["is_virtual"] = True
+                summary["alarm_type"] = event.alarm_type
                 virtual_event_count += 1
+            elif summary.get("site_id"):
+                real_site_ids.add(str(summary["site_id"]))
         virtual_period_count = sum(1 for p in periods if getattr(p, "is_virtual", False))
         summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
         anchor = self.periods.get(group.anchor_period_id)
@@ -2666,6 +2882,12 @@ class AlarmPeriodMHPAssigner:
                     "target_event_id": tgt.get("event_id", ""),
                     "source_occurrence_uuid": src.get("occurrence_uuid", ""),
                     "target_occurrence_uuid": tgt.get("occurrence_uuid", ""),
+                    "source_index": rel.source_event.index,
+                    "target_index": rel.target_event.index,
+                    "source_type": rel.source_event.alarm_type,
+                    "target_type": rel.target_event.alarm_type,
+                    "source_virtual": bool(src.get("virtual")),
+                    "target_virtual": bool(tgt.get("virtual")),
                     "score": float(rel.score),
                     "strength": float(rel.strength),
                 }
@@ -2688,6 +2910,8 @@ class AlarmPeriodMHPAssigner:
             "anchor_period_id": group.anchor_period_id,
             "core_period_ids": list(group.core_period_ids),
             "site_list": sorted({s["site_id"] for s in summaries if s.get("site_id")}),
+            "real_site_list": sorted(real_site_ids),
+            "real_site_count": len(real_site_ids),
             "alarm_source_list": sorted(
                 {s["alarm_source"] for s in summaries if s.get("alarm_source")}
             ),
@@ -3118,6 +3342,12 @@ def _build_parser():
         help="Groups with fewer events are dropped at finalization; default 1 keeps all groups.",
     )
     parser.add_argument(
+        "--min-site-num",
+        type=int,
+        default=1,
+        help="Groups spanning fewer unique non-empty sites are dropped at finalization; default 1.",
+    )
+    parser.add_argument(
         "--regions",
         default="",
         help="Optional region filter for input alarms; default: no filtering (artifact regions are NOT inherited).",
@@ -3172,14 +3402,17 @@ def _build_parser():
         default=-2.0,
         help=(
             "Log-prior penalty per imputed virtual source period (κ). More "
-            "negative ⇒ fewer / stricter births. Default: -2.0."
+            "negative ⇒ fewer / stricter births; must be <= 0. Default: -2.0."
         ),
     )
     parser.add_argument(
         "--impute-max-candidates",
         type=int,
         default=16,
-        help="Max incoming edges examined per orphan target. Default: 16.",
+        help=(
+            "Max highest-scoring eligible incoming edges retained per orphan "
+            "target after scanning the association rows. Default: 16."
+        ),
     )
     parser.add_argument(
         "--impute-lag-sec",
@@ -3320,6 +3553,7 @@ def main():
         time_scale_sec=float(artifact.config.time_scale_sec),
         close_inactive_sec=args.close_inactive_sec,
         min_group_events=min_group_events,
+        min_site_num=args.min_site_num,
         immigrant_bias=args.immigrant_bias,
         feature_alpha_floor=floor,
         attach_threshold_ratio=args.attach_threshold_ratio,
@@ -3407,6 +3641,10 @@ def main():
             lag_sec=float(args.impute_lag_sec),
             min_score_ratio=float(args.impute_min_score_ratio),
         )
+        try:
+            impute_config.validate()
+        except ValueError as exc:
+            parser.error(str(exc))
     with _profile_phase(timer, "init.build_engine"):
         engine = AlarmPeriodMHPAssigner(
             artifact,
@@ -3437,6 +3675,9 @@ def main():
         "streaming_input": bool(streaming_input),
         "profiling": bool(args.profile),
         "config": {key: value for key, value in vars(config).items()},
+        "impute_config": (
+            impute_config.to_dict() if impute_config is not None else {"enabled": False}
+        ),
     }
     with _profile_phase(timer, "init.build_output"):
         output = IncrementalPeriodOutput(

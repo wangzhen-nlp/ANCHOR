@@ -19,7 +19,7 @@ Design (kept deliberately minimal for v1):
   candidate buckets, so it stays inert to normal period matching and cannot
   accrete beyond the group it was born to explain.
 * **κ-penalised acceptance.**  A birth is accepted only when the time-decayed
-  edge score, penalised by a per-virtual-period log-prior ``κ`` (< 0), still
+  edge score, penalised by a per-virtual-period log-prior ``κ`` (≤ 0), still
   beats the background immigrant explanation ``μ`` of the target.  Because the
   observed-relation bar is already ``score ≥ μ`` (``edge.threshold``), κ raises
   the bar for a *virtual* source above that of a real one — exactly the intent.
@@ -44,8 +44,9 @@ EPS = 1e-12
 class PeriodImputeConfig:
     """Knobs for one-hop virtual source-period imputation.
 
-    ``kappa`` is the log-prior penalty per imputed virtual period (more negative
-    ⇒ fewer / stricter births), aligned with ``--impute-kappa`` in the
+    ``kappa`` is a non-positive log-prior penalty per imputed virtual period
+    (more negative ⇒ fewer / stricter births), aligned with
+    ``--impute-kappa`` in the
     occurrence engine.  ``lag_sec`` places the virtual source that many seconds
     before the target's first occurrence; ``0`` falls back to the engine's
     ``time_slack_sec`` (the exp kernel's MAP placement is "as close as allowed").
@@ -60,10 +61,21 @@ class PeriodImputeConfig:
     def validate(self):
         if self.max_candidates < 1:
             raise ValueError("max_candidates must be >= 1")
-        if self.lag_sec < 0:
-            raise ValueError("lag_sec must be >= 0")
-        if self.min_score_ratio <= 0:
-            raise ValueError("min_score_ratio must be > 0")
+        if not math.isfinite(self.kappa) or self.kappa > 0:
+            raise ValueError("kappa must be finite and <= 0")
+        if not math.isfinite(self.lag_sec) or self.lag_sec < 0:
+            raise ValueError("lag_sec must be finite and >= 0")
+        if not math.isfinite(self.min_score_ratio) or self.min_score_ratio <= 0:
+            raise ValueError("min_score_ratio must be finite and > 0")
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "kappa": float(self.kappa),
+            "max_candidates": int(self.max_candidates),
+            "lag_sec": float(self.lag_sec),
+            "min_score_ratio": float(self.min_score_ratio),
+        }
 
 
 class PeriodSourceImputer:
@@ -140,16 +152,20 @@ class PeriodSourceImputer:
         engine = self.engine
         cfg = self.config
         sig = period.signature
-        offset = cfg.lag_sec if cfg.lag_sec > 0 else max(float(engine.config.time_slack_sec), 1.0)
+        offset = self._source_offset_sec()
         dt = float(offset)
         accept_factor = math.exp(cfg.kappa)
 
+        top_edges = getattr(engine.plan, "top_edges_by_target", None)
+        if top_edges is None:
+            # Lightweight compatibility path for policy-only test doubles.
+            incoming = engine.plan.iter_edges_by_target(sig)
+        else:
+            incoming = top_edges(sig, cfg.max_candidates, dt)
+
         best = None
         examined = 0
-        for source_key, edge in engine.plan.iter_edges_by_target(sig):
-            if examined >= cfg.max_candidates:
-                break
-            examined += 1
+        for source_key, edge in incoming:
             src_sig = self._source_signature(source_key)
             if src_sig is None:
                 continue
@@ -159,13 +175,27 @@ class PeriodSourceImputer:
                 continue
             if dt > edge.past_window_sec + EPS:
                 continue
+            if top_edges is None and examined >= cfg.max_candidates:
+                break
+            examined += 1
             score = engine._past_score(edge, dt)
-            # κ-penalised birth vs. background immigrant (μ = edge.threshold).
-            if score * accept_factor <= edge.threshold * cfg.min_score_ratio:
+            # Apply the optional raw-score guard before the independent
+            # κ-penalised birth-vs-background test.  Keeping these separate
+            # matches the CLI contract and avoids multiplying the ratio by
+            # exp(-κ).
+            if score + EPS < edge.threshold * cfg.min_score_ratio:
+                continue
+            if score * accept_factor <= edge.threshold:
                 continue
             if best is None or score > best[0]:
                 best = (score, src_sig, edge)
         return best
+
+    def _source_offset_sec(self) -> float:
+        cfg = self.config
+        if cfg.lag_sec > 0:
+            return float(cfg.lag_sec)
+        return float(self.engine.config.time_slack_sec)
 
     def _source_signature(self, source_key):
         """Coerce a plan candidate key into a concrete source PeriodSignature.
@@ -189,8 +219,7 @@ class PeriodSourceImputer:
         from alarm_flow_mhp.stream_alarm_period_mhp import RelationEvidence
 
         engine = self.engine
-        cfg = self.config
-        offset = cfg.lag_sec if cfg.lag_sec > 0 else max(float(engine.config.time_slack_sec), 1.0)
+        offset = self._source_offset_sec()
         ts = float(period.first_ts) - float(offset)
 
         virtual = engine.create_virtual_source_period(src_sig, ts)

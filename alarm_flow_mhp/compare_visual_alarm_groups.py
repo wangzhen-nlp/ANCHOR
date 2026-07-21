@@ -27,6 +27,7 @@ if __package__ in (None, ""):
 from alarm_tools.alarm_inputs import stream_alarm_inputs
 from fault_grouping.alarm_events.io import parse_datetime_text
 from alarm_flow_mhp.missing_chain_sampler import MHP_VIRTUAL_RULE
+from fault_grouping.tools.analyze_visual_group_clear_metrics import analyze_grouped_symptoms
 from topology_resources import NE_GRAPH_JSON, resource_display
 from ticket_recall.evaluation.recall_common import (
     _extract_group_id,
@@ -555,6 +556,54 @@ def _alarm_universe(group_to_alarm_keys):
     return universe
 
 
+def _gold_groups_for_clear_consistency(details, group_to_site_alarms):
+    """Rebuild exactly the evaluated gold groups as group -> alarm records."""
+    grouped = {}
+    for detail in details:
+        group_id = detail.get("gold_id", "")
+        if not group_id:
+            continue
+        site_alarm_map = group_to_site_alarms.get(group_id, {})
+        records = []
+        for site_id in detail.get("gold_sites", []):
+            records.extend(site_alarm_map.get(site_id, []))
+        grouped[group_id] = records
+    return grouped
+
+
+def _compute_clear_time_consistency(details, group_to_site_alarms):
+    """Score a gold-label assignment against label-free clear-time evidence."""
+    grouped = _gold_groups_for_clear_consistency(details, group_to_site_alarms)
+    report = analyze_grouped_symptoms(grouped, include_details=False)
+    overall = report.get("overall", {})
+    separation = report.get("separation", {})
+    health = report.get("health", {})
+    components = health.get("components", {})
+    return {
+        # The separation component is the consistency score: AUC 0.5 -> 0,
+        # AUC 1.0 -> 100.  Unlike the composite health score, it does not mix
+        # in data availability (coverage) or bulk-clear prevalence.
+        "score": components.get("clear_separation"),
+        "score_scale": "0-100",
+        "separation_auc": separation.get("auc"),
+        "within_pair_count": separation.get("within_pair_count", 0),
+        "null_pair_count": separation.get("null_pair_count", 0),
+        "null_occurrence_window_sec": separation.get("null_occurrence_window_sec"),
+        "clear_coverage": overall.get("clear_coverage", 0.0),
+        "group_count": overall.get("group_count", 0),
+        "real_event_count": overall.get("real_event_count", 0),
+        "cleared_event_count": overall.get("cleared_event_count", 0),
+        "clear_health_score": health.get("clear_health_score"),
+        "health_components": components,
+        "bulk_alarm_ratio": report.get("bulk", {}).get("bulk_alarm_ratio", 0.0),
+        "interpretation": (
+            "0-100 clear-time separation score; higher means alarms in the same gold group "
+            "clear closer together than occurrence-time-matched alarms in different groups. "
+            "N/A when within-group or cross-group pairs are insufficient."
+        ),
+    }
+
+
 def _compute_scope_result(
     indexes,
     alarm_side,
@@ -635,6 +684,15 @@ def _compute_scope_result(
         pred_group_to_alarm_ids=indexes["mhp_group_to_alarm_keys"],
         pred_side_alarm_universe=mhp_alarm_universe,
         progress_label=f"计算指标 {scope_name}/alarm_group_as_gold".lstrip("/"),
+    )
+
+    mhp_group_as_gold["clear_time_consistency"] = _compute_clear_time_consistency(
+        mhp_group_as_gold.get("details", []),
+        indexes["mhp_group_to_site_alarms"],
+    )
+    alarm_group_as_gold["clear_time_consistency"] = _compute_clear_time_consistency(
+        alarm_group_as_gold.get("details", []),
+        alarm_side["alarm_group_to_site_alarms"],
     )
 
     if only_unrecalled_predictions:
@@ -873,6 +931,17 @@ def _print_direction(label, payload):
     print(
         f"gold告警中对侧全集不存在的条数: {payload.get('gold_alarms_missing_from_pred_universe_total', 0)}"
         f" / {payload.get('gold_alarm_total', 0)}"
+    )
+    clear_consistency = payload.get("clear_time_consistency", {})
+    score = clear_consistency.get("score")
+    auc = clear_consistency.get("separation_auc")
+    score_text = "N/A" if score is None else f"{score:.2f}/100"
+    auc_text = "N/A" if auc is None else f"{auc:.6f}"
+    print(
+        f"[清除时间] gold label 一致性分数: {score_text} "
+        f"(AUC={auc_text}, 覆盖率={clear_consistency.get('clear_coverage', 0.0):.6f}, "
+        f"组内配对={clear_consistency.get('within_pair_count', 0)}, "
+        f"跨组配对={clear_consistency.get('null_pair_count', 0)})"
     )
 
 

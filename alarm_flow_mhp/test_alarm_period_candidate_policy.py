@@ -1,6 +1,7 @@
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
+import random
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -19,22 +20,34 @@ from alarm_flow_mhp.candidate_policy import (
     write_candidate_policy,
 )
 from alarm_flow_mhp.feature_spec import FeatureLayout, RuntimeFeatureScorer
+from alarm_flow_mhp.period_source_imputer import PeriodImputeConfig, PeriodSourceImputer
 from alarm_flow_mhp.learn_alarm_period_candidate_policy import (
     _teacher_positive_masks,
 )
 from alarm_flow_mhp.stream_alarm_period_mhp import (
+    CACHE_STATE_LAYOUT_TARGET_ONLY,
     AlarmPeriod,
     AlarmPeriodMHPAssigner,
+    CompiledEdge,
     CompiledAssociationPlan,
+    CompactAssociationIndex,
     PeriodFaultGroup,
     PeriodSignature,
     PeriodStreamConfig,
     PeriodType,
+    RelationEvidence,
     _enable_period_profiling,
     _iter_profiled_events,
     _print_period_profile,
+    build_compact_csr_arrays,
 )
+from alarm_flow_mhp.stream_alarm_mhp import OnlineEvent
+from alarm_flow_mhp.visual_output import _symptom_to_visual_record_mhp
 from fault_grouping.matching.profiling import PhaseTimer
+from fault_grouping.tools.analyze_visual_group_clear_metrics import (
+    ClearedAlarm,
+    _sample_null_pairs,
+)
 from mhp.feature_kernel import FeatureKernel
 
 
@@ -506,7 +519,7 @@ class AlarmPeriodEvictionHeapTest(unittest.TestCase):
         self.assertNotIn(period.period_type, engine.period_ids_by_type)
         self.assertEqual(engine.evicted_period_count, 1)
 
-    def test_active_group_period_is_rearmed_when_group_finalizes(self):
+    def test_group_finalizes_when_last_candidate_period_expires(self):
         engine = _eviction_engine()
         period = _closed_period(group_id=1)
         _index_period(engine, period)
@@ -514,17 +527,15 @@ class AlarmPeriodEvictionHeapTest(unittest.TestCase):
             group_id=1,
             anchor_period_id=period.period_id,
             period_ids={period.period_id},
+            active_member_count=1,
         )
         engine._group_record = lambda _group: {"event_count": 0, "real_event_count": 0}
         engine._schedule_period_eviction(period)
 
         engine._evict_expired_periods(30.0)
-        self.assertIn(period.period_id, engine.periods)
-        self.assertEqual(engine.eviction_group_deferred_count, 1)
-
-        engine._finalize_group(1)
-        engine._evict_expired_periods(30.0)
         self.assertNotIn(period.period_id, engine.periods)
+        self.assertNotIn(1, engine.groups)
+        self.assertEqual(engine.eviction_group_deferred_count, 0)
 
     def test_new_generation_makes_older_heap_entry_stale(self):
         engine = _eviction_engine()
@@ -537,6 +548,421 @@ class AlarmPeriodEvictionHeapTest(unittest.TestCase):
         self.assertNotIn(period.period_id, engine.periods)
         self.assertEqual(engine.eviction_stale_entry_count, 1)
         self.assertEqual(engine.evicted_period_count, 1)
+
+
+class AlarmPeriodOutputFilterTest(unittest.TestCase):
+    def test_min_site_num_filters_on_unique_non_empty_sites(self):
+        engine = _eviction_engine()
+        engine.config.min_site_num = 2
+        emitted = []
+        engine.closed_group_sink = emitted.append
+
+        def finalize(real_site_list):
+            engine.groups[1] = PeriodFaultGroup(group_id=1, anchor_period_id=0)
+            engine._group_record = lambda _group: {
+                "real_event_count": 2,
+                "real_site_list": real_site_list,
+            }
+            engine._finalize_group(1)
+
+        finalize(["S1"])
+        self.assertEqual(emitted, [])
+        self.assertEqual(engine.closed_group_count, 0)
+
+        finalize(["S1", "S2"])
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(engine.closed_group_count, 1)
+
+    def test_min_site_num_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "min_site_num must be >= 1"):
+            PeriodStreamConfig(min_site_num=0).validate()
+
+
+class PeriodSourceImputationRegressionTest(unittest.TestCase):
+    @staticmethod
+    def _virtual_engine(node_field="alarm_source"):
+        engine = object.__new__(AlarmPeriodMHPAssigner)
+        engine.artifact = SimpleNamespace(
+            config=SimpleNamespace(topology_node_field=node_field)
+        )
+        engine.feature_scorer = SimpleNamespace(
+            node_infos={
+                "A": SimpleNamespace(site_id="S1"),
+                "B": SimpleNamespace(site_id="S2"),
+            }
+        )
+        engine._next_period_id = 0
+        engine._next_event_index = 0
+        engine.periods = {}
+        engine._period_retention_sec = 10.0
+        engine._eviction_heap = []
+        engine._heap_seq = 0
+        return engine
+
+    def test_virtual_summary_preserves_model_alarm_type(self):
+        engine = self._virtual_engine()
+        period = engine.create_virtual_source_period(
+            PeriodSignature(PeriodType("A", "link"), 0), 50.0
+        )
+        group = PeriodFaultGroup(
+            group_id=1,
+            anchor_period_id=period.period_id,
+            period_ids={period.period_id},
+        )
+
+        record = engine._group_record(group)
+        symptom = record["symptoms"][0]
+        self.assertEqual(symptom["alarm_type"], "link")
+        self.assertEqual(symptom["alarm_title"], "")
+        self.assertEqual(symptom["alarm_source"], "A")
+        self.assertEqual(symptom["site_id"], "S1")
+
+        site_engine = self._virtual_engine(node_field="site_id")
+        site_period = site_engine.create_virtual_source_period(
+            PeriodSignature(PeriodType("SITE-1\x1fRAN", "power"), 0), 60.0
+        )
+        site_group = PeriodFaultGroup(
+            group_id=2,
+            anchor_period_id=site_period.period_id,
+            period_ids={site_period.period_id},
+        )
+        site_symptom = site_engine._group_record(site_group)["symptoms"][0]
+        self.assertEqual(site_symptom["alarm_type"], "power")
+        self.assertEqual(site_symptom["site_id"], "SITE-1")
+        self.assertEqual(site_symptom["alarm_source"], "")
+        self.assertEqual(site_period.events[0].alarm["device_domain"], "RAN")
+
+    def test_real_sites_are_topology_enriched_and_exclude_virtual_sites(self):
+        engine = self._virtual_engine()
+        real = AlarmPeriod(
+            period_id=10,
+            period_type=PeriodType("A", "link"),
+            initial_state=(0, 0, 0),
+            initial_state_combo=0,
+            first_ts=50.0,
+            last_raise_ts=50.0,
+        )
+        real.append(
+            OnlineEvent(
+                index=10,
+                ts=50.0,
+                type_id=-1,
+                type_label="link",
+                alarm={
+                    "eid": "real-10",
+                    "occurrence_uuid": "00000000-0000-0000-0000-000000000010",
+                    "ts": 50.0,
+                    "alarm_source": "A",
+                    "alarm_title": "",
+                    "alarm": {},
+                },
+                alarm_type="link",
+                ne="A",
+            )
+        )
+        engine.periods[real.period_id] = real
+        virtual = engine.create_virtual_source_period(
+            PeriodSignature(PeriodType("B", "power"), 0), 49.0
+        )
+        group = PeriodFaultGroup(
+            group_id=3,
+            anchor_period_id=real.period_id,
+            period_ids={real.period_id, virtual.period_id},
+        )
+        edge = CompiledEdge(10.0, 1.0, 60.0, 0.0)
+        group.evidence_by_pair[(virtual.period_id, real.period_id)] = RelationEvidence(
+            target_period_id=real.period_id,
+            source_period_id=virtual.period_id,
+            target_event=real.events[0],
+            source_event=virtual.events[0],
+            score=10.0,
+            strength=10.0,
+            edge=edge,
+        )
+
+        record = engine._group_record(group)
+        self.assertEqual(record["site_list"], ["S1", "S2"])
+        self.assertEqual(record["real_site_list"], ["S1"])
+        self.assertEqual(record["real_site_count"], 1)
+        virtual_symptom = next(s for s in record["symptoms"] if s.get("virtual"))
+        visual = _symptom_to_visual_record_mhp(virtual_symptom)
+        self.assertTrue(visual["virtual"])
+        self.assertEqual(record["edges"][0]["source_virtual"], True)
+        self.assertEqual(record["edges"][0]["target_virtual"], False)
+
+    def test_min_score_ratio_is_a_pre_kappa_guard(self):
+        edge = CompiledEdge(
+            base_score=10.0,
+            threshold=1.0,
+            past_window_sec=60.0,
+            future_window_sec=0.0,
+        )
+        target = _closed_period(period_id=1, group_id=1)
+        target.period_type = PeriodType("A", "X")
+        target.events = [SimpleNamespace(index=1)]
+        group = PeriodFaultGroup(
+            group_id=1,
+            anchor_period_id=target.period_id,
+            period_ids={target.period_id},
+        )
+        engine = SimpleNamespace(
+            config=SimpleNamespace(time_slack_sec=1.0),
+            groups={1: group},
+            plan=SimpleNamespace(
+                iter_edges_by_target=lambda _sig: iter(
+                    [(PeriodType("B", "Y"), edge)]
+                )
+            ),
+            _resolve_group_id=lambda gid: gid,
+            _past_score=lambda _edge, _dt: 10.0,
+        )
+        imputer = PeriodSourceImputer(
+            engine,
+            PeriodImputeConfig(
+                enabled=True,
+                kappa=-2.0,
+                min_score_ratio=2.0,
+            ),
+        )
+
+        best = imputer._best_candidate(target)
+        self.assertIsNotNone(best)
+
+    def test_candidate_cap_uses_cached_top_index_and_bounds_scoring(self):
+        period_types = [PeriodType("A", "X")] + [
+            PeriodType(f"S{i:04d}", "Y") for i in range(1000)
+        ]
+        edge_count = len(period_types) - 1
+        arrays = build_compact_csr_arrays(
+            target_signature_ids=np.zeros(edge_count, dtype=np.int64),
+            source_signature_ids=np.arange(1, len(period_types), dtype=np.int64),
+            base_scores=np.arange(1, edge_count + 1, dtype=np.float64),
+            thresholds=np.ones(edge_count, dtype=np.float64),
+            past_windows=np.full(edge_count, 60.0, dtype=np.float64),
+            future_windows=np.zeros(edge_count, dtype=np.float64),
+            signature_count=len(period_types) * 8,
+            source_key_count=len(period_types),
+        )
+        index = CompactAssociationIndex(
+            period_types,
+            arrays,
+            state_layout=CACHE_STATE_LAYOUT_TARGET_ONLY,
+        )
+        plan = object.__new__(CompiledAssociationPlan)
+        plan.precompiled_indexes = [index]
+        plan.edges_by_target = {}
+        plan._target_edge_versions = {}
+        plan._top_edges_by_target_cache = {}
+        target = _closed_period(period_id=1, group_id=1)
+        target.period_type = PeriodType("A", "X")
+        score_calls = []
+        engine = SimpleNamespace(
+            config=SimpleNamespace(time_slack_sec=1.0),
+            plan=plan,
+            _past_score=lambda edge, _dt: (
+                score_calls.append(edge.base_score) or edge.base_score
+            ),
+        )
+        imputer = PeriodSourceImputer(
+            engine,
+            PeriodImputeConfig(enabled=True, kappa=-2.0, max_candidates=1),
+        )
+
+        first = imputer._best_candidate(target)
+        second = imputer._best_candidate(target)
+        self.assertEqual(first[1].period_type.entity, "S0999")
+        self.assertEqual(second[1].period_type.entity, "S0999")
+        self.assertEqual(score_calls, [1000.0, 1000.0])
+        self.assertEqual(len(plan._top_edges_by_target_cache), 1)
+
+        dynamic_source = PeriodSignature(PeriodType("DYNAMIC", "Y"), 0)
+        plan.edges_by_target[target.signature] = {
+            dynamic_source: CompiledEdge(2000.0, 1.0, 60.0, 0.0)
+        }
+        plan._target_edge_versions[target.signature] = 1
+        refreshed = imputer._best_candidate(target)
+        self.assertEqual(refreshed[1].period_type.entity, "DYNAMIC")
+        self.assertEqual(score_calls, [1000.0, 1000.0, 2000.0])
+        self.assertEqual(len(plan._top_edges_by_target_cache), 1)
+
+    def test_cached_top_index_breaks_cutoff_ties_by_source_id(self):
+        period_types = [
+            PeriodType("TARGET", "X"),
+            PeriodType("S1", "Y"),
+            PeriodType("S2", "Y"),
+            PeriodType("S3", "Y"),
+        ]
+
+        def selected_entities(source_ids):
+            edge_count = len(source_ids)
+            arrays = build_compact_csr_arrays(
+                target_signature_ids=np.zeros(edge_count, dtype=np.int64),
+                source_signature_ids=np.asarray(source_ids, dtype=np.int64),
+                base_scores=np.ones(edge_count, dtype=np.float64),
+                thresholds=np.ones(edge_count, dtype=np.float64),
+                past_windows=np.full(edge_count, 60.0, dtype=np.float64),
+                future_windows=np.zeros(edge_count, dtype=np.float64),
+                signature_count=len(period_types) * 8,
+                source_key_count=len(period_types),
+            )
+            index = CompactAssociationIndex(
+                period_types,
+                arrays,
+                state_layout=CACHE_STATE_LAYOUT_TARGET_ONLY,
+            )
+            target = PeriodSignature(period_types[0], 0)
+            return [
+                source.entity
+                for source, _edge in index.top_target(target, 2)
+            ]
+
+        self.assertEqual(selected_entities([3, 1, 2]), ["S1", "S2"])
+        self.assertEqual(selected_entities([2, 3, 1]), ["S1", "S2"])
+
+    def test_dynamic_top_edges_break_ties_by_source_signature(self):
+        target = PeriodSignature(PeriodType("TARGET", "X"), 0)
+        source_a = PeriodSignature(PeriodType("A", "Y"), 0)
+        source_b = PeriodSignature(PeriodType("B", "Y"), 0)
+        edge = CompiledEdge(10.0, 1.0, 60.0, 0.0)
+        plan = object.__new__(CompiledAssociationPlan)
+        plan.precompiled_indexes = []
+        plan.edges_by_target = {target: {source_b: edge, source_a: edge}}
+        plan._target_edge_versions = {target: 2}
+        plan._top_edges_by_target_cache = {}
+
+        selected = plan.top_edges_by_target(target, 1)
+
+        self.assertEqual(selected[0][0], source_a)
+
+    def test_overlapping_caches_do_not_consume_multiple_candidate_slots(self):
+        target = _closed_period(period_id=1, group_id=1)
+        target.period_type = PeriodType("TARGET", "X")
+        rejected_source = PeriodSignature(PeriodType("A", "Y"), 0)
+        accepted_source = PeriodSignature(PeriodType("B", "Y"), 0)
+        rejected_edge = CompiledEdge(100.0, 50.0, 60.0, 0.0)
+        accepted_edge = CompiledEdge(90.0, 1.0, 60.0, 0.0)
+
+        class StubIndex:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def top_target(self, _signature, _limit, _min_past_window):
+                return list(self.rows)
+
+        plan = object.__new__(CompiledAssociationPlan)
+        plan.precompiled_indexes = [
+            StubIndex(
+                [
+                    (rejected_source, rejected_edge),
+                    (accepted_source, accepted_edge),
+                ]
+            ),
+            StubIndex([(rejected_source, rejected_edge)]),
+        ]
+        plan.edges_by_target = {}
+        plan._target_edge_versions = {}
+        plan._top_edges_by_target_cache = {}
+        engine = SimpleNamespace(
+            config=SimpleNamespace(time_slack_sec=1.0),
+            plan=plan,
+            _past_score=lambda edge, _dt: edge.base_score,
+        )
+        imputer = PeriodSourceImputer(
+            engine,
+            PeriodImputeConfig(enabled=True, kappa=-2.0, max_candidates=2),
+        )
+
+        best = imputer._best_candidate(target)
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best[1], accepted_source)
+
+    def test_zero_lag_uses_zero_map_offset(self):
+        edge = CompiledEdge(
+            base_score=10.0,
+            threshold=1.0,
+            past_window_sec=0.5,
+            future_window_sec=0.0,
+        )
+        seen_dt = []
+        target = _closed_period(period_id=1, group_id=1)
+        target.period_type = PeriodType("A", "X")
+        engine = SimpleNamespace(
+            config=SimpleNamespace(time_slack_sec=0.0),
+            plan=SimpleNamespace(
+                iter_edges_by_target=lambda _sig: iter(
+                    [(PeriodType("B", "Y"), edge)]
+                )
+            ),
+            _past_score=lambda candidate, dt: (
+                seen_dt.append(dt) or candidate.base_score
+            ),
+        )
+        imputer = PeriodSourceImputer(
+            engine,
+            PeriodImputeConfig(enabled=True, kappa=-2.0, lag_sec=0.0),
+        )
+
+        self.assertIsNotNone(imputer._best_candidate(target))
+        self.assertEqual(seen_dt, [0.0])
+        self.assertEqual(imputer._source_offset_sec(), 0.0)
+
+    def test_config_rejects_non_finite_and_rewarding_values(self):
+        invalid = (
+            {"kappa": 0.1},
+            {"kappa": float("nan")},
+            {"kappa": float("inf")},
+            {"lag_sec": float("nan")},
+            {"lag_sec": float("inf")},
+            {"min_score_ratio": float("nan")},
+            {"min_score_ratio": float("inf")},
+        )
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    PeriodImputeConfig(enabled=True, **kwargs).validate()
+
+    def test_config_metadata_contains_effective_imputation_knobs(self):
+        config = PeriodImputeConfig(
+            enabled=True,
+            kappa=-3.0,
+            max_candidates=7,
+            lag_sec=2.5,
+            min_score_ratio=1.5,
+        )
+        self.assertEqual(
+            config.to_dict(),
+            {
+                "enabled": True,
+                "kappa": -3.0,
+                "max_candidates": 7,
+                "lag_sec": 2.5,
+                "min_score_ratio": 1.5,
+            },
+        )
+
+
+class ClearMetricNullSamplingTest(unittest.TestCase):
+    def test_draws_per_alarm_caps_distinct_cross_group_partners(self):
+        alarms = [
+            ClearedAlarm("anchor", "A", 0.0, 0.0),
+            ClearedAlarm("b1", "B", 1.0, 10.0),
+            ClearedAlarm("b2", "B", 2.0, 20.0),
+            ClearedAlarm("b3", "B", 3.0, 30.0),
+            ClearedAlarm("b4", "B", 4.0, 40.0),
+            ClearedAlarm("b5", "B", 5.0, 50.0),
+        ]
+
+        deltas = _sample_null_pairs(
+            alarms,
+            occ_window_sec=100.0,
+            max_null_pairs=100,
+            draws_per_alarm=3,
+            rng=random.Random(0),
+        )
+
+        self.assertEqual(len(deltas), 3)
+        self.assertEqual(len(deltas), len(set(deltas)))
 
 
 if __name__ == "__main__":
