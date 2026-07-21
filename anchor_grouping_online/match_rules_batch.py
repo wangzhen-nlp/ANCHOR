@@ -388,33 +388,13 @@ class BatchFaultGroupMatcher:
         min_ts = None
         group_last_ts = None
         for generated_alarm in group_alarms or ():
-            matching_alarm = _matching_alarm(generated_alarm, matching_cache, ne_to_site)
-            alarm_id = matching_alarm["alarm_id"]
-            ts = matching_alarm["ts"]
-            first_in_batch = alarm_id not in batch_alarm_ids
-            batch_alarm_ids.add(alarm_id)
-            if first_in_batch:
-                batch.current_generated_alarms.append(generated_alarm)
-            if batch.batch_min_ts is None or ts < batch.batch_min_ts:
-                batch.batch_min_ts = ts
+            ts, registered_ts = self._register_batch_alarm(
+                session, batch, batch_alarm_ids, group_id, generated_alarm,
+                alarm_ids, kept_alarms, matching_cache, ne_to_site,
+            )
             min_ts = ts if min_ts is None else min(min_ts, ts)
-            if alarm_id not in alarm_ids:
-                kept_alarms.append(generated_alarm)
-            alarm_ids.add(alarm_id)
-            owner_group_ids = batch.local_alarm_owners.setdefault(alarm_id, [])
-            if group_id not in owner_group_ids:
-                owner_group_ids.append(group_id)
-            alarm_entry = session["alarm_registry"].get(alarm_id)
-            alarm_was_registered = alarm_entry is not None
-            if alarm_entry is None:
-                alarm_entry = _register_alarm(session, alarm_id, ts, None)
-            registered_ts = alarm_entry[0]
             if group_last_ts is None or registered_ts > group_last_ts:
                 group_last_ts = registered_ts
-            self._classify_trigger_eligibility(
-                batch, generated_alarm, first_in_batch, alarm_was_registered,
-                matching_alarm["is_clear"],
-            )
         batch.local_group_alarm_ids[group_id] = alarm_ids
         batch.local_group_alarms[group_id] = kept_alarms
         batch.local_group_min_ts[group_id] = min_ts
@@ -424,6 +404,41 @@ class BatchFaultGroupMatcher:
             _register_group(session, group_id, group_last_ts, None)
         else:
             _touch_group(session, group_id, group_last_ts)
+
+    def _register_batch_alarm(
+        self, session, batch, batch_alarm_ids, group_id, generated_alarm,
+        alarm_ids, kept_alarms, matching_cache, ne_to_site,
+    ):
+        """登记单条本批告警：更新批工作集/归属/事件缓存与 trigger 资格。
+
+        原地填充组内去重集合 alarm_ids 与保序告警列表 kept_alarms，返回
+        (该告警 ts, 已登记 ts)——已登记 ts 取自缓存中同 ID 告警，供上层算
+        组最近时间。
+        """
+        matching_alarm = _matching_alarm(generated_alarm, matching_cache, ne_to_site)
+        alarm_id = matching_alarm["alarm_id"]
+        ts = matching_alarm["ts"]
+        first_in_batch = alarm_id not in batch_alarm_ids
+        batch_alarm_ids.add(alarm_id)
+        if first_in_batch:
+            batch.current_generated_alarms.append(generated_alarm)
+        if batch.batch_min_ts is None or ts < batch.batch_min_ts:
+            batch.batch_min_ts = ts
+        if alarm_id not in alarm_ids:
+            kept_alarms.append(generated_alarm)
+        alarm_ids.add(alarm_id)
+        owner_group_ids = batch.local_alarm_owners.setdefault(alarm_id, [])
+        if group_id not in owner_group_ids:
+            owner_group_ids.append(group_id)
+        alarm_entry = session["alarm_registry"].get(alarm_id)
+        alarm_was_registered = alarm_entry is not None
+        if alarm_entry is None:
+            alarm_entry = _register_alarm(session, alarm_id, ts, None)
+        self._classify_trigger_eligibility(
+            batch, generated_alarm, first_in_batch, alarm_was_registered,
+            matching_alarm["is_clear"],
+        )
+        return ts, alarm_entry[0]
 
     @staticmethod
     def _classify_trigger_eligibility(
@@ -482,11 +497,31 @@ class BatchFaultGroupMatcher:
         return self._merge_batch_and_finalize(engine, raw_matches)
 
     def _link_batch_groups(self, session, alarm_groups, batch, output_matches):
+        """把共享告警、症状匹配、组 ID 连续性三类证据汇成组间连边。
+
+        返回 (本批连通并查集, 组->历史汇聚组候选, 本批连通边, 共享告警刚性边)。
+        """
         local_union = _GroupUnionFind()
         for group_id in alarm_groups:
             local_union.add(group_id)
         linked_agg_ids_by_group = {group_id: [] for group_id in alarm_groups}
         current_group_edges = []
+        shared_alarm_edges = self._collect_shared_alarm_edges(
+            batch, local_union, current_group_edges
+        )
+        self._link_symptom_matches(
+            session, batch, output_matches, local_union,
+            linked_agg_ids_by_group, current_group_edges,
+        )
+        self._link_group_continuity(session, batch, linked_agg_ids_by_group)
+        return (
+            local_union, linked_agg_ids_by_group,
+            current_group_edges, shared_alarm_edges,
+        )
+
+    @staticmethod
+    def _collect_shared_alarm_edges(batch, local_union, current_group_edges):
+        """共享同一条告警的原始组两两连边（同时并入本批连通与刚性簇）。"""
         shared_alarm_edges = []
         for owner_group_ids in batch.local_alarm_owners.values():
             if len(owner_group_ids) >= 2:
@@ -494,12 +529,25 @@ class BatchFaultGroupMatcher:
                 edge = list(owner_group_ids)
                 current_group_edges.append(edge)
                 shared_alarm_edges.append(edge)
-        def link_group_to_agg(group_id, agg_id):
-            linked = linked_agg_ids_by_group[group_id]
-            if agg_id is not None and agg_id in session["agg_registry"] and agg_id not in linked:
-                linked.append(agg_id)
-        conflicted_alarm_ids = session.get("conflicted_alarm_ids") or frozenset()
-        conflicted_group_ids = session.get("conflicted_group_ids") or frozenset()
+        return shared_alarm_edges
+
+    @staticmethod
+    def _link_group_to_agg(session, linked_agg_ids_by_group, group_id, agg_id):
+        """把 group_id 挂到既有汇聚组 agg_id 的候选列表（去重、仅限现存组）。"""
+        linked = linked_agg_ids_by_group[group_id]
+        if (
+            agg_id is not None
+            and agg_id in session["agg_registry"]
+            and agg_id not in linked
+        ):
+            linked.append(agg_id)
+
+    def _link_symptom_matches(
+        self, session, batch, output_matches, local_union,
+        linked_agg_ids_by_group, current_group_edges,
+    ):
+        """症状匹配组内原始组连边，并挂到症状告警的既有历史汇聚组上。"""
+        conflicted_alarm_ids = session["conflicted_alarm_ids"]
         for match in self._iter_output_matches(output_matches):
             related_group_ids = []
             related_agg_ids = []
@@ -519,16 +567,27 @@ class BatchFaultGroupMatcher:
                 current_group_edges.append(list(related_group_ids))
             for group_id in related_group_ids:
                 for agg_id in related_agg_ids:
-                    link_group_to_agg(group_id, agg_id)
+                    self._link_group_to_agg(
+                        session, linked_agg_ids_by_group, group_id, agg_id
+                    )
+
+    def _link_group_continuity(self, session, batch, linked_agg_ids_by_group):
+        """组 ID 连续性：非冲突原始组挂到其既有归属及其告警的既有汇聚组。"""
+        conflicted_alarm_ids = session["conflicted_alarm_ids"]
+        conflicted_group_ids = session["conflicted_group_ids"]
         for group_id, alarm_ids in batch.local_group_alarm_ids.items():
             if group_id in conflicted_group_ids:
                 continue
-            link_group_to_agg(group_id, session["group_registry"][group_id][1])
+            self._link_group_to_agg(
+                session, linked_agg_ids_by_group, group_id,
+                session["group_registry"][group_id][1],
+            )
             for alarm_id in alarm_ids:
                 alarm_entry = session["alarm_registry"].get(alarm_id)
                 if alarm_entry is not None and alarm_id not in conflicted_alarm_ids:
-                    link_group_to_agg(group_id, alarm_entry[1])
-        return local_union, linked_agg_ids_by_group, current_group_edges, shared_alarm_edges
+                    self._link_group_to_agg(
+                        session, linked_agg_ids_by_group, group_id, alarm_entry[1]
+                    )
 
     def _assign_components(self, session, alarm_groups, batch, links, max_member_count):
         """按本批连通分量分配稳定的汇聚组 ID（上限按原始组个数计）：
@@ -573,7 +632,7 @@ class BatchFaultGroupMatcher:
         current_group_edges, rigid_union, max_member_count,
         batch_member_entries_by_agg, changed_agg_ids,
     ):
-        conflicted_group_ids = session.get("conflicted_group_ids") or frozenset()
+        conflicted_group_ids = session["conflicted_group_ids"]
         linked_agg_ids = []
         for group_id in members:
             if group_id in conflicted_group_ids:
@@ -612,8 +671,8 @@ class BatchFaultGroupMatcher:
     def _assign_rigid_cluster(
         self, session, batch, cluster_members, unassigned_members,
         batch_member_entries_by_agg, changed_agg_ids):
-        conflicted_alarm_ids = session.get("conflicted_alarm_ids") or frozenset()
-        conflicted_group_ids = session.get("conflicted_group_ids") or frozenset()
+        conflicted_alarm_ids = session["conflicted_alarm_ids"]
+        conflicted_group_ids = session["conflicted_group_ids"]
         cluster_members = [group_id for group_id in cluster_members if group_id not in conflicted_group_ids]
         if not cluster_members:
             return
@@ -697,9 +756,7 @@ class BatchFaultGroupMatcher:
         """成员组划入汇聚组：登记归属/计数/告警映射与本批条目。"""
         new_alarm_ids = []
         seen_new_alarm_ids = set()
-        conflicted_alarm_ids = (
-            session.get("conflicted_alarm_ids") or frozenset()
-        )
+        conflicted_alarm_ids = session["conflicted_alarm_ids"]
         new_group_count = 0
         for group_id in member_group_ids:
             group_entry = session["group_registry"][group_id]
@@ -711,19 +768,10 @@ class BatchFaultGroupMatcher:
             if group_entry[1] is None:
                 new_group_count += 1
             _set_group_owner(session, group_id, agg_id)
-            # 跨组去重：同一条新告警被簇内多个成员组共同包含时只登记一次。
-            # 告警归属在本方法末尾（_attach_alarms_to_agg）才统一写入，遍历
-            # 期间共享告警始终显示未归属，不去重会被每个组各收一次，导致
-            # 汇聚组告警计数按重复次数虚增。
-            for alarm_id in batch.local_group_alarm_ids[group_id]:
-                if alarm_id in conflicted_alarm_ids:
-                    continue
-                if alarm_id in seen_new_alarm_ids:
-                    continue
-                if session["alarm_registry"][alarm_id][1] is not None:
-                    continue
-                seen_new_alarm_ids.add(alarm_id)
-                new_alarm_ids.append(alarm_id)
+            self._collect_group_new_alarm_ids(
+                session, group_id, batch, conflicted_alarm_ids,
+                seen_new_alarm_ids, new_alarm_ids,
+            )
         session["agg_registry"][agg_id][0] += new_group_count
         _attach_alarms_to_agg(session, agg_id, new_alarm_ids)
         if new_group_count or new_alarm_ids:
@@ -732,6 +780,28 @@ class BatchFaultGroupMatcher:
             {group_id: batch.local_group_alarms[group_id]}
             for group_id in member_group_ids
         )
+
+    @staticmethod
+    def _collect_group_new_alarm_ids(
+        session, group_id, batch, conflicted_alarm_ids,
+        seen_new_alarm_ids, new_alarm_ids,
+    ):
+        """收集组内尚未归属、非冲突且跨组去重后的新告警 ID（原地追加）。
+
+        跨组去重：同一条新告警被簇内多个成员组共同包含时只登记一次。告警
+        归属在 _assign_members_to_agg 末尾（_attach_alarms_to_agg）才统一写入，
+        遍历期间共享告警始终显示未归属，不去重会被每个组各收一次，导致汇聚
+        组告警计数按重复次数虚增。
+        """
+        for alarm_id in batch.local_group_alarm_ids[group_id]:
+            if alarm_id in conflicted_alarm_ids:
+                continue
+            if alarm_id in seen_new_alarm_ids:
+                continue
+            if session["alarm_registry"][alarm_id][1] is not None:
+                continue
+            seen_new_alarm_ids.add(alarm_id)
+            new_alarm_ids.append(alarm_id)
 
     @staticmethod
     def _build_batch_increments(
@@ -886,7 +956,7 @@ class BatchFaultGroupMatcher:
             alarm_entry = session["alarm_registry"].get(alarm_id)
             _mark_conflicted_alarm(session, alarm_id, alarm_entry[1] if alarm_entry is not None else None)
         if conflicted_group_ids:
-            session.setdefault("conflicted_group_ids", set()).update(conflicted_group_ids)
+            session["conflicted_group_ids"].update(conflicted_group_ids)
         ne_to_site = self.static_context.ne_to_site
         current_alarm_records_by_group, current_matching_alarms_by_id, current_generated_alarms_by_id = (
             _index_current_alarms(raw_alarm_groups, matching_cache, ne_to_site)
@@ -898,7 +968,7 @@ class BatchFaultGroupMatcher:
             need_id_sets=imported_agg_counts is None,
         )
         if imported_agg_counts is not None:
-            final_conflicted_alarm_ids = session.get("conflicted_alarm_ids") or frozenset()
+            final_conflicted_alarm_ids = session["conflicted_alarm_ids"]
             newly_excluded_alarm_ids = set(final_conflicted_alarm_ids) - incoming_conflicted_alarm_ids
             if newly_excluded_alarm_ids:
                 imported_agg_counts = _exclude_conflicts_from_imported_counts(
@@ -927,40 +997,40 @@ class BatchFaultGroupMatcher:
         matching_cache=None, history_horizon_ts=None,
     ):
         session = self._new_session(associate_time, max_group_time)
-        session.setdefault("inactive_external_agg_ids", set())
-        session.setdefault("conflicted_alarm_ids", set())
-        conflicted_group_ids = session.setdefault("conflicted_group_ids", set())
-        group_to_aggs = {}
-        for agg_id, member_entries in old_agg_alarm_groups.items():
-            for member_entry in member_entries or ():
-                for group_id in member_entry:
-                    group_to_aggs.setdefault(group_id, set()).add(agg_id)
-        for group_id, aggs in group_to_aggs.items():
-            if len(aggs) >= 2:
-                conflicted_group_ids.add(group_id)
+        _mark_rebuild_group_conflicts(session, old_agg_alarm_groups)
         ne_to_site = self.static_context.ne_to_site
         for agg_id, member_entries in old_agg_alarm_groups.items():
-            agg_entry = _ensure_agg(session, agg_id)
-            agg_last_ts = None
-            agg_has_alive_history = False
-            for member_entry in member_entries or ():
-                for group_id, group_alarms in member_entry.items():
-                    group_last_ts, group_has_alive_history = self._rebuild_group_entry(
-                        session, agg_id, agg_entry, group_id, group_alarms,
-                        matching_cache, ne_to_site, history_horizon_ts,
-                    )
-                    agg_has_alive_history = (
-                        agg_has_alive_history or group_has_alive_history
-                    )
-                    if group_last_ts is not None and (
-                        agg_last_ts is None or group_last_ts > agg_last_ts
-                    ):
-                        agg_last_ts = group_last_ts
-            if agg_last_ts is not None:
-                _touch_agg(session, agg_id, agg_last_ts)
-            if history_horizon_ts is not None and not agg_has_alive_history:
-                session["inactive_external_agg_ids"].add(agg_id)
+            self._rebuild_agg_entry(
+                session, agg_id, member_entries,
+                matching_cache, ne_to_site, history_horizon_ts,
+            )
         return session
+
+    def _rebuild_agg_entry(
+        self, session, agg_id, member_entries,
+        matching_cache, ne_to_site, history_horizon_ts,
+    ):
+        """重建单个外置汇聚组：逐成员条目导入，刷新最晚时间与失活标记。"""
+        agg_entry = _ensure_agg(session, agg_id)
+        agg_last_ts = None
+        agg_has_alive_history = False
+        for member_entry in member_entries or ():
+            for group_id, group_alarms in member_entry.items():
+                group_last_ts, group_has_alive_history = self._rebuild_group_entry(
+                    session, agg_id, agg_entry, group_id, group_alarms,
+                    matching_cache, ne_to_site, history_horizon_ts,
+                )
+                agg_has_alive_history = (
+                    agg_has_alive_history or group_has_alive_history
+                )
+                if group_last_ts is not None and (
+                    agg_last_ts is None or group_last_ts > agg_last_ts
+                ):
+                    agg_last_ts = group_last_ts
+        if agg_last_ts is not None:
+            _touch_agg(session, agg_id, agg_last_ts)
+        if history_horizon_ts is not None and not agg_has_alive_history:
+            session["inactive_external_agg_ids"].add(agg_id)
 
     def _rebuild_group_entry(
         self, session, agg_id, agg_entry, group_id, group_alarms,
@@ -977,37 +1047,52 @@ class BatchFaultGroupMatcher:
         group_last_ts = None
         group_has_alive_history = False
         for generated_alarm in group_alarms or ():
-            matching_alarm = _matching_alarm(
-                generated_alarm, matching_cache, ne_to_site
+            ts, alarm_is_alive = self._rebuild_import_alarm(
+                session, agg_id, agg_entry, is_conflicted_group,
+                generated_alarm, matching_cache, ne_to_site, history_horizon_ts,
             )
-            if matching_alarm["is_clear"]:
-                raise ValueError(
-                    "old_agg 只允许包含有效发生告警，不允许清除告警"
-                )
-            alarm_id = matching_alarm["alarm_id"]
-            ts = matching_alarm["ts"]
-            alarm_is_alive = history_horizon_ts is None or ts >= history_horizon_ts
             group_has_alive_history = group_has_alive_history or alarm_is_alive
-            if is_conflicted_group:
-                self._register_conflicted_group_alarm(
-                    session, matching_alarm, alarm_is_alive
-                )
-            else:
-                alarm_entry = session["alarm_registry"].get(alarm_id)
-                if alarm_entry is None:
-                    _register_alarm(session, alarm_id, ts, agg_id)
-                    if alarm_is_alive:
-                        self._process_matching_alarm(
-                            session["engine"], matching_alarm, index_trigger=False
-                        )
-                    agg_entry[2] += 1
-                elif alarm_entry[1] != agg_id:
-                    _mark_conflicted_alarm(session, alarm_id, alarm_entry[1])
             if group_last_ts is None or ts > group_last_ts:
                 group_last_ts = ts
         if group_last_ts is not None:
             _touch_group(session, group_id, group_last_ts)
         return group_last_ts, group_has_alive_history
+
+    def _rebuild_import_alarm(
+        self, session, agg_id, agg_entry, is_conflicted_group,
+        generated_alarm, matching_cache, ne_to_site, history_horizon_ts,
+    ):
+        """导入 old_agg 中的单条告警，返回 (ts, 是否视界内存活)。
+
+        冲突组告警连坐 conflicted；正常组首见登记归属并计数，存活时喂引擎
+        一次，已被别的 agg 登记的记为告警级冲突。old_agg 不允许清除告警。
+        """
+        matching_alarm = _matching_alarm(
+            generated_alarm, matching_cache, ne_to_site
+        )
+        if matching_alarm["is_clear"]:
+            raise ValueError(
+                "old_agg 只允许包含有效发生告警，不允许清除告警"
+            )
+        alarm_id = matching_alarm["alarm_id"]
+        ts = matching_alarm["ts"]
+        alarm_is_alive = history_horizon_ts is None or ts >= history_horizon_ts
+        if is_conflicted_group:
+            self._register_conflicted_group_alarm(
+                session, matching_alarm, alarm_is_alive
+            )
+        else:
+            alarm_entry = session["alarm_registry"].get(alarm_id)
+            if alarm_entry is None:
+                _register_alarm(session, alarm_id, ts, agg_id)
+                if alarm_is_alive:
+                    self._process_matching_alarm(
+                        session["engine"], matching_alarm, index_trigger=False
+                    )
+                agg_entry[2] += 1
+            elif alarm_entry[1] != agg_id:
+                _mark_conflicted_alarm(session, alarm_id, alarm_entry[1])
+        return ts, alarm_is_alive
 
     @staticmethod
     def _register_conflicted_group_alarm(session, matching_alarm, alarm_is_alive):
@@ -1023,7 +1108,7 @@ class BatchFaultGroupMatcher:
         alarm_entry = session["alarm_registry"].get(alarm_id)
         if alarm_entry is None:
             _register_alarm(session, alarm_id, matching_alarm["ts"], None)
-            session.setdefault("conflicted_alarm_ids", set()).add(alarm_id)
+            session["conflicted_alarm_ids"].add(alarm_id)
             if alarm_is_alive:
                 BatchFaultGroupMatcher._process_matching_alarm(
                     session["engine"], matching_alarm, index_trigger=False
@@ -1087,6 +1172,9 @@ class BatchFaultGroupMatcher:
             # 内部会话既有归属不一致）。降级容忍——各 agg 仍把它挂名为
             # 成员、归属先到先得，但连续性挂起、其所有告警连坐 conflicted。
             "conflicted_group_ids": set(),
+            # 告警级冲突：同一告警编码 ID 落在多个汇聚组下。始终建成空集，
+            # 使各阶段可直接读取（不再 get/setdefault 兜底）。
+            "conflicted_alarm_ids": set(),
             # 仅持久会话维护。临时/隔离会话不做 TTL，避免额外堆内存。
             "history_expiry_indexes": (
                 _new_history_expiry_indexes()
@@ -1510,7 +1598,7 @@ def _overwrite_agg_counts(
     O(|group_registry| + |alarm_registry|) 的内部全表扫描。
     """
     if imported_agg_counts is None:
-        conflicted_alarm_ids = session.get("conflicted_alarm_ids") or frozenset()
+        conflicted_alarm_ids = session["conflicted_alarm_ids"]
         imported_agg_counts = {
             agg_id: (
                 len(imported_group_ids[agg_id]),
@@ -1526,11 +1614,17 @@ def _overwrite_agg_counts(
 
 def _prune_session_history(session, horizon_ts):
     """按三个最小堆增量回收视界之前的会话状态。"""
-    indexes = session["history_expiry_indexes"]
+    _prune_expired_alarms(session, horizon_ts)
+    _prune_expired_aggs(session, horizon_ts)
+    _prune_expired_groups(session, horizon_ts)
+    _maybe_compact_history_expiry_heaps(session)
 
+
+def _prune_expired_alarms(session, horizon_ts):
+    """回收最晚告警早于视界的告警缓存条目，同步清冲突标记。"""
     alarm_registry = session["alarm_registry"]
     conflicted_alarm_ids = session.get("conflicted_alarm_ids")
-    alarm_heap = indexes["alarm_heap"]
+    alarm_heap = session["history_expiry_indexes"]["alarm_heap"]
     while alarm_heap and alarm_heap[0][0] < horizon_ts:
         ts, _seq, alarm_id = heapq.heappop(alarm_heap)
         entry = alarm_registry.get(alarm_id)
@@ -1539,7 +1633,10 @@ def _prune_session_history(session, horizon_ts):
             if conflicted_alarm_ids:
                 conflicted_alarm_ids.discard(alarm_id)
 
-    # 汇聚组：最晚告警早于视界（或从未有告警）即整体回收。
+
+def _prune_expired_aggs(session, horizon_ts):
+    """汇聚组：最晚告警早于视界（或从未有告警）即整体回收。"""
+    indexes = session["history_expiry_indexes"]
     agg_registry = session["agg_registry"]
     for agg_id in tuple(indexes["empty_agg_ids"]):
         entry = agg_registry.get(agg_id)
@@ -1554,17 +1651,17 @@ def _prune_session_history(session, horizon_ts):
         if entry is not None and entry[1] == ts:
             _expire_agg(session, agg_id)
 
-    # 原始组自身过期时删除；汇聚组过期导致的归属清空由 groups_by_agg
-    # 反向索引精确处理，不再扫描全部 group_registry。
+
+def _prune_expired_groups(session, horizon_ts):
+    """原始组自身过期时删除；汇聚组过期导致的归属清空由 groups_by_agg
+    反向索引精确处理，不再扫描全部 group_registry。"""
     group_registry = session["group_registry"]
-    group_heap = indexes["group_heap"]
+    group_heap = session["history_expiry_indexes"]["group_heap"]
     while group_heap and group_heap[0][0] < horizon_ts:
         ts, _seq, group_id = heapq.heappop(group_heap)
         entry = group_registry.get(group_id)
         if entry is not None and entry[0] == ts:
             _delete_group(session, group_id)
-
-    _maybe_compact_history_expiry_heaps(session)
 
 
 def _new_history_expiry_indexes():
@@ -1603,7 +1700,7 @@ def _mark_conflicted_alarm(session, alarm_id, owner_agg_id):
     old_agg 遍历序影响。重复标记（同一告警挂三个以上汇聚组、或跨调用
     再次发现）幂等，不重复回滚。
     """
-    conflicted_alarm_ids = session.setdefault("conflicted_alarm_ids", set())
+    conflicted_alarm_ids = session["conflicted_alarm_ids"]
     if alarm_id in conflicted_alarm_ids:
         return
     conflicted_alarm_ids.add(alarm_id)
@@ -1837,6 +1934,38 @@ def _index_current_alarms(raw_alarm_groups, matching_cache, ne_to_site):
     )
 
 
+def _mark_rebuild_group_conflicts(session, old_agg_alarm_groups):
+    """外置重建：把落在多个汇聚组下的原始组记入 conflicted_group_ids。"""
+    conflicted_group_ids = session["conflicted_group_ids"]
+    group_to_aggs = {}
+    for agg_id, member_entries in old_agg_alarm_groups.items():
+        for member_entry in member_entries or ():
+            for group_id in member_entry:
+                group_to_aggs.setdefault(group_id, set()).add(agg_id)
+    for group_id, aggs in group_to_aggs.items():
+        if len(aggs) >= 2:
+            conflicted_group_ids.add(group_id)
+
+
+def _detect_external_group_conflicts(session, agg_output):
+    """定位组级冲突并记入 conflicted_group_ids：同一原始组跨多个 agg，或与
+    内部会话既有归属不一致。返回该会话的 conflicted_group_ids 集合。"""
+    conflicted_group_ids = session["conflicted_group_ids"]
+    group_to_aggs = {}
+    for agg_id, member_entries in agg_output.items():
+        for member_entry in member_entries:
+            for group_id in member_entry:
+                aggs = group_to_aggs.setdefault(group_id, set())
+                aggs.add(agg_id)
+                internal_entry = session["group_registry"].get(group_id)
+                if internal_entry is not None and internal_entry[1] is not None:
+                    aggs.add(internal_entry[1])
+    for group_id, aggs in group_to_aggs.items():
+        if len(aggs) >= 2:
+            conflicted_group_ids.add(group_id)
+    return conflicted_group_ids
+
+
 def _validate_external_increment(
     session, agg_output, resolve_matching_alarm, need_id_sets
 ):
@@ -1857,20 +1986,8 @@ def _validate_external_increment(
     imported_alarm_ids = (
         {agg_id: set() for agg_id in agg_output} if need_id_sets else None
     )
-    conflicted_group_ids = session.setdefault("conflicted_group_ids", set())
     # 两遍：先定位组级冲突（增量自身跨多个 agg，或与内部会话既有归属不一致）。
-    group_to_aggs = {}
-    for agg_id, member_entries in agg_output.items():
-        for member_entry in member_entries:
-            for group_id in member_entry:
-                aggs = group_to_aggs.setdefault(group_id, set())
-                aggs.add(agg_id)
-                internal_entry = session["group_registry"].get(group_id)
-                if internal_entry is not None and internal_entry[1] is not None:
-                    aggs.add(internal_entry[1])
-    for group_id, aggs in group_to_aggs.items():
-        if len(aggs) >= 2:
-            conflicted_group_ids.add(group_id)
+    conflicted_group_ids = _detect_external_group_conflicts(session, agg_output)
     for agg_id, member_entries in agg_output.items():
         for member_entry in member_entries:
             for group_id, group_alarms in member_entry.items():
@@ -1915,44 +2032,65 @@ def _validate_external_alarm_owners(
 
 
 def _import_external_entries(session, agg_output, resolve_matching_alarm):
-    conflicted_group_ids = session.get("conflicted_group_ids") or frozenset()
-    conflicted_alarm_ids = session.setdefault("conflicted_alarm_ids", set())
     for agg_id, member_entries in agg_output.items():
         agg_entry = _ensure_agg(session, agg_id)
         imported_agg_last_ts = agg_entry[1]
         for member_entry in member_entries:
             for group_id, group_alarms in member_entry.items():
-                group_conflicted = group_id in conflicted_group_ids
-                group_entry = session["group_registry"].get(group_id)
-                if group_entry is None:
-                    group_entry = _register_group(session, group_id, None, None)
-                if group_conflicted:
-                    agg_entry[0] += 1
-                    if group_entry[1] is None:
-                        _set_group_owner(session, group_id, agg_id)
-                elif group_entry[1] != agg_id:
-                    agg_entry[0] += 1
-                    _set_group_owner(session, group_id, agg_id)
-                imported_group_last_ts = group_entry[0]
-                for generated_alarm in group_alarms:
-                    matching_alarm = resolve_matching_alarm(generated_alarm)
-                    alarm_id = matching_alarm["alarm_id"]
-                    ts = matching_alarm["ts"]
-                    alarm_entry = session["alarm_registry"].get(alarm_id)
-                    if group_conflicted or alarm_id in conflicted_alarm_ids:
-                        if alarm_entry is None:
-                            _register_alarm(session, alarm_id, ts, None)
-                        conflicted_alarm_ids.add(alarm_id)
-                    elif alarm_entry is None:
-                        _register_alarm(session, alarm_id, ts, agg_id)
-                        agg_entry[2] += 1
-                    elif alarm_entry[1] is None:
-                        alarm_entry[1] = agg_id
-                        agg_entry[2] += 1
-                    if imported_agg_last_ts is None or ts > imported_agg_last_ts:
-                        imported_agg_last_ts = ts
-                    if imported_group_last_ts is None or ts > imported_group_last_ts:
-                        imported_group_last_ts = ts
-                _touch_group(session, group_id, imported_group_last_ts)
+                group_alarm_max_ts = _import_external_group_entry(
+                    session, agg_id, agg_entry, group_id, group_alarms,
+                    resolve_matching_alarm,
+                )
+                if group_alarm_max_ts is not None and (
+                    imported_agg_last_ts is None
+                    or group_alarm_max_ts > imported_agg_last_ts
+                ):
+                    imported_agg_last_ts = group_alarm_max_ts
         if imported_agg_last_ts is not None:
             _touch_agg(session, agg_id, imported_agg_last_ts)
+
+
+def _import_external_group_entry(
+    session, agg_id, agg_entry, group_id, group_alarms, resolve_matching_alarm,
+):
+    """导入单个成员条目：登记组归属/计数、逐告警并入，刷新组最近告警时间。
+
+    返回该条目内告警的最晚时间（无告警时 None），供上层累计汇聚组最晚时间；
+    组的最近时间用「既有组时间与本条目告警」取大，故不参与汇聚组累计。
+    """
+    conflicted_group_ids = session["conflicted_group_ids"]
+    conflicted_alarm_ids = session["conflicted_alarm_ids"]
+    group_conflicted = group_id in conflicted_group_ids
+    group_entry = session["group_registry"].get(group_id)
+    if group_entry is None:
+        group_entry = _register_group(session, group_id, None, None)
+    if group_conflicted:
+        agg_entry[0] += 1
+        if group_entry[1] is None:
+            _set_group_owner(session, group_id, agg_id)
+    elif group_entry[1] != agg_id:
+        agg_entry[0] += 1
+        _set_group_owner(session, group_id, agg_id)
+    imported_group_last_ts = group_entry[0]
+    max_alarm_ts = None
+    for generated_alarm in group_alarms:
+        matching_alarm = resolve_matching_alarm(generated_alarm)
+        alarm_id = matching_alarm["alarm_id"]
+        ts = matching_alarm["ts"]
+        alarm_entry = session["alarm_registry"].get(alarm_id)
+        if group_conflicted or alarm_id in conflicted_alarm_ids:
+            if alarm_entry is None:
+                _register_alarm(session, alarm_id, ts, None)
+            conflicted_alarm_ids.add(alarm_id)
+        elif alarm_entry is None:
+            _register_alarm(session, alarm_id, ts, agg_id)
+            agg_entry[2] += 1
+        elif alarm_entry[1] is None:
+            alarm_entry[1] = agg_id
+            agg_entry[2] += 1
+        if max_alarm_ts is None or ts > max_alarm_ts:
+            max_alarm_ts = ts
+        if imported_group_last_ts is None or ts > imported_group_last_ts:
+            imported_group_last_ts = ts
+    _touch_group(session, group_id, imported_group_last_ts)
+    return max_alarm_ts
