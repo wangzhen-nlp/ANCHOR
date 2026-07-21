@@ -340,6 +340,11 @@ def _teacher_positive_masks(
                     for index in np.flatnonzero(keep):
                         source = PeriodType(entities[int(index)], source_at)
                         mask = candidate_rule_mask(target, source, plan.scorer)
+                        # The related branch owns its pairs from a separate
+                        # cache; the unrelated policy only cares about positives
+                        # the related predicate cannot retrieve.
+                        if mask & RELATED_MASK:
+                            continue
                         counts[pair_key][int(mask)] += 1
             # entity_parts_from_table caches one (source_count, 7) site-pair
             # matrix per target site. Learning samples many sites, so retain no
@@ -378,28 +383,36 @@ def _rule_costs(target_entities, alarm_types, prepared):
 NONLOCAL_RULES = tuple(rule for rule in RULES if rule not in RELATED_RULES)
 
 
-def _covered_union(mask_counts, selected_mask):
-    """Positives the two-branch system recalls: related-covered ∪ policy-covered.
+def _nonrelated_total(mask_counts):
+    """Positives the related branch cannot retrieve — the unrelated branch's job.
 
-    A positive is recalled if the related predicate would retrieve it (any
-    ``RELATED_MASK`` bit set — the related cache owns it) or a selected non-local
-    rule retrieves it. This is the recall the online union actually achieves.
+    A positive with any ``RELATED_MASK`` bit set belongs to the related cache
+    (the two branches are disjoint), so it is excluded here. Recall is measured
+    purely over these non-related positives; the related branch is ignored.
     """
     return sum(
         count
         for mask, count in mask_counts.items()
-        if (int(mask) & RELATED_MASK) or (int(mask) & selected_mask)
+        if not (int(mask) & RELATED_MASK)
+    )
+
+
+def _nonrelated_covered(mask_counts, selected_mask):
+    return sum(
+        count
+        for mask, count in mask_counts.items()
+        if not (int(mask) & RELATED_MASK) and (int(mask) & selected_mask)
     )
 
 
 def _choose_rules(mask_counts, rule_costs, recall_target):
-    """Cheapest non-local rule union whose related∪delta recall clears target.
+    """Cheapest non-local rule union recalling the target's non-related positives.
 
-    Related-covered positives are free (served by the related cache), so the
-    delta only has to recall what related misses. An empty selection is valid
-    and means the related branch alone already meets the target for this pair.
+    Related positives are ignored entirely (the related cache owns them). If a
+    pair has no non-related positives there is nothing for the unrelated branch
+    to do, so it returns an empty rule set.
     """
-    total = sum(mask_counts.values())
+    total = _nonrelated_total(mask_counts)
     if not total:
         return ()
     best = None
@@ -408,7 +421,7 @@ def _choose_rules(mask_counts, rule_costs, recall_target):
         for index, rule in enumerate(NONLOCAL_RULES):
             if extra & (1 << index):
                 selected_mask |= RULE_BITS[rule]
-        if _covered_union(mask_counts, selected_mask) / total + 1e-15 < recall_target:
+        if _nonrelated_covered(mask_counts, selected_mask) / total + 1e-15 < recall_target:
             continue
         selected = tuple(
             rule for rule in NONLOCAL_RULES if selected_mask & RULE_BITS[rule]
@@ -451,17 +464,21 @@ def _wilson_lower_bound(successes, total, confidence):
 def _validation_report(policy, masks, confidence, recall_target, min_pair_positives):
     rows = {}
     total = covered = 0
+    related_positive_count = 0
     pair_failures = []
     for target_at, row in policy.rules_by_alarm_pair.items():
         for source_at, rules in row.items():
             key = (str(target_at), str(source_at))
             mask_counts = masks.get(key, {})
-            pair_total = sum(mask_counts.values())
+            all_positives = sum(mask_counts.values())
+            pair_total = _nonrelated_total(mask_counts)
+            related_positive_count += all_positives - pair_total
             selected_mask = sum(RULE_BITS[rule] for rule in rules)
-            pair_covered = _covered_union(mask_counts, selected_mask)
+            pair_covered = _nonrelated_covered(mask_counts, selected_mask)
             recall = pair_covered / pair_total if pair_total else None
             rows[f"{target_at}->{source_at}"] = {
-                "positive_count": pair_total,
+                "nonrelated_positive_count": pair_total,
+                "related_positive_count": all_positives - pair_total,
                 "covered_positive_count": pair_covered,
                 "recall": recall,
                 "rules": list(rules),
@@ -474,10 +491,13 @@ def _validation_report(policy, masks, confidence, recall_target, min_pair_positi
                 and recall + 1e-15 < recall_target
             ):
                 pair_failures.append(f"{target_at}->{source_at}")
-    recall = covered / total if total else 0.0
-    lower = _wilson_lower_bound(covered, total, confidence)
+    # Recall is measured purely over non-related positives. With none to cover,
+    # an empty policy is vacuously correct.
+    recall = covered / total if total else 1.0
+    lower = _wilson_lower_bound(covered, total, confidence) if total else 1.0
     return {
-        "positive_count": total,
+        "nonrelated_positive_count": total,
+        "related_positive_count": related_positive_count,
         "covered_positive_count": covered,
         "recall": recall,
         "confidence": confidence,
@@ -486,7 +506,7 @@ def _validation_report(policy, masks, confidence, recall_target, min_pair_positi
         "min_pair_positives": min_pair_positives,
         "pair_failures": pair_failures,
         "alarm_pairs": rows,
-        "approved": bool(total and lower >= recall_target and not pair_failures),
+        "approved": bool(lower >= recall_target and not pair_failures),
     }
 
 
@@ -627,15 +647,14 @@ def main():
         args.min_pair_positives,
     )
     calibration_point_ok = bool(
-        calibration_report["positive_count"]
-        and calibration_report["recall"] + 1e-15 >= args.recall_target
+        calibration_report["recall"] + 1e-15 >= args.recall_target
         and not calibration_report["pair_failures"]
     )
     validation["approved"] = bool(
         validation["approved"] and calibration_point_ok
     )
     validation["calibration"] = {
-        "positive_count": calibration_report["positive_count"],
+        "nonrelated_positive_count": calibration_report["nonrelated_positive_count"],
         "covered_positive_count": calibration_report["covered_positive_count"],
         "recall": calibration_report["recall"],
         "pair_failures": calibration_report["pair_failures"],
@@ -687,6 +706,8 @@ def main():
     write_candidate_policy(args.output, policy)
     print(
         f"[candidate-policy] approved={policy.approved}, "
+        f"nonrelated_positives={validation['nonrelated_positive_count']} "
+        f"(related={validation['related_positive_count']}), "
         f"recall={validation['recall']:.6f}, "
         f"lower_bound={validation['recall_lower_bound']:.6f}, "
         f"candidate_ratio={validation['candidate_ratio']:.6%}, "

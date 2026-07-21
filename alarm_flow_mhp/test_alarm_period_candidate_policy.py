@@ -334,9 +334,14 @@ class CandidatePolicyTest(unittest.TestCase):
                 2,
                 quiet=True,
             )
-            teacher_positive_count = sum(masks[("X", "X")].values())
+            teacher_positive_count = sum(masks.get(("X", "X"), {}).values())
             brute_positive_count = 0
             for source_type in period_types:
+                # The teacher only records non-related positives now.
+                if candidate_rule_mask(
+                    period_types[0], source_type, plan.scorer
+                ) & RELATED_MASK:
+                    continue
                 found = False
                 for target_state in range(8):
                     for source_state in range(8):
