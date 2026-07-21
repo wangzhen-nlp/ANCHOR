@@ -23,7 +23,10 @@ from alarm_flow_mhp.learn_alarm_period_candidate_policy import (
     _teacher_positive_masks,
 )
 from alarm_flow_mhp.stream_alarm_period_mhp import (
+    AlarmPeriod,
+    AlarmPeriodMHPAssigner,
     CompiledAssociationPlan,
+    PeriodFaultGroup,
     PeriodSignature,
     PeriodStreamConfig,
     PeriodType,
@@ -436,6 +439,104 @@ class AlarmPeriodProfilingTest(unittest.TestCase):
         self.assertIn("AlarmPeriod MHP 性能分析", text)
         self.assertIn("harvest.collect_relations", text)
         self.assertIn("父阶段包含子阶段", text)
+
+
+def _eviction_engine():
+    engine = object.__new__(AlarmPeriodMHPAssigner)
+    engine.config = PeriodStreamConfig(
+        history_window_sec=10.0,
+        aggregation_wait_sec=5.0,
+        time_slack_sec=2.0,
+    )
+    engine._period_retention_sec = 17.0
+    engine.periods = {}
+    engine.period_ids_by_signature = {}
+    engine.period_ids_by_type = {}
+    engine._group_redirect = {}
+    engine.groups = {}
+    engine._eviction_heap = []
+    engine._heap_seq = 0
+    engine.evicted_period_count = 0
+    engine.eviction_heap_pop_count = 0
+    engine.eviction_stale_entry_count = 0
+    engine.eviction_group_deferred_count = 0
+    engine.closed_group_sink = None
+    engine.closed_group_count = 0
+    return engine
+
+
+def _closed_period(period_id=0, group_id=None):
+    return AlarmPeriod(
+        period_id=period_id,
+        period_type=PeriodType("NE", "X"),
+        initial_state=(0, 0, 0),
+        initial_state_combo=0,
+        first_ts=10.0,
+        last_raise_ts=10.0,
+        status="closed",
+        close_ts=11.0,
+        close_reason="clear",
+        primary_group_id=group_id,
+    )
+
+
+def _index_period(engine, period):
+    engine.periods[period.period_id] = period
+    engine.period_ids_by_signature.setdefault(period.signature, set()).add(
+        period.period_id
+    )
+    engine.period_ids_by_type.setdefault(period.period_type, set()).add(
+        period.period_id
+    )
+
+
+class AlarmPeriodEvictionHeapTest(unittest.TestCase):
+    def test_preserves_strict_legacy_expiry_boundary(self):
+        engine = _eviction_engine()
+        period = _closed_period()
+        _index_period(engine, period)
+        engine._schedule_period_eviction(period)
+
+        engine._evict_expired_periods(27.0)
+        self.assertIn(period.period_id, engine.periods)
+
+        engine._evict_expired_periods(27.001)
+        self.assertNotIn(period.period_id, engine.periods)
+        self.assertNotIn(period.signature, engine.period_ids_by_signature)
+        self.assertNotIn(period.period_type, engine.period_ids_by_type)
+        self.assertEqual(engine.evicted_period_count, 1)
+
+    def test_active_group_period_is_rearmed_when_group_finalizes(self):
+        engine = _eviction_engine()
+        period = _closed_period(group_id=1)
+        _index_period(engine, period)
+        engine.groups[1] = PeriodFaultGroup(
+            group_id=1,
+            anchor_period_id=period.period_id,
+            period_ids={period.period_id},
+        )
+        engine._group_record = lambda _group: {"event_count": 0}
+        engine._schedule_period_eviction(period)
+
+        engine._evict_expired_periods(30.0)
+        self.assertIn(period.period_id, engine.periods)
+        self.assertEqual(engine.eviction_group_deferred_count, 1)
+
+        engine._finalize_group(1)
+        engine._evict_expired_periods(30.0)
+        self.assertNotIn(period.period_id, engine.periods)
+
+    def test_new_generation_makes_older_heap_entry_stale(self):
+        engine = _eviction_engine()
+        period = _closed_period()
+        _index_period(engine, period)
+        engine._schedule_period_eviction(period)
+        engine._schedule_period_eviction(period)
+
+        engine._evict_expired_periods(30.0)
+        self.assertNotIn(period.period_id, engine.periods)
+        self.assertEqual(engine.eviction_stale_entry_count, 1)
+        self.assertEqual(engine.evicted_period_count, 1)
 
 
 if __name__ == "__main__":

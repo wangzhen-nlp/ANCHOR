@@ -665,6 +665,7 @@ class AlarmPeriod:
     pending_ready_ts: Optional[float] = None
     harvested_version: int = 0
     primary_group_id: Optional[int] = None
+    eviction_generation: int = 0
 
     @property
     def signature(self) -> PeriodSignature:
@@ -1714,6 +1715,12 @@ class AlarmPeriodMHPAssigner:
         self.period_by_occurrence: dict[tuple, int] = {}
         self._idle_heap: list = []
         self._pending_heap: list = []
+        self._eviction_heap: list = []
+        self._period_retention_sec = (
+            self.config.history_window_sec
+            + self.config.aggregation_wait_sec
+            + self.config.time_slack_sec
+        )
         self._heap_seq = 0
         self.groups: dict[int, PeriodFaultGroup] = {}
         self._group_redirect: dict[int, int] = {}
@@ -1735,6 +1742,10 @@ class AlarmPeriodMHPAssigner:
         self.relation_count = 0
         self.period_attach_count = 0
         self.group_merge_count = 0
+        self.evicted_period_count = 0
+        self.eviction_heap_pop_count = 0
+        self.eviction_stale_entry_count = 0
+        self.eviction_group_deferred_count = 0
 
     # ---- ingest and period lifecycle ---------------------------------
 
@@ -1844,6 +1855,7 @@ class AlarmPeriodMHPAssigner:
             return
         if matched_period.close(ts, "clear"):
             self.clear_closed_periods += 1
+            self._schedule_period_eviction(matched_period)
             if self.open_period_by_type.get(matched_period.period_type) == matched_period.period_id:
                 self.open_period_by_type.pop(matched_period.period_type, None)
 
@@ -1881,6 +1893,7 @@ class AlarmPeriodMHPAssigner:
                 continue
             if period.close(deadline, "idle"):
                 self.idle_closed_periods += 1
+                self._schedule_period_eviction(period)
                 if self.open_period_by_type.get(period.period_type) == pid:
                     self.open_period_by_type.pop(period.period_type, None)
 
@@ -2271,26 +2284,72 @@ class AlarmPeriodMHPAssigner:
             self.closed_group_sink(record)
             self.closed_group_count += 1
 
-    def _evict_expired_periods(self, watermark):
-        cutoff = float(watermark) - (
-            self.config.history_window_sec
-            + self.config.aggregation_wait_sec
-            + self.config.time_slack_sec
+        # Periods retained for active-group output may already be older than the
+        # matching horizon. Re-arm their original expiry deadline now that the
+        # group no longer owns them; the eviction heap will remove due entries
+        # during the same watermark advance.
+        for pid in group.period_ids:
+            period = self.periods.get(pid)
+            if period is not None:
+                self._schedule_period_eviction(period)
+
+    def _schedule_period_eviction(self, period, retry_ts=None):
+        """Schedule a closed Period by its exact legacy eviction deadline."""
+        if period.status != "closed":
+            return
+        deadline = period.last_raise_ts + self._period_retention_sec
+        if retry_ts is not None:
+            deadline = max(deadline, float(retry_ts))
+        period.eviction_generation += 1
+        self._heap_seq += 1
+        heapq.heappush(
+            self._eviction_heap,
+            (
+                float(deadline),
+                self._heap_seq,
+                period.period_id,
+                period.eviction_generation,
+            ),
         )
-        dead = []
-        for pid, period in self.periods.items():
+
+    def _evict_expired_periods(self, watermark):
+        watermark = float(watermark)
+        # Preserve the legacy strict comparison:
+        #   last_raise_ts < watermark - retention
+        # is exactly:
+        #   last_raise_ts + retention < watermark
+        while self._eviction_heap and self._eviction_heap[0][0] < watermark:
+            _deadline, _seq, pid, generation = heapq.heappop(
+                self._eviction_heap
+            )
+            self.eviction_heap_pop_count += 1
+            period = self.periods.get(pid)
+            if period is None or generation != period.eviction_generation:
+                self.eviction_stale_entry_count += 1
+                continue
+
             # Active groups own their periods until group finalization; output,
             # core-gating, and merge proposals all need the period metadata even
-            # after it has aged out of the candidate window.
+            # after it has aged out of the candidate window. _finalize_group()
+            # re-arms these entries once ownership ends.
             if self._resolve_group_id(period.primary_group_id) is not None:
+                self.eviction_group_deferred_count += 1
                 continue
-            if period.status == "closed" and period.last_raise_ts < cutoff:
-                if period.pending_ready_ts is None and not period.is_dirty:
-                    dead.append(pid)
-        for pid in dead:
-            period = self.periods.pop(pid, None)
-            if period is None:
+            if period.status != "closed":
                 continue
+            if period.pending_ready_ts is not None or period.is_dirty:
+                self._schedule_period_eviction(
+                    period,
+                    retry_ts=(
+                        period.pending_ready_ts
+                        if period.pending_ready_ts is not None
+                        else watermark
+                    ),
+                )
+                continue
+
+            self.periods.pop(pid, None)
+            self.evicted_period_count += 1
             ids = self.period_ids_by_signature.get(period.signature)
             if ids is not None:
                 ids.discard(pid)
@@ -2306,6 +2365,7 @@ class AlarmPeriodMHPAssigner:
         for period in list(self.periods.values()):
             if period.status == "open":
                 period.close(period.last_raise_ts, "stream_end")
+                self._schedule_period_eviction(period)
                 if self.open_period_by_type.get(period.period_type) == period.period_id:
                     self.open_period_by_type.pop(period.period_type, None)
             if period.is_dirty and period.pending_ready_ts is None:
@@ -2390,6 +2450,11 @@ class AlarmPeriodMHPAssigner:
             "relation_count": self.relation_count,
             "period_attach_count": self.period_attach_count,
             "group_merge_count": self.group_merge_count,
+            "evicted_period_count": self.evicted_period_count,
+            "eviction_heap_size": len(self._eviction_heap),
+            "eviction_heap_pop_count": self.eviction_heap_pop_count,
+            "eviction_stale_entry_count": self.eviction_stale_entry_count,
+            "eviction_group_deferred_count": self.eviction_group_deferred_count,
             "compiled_pair_count": self.plan.compiled_pair_count,
             "pruned_pair_count": self.plan.pruned_pair_count,
             "incremental_evaluated_pair_count": (
