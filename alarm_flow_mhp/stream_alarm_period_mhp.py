@@ -735,33 +735,6 @@ class CompactAssociationIndex:
                 self.source_order,
             )
         )
-        # Precompute the CSR offsets as Python ints and one source/target key
-        # object per edge so the hot iteration path avoids per-edge numpy scalar
-        # extraction, divmod, and PeriodSignature/PeriodType construction. Keys
-        # are deduplicated by signature id, so this adds a single reference per
-        # edge (~8 bytes), not one fresh object per edge.
-        self._target_offsets_list = self.target_offsets.tolist()
-        self._source_offsets_list = self.source_offsets.tolist()
-        source_ids = self.source_signature_ids.tolist()
-        if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY:
-            period_types = self.period_types
-            self._source_key_by_index = [period_types[sid] for sid in source_ids]
-        else:
-            self._source_key_by_index = self._keys_from_ids(source_ids)
-        self._target_sig_by_index = self._keys_from_ids(
-            self.target_signature_ids.tolist()
-        )
-
-    def _keys_from_ids(self, ids):
-        """Deduplicated PeriodSignature per raw signature id, in edge order."""
-        cache = {}
-        keys = []
-        for sid in ids:
-            key = cache.get(sid)
-            if key is None:
-                key = cache[sid] = self._signature(sid)
-            keys.append(key)
-        return keys
 
     def _target_signature_id(self, signature):
         type_id = self.type_to_id.get(signature.period_type)
@@ -789,26 +762,51 @@ class CompactAssociationIndex:
             future_window_sec=float(self.future_windows[index]),
         )
 
-    def iter_target(self, target):
+    def edge_at(self, index):
+        return self._edge(index)
+
+    def iter_target_ids(self, target):
+        """Yield ``(source_key, edge_index)`` without building the edge.
+
+        Only the bucket key is materialized here so the caller can skip
+        candidate-free sources cheaply; ``edge_at`` builds the CompiledEdge only
+        when the source key actually has live periods. Source ids for one target
+        are read as one small native-int slice to avoid per-edge numpy boxing.
+        """
         signature_id = self._target_signature_id(target)
         if signature_id is None:
             return
-        offsets = self._target_offsets_list
-        keys = self._source_key_by_index
-        for index in range(offsets[signature_id], offsets[signature_id + 1]):
-            yield keys[index], self._edge(index)
+        start = int(self.target_offsets[signature_id])
+        end = int(self.target_offsets[signature_id + 1])
+        source_ids = self.source_signature_ids[start:end].tolist()
+        if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY:
+            period_types = self.period_types
+            for offset, source_id in enumerate(source_ids):
+                yield period_types[source_id], start + offset
+        else:
+            for offset, source_id in enumerate(source_ids):
+                yield self._signature(source_id), start + offset
 
-    def iter_source(self, source):
+    def iter_source_ids(self, source):
+        """Yield ``(target_signature, edge_index)`` without building the edge."""
         source_key_id = self._source_key_id(source)
         if source_key_id is None:
             return
-        offsets = self._source_offsets_list
-        keys = self._target_sig_by_index
-        # Materialize native ints for this source's slice only, avoiding a
-        # retained per-edge int list while still skipping numpy scalar boxing.
-        order = self.source_order[offsets[source_key_id]:offsets[source_key_id + 1]]
-        for index in order.tolist():
-            yield keys[index], self._edge(index)
+        start = int(self.source_offsets[source_key_id])
+        end = int(self.source_offsets[source_key_id + 1])
+        order = self.source_order[start:end]
+        indices = order.tolist()
+        target_ids = self.target_signature_ids[order].tolist()
+        for index, target_id in zip(indices, target_ids):
+            yield self._signature(target_id), index
+
+    def iter_target(self, target):
+        for source_key, index in self.iter_target_ids(target):
+            yield source_key, self._edge(index)
+
+    def iter_source(self, source):
+        for target_key, index in self.iter_source_ids(source):
+            yield target_key, self._edge(index)
 
 
 @dataclass
@@ -1979,16 +1977,32 @@ class AlarmPeriodMHPAssigner:
     def _collect_relations(self, period: AlarmPeriod, new_events: list[OnlineEvent]):
         best_by_directed_pair: dict[tuple, RelationEvidence] = {}
         sig = period.signature
-        pid = period.period_id
-        periods = self.periods
+        plan = self.plan
         by_type = self.period_ids_by_type
         by_signature = self.period_ids_by_signature
 
         # Current period acts as target; only its newly mature times are probed.
-        # The candidate bucket is fetched before scoring so a live-period-free
-        # source key costs only a dict lookup. Buckets are read directly (not
-        # copied) because nothing mutates them within a harvest.
-        for source_key, edge in self.plan.iter_edges_by_target(sig):
+        # The candidate bucket is fetched before the edge is built, so a source
+        # key with no live periods (the overwhelming majority at graph scale)
+        # costs only a dict lookup instead of a wasted CompiledEdge allocation.
+        # Buckets are read directly (not copied) because nothing mutates them
+        # within a harvest.
+        for index_obj in plan.precompiled_indexes:
+            for source_key, edge_index in index_obj.iter_target_ids(sig):
+                self.collect_edge_count += 1
+                bucket = (
+                    by_type.get(source_key)
+                    if isinstance(source_key, PeriodType)
+                    else by_signature.get(source_key)
+                )
+                if not bucket:
+                    self.collect_empty_bucket_count += 1
+                    continue
+                self._score_new_targets(
+                    index_obj.edge_at(edge_index), period, new_events,
+                    bucket, best_by_directed_pair,
+                )
+        for source_key, edge in plan.edges_by_target.get(sig, {}).items():
             self.collect_edge_count += 1
             bucket = (
                 by_type.get(source_key)
@@ -1998,41 +2012,62 @@ class AlarmPeriodMHPAssigner:
             if not bucket:
                 self.collect_empty_bucket_count += 1
                 continue
-            for source_pid in bucket:
-                if source_pid == pid:
-                    continue
-                source_period = periods.get(source_pid)
-                if not self._candidate_period_ok(source_period):
-                    continue
-                self.collect_candidate_count += 1
-                ev = self._best_for_new_targets(edge, period, new_events, source_period)
-                if ev is not None:
-                    self.collect_match_count += 1
-                    self._keep_best_relation(best_by_directed_pair, ev)
+            self._score_new_targets(edge, period, new_events, bucket, best_by_directed_pair)
 
         # Current period acts as source; reverse index catches relationships to
         # older target periods without rescanning every historical occurrence.
-        for target_sig, edge in self.plan.iter_edges_by_source(sig):
+        for index_obj in plan.precompiled_indexes:
+            for target_sig, edge_index in index_obj.iter_source_ids(sig):
+                self.collect_edge_count += 1
+                bucket = by_signature.get(target_sig)
+                if not bucket:
+                    self.collect_empty_bucket_count += 1
+                    continue
+                self._score_new_sources(
+                    index_obj.edge_at(edge_index), period, new_events,
+                    bucket, best_by_directed_pair,
+                )
+        for target_sig, edge in plan.edges_by_source.get(sig, {}).items():
             self.collect_edge_count += 1
             bucket = by_signature.get(target_sig)
             if not bucket:
                 self.collect_empty_bucket_count += 1
                 continue
-            for target_pid in bucket:
-                if target_pid == pid:
-                    continue
-                target_period = periods.get(target_pid)
-                if not self._candidate_period_ok(target_period):
-                    continue
-                self.collect_candidate_count += 1
-                ev = self._best_for_new_sources(edge, target_period, period, new_events)
-                if ev is not None:
-                    self.collect_match_count += 1
-                    self._keep_best_relation(best_by_directed_pair, ev)
+            self._score_new_sources(edge, period, new_events, bucket, best_by_directed_pair)
 
         out = sorted(best_by_directed_pair.values(), key=lambda x: (-x.score, x.period_pair))
         self.relation_count += len(out)
         return out
+
+    def _score_new_targets(self, edge, period, new_events, bucket, best):
+        pid = period.period_id
+        periods = self.periods
+        for source_pid in bucket:
+            if source_pid == pid:
+                continue
+            source_period = periods.get(source_pid)
+            if not self._candidate_period_ok(source_period):
+                continue
+            self.collect_candidate_count += 1
+            ev = self._best_for_new_targets(edge, period, new_events, source_period)
+            if ev is not None:
+                self.collect_match_count += 1
+                self._keep_best_relation(best, ev)
+
+    def _score_new_sources(self, edge, period, new_events, bucket, best):
+        pid = period.period_id
+        periods = self.periods
+        for target_pid in bucket:
+            if target_pid == pid:
+                continue
+            target_period = periods.get(target_pid)
+            if not self._candidate_period_ok(target_period):
+                continue
+            self.collect_candidate_count += 1
+            ev = self._best_for_new_sources(edge, target_period, period, new_events)
+            if ev is not None:
+                self.collect_match_count += 1
+                self._keep_best_relation(best, ev)
 
     def _candidate_period_ok(self, period):
         if period is None or not period.events:
