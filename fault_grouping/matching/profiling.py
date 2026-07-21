@@ -43,6 +43,16 @@ class PhaseTimer:
             slot[0] += sec
             slot[1] += 1
 
+    def snapshot(self):
+        """Return a read-only-style copy of the aggregated phase statistics."""
+        return {
+            name: {
+                "total_seconds": float(total),
+                "count": int(count),
+            }
+            for name, (total, count) in self._phases.items()
+        }
+
     def wrap_method(self, owner, attr, phase_name):
         """把 owner.attr 这个 bound 方法/函数替换成计时版。返回原始可调用对象。"""
         original = getattr(owner, attr)

@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -25,7 +27,11 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
     PeriodSignature,
     PeriodStreamConfig,
     PeriodType,
+    _enable_period_profiling,
+    _iter_profiled_events,
+    _print_period_profile,
 )
+from fault_grouping.matching.profiling import PhaseTimer
 from mhp.feature_kernel import FeatureKernel
 
 
@@ -356,6 +362,80 @@ class CandidatePolicyTest(unittest.TestCase):
                         break
                 brute_positive_count += int(found)
             self.assertEqual(teacher_positive_count, brute_positive_count)
+
+
+_PROFILED_ENGINE_METHODS = (
+    "process",
+    "_open_or_create_period",
+    "_handle_clear",
+    "_close_idle_periods",
+    "_advance_watermark",
+    "_harvest_ready",
+    "_harvest_period",
+    "_collect_relations",
+    "_best_for_new_targets",
+    "_best_for_new_sources",
+    "_apply_relations",
+    "_choose_or_create_group",
+    "_try_ready_merge_proposals",
+    "_merge_groups",
+    "_close_inactive_groups",
+    "_finalize_group",
+    "_evict_expired_periods",
+    "_group_record",
+    "flush",
+)
+
+
+class AlarmPeriodProfilingTest(unittest.TestCase):
+    def test_event_iterator_records_only_returned_events(self):
+        timer = PhaseTimer()
+        self.assertEqual(list(_iter_profiled_events([1, 2, 3], timer)), [1, 2, 3])
+        self.assertEqual(timer.snapshot()["input.read_event"]["count"], 3)
+
+    def test_method_wrapping_preserves_calls_and_refreshes_group_sink(self):
+        calls = []
+        engine = SimpleNamespace()
+        for method_name in _PROFILED_ENGINE_METHODS:
+            setattr(
+                engine,
+                method_name,
+                lambda value=None, name=method_name: (name, value),
+            )
+        engine.plan = SimpleNamespace(
+            register_signature=lambda value=None: ("register", value),
+            _compute_edge=lambda value=None: ("compute", value),
+        )
+        output = SimpleNamespace(
+            emit_group=lambda value: calls.append(value),
+            _write_group_record=lambda value=None: value,
+            close=lambda value=None: value,
+            visual=None,
+        )
+        timer = PhaseTimer()
+
+        _enable_period_profiling(timer, engine, output)
+
+        self.assertEqual(engine.process("event"), ("process", "event"))
+        engine.closed_group_sink("group")
+        self.assertEqual(calls, ["group"])
+        phases = timer.snapshot()
+        self.assertEqual(phases["ingest.process"]["count"], 1)
+        self.assertEqual(phases["output.emit_group"]["count"], 1)
+
+    def test_summary_lists_recorded_phase(self):
+        timer = PhaseTimer()
+        timer.mark_wall_start()
+        with timer.time("harvest.collect_relations"):
+            pass
+        timer.mark_wall_end()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _print_period_profile(timer)
+        text = output.getvalue()
+        self.assertIn("AlarmPeriod MHP 性能分析", text)
+        self.assertIn("harvest.collect_relations", text)
+        self.assertIn("父阶段包含子阶段", text)
 
 
 if __name__ == "__main__":

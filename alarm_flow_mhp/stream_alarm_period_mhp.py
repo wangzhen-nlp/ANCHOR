@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import bisect
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import heapq
 import hashlib
@@ -91,6 +92,7 @@ from fault_grouping.alarm_events.sorted_cache import (
     is_sorted_alarm_cache_file,
     iter_sorted_alarm_cache_items,
 )
+from fault_grouping.matching.profiling import PhaseTimer
 from mhp.feature_kernel import FeatureKernel
 from ne_link_learning.core import normalize_text
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
@@ -109,6 +111,154 @@ EPS = 1e-12
 # candidate that exact scoring would keep. Logit magnitudes are O(10²), so the
 # reassociation error is bounded well below 1e-9.
 PRESCREEN_LOGIT_MARGIN = 1e-6
+
+
+def _profile_phase(timer, name):
+    return timer.time(name) if timer is not None else nullcontext()
+
+
+def _iter_profiled_events(events, timer):
+    """Attribute lazy input decoding/filtering time separately from processing."""
+    iterator = iter(events)
+    while True:
+        started = time.perf_counter()
+        try:
+            event = next(iterator)
+        except StopIteration:
+            return
+        timer._record("input.read_event", time.perf_counter() - started)
+        yield event
+
+
+def _enable_period_profiling(timer, engine, output):
+    """Instrument the AlarmPeriod hot path only when ``--profile`` is enabled.
+
+    This follows ``fault_grouping.match_rules``: production methods stay
+    untouched until profiling is requested, then bound methods are wrapped with
+    aggregated ``perf_counter`` timing.  Nested phases intentionally overlap.
+    """
+    engine_phases = (
+        ("process", "ingest.process"),
+        ("_open_or_create_period", "period.open_or_create"),
+        ("_handle_clear", "period.handle_clear"),
+        ("_close_idle_periods", "maintenance.close_idle_periods"),
+        ("_advance_watermark", "ingest.advance_watermark"),
+        ("_harvest_ready", "harvest.ready"),
+        ("_harvest_period", "harvest.period"),
+        ("_collect_relations", "harvest.collect_relations"),
+        ("_best_for_new_targets", "harvest.match_new_targets"),
+        ("_best_for_new_sources", "harvest.match_new_sources"),
+        ("_apply_relations", "group.apply_relations"),
+        ("_choose_or_create_group", "group.choose_or_create"),
+        ("_try_ready_merge_proposals", "group.scan_merge_proposals"),
+        ("_merge_groups", "group.merge"),
+        ("_close_inactive_groups", "maintenance.close_inactive_groups"),
+        ("_finalize_group", "maintenance.finalize_group"),
+        ("_evict_expired_periods", "maintenance.evict_expired_periods"),
+        ("_group_record", "output.build_group_record"),
+        ("flush", "flush.total"),
+    )
+    for method_name, phase_name in engine_phases:
+        timer.wrap_method(engine, method_name, phase_name)
+
+    plan_phases = (
+        ("register_signature", "association.register_signature"),
+        ("_compute_edge", "association.compute_edge"),
+    )
+    for method_name, phase_name in plan_phases:
+        timer.wrap_method(engine.plan, method_name, phase_name)
+
+    output_phases = (
+        ("emit_group", "output.emit_group"),
+        ("_write_group_record", "output.groups_jsonl"),
+        ("close", "output.close"),
+    )
+    for method_name, phase_name in output_phases:
+        timer.wrap_method(output, method_name, phase_name)
+    if output.visual is not None:
+        timer.wrap_method(output.visual, "emit_groups", "output.visual")
+
+    # The sink stores a bound method, so refresh it after emit_group is wrapped.
+    engine.closed_group_sink = output.emit_group
+
+
+def _print_period_profile(timer):
+    """Print an AlarmPeriod-specific flat summary of nested cumulative phases."""
+    phases = timer.snapshot()
+    wall = timer.wall_elapsed
+    if not phases and wall <= 0:
+        return
+
+    blocks = (
+        ("init", "准备阶段", lambda name: name.startswith("init.")),
+        (
+            "pipeline",
+            "输入与主流程",
+            lambda name: name in {
+                "pipeline.total",
+                "pipeline.progress",
+                "input.read_event",
+                "ingest.process",
+                "flush.total",
+            },
+        ),
+        (
+            "period",
+            "Period 生命周期",
+            lambda name: name.startswith("period.") or name == "ingest.advance_watermark",
+        ),
+        ("harvest", "关系收集", lambda name: name.startswith("harvest.")),
+        ("group", "分组与合并", lambda name: name.startswith("group.")),
+        ("maintenance", "维护与淘汰", lambda name: name.startswith("maintenance.")),
+        ("association", "缓存外关系编译", lambda name: name.startswith("association.")),
+        ("output", "输出", lambda name: name.startswith("output.")),
+    )
+
+    def format_row(name, values):
+        total = values["total_seconds"]
+        count = values["count"]
+        wall_pct = total / wall * 100.0 if wall > 0 else 0.0
+        average_ms = total / max(count, 1) * 1000.0
+        return (
+            f"  {name:<38} {total:>10.3f}s {wall_pct:>7.1f}% "
+            f"{count:>10}次 avg={average_ms:>10.3f}ms"
+        )
+
+    line_width = 100
+    print()
+    print("=" * line_width)
+    print(f"AlarmPeriod MHP 性能分析（wall={wall:.3f}s）")
+    print("=" * line_width)
+    emitted = set()
+    for _key, title, predicate in blocks:
+        rows = [
+            (name, values)
+            for name, values in phases.items()
+            if predicate(name) and name not in emitted
+        ]
+        if not rows:
+            continue
+        rows.sort(key=lambda item: -item[1]["total_seconds"])
+        print()
+        print(f"[{title}]")
+        for name, values in rows:
+            print(format_row(name, values))
+            emitted.add(name)
+
+    other_rows = [
+        (name, values) for name, values in phases.items() if name not in emitted
+    ]
+    if other_rows:
+        print()
+        print("[其他]")
+        for name, values in sorted(
+            other_rows, key=lambda item: -item[1]["total_seconds"]
+        ):
+            print(format_row(name, values))
+    print()
+    print("说明：各阶段是累计耗时；父阶段包含子阶段，百分比不能直接相加。")
+    print("      profiling 会增加少量 perf_counter/方法包装开销，仅用于定位瓶颈。")
+    print("=" * line_width)
 
 
 def _softplus_lower_logit(y: float) -> float:
@@ -2659,6 +2809,14 @@ def _build_parser():
         default=1,
         help="Refresh live counters every N events; default 1 (display is time-throttled). 0 disables.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Print aggregated phase timings for input, ingest, harvest, grouping, "
+            "maintenance, association compilation, and output."
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -2666,6 +2824,9 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    timer = PhaseTimer() if args.profile else None
+    if timer is not None:
+        timer.mark_wall_start()
     if not str(args.groups_output).lower().endswith(".jsonl"):
         parser.error("--groups-output must end with .jsonl (incremental format)")
     if args.progress_every < 0:
@@ -2678,54 +2839,57 @@ def main():
         parser.error(str(exc))
 
     t0 = time.monotonic()
-    artifact = load_alarm_mhp_artifact(args.model)
-    scorer, mu_scorer, ne_graph_data = _build_runtime_scorers(
-        artifact, args.ne_graph, args.site_graph, quiet=args.quiet
-    )
-    annotate_domain = DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields)
-    streaming_input = is_sorted_alarm_cache_file(args.alarms)
-    stream_filter_stats = {}
-    if streaming_input:
-        # Sorted caches are consumed straight off disk: the engine, the
-        # region/domain filters, and the outputs are all incremental, so the
-        # full event list never materializes in memory.  Filter statistics are
-        # only complete at the end and go into the summary record.
-        cache_stream = SortedAlarmCacheStream(args.alarms)
-        alarm_metadata = dict(cache_stream.metadata)
-        total_events = len(cache_stream)
-        if args.clear_delay_sec and not args.quiet:
-            print(
-                "[period] note: --clear-delay-sec is baked into the sorted cache "
-                "at prepare time and is ignored for cache input.",
-                flush=True,
-            )
-        try:
-            events = _stream_sorted_cache_events(
-                args.alarms,
-                ne_graph_data,
-                start_time=args.start_time,
-                end_time=args.end_time,
-                regions=args.regions,
-                annotate_domain=annotate_domain,
-                filter_stats=stream_filter_stats,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-    else:
-        events, alarm_metadata = load_ordered_alarm_events(
-            args.alarms,
-            topo_path=args.site_graph,
-            ne_graph_path=args.ne_graph,
-            start_time=args.start_time or None,
-            end_time=args.end_time or None,
-            clear_delay_sec=args.clear_delay_sec,
-            regions=args.regions,
+    with _profile_phase(timer, "init.load_model"):
+        artifact = load_alarm_mhp_artifact(args.model)
+    with _profile_phase(timer, "init.build_runtime_scorers"):
+        scorer, mu_scorer, ne_graph_data = _build_runtime_scorers(
+            artifact, args.ne_graph, args.site_graph, quiet=args.quiet
         )
-        if annotate_domain:
-            events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
-            if not args.quiet:
-                print(f"[period] domain filter: {domain_stats}", flush=True)
-        total_events = len(events)
+    annotate_domain = DEVICE_DOMAIN_FIELD in tuple(artifact.config.type_fields)
+    stream_filter_stats = {}
+    with _profile_phase(timer, "init.prepare_input"):
+        streaming_input = is_sorted_alarm_cache_file(args.alarms)
+        if streaming_input:
+            # Sorted caches are consumed straight off disk: the engine, the
+            # region/domain filters, and the outputs are all incremental, so the
+            # full event list never materializes in memory.  Filter statistics are
+            # only complete at the end and go into the summary record.
+            cache_stream = SortedAlarmCacheStream(args.alarms)
+            alarm_metadata = dict(cache_stream.metadata)
+            total_events = len(cache_stream)
+            if args.clear_delay_sec and not args.quiet:
+                print(
+                    "[period] note: --clear-delay-sec is baked into the sorted cache "
+                    "at prepare time and is ignored for cache input.",
+                    flush=True,
+                )
+            try:
+                events = _stream_sorted_cache_events(
+                    args.alarms,
+                    ne_graph_data,
+                    start_time=args.start_time,
+                    end_time=args.end_time,
+                    regions=args.regions,
+                    annotate_domain=annotate_domain,
+                    filter_stats=stream_filter_stats,
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
+        else:
+            events, alarm_metadata = load_ordered_alarm_events(
+                args.alarms,
+                topo_path=args.site_graph,
+                ne_graph_path=args.ne_graph,
+                start_time=args.start_time or None,
+                end_time=args.end_time or None,
+                clear_delay_sec=args.clear_delay_sec,
+                regions=args.regions,
+            )
+            if annotate_domain:
+                events, domain_stats = filter_and_annotate_device_domain(events, ne_graph_data)
+                if not args.quiet:
+                    print(f"[period] domain filter: {domain_stats}", flush=True)
+            total_events = len(events)
     if artifact.config.regions and not args.regions:
         print(
             f"[period] note: artifact was trained with regions={list(artifact.config.regions)}, "
@@ -2797,66 +2961,69 @@ def main():
         parser.error("--candidate-policy requires --candidate-scope unrelated")
     candidate_policy = None
     if args.candidate_policy:
-        try:
-            policy_fingerprint = candidate_policy_fingerprint(
-                args.model,
-                args.ne_graph,
-                args.site_graph,
-                _association_plan_config(config),
-                artifact.config.topology_node_field,
-            )
-            candidate_policy = load_candidate_policy(
-                args.candidate_policy,
-                expected_fingerprint=policy_fingerprint,
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            parser.error(f"cannot load --candidate-policy: {exc}")
+        with _profile_phase(timer, "init.load_candidate_policy"):
+            try:
+                policy_fingerprint = candidate_policy_fingerprint(
+                    args.model,
+                    args.ne_graph,
+                    args.site_graph,
+                    _association_plan_config(config),
+                    artifact.config.topology_node_field,
+                )
+                candidate_policy = load_candidate_policy(
+                    args.candidate_policy,
+                    expected_fingerprint=policy_fingerprint,
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                parser.error(f"cannot load --candidate-policy: {exc}")
 
     association_caches = []
     if args.association_cache:
         # One expected fingerprint pins model/graphs/plan-config; per-cache scope
         # and policy digest are ignored so a related cache and a disjoint
         # unrelated cache (built from the same model/graphs) both validate.
-        try:
-            fingerprint = association_cache_fingerprint(
-                args.model,
-                args.ne_graph,
-                args.site_graph,
-                config,
-                artifact.config.topology_node_field,
-            )
-        except OSError as exc:
-            parser.error(f"cannot fingerprint association cache inputs: {exc}")
-        for cache_path in args.association_cache:
+        with _profile_phase(timer, "init.load_association_caches"):
             try:
-                payload = load_association_cache(
-                    cache_path,
-                    expected_fingerprint=fingerprint,
-                    allow_scope_mismatch=True,
+                fingerprint = association_cache_fingerprint(
+                    args.model,
+                    args.ne_graph,
+                    args.site_graph,
+                    config,
+                    artifact.config.topology_node_field,
                 )
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                parser.error(f"cannot load --association-cache {cache_path}: {exc}")
-            association_caches.append(payload)
-            if not args.quiet:
-                cache_md = payload.get("metadata") or {}
-                array_mib = sum(
-                    array.nbytes for array in payload.get("arrays", {}).values()
-                ) / (1024 * 1024)
-                print(
-                    f"[period] association cache loaded ({os.path.basename(cache_path)}): "
-                    f"scope={((payload.get('fingerprint') or {}).get('plan_config') or {}).get('candidate_scope', '?')}, "
-                    f"edges={cache_md.get('edge_count', 0)}, arrays={array_mib:.1f}MiB",
-                    flush=True,
-                )
+            except OSError as exc:
+                parser.error(f"cannot fingerprint association cache inputs: {exc}")
+            for cache_path in args.association_cache:
+                try:
+                    payload = load_association_cache(
+                        cache_path,
+                        expected_fingerprint=fingerprint,
+                        allow_scope_mismatch=True,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    parser.error(f"cannot load --association-cache {cache_path}: {exc}")
+                association_caches.append(payload)
+                if not args.quiet:
+                    cache_md = payload.get("metadata") or {}
+                    array_mib = sum(
+                        array.nbytes for array in payload.get("arrays", {}).values()
+                    ) / (1024 * 1024)
+                    print(
+                        f"[period] association cache loaded ({os.path.basename(cache_path)}): "
+                        f"scope={((payload.get('fingerprint') or {}).get('plan_config') or {}).get('candidate_scope', '?')}, "
+                        f"edges={cache_md.get('edge_count', 0)}, arrays={array_mib:.1f}MiB",
+                        flush=True,
+                    )
 
-    engine = AlarmPeriodMHPAssigner(
-        artifact,
-        config,
-        feature_scorer=scorer,
-        mu_scorer=mu_scorer,
-        association_cache=association_caches or None,
-        candidate_policy=candidate_policy,
-    )
+    with _profile_phase(timer, "init.build_engine"):
+        engine = AlarmPeriodMHPAssigner(
+            artifact,
+            config,
+            feature_scorer=scorer,
+            mu_scorer=mu_scorer,
+            association_cache=association_caches or None,
+            candidate_policy=candidate_policy,
+        )
     # The plan owns decoded edge objects now; release the JSON row arrays before
     # processing a potentially large alarm stream.
     association_caches = None
@@ -2875,17 +3042,22 @@ def main():
         "visual_output": os.path.abspath(args.visual_output),
         "alarm_metadata": alarm_metadata,
         "streaming_input": bool(streaming_input),
+        "profiling": bool(args.profile),
         "config": {key: value for key, value in vars(config).items()},
     }
-    output = IncrementalPeriodOutput(
-        args.groups_output,
-        run_metadata,
-        edges_path=args.edges_output,
-        visual_path=args.visual_output,
-        ne_graph_path=args.ne_graph,
-        site_graph_path=args.site_graph,
-    )
+    with _profile_phase(timer, "init.build_output"):
+        output = IncrementalPeriodOutput(
+            args.groups_output,
+            run_metadata,
+            edges_path=args.edges_output,
+            visual_path=args.visual_output,
+            ne_graph_path=args.ne_graph,
+            site_graph_path=args.site_graph,
+        )
     engine.closed_group_sink = output.emit_group
+    if timer is not None:
+        _enable_period_profiling(timer, engine, output)
+        events = _iter_profiled_events(events, timer)
     if not args.quiet:
         print(
             f"[period] incremental outputs: groups={args.groups_output}, "
@@ -2916,23 +3088,27 @@ def main():
 
     if process_progress is not None:
         process_progress.extra_text = live_progress_text()
+        if timer is not None:
+            timer.wrap_method(process_progress, "update", "pipeline.progress")
+            timer.wrap_method(process_progress, "close", "pipeline.progress")
     completed = False
     stats = None
     elapsed = 0.0
     try:
-        try:
-            for i, event in enumerate(events):
-                engine.process(event)
+        with _profile_phase(timer, "pipeline.total"):
+            try:
+                for i, event in enumerate(events):
+                    engine.process(event)
+                    if process_progress is not None:
+                        if (i + 1) % args.progress_every == 0:
+                            process_progress.extra_text = live_progress_text()
+                        process_progress.update()
+            finally:
                 if process_progress is not None:
-                    if (i + 1) % args.progress_every == 0:
-                        process_progress.extra_text = live_progress_text()
-                    process_progress.update()
-        finally:
-            if process_progress is not None:
-                process_progress.extra_text = live_progress_text()
-                process_progress.close()
-        engine.flush()
-        completed = True
+                    process_progress.extra_text = live_progress_text()
+                    process_progress.close()
+            engine.flush()
+            completed = True
     finally:
         stats = engine.stats()
         elapsed = time.monotonic() - t0
@@ -2943,7 +3119,12 @@ def main():
         }
         if stream_filter_stats:
             summary["input_filter_stats"] = stream_filter_stats
-        output.close(summary)
+        try:
+            output.close(summary)
+        finally:
+            if timer is not None:
+                timer.mark_wall_end()
+                _print_period_profile(timer)
     if not args.quiet:
         for name, filter_summary in stream_filter_stats.items():
             print(f"[period] {name} (streamed): {filter_summary}", flush=True)
