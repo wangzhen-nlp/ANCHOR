@@ -1006,6 +1006,9 @@ class CompiledAssociationPlan:
         # runtime.  Offline coverage is type-level because all eight states are
         # guaranteed compiled and materializing 8× coverage objects is wasteful.
         self.signatures: set[PeriodSignature] = set()
+        self._signatures_by_type: dict[PeriodType, set[PeriodSignature]] = (
+            defaultdict(set)
+        )
         self.covered_period_types: set[PeriodType] = set()
         self._covered_candidate_index = None
         # One index per loaded association cache; runtime unions them (e.g. a
@@ -1137,8 +1140,12 @@ class CompiledAssociationPlan:
 
     def _is_related_pair(self, a: PeriodSignature, b: PeriodSignature) -> bool:
         """Deterministic related-scope predicate, independent of runtime scope."""
-        ae = a.period_type.entity
-        be = b.period_type.entity
+        return self._is_related_period_type_pair(a.period_type, b.period_type)
+
+    def _is_related_period_type_pair(self, a: PeriodType, b: PeriodType) -> bool:
+        """Type-level related predicate shared by all eight state signatures."""
+        ae = a.entity
+        be = b.entity
         if ae == be:
             return True
         an = topo_node_of(ae)
@@ -1202,6 +1209,27 @@ class CompiledAssociationPlan:
             return
         existing = list(self.signatures)
         self.signatures.add(signature)
+        self._signatures_by_type[signature.period_type].add(signature)
+
+        # A related cache already authoritatively covers every state pair for
+        # related graph types.  When that cache is used as the base of a global
+        # runtime, group observed signatures by PeriodType and evaluate the
+        # related predicate once per type pair instead of once per state pair.
+        # Only non-related observed pairs need incremental compilation.
+        if partial_related_base:
+            for other_type, other_signatures in self._signatures_by_type.items():
+                if other_type == signature.period_type:
+                    continue
+                if (
+                    other_type in self.covered_period_types
+                    and self._is_related_period_type_pair(signature.period_type, other_type)
+                ):
+                    continue
+                for other in other_signatures:
+                    self._compile(signature, other)
+                    self._compile(other, signature)
+            return
+
         for other in existing:
             if not self._related(signature, other):
                 continue
@@ -1937,11 +1965,16 @@ class AlarmPeriodMHPAssigner:
         self.groups: dict[int, PeriodFaultGroup] = {}
         self._group_redirect: dict[int, int] = {}
         self.merge_proposals: dict[tuple, MergeProposal] = {}
+        self._ready_merge_proposal_keys: set[tuple] = set()
+        self._merge_proposal_keys_by_group: dict[int, set[tuple]] = defaultdict(set)
+        self.merge_proposal_peak_count = 0
+        self.merge_proposal_pruned_count = 0
         self.closed_group_sink = closed_group_sink
         self.closed_group_count = 0
         self._next_event_index = 0
         self._next_period_id = 0
         self._next_group_id = 0
+        self._seen_period_signatures: set[PeriodSignature] = set()
         self.current_watermark = -math.inf
         self.total_input_events = 0
         self.total_raise_events = 0
@@ -2051,7 +2084,10 @@ class AlarmPeriodMHPAssigner:
             self.open_period_by_type[period_type] = period.period_id
             self.period_ids_by_signature[period.signature].add(period.period_id)
             self.period_ids_by_type[period.period_type].add(period.period_id)
-            self.plan.register_signature(period.signature)
+            signature = period.signature
+            if signature not in self._seen_period_signatures:
+                self._seen_period_signatures.add(signature)
+                self.plan.register_signature(signature)
         period.append(event)
         return period
 
@@ -2561,22 +2597,52 @@ class AlarmPeriodMHPAssigner:
         if proposal is None:
             proposal = MergeProposal(group_ids=key)
             self.merge_proposals[key] = proposal
+            self._merge_proposal_keys_by_group[key[0]].add(key)
+            self._merge_proposal_keys_by_group[key[1]].add(key)
+            self.merge_proposal_peak_count = max(
+                self.merge_proposal_peak_count, len(self.merge_proposals)
+            )
         proposal.evidence_pairs.add(rel.period_pair)
         proposal.max_strength = max(proposal.max_strength, rel.strength)
         proposal.max_score = max(proposal.max_score, rel.score)
+        if (
+            len(proposal.evidence_pairs) >= self.config.merge_min_evidence
+            and proposal.max_strength >= self.config.merge_strength_ratio
+        ):
+            self._ready_merge_proposal_keys.add(key)
+
+    def _pop_merge_proposal(self, key):
+        proposal = self.merge_proposals.pop(key, None)
+        self._ready_merge_proposal_keys.discard(key)
+        if proposal is None:
+            return None
+        for gid in proposal.group_ids:
+            keys = self._merge_proposal_keys_by_group.get(gid)
+            if keys is None:
+                continue
+            keys.discard(key)
+            if not keys:
+                self._merge_proposal_keys_by_group.pop(gid, None)
+        return proposal
+
+    def _prune_merge_proposals_for_group(self, gid):
+        keys = tuple(self._merge_proposal_keys_by_group.get(gid, ()))
+        for key in keys:
+            if self._pop_merge_proposal(key) is not None:
+                self.merge_proposal_pruned_count += 1
 
     def _try_ready_merge_proposals(self):
+        # Readiness changes only when _record_merge_proposal adds evidence, so
+        # scanning every historical proposal after every harvest is unnecessary.
+        # Pop the whole ready batch before merging; this preserves the legacy
+        # ordering when two ready proposals share a group that the first merge
+        # redirects.
         ready = []
-        for key, proposal in list(self.merge_proposals.items()):
-            if (
-                len(proposal.evidence_pairs) >= self.config.merge_min_evidence
-                and proposal.max_strength >= self.config.merge_strength_ratio
-            ):
-                ready.append((proposal.max_strength, key))
-        for _strength, key in sorted(ready, key=lambda x: (-x[0], x[1])):
-            proposal = self.merge_proposals.pop(key, None)
-            if proposal is None:
-                continue
+        for key in tuple(self._ready_merge_proposal_keys):
+            proposal = self._pop_merge_proposal(key)
+            if proposal is not None:
+                ready.append((proposal.max_strength, key, proposal))
+        for _strength, key, proposal in sorted(ready, key=lambda x: (-x[0], x[1])):
             g1 = self._resolve_group_id(proposal.group_ids[0])
             g2 = self._resolve_group_id(proposal.group_ids[1])
             if g1 is None or g2 is None or g1 == g2:
@@ -2611,6 +2677,10 @@ class AlarmPeriodMHPAssigner:
                 keep.evidence_by_pair[pair] = rel
         self.groups.pop(drop_id, None)
         self._group_redirect[drop_id] = keep_id
+        # Non-ready proposals involving the redirected group can never receive
+        # more evidence under their old key. Ready proposals from this batch
+        # were popped before merging and are therefore preserved above.
+        self._prune_merge_proposals_for_group(drop_id)
         self.group_merge_count += 1
         return keep
 
@@ -2693,6 +2763,7 @@ class AlarmPeriodMHPAssigner:
         group = self.groups.pop(gid, None)
         if group is None:
             return
+        self._prune_merge_proposals_for_group(gid)
         record = self._group_record(group)
         # Gate on REAL events only: an imputed (virtual) source must not push a
         # group past min_group_events on its own. Without imputation
@@ -2945,6 +3016,9 @@ class AlarmPeriodMHPAssigner:
             "collect_match_count": self.collect_match_count,
             "period_attach_count": self.period_attach_count,
             "group_merge_count": self.group_merge_count,
+            "pending_merge_proposal_count": len(self.merge_proposals),
+            "merge_proposal_peak_count": self.merge_proposal_peak_count,
+            "merge_proposal_pruned_count": self.merge_proposal_pruned_count,
             "evicted_period_count": self.evicted_period_count,
             "eviction_heap_size": len(self._eviction_heap),
             "eviction_heap_pop_count": self.eviction_heap_pop_count,

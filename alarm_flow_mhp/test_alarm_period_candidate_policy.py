@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+from collections import defaultdict
 import io
 from pathlib import Path
 import random
@@ -467,6 +468,11 @@ def _eviction_engine():
     engine.period_ids_by_type = {}
     engine._group_redirect = {}
     engine.groups = {}
+    engine.merge_proposals = {}
+    engine._ready_merge_proposal_keys = set()
+    engine._merge_proposal_keys_by_group = defaultdict(set)
+    engine.merge_proposal_peak_count = 0
+    engine.merge_proposal_pruned_count = 0
     engine._eviction_heap = []
     engine._heap_seq = 0
     engine.evicted_period_count = 0
@@ -576,6 +582,84 @@ class AlarmPeriodOutputFilterTest(unittest.TestCase):
     def test_min_site_num_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "min_site_num must be >= 1"):
             PeriodStreamConfig(min_site_num=0).validate()
+
+
+class AlarmPeriodMergeProposalQueueTest(unittest.TestCase):
+    def test_only_newly_ready_proposals_are_examined(self):
+        engine = _eviction_engine()
+        engine.config.merge_min_evidence = 2
+        engine.config.merge_strength_ratio = 2.0
+        for gid in range(1, 5):
+            engine.groups[gid] = PeriodFaultGroup(group_id=gid, anchor_period_id=gid)
+
+        def evidence(pair, strength):
+            return SimpleNamespace(
+                period_pair=pair,
+                strength=strength,
+                score=strength,
+            )
+
+        engine._record_merge_proposal(1, 2, evidence((10, 11), 3.0))
+        engine._record_merge_proposal(3, 4, evidence((20, 21), 3.0))
+        engine._record_merge_proposal(3, 4, evidence((22, 23), 3.0))
+        self.assertEqual(engine._ready_merge_proposal_keys, {(3, 4)})
+
+        merged = []
+        engine._merge_groups = lambda left, right: merged.append((left, right))
+        engine._try_ready_merge_proposals()
+
+        self.assertEqual(merged, [(3, 4)])
+        self.assertIn((1, 2), engine.merge_proposals)
+        self.assertNotIn((3, 4), engine.merge_proposals)
+
+    def test_group_cleanup_removes_stale_proposals(self):
+        engine = _eviction_engine()
+        for gid in range(1, 4):
+            engine.groups[gid] = PeriodFaultGroup(group_id=gid, anchor_period_id=gid)
+        rel = SimpleNamespace(period_pair=(10, 11), strength=1.0, score=1.0)
+        engine._record_merge_proposal(1, 2, rel)
+        engine._record_merge_proposal(1, 3, rel)
+
+        engine._prune_merge_proposals_for_group(1)
+
+        self.assertEqual(engine.merge_proposals, {})
+        self.assertEqual(engine._merge_proposal_keys_by_group, {})
+        self.assertEqual(engine.merge_proposal_pruned_count, 2)
+
+
+class AlarmPeriodSignatureRegistrationTest(unittest.TestCase):
+    def test_reopened_period_registers_each_signature_only_once(self):
+        engine = object.__new__(AlarmPeriodMHPAssigner)
+        engine._next_period_id = 0
+        engine.created_periods = 0
+        engine.periods = {}
+        engine.open_period_by_type = {}
+        engine.period_ids_by_signature = defaultdict(set)
+        engine.period_ids_by_type = defaultdict(set)
+        engine._seen_period_signatures = set()
+        registered = []
+        engine.plan = SimpleNamespace(register_signature=registered.append)
+        period_type = PeriodType("NE-1", "A")
+
+        first = engine._open_or_create_period(
+            period_type, SimpleNamespace(ts=1.0), (0, 0, 0)
+        )
+        first.close(2.0, "test")
+        second = engine._open_or_create_period(
+            period_type, SimpleNamespace(ts=3.0), (0, 0, 0)
+        )
+        second.close(4.0, "test")
+        engine._open_or_create_period(
+            period_type, SimpleNamespace(ts=5.0), (1, 0, 0)
+        )
+
+        self.assertEqual(
+            registered,
+            [
+                PeriodSignature(period_type, 0),
+                PeriodSignature(period_type, 1),
+            ],
+        )
 
 
 class PeriodSourceImputationRegressionTest(unittest.TestCase):
