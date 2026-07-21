@@ -820,6 +820,7 @@ class PeriodFaultGroup:
     evidence_by_pair: dict = field(default_factory=dict)
     start_ts: float = math.inf
     last_ts: float = -math.inf
+    close_generation: int = 0
 
 
 def _state_combo(mark) -> int:
@@ -1716,6 +1717,7 @@ class AlarmPeriodMHPAssigner:
         self._idle_heap: list = []
         self._pending_heap: list = []
         self._eviction_heap: list = []
+        self._group_close_heap: list = []
         self._period_retention_sec = (
             self.config.history_window_sec
             + self.config.aggregation_wait_sec
@@ -1800,6 +1802,7 @@ class AlarmPeriodMHPAssigner:
             group = self._group(period.primary_group_id)
             if group is not None:
                 group.last_ts = max(group.last_ts, ts)
+                self._schedule_group_close(group)
         self._schedule_idle(period)
         self._schedule_harvest(period, ts)
         self._advance_watermark(ts)
@@ -1856,6 +1859,7 @@ class AlarmPeriodMHPAssigner:
         if matched_period.close(ts, "clear"):
             self.clear_closed_periods += 1
             self._schedule_period_eviction(matched_period)
+            self._reschedule_group_close_for(matched_period.primary_group_id)
             if self.open_period_by_type.get(matched_period.period_type) == matched_period.period_id:
                 self.open_period_by_type.pop(matched_period.period_type, None)
 
@@ -1894,6 +1898,7 @@ class AlarmPeriodMHPAssigner:
             if period.close(deadline, "idle"):
                 self.idle_closed_periods += 1
                 self._schedule_period_eviction(period)
+                self._reschedule_group_close_for(period.primary_group_id)
                 if self.open_period_by_type.get(period.period_type) == pid:
                     self.open_period_by_type.pop(period.period_type, None)
 
@@ -1935,6 +1940,11 @@ class AlarmPeriodMHPAssigner:
         self.harvest_count += 1
         if period.is_dirty:
             self._schedule_harvest(period, period.timestamps[mature_version])
+        else:
+            # A now-clean period may have been the last thing blocking its
+            # group's inactivity close; re-arm the group so the close heap can
+            # finalize it at exactly the watermark the full scan would have.
+            self._reschedule_group_close_for(period.primary_group_id)
 
     def _collect_relations(self, period: AlarmPeriod, new_events: list[OnlineEvent]):
         best_by_directed_pair: dict[tuple, RelationEvidence] = {}
@@ -2171,6 +2181,7 @@ class AlarmPeriodMHPAssigner:
         if core and len(group.core_period_ids) < self.config.max_core_periods:
             group.core_period_ids.append(period.period_id)
         self.period_attach_count += 1
+        self._schedule_group_close(group)
         return True
 
     @staticmethod
@@ -2232,6 +2243,7 @@ class AlarmPeriodMHPAssigner:
         keep.core_period_ids = core_candidates[: self.config.max_core_periods]
         keep.start_ts = min(keep.start_ts, drop.start_ts)
         keep.last_ts = max(keep.last_ts, drop.last_ts)
+        self._schedule_group_close(keep)
         for pair, rel in drop.evidence_by_pair.items():
             old = keep.evidence_by_pair.get(pair)
             if old is None or rel.score > old.score:
@@ -2258,19 +2270,62 @@ class AlarmPeriodMHPAssigner:
 
     # ---- closure, eviction, output -----------------------------------
 
+    def _schedule_group_close(self, group):
+        """Arm the inactivity-close deadline for ``group`` on the close heap.
+
+        Mirrors the period eviction heap: every call bumps ``close_generation``
+        so any earlier heap entry (which encoded a smaller ``last_ts``) becomes
+        stale and is skipped on pop, keeping a single live entry per group.
+        Call this wherever ``group.last_ts`` advances.
+        """
+        if self.config.close_inactive_sec <= 0:
+            return
+        group.close_generation += 1
+        self._heap_seq += 1
+        heapq.heappush(
+            self._group_close_heap,
+            (
+                group.last_ts + self.config.close_inactive_sec,
+                self._heap_seq,
+                group.group_id,
+                group.close_generation,
+            ),
+        )
+
+    def _reschedule_group_close_for(self, primary_group_id):
+        """Re-arm a group when a member period stops blocking its close.
+
+        The inactivity-close predicate also requires that no member period is
+        still open or dirty. Those transitions (idle/clear close, harvest going
+        clean) do not move ``last_ts``, so the standing heap entry may already
+        have been consumed while the group was blocked; re-push one so the close
+        heap re-examines the group at exactly this watermark.
+        """
+        gid = self._resolve_group_id(primary_group_id)
+        if gid is not None:
+            self._schedule_group_close(self.groups[gid])
+
     def _close_inactive_groups(self, watermark):
         if self.config.close_inactive_sec <= 0:
             return
-        cutoff = float(watermark) - self.config.close_inactive_sec
+        watermark = float(watermark)
+        # last_ts + close_inactive_sec < watermark is exactly the full-scan
+        # predicate last_ts < watermark - close_inactive_sec; the strict `<`
+        # gate matches, and stale/blocked entries are dropped so a later
+        # transition re-arms them. Ready gids are finalized in ascending order
+        # to reproduce the scan's insertion-ordered (== gid-ordered) sweep.
+        heap = self._group_close_heap
         ready = []
-        for gid, group in self.groups.items():
-            if group.last_ts >= cutoff:
+        while heap and heap[0][0] < watermark:
+            _deadline, _seq, gid, generation = heapq.heappop(heap)
+            group = self.groups.get(gid)
+            if group is None or generation != group.close_generation:
                 continue
             periods = [self.periods.get(pid) for pid in group.period_ids]
             if any(p is not None and (p.status == "open" or p.is_dirty) for p in periods):
                 continue
             ready.append(gid)
-        for gid in ready:
+        for gid in sorted(ready):
             self._finalize_group(gid)
 
     def _finalize_group(self, gid):
