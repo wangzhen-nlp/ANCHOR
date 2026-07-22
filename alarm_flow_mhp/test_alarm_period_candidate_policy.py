@@ -270,6 +270,56 @@ class CandidatePolicyTest(unittest.TestCase):
         for value in actual:
             self.assertIs(value, original_by_value[value])
 
+    def test_dense_candidate_metadata_matches_legacy_arrays_with_oov_types(self):
+        base = _plan(
+            dynamic="target",
+            at_vocab=("a",),
+        )
+        alarm_types = ("a", "oov-1", "oov-2")
+        period_types = tuple(
+            PeriodType(node, alarm_type)
+            for node in NODES
+            for alarm_type in alarm_types
+        )
+        policy = CandidatePolicy(
+            {
+                target: {
+                    source: ("same_ne_type", "same_vendor")
+                    for source in alarm_types
+                }
+                for target in alarm_types
+            },
+            approved=True,
+        )
+        plan = CompiledAssociationPlan(
+            base.scorer,
+            None,
+            base.artifact,
+            PeriodStreamConfig(candidate_scope="unrelated"),
+            candidate_policy=policy,
+        )
+        prepared = plan.prepare_candidate_period_types(
+            period_types, count_pairs=False
+        )
+        target = prepared["period_types"][0]
+        context = plan._adaptive_entity_context(
+            tuple(value for value in period_types if value.entity == target.entity),
+            prepared,
+        )
+        source_types = plan._candidate_sources(
+            target, prepared, adaptive_entity_context=context
+        )
+        fast = plan._candidate_arrays(source_types)
+        legacy = plan._candidate_arrays(tuple(source_types))
+
+        self.assertIs(fast, source_types.candidate_arrays)
+        np.testing.assert_array_equal(fast[0], legacy[0])
+        np.testing.assert_array_equal(fast[1], legacy[1])
+        self.assertEqual(list(fast[2]), list(legacy[2]))
+        np.testing.assert_array_equal(fast[3], legacy[3])
+        np.testing.assert_array_equal(fast[4], legacy[4])
+        self.assertGreater(np.count_nonzero(fast[0] == -1), 1)
+
     def test_sparse_unrelated_universe_keeps_compatibility_path(self):
         base = _plan(at_vocab=("a", "b"))
         period_types = (

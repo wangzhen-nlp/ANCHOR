@@ -63,6 +63,7 @@ from alarm_flow_isahp.sequences import (
 )
 from alarm_flow_mhp.aggregator import load_alarm_mhp_artifact
 from alarm_flow_mhp.candidate_policy import (
+    CandidateEntityView,
     adaptive_candidate_sources,
     candidate_policy_fingerprint,
     load_candidate_policy,
@@ -1651,6 +1652,9 @@ class CompiledAssociationPlan:
         entity list, an (at_id+1, entity_index) -> candidate position grid
         (-1 where the combo is absent), and the distinct at ids present.
         """
+        prepared_arrays = getattr(source_types, "candidate_arrays", None)
+        if prepared_arrays is not None:
+            return prepared_arrays
         at_to_id = self.scorer.at_to_id
         src_at_ids = np.fromiter(
             (at_to_id.get(str(value.alarm_type), -1) for value in source_types),
@@ -1732,12 +1736,21 @@ class CompiledAssociationPlan:
             )
             part_ent_inverse = ent_inverse
         else:
-            row_of, parts, full_z_entity, full_z_same = shared_basis
-            basis_rows = np.fromiter(
-                (row_of[value] for value in unique_entities),
-                dtype=np.int64,
-                count=len(unique_entities),
+            basis_index, parts, full_z_entity, full_z_same = shared_basis
+            source_entity_ids = getattr(
+                source_types, "unique_entity_ids", None
             )
+            if (
+                isinstance(basis_index, np.ndarray)
+                and source_entity_ids is not None
+            ):
+                basis_rows = np.searchsorted(basis_index, source_entity_ids)
+            else:
+                basis_rows = np.fromiter(
+                    (basis_index[value] for value in unique_entities),
+                    dtype=np.int64,
+                    count=len(unique_entities),
+                )
             part_ent_inverse = basis_rows[ent_inverse]
             z_entity = full_z_entity[basis_rows]
             z_same = full_z_same[basis_rows]
@@ -1837,7 +1850,9 @@ class CompiledAssociationPlan:
                 sources_by_target = {}
                 source_key_by_target = {}
                 sources_by_key = {}
-                union_entities = set()
+                union_entity_id_arrays = []
+                union_entities_fallback = set()
+                integer_union = static_table is not None
                 for target_type in targets:
                     # Candidate membership depends on the policy's ordered rule
                     # tuple for each source alarm type.  Multiple target alarm
@@ -1861,9 +1876,31 @@ class CompiledAssociationPlan:
                         sources_by_key[source_key] = source_types
                     sources_by_target[target_type] = source_types
                     source_key_by_target[target_type] = source_key
-                    union_entities.update(value.entity for value in source_types)
-                if union_entities:
-                    union_entities = tuple(sorted(union_entities))
+                    source_entity_ids = getattr(
+                        source_types, "unique_entity_ids", None
+                    )
+                    if integer_union and source_entity_ids is not None:
+                        union_entity_id_arrays.append(source_entity_ids)
+                    else:
+                        integer_union = False
+                        union_entities_fallback.update(
+                            value.entity for value in source_types
+                        )
+                if integer_union and union_entity_id_arrays:
+                    union_rows = np.unique(
+                        np.concatenate(union_entity_id_arrays)
+                    )
+                    union_entities = CandidateEntityView(
+                        prepared["entities"], union_rows
+                    )
+                    basis_index = union_rows
+                else:
+                    for entity_ids in union_entity_id_arrays:
+                        union_entities_fallback.update(
+                            prepared["entities"][int(entity_id)]
+                            for entity_id in entity_ids
+                        )
+                    union_entities = tuple(sorted(union_entities_fallback))
                     union_rows = (
                         np.fromiter(
                             (
@@ -1876,6 +1913,10 @@ class CompiledAssociationPlan:
                         if static_table is not None
                         else None
                     )
+                    basis_index = {
+                        value: i for i, value in enumerate(union_entities)
+                    }
+                if len(union_entities):
                     union_parts, union_z_entity, union_z_same = self._prescreen_basis(
                         entity,
                         union_entities,
@@ -1883,7 +1924,7 @@ class CompiledAssociationPlan:
                         static_rows=union_rows,
                     )
                     shared_basis = (
-                        {value: i for i, value in enumerate(union_entities)},
+                        basis_index,
                         union_parts,
                         union_z_entity,
                         union_z_same,

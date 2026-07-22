@@ -16,6 +16,8 @@ import math
 import os
 import tempfile
 
+import numpy as np
+
 from alarm_flow_mhp.feature_spec import phi_domain_of, topo_node_of
 
 
@@ -91,6 +93,39 @@ RELATED_MASK = 0
 for _rule in RELATED_RULES:
     RELATED_MASK |= RULE_BITS[_rule]
 del _rule
+
+
+class CandidateEntityView:
+    """Lazy entity-name sequence backed by sorted integer entity ids."""
+
+    __slots__ = ("_entities", "entity_ids")
+
+    def __init__(self, entities, entity_ids):
+        self._entities = entities
+        self.entity_ids = entity_ids
+
+    def __len__(self):
+        return len(self.entity_ids)
+
+    def __iter__(self):
+        entities = self._entities
+        return (entities[int(entity_id)] for entity_id in self.entity_ids)
+
+    def __getitem__(self, index):
+        entity_ids = self.entity_ids[index]
+        if np.isscalar(entity_ids):
+            return self._entities[int(entity_ids)]
+        return tuple(self._entities[int(entity_id)] for entity_id in entity_ids)
+
+
+class CandidateSources(tuple):
+    """Tuple-compatible candidates carrying prescreen-ready integer arrays."""
+
+    def __new__(cls, values, candidate_arrays, unique_entity_ids):
+        instance = super().__new__(cls, values)
+        instance.candidate_arrays = candidate_arrays
+        instance.unique_entity_ids = unique_entity_ids
+        return instance
 
 
 def sha256_file(path: str) -> str:
@@ -359,6 +394,10 @@ def build_candidate_indices(
     alarm_type_to_id = {
         alarm_type: index for index, alarm_type in enumerate(alarm_types)
     }
+    model_alarm_type_ids = np.asarray(
+        [scorer.at_to_id.get(alarm_type, -1) for alarm_type in alarm_types],
+        dtype=np.int64,
+    )
     # The cache compiler's production universe is the complete, sorted
     # entity x alarm-type grid.  In that layout a PeriodType's existing tuple
     # position is also a compact integer id, so candidate enumeration can sort
@@ -417,6 +456,8 @@ def build_candidate_indices(
         "entities": entities,
         "entity_to_id": entity_to_id,
         "alarm_type_to_id": alarm_type_to_id,
+        "model_alarm_type_ids": model_alarm_type_ids,
+        "candidate_grid_row_count": len(scorer.at_to_id) + 1,
         "dense_period_grid": dense_period_grid,
         "indexes": indexes,
         "geo_cells": geo_cells,
@@ -575,7 +616,43 @@ def _adaptive_candidate_sources_by_id(
         )
 
     candidate_positions.sort()
-    return tuple(period_types[position] for position in candidate_positions)
+    positions = np.asarray(candidate_positions, dtype=np.int64)
+    del candidate_positions
+    entity_ids = positions // alarm_type_count
+    source_alarm_type_ids = positions % alarm_type_count
+    if len(positions):
+        entity_starts = np.empty(len(positions), dtype=np.bool_)
+        entity_starts[0] = True
+        entity_starts[1:] = entity_ids[1:] != entity_ids[:-1]
+        unique_entity_ids = entity_ids[entity_starts]
+        ent_inverse = np.cumsum(entity_starts, dtype=np.int64) - 1
+    else:
+        unique_entity_ids = np.zeros(0, dtype=np.int64)
+        ent_inverse = np.zeros(0, dtype=np.int64)
+    src_at_ids = prepared["model_alarm_type_ids"][source_alarm_type_ids]
+    unique_entities = CandidateEntityView(
+        prepared["entities"], unique_entity_ids
+    )
+    grid_index = np.full(
+        (prepared["candidate_grid_row_count"], len(unique_entity_ids)),
+        -1,
+        dtype=np.int64,
+    )
+    grid_index[src_at_ids + 1, ent_inverse] = np.arange(
+        len(positions), dtype=np.int64
+    )
+    candidate_arrays = (
+        src_at_ids,
+        ent_inverse,
+        unique_entities,
+        grid_index,
+        np.unique(src_at_ids),
+    )
+    return CandidateSources(
+        (period_types[int(position)] for position in positions),
+        candidate_arrays,
+        unique_entity_ids,
+    )
 
 
 def adaptive_candidate_sources(
