@@ -2582,6 +2582,12 @@
             indirect_topology: { color: '#2563eb', label: 'indirect topology' },
             cross_site: { color: '#dc2626', label: 'cross site' },
             same_device: { color: '#059669', label: 'same device' },
+            mhp_same_device: { color: '#059669', label: 'MHP same device' },
+            mhp_same_site: { color: '#d97706', label: 'MHP same site' },
+            mhp_indirect_topology: { color: '#2563eb', label: 'MHP indirect topology' },
+            mhp_cross_site: { color: '#dc2626', label: 'MHP cross site' },
+            mhp_hawkes_unknown_context: { color: '#6b7280', label: 'MHP Hawkes' },
+            mhp_unrelated: { color: '#7c3aed', label: 'MHP unrelated (虚边)' },
             default: { color: '#dc2626', label: 'unknown' }
         };
 
@@ -2602,6 +2608,12 @@
             if (relation === 'indirect_topology' || relation === 'indirect-topology' || relation === 'indirect topology') return 'indirect_topology';
             if (relation === 'cross_site' || relation === 'cross-site' || relation === 'cross site') return 'cross_site';
             if (relation === 'same_device' || relation === 'same-device' || relation === 'same device') return 'same_device';
+            if (relation === 'mhp_same_device' || relation === 'mhp-same-device' || relation === 'mhp same device') return 'mhp_same_device';
+            if (relation === 'mhp_same_site' || relation === 'mhp-same-site' || relation === 'mhp same site') return 'mhp_same_site';
+            if (relation === 'mhp_indirect_topology' || relation === 'mhp-indirect-topology' || relation === 'mhp indirect topology') return 'mhp_indirect_topology';
+            if (relation === 'mhp_cross_site' || relation === 'mhp-cross-site' || relation === 'mhp cross site') return 'mhp_cross_site';
+            if (relation === 'mhp_hawkes_unknown_context' || relation === 'mhp-hawkes-unknown-context' || relation === 'mhp hawkes unknown context') return 'mhp_hawkes_unknown_context';
+            if (relation === 'mhp_unrelated' || relation === 'mhp-unrelated' || relation === 'mhp unrelated') return 'mhp_unrelated';
             return 'default';
         }
 
