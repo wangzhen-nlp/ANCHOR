@@ -6,12 +6,14 @@ import random
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from alarm_flow_mhp.candidate_policy import (
     CandidatePolicy,
     RELATED_MASK,
+    RELATED_RULES,
     adaptive_candidate_sources,
     build_candidate_indices,
     candidate_rule_mask,
@@ -329,6 +331,94 @@ class CandidatePolicyTest(unittest.TestCase):
             period_types, edge_batch_sink=lambda *_args: None
         )
         self.assertGreater(pair_count, 0)
+
+    def test_unrelated_batch_builds_entity_features_once_per_target_entity(self):
+        alarm_types = ("a", "b")
+        policy = CandidatePolicy(
+            {
+                target: {
+                    source: ("same_ne_type", "same_vendor")
+                    for source in alarm_types
+                }
+                for target in alarm_types
+            },
+            approved=True,
+        )
+        plan = _plan(
+            dynamic="target",
+            at_vocab=alarm_types,
+            scope="unrelated",
+            policy=policy,
+        )
+        period_types = tuple(
+            PeriodType(node, alarm_type)
+            for node in NODES
+            for alarm_type in alarm_types
+        )
+        original = plan.decomposed.entity_parts_for_target
+        calls = []
+
+        def counted(target_entity, source_entities):
+            calls.append((target_entity, tuple(source_entities)))
+            return original(target_entity, source_entities)
+
+        plan.decomposed.entity_parts_for_target = counted
+        plan.precompile_period_types(
+            period_types, edge_batch_sink=lambda *_args: None
+        )
+        self.assertEqual([target for target, _sources in calls], list(NODES))
+        self.assertTrue(all(sources for _target, sources in calls))
+
+    def test_unrelated_batch_resolves_each_rule_once_per_target_entity(self):
+        import alarm_flow_mhp.candidate_policy as candidate_policy_module
+
+        alarm_types = ("a", "b")
+        selected_rules = tuple(RELATED_RULES) + ("same_ne_type", "same_vendor")
+        policy = CandidatePolicy(
+            {
+                target: {
+                    source: ("same_ne_type", "same_vendor")
+                    for source in alarm_types
+                }
+                for target in alarm_types
+            },
+            approved=True,
+        )
+        plan = _plan(
+            dynamic="target",
+            at_vocab=alarm_types,
+            scope="unrelated",
+            policy=policy,
+        )
+        period_types = tuple(
+            PeriodType(node, alarm_type)
+            for node in NODES
+            for alarm_type in alarm_types
+        )
+        prepared = plan.prepare_candidate_period_types(
+            period_types, count_pairs=False
+        )
+        original = candidate_policy_module.rule_candidates
+        calls = defaultdict(int)
+
+        def counted(target, source_alarm_type, rule, prepared):
+            calls[(target.entity, rule)] += 1
+            return original(target, source_alarm_type, rule, prepared)
+
+        with patch.object(candidate_policy_module, "rule_candidates", counted):
+            plan.precompile_period_types(
+                period_types,
+                prepared_candidates=prepared,
+                edge_batch_sink=lambda *_args: None,
+            )
+        self.assertEqual(
+            calls,
+            {
+                (entity, rule): 1
+                for entity in NODES
+                for rule in selected_rules
+            },
+        )
 
     def test_profile_target_entity_limit_keeps_complete_entity_groups(self):
         period_types = tuple(

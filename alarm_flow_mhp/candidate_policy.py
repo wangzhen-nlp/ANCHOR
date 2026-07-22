@@ -447,16 +447,63 @@ def _related_entity_set(target, prepared):
     return related
 
 
-def adaptive_candidate_sources(target, policy, prepared, exclude_related=False):
+def prepare_adaptive_entity_context(
+    target,
+    target_alarm_types,
+    policy,
+    prepared,
+    exclude_related=False,
+):
+    """Resolve reusable rule candidates for one target entity group.
+
+    Rule lookup depends on the target entity but not its alarm type. Offline
+    target-dynamic compilation processes every alarm type of an entity together,
+    so resolving each selected rule once avoids repeating topology/geo/index
+    unions while keeping the context bounded to the current entity group.
+    """
+    selected_rules = set(RELATED_RULES if exclude_related else ())
+    for target_alarm_type in target_alarm_types:
+        for source_alarm_type in prepared["alarm_types"]:
+            selected_rules.update(
+                policy.rules_for(target_alarm_type, source_alarm_type)
+            )
+    candidates_by_rule = {
+        rule: rule_candidates(target, None, rule, prepared)
+        for rule in selected_rules
+    }
+    related = set()
+    if exclude_related:
+        for rule in RELATED_RULES:
+            related.update(candidates_by_rule.get(rule, ()))
+    return {
+        "candidates_by_rule": candidates_by_rule,
+        "related": related,
+    }
+
+
+def adaptive_candidate_sources(
+    target,
+    policy,
+    prepared,
+    exclude_related=False,
+    entity_context=None,
+):
     candidates = set()
     period_type_class = target.__class__
-    related = _related_entity_set(target, prepared) if exclude_related else ()
+    related = (
+        entity_context["related"]
+        if entity_context is not None and exclude_related
+        else _related_entity_set(target, prepared) if exclude_related else ()
+    )
     for source_at in prepared["alarm_types"]:
         candidate_entities = set()
         for rule in policy.rules_for(target.alarm_type, source_at):
-            candidate_entities.update(
-                rule_candidates(target, source_at, rule, prepared)
+            values = (
+                entity_context["candidates_by_rule"].get(rule, ())
+                if entity_context is not None
+                else rule_candidates(target, source_at, rule, prepared)
             )
+            candidate_entities.update(values)
         if exclude_related:
             candidate_entities -= related
         candidates.update(

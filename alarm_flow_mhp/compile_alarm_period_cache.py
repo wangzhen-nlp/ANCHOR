@@ -249,8 +249,10 @@ def _first_target_entities(period_types, limit):
 def _enable_compile_profiling(timer, plan, spool):
     """Wrap high-value compile phases without affecting the normal path."""
     for owner, method_name, phase_name in (
+        (plan, "_adaptive_entity_context", "score.candidate_context"),
         (plan, "_candidate_sources", "score.candidate_enumeration"),
         (plan, "_candidate_arrays", "score.candidate_arrays"),
+        (plan, "_prescreen_basis", "score.prescreen_basis"),
         (plan, "_prescreen_source_state", "score.prescreen_prepare"),
         (plan, "_compute_edge", "score.compute_edge"),
         (plan.decomposed, "entity_parts_for_target", "score.entity_features"),
@@ -318,6 +320,8 @@ def _print_compile_profile(
         phases.get(name, {}).get("total_seconds", 0.0)
         for name in (
             "score.candidate_enumeration",
+            "score.candidate_context",
+            "score.prescreen_basis",
             "score.prescreen_prepare",
             "score.compute_edge",
             "score.edge_spool",

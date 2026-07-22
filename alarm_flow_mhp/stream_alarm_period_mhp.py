@@ -66,6 +66,7 @@ from alarm_flow_mhp.candidate_policy import (
     adaptive_candidate_sources,
     candidate_policy_fingerprint,
     load_candidate_policy,
+    prepare_adaptive_entity_context,
     prepare_adaptive_candidates,
     unrelated_pair_allowed,
 )
@@ -1600,7 +1601,7 @@ class CompiledAssociationPlan:
         prepared["total_pair_count"] = total_pair_count
         return prepared
 
-    def _candidate_sources(self, target, prepared):
+    def _candidate_sources(self, target, prepared, adaptive_entity_context=None):
         period_types = prepared["period_types"]
         if prepared.get("adaptive"):
             return adaptive_candidate_sources(
@@ -1608,6 +1609,7 @@ class CompiledAssociationPlan:
                 prepared["policy"],
                 prepared,
                 exclude_related=prepared.get("exclude_related", False),
+                entity_context=adaptive_entity_context,
             )
         if prepared["global"]:
             return period_types
@@ -1626,6 +1628,16 @@ class CompiledAssociationPlan:
             for neighbor in neighbor_nodes.get(node, ()):
                 candidates.update(by_node.get(neighbor, ()))
         return tuple(sorted(candidates, key=lambda x: (x.entity, x.alarm_type)))
+
+    def _adaptive_entity_context(self, targets, prepared):
+        """Build bounded candidate-rule state shared by one target entity group."""
+        return prepare_adaptive_entity_context(
+            targets[0],
+            (target.alarm_type for target in targets),
+            prepared["policy"],
+            prepared,
+            exclude_related=prepared.get("exclude_related", False),
+        )
 
     def _candidate_period_type_pairs(self, prepared):
         for target in prepared["period_types"]:
@@ -1665,27 +1677,14 @@ class CompiledAssociationPlan:
         distinct_at_ids = np.unique(src_at_ids)
         return src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids
 
-    def _prescreen_source_state(self, entity, source_types, shared, static_table):
-        """Vectorized prescreen tables for one target entity's candidate set.
-
-        Returns ``None`` for an empty candidate set. ``shared``/``static_table``
-        let the ``global`` scope reuse its one fixed source universe; ``related``
-        and ``adaptive`` rebuild the tables per candidate set (``adaptive``'s set
-        depends on the target alarm type, so it is rebuilt per target row).
-        """
-        if not source_types:
-            return None
+    def _prescreen_basis(self, entity, unique_entities, static_table=None):
+        """Build entity-pair parts and alarm-type-neutral prescreen logits."""
         d = self.decomposed
-        src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids = (
-            shared if shared is not None else self._candidate_arrays(source_types)
-        )
         parts = (
             d.entity_parts_from_table(entity, static_table)
             if static_table is not None
             else d.entity_parts_for_target(entity, unique_entities)
         )
-        # z_entity: the exact logit with the at-pair block muted (id -1 hits the
-        # zero-padded W_at row and disables same_at).
         z_entity = d.logits_from_parts(
             -1,
             np.full(len(unique_entities), -1, dtype=np.int64),
@@ -1693,13 +1692,51 @@ class CompiledAssociationPlan:
             tgt_term=0.0,
             **parts,
         )
-        # delta_same: contribution of same_alarm_type and its cross columns on
-        # any v == u row.
         z_same = z_entity + d.same_at_delta_from_parts(parts)
+        return parts, z_entity, z_same
+
+    def _prescreen_source_state(
+        self,
+        entity,
+        source_types,
+        shared,
+        static_table,
+        shared_basis=None,
+    ):
+        """Vectorized prescreen tables for one target entity's candidate set.
+
+        Returns ``None`` for an empty candidate set. ``shared``/``static_table``
+        let the ``global`` scope reuse its one fixed source universe; ``related``
+        and ``adaptive`` rebuild the tables per candidate set (``adaptive``'s set
+        depends on the target alarm type). ``shared_basis`` lets all adaptive
+        alarm types of one target entity reuse entity features over their bounded
+        candidate-entity union while retaining compact per-candidate grids.
+        """
+        if not source_types:
+            return None
+        src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids = (
+            shared if shared is not None else self._candidate_arrays(source_types)
+        )
+        if shared_basis is None:
+            parts, z_entity, z_same = self._prescreen_basis(
+                entity, unique_entities, static_table
+            )
+            part_ent_inverse = ent_inverse
+        else:
+            row_of, parts, full_z_entity, full_z_same = shared_basis
+            basis_rows = np.fromiter(
+                (row_of[value] for value in unique_entities),
+                dtype=np.int64,
+                count=len(unique_entities),
+            )
+            part_ent_inverse = basis_rows[ent_inverse]
+            z_entity = full_z_entity[basis_rows]
+            z_same = full_z_same[basis_rows]
         oov_source_indices = np.flatnonzero(src_at_ids == -1)
         return (
             src_at_ids,
             ent_inverse,
+            part_ent_inverse,
             grid_index,
             distinct_at_ids,
             parts,
@@ -1774,16 +1811,45 @@ class CompiledAssociationPlan:
                     entity, group_source_types, shared, static_table
                 )
             else:
-                # Adaptive rebuilds per target alarm type, but target types
-                # whose policy rules resolve to the same candidate set still
-                # reuse the prescreen tables — keyed by that resolved set.
+                # Resolve every selected rule once for this target entity, then
+                # enumerate the alarm-type-specific candidate sets from that
+                # bounded context. Entity-pair features are built once over the
+                # union and gathered by each compact candidate state.
+                adaptive_context = self._adaptive_entity_context(targets, prepared)
+                sources_by_target = {}
+                union_entities = set()
+                for target_type in targets:
+                    source_types = self._candidate_sources(
+                        target_type,
+                        prepared,
+                        adaptive_entity_context=adaptive_context,
+                    )
+                    sources_by_target[target_type] = source_types
+                    union_entities.update(value.entity for value in source_types)
+                if union_entities:
+                    union_entities = tuple(sorted(union_entities))
+                    union_parts, union_z_entity, union_z_same = self._prescreen_basis(
+                        entity, union_entities
+                    )
+                    shared_basis = (
+                        {value: i for i, value in enumerate(union_entities)},
+                        union_parts,
+                        union_z_entity,
+                        union_z_same,
+                    )
+                else:
+                    shared_basis = None
                 state_by_sources = {}
             for target_type in targets:
                 if per_target_sources:
-                    source_types = self._candidate_sources(target_type, prepared)
+                    source_types = sources_by_target[target_type]
                     if source_types not in state_by_sources:
                         state_by_sources[source_types] = self._prescreen_source_state(
-                            entity, source_types, shared, static_table
+                            entity,
+                            source_types,
+                            shared,
+                            static_table,
+                            shared_basis=shared_basis,
                         )
                     state = state_by_sources[source_types]
                 else:
@@ -1795,6 +1861,7 @@ class CompiledAssociationPlan:
                     (
                         src_at_ids,
                         ent_inverse,
+                        part_ent_inverse,
                         grid_index,
                         distinct_at_ids,
                         parts,
@@ -1864,7 +1931,7 @@ class CompiledAssociationPlan:
                     self.prescreen_dropped_pair_count += source_count - len(survivors)
                     if len(survivors):
                         surv_types = [source_types[i] for i in survivors]
-                        surv_inverse = ent_inverse[survivors]
+                        surv_inverse = part_ent_inverse[survivors]
                         # Exact rescoring reuses the group's entity parts by
                         # gather; logits_from_parts is elementwise, so this is
                         # bit-identical to rebuilding features per candidate.
