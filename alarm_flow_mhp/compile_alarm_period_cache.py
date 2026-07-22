@@ -17,7 +17,10 @@ kept in process memory only.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import multiprocessing as mp
 import os
+import shutil
 import tempfile
 import time
 
@@ -225,6 +228,149 @@ class _BinaryEdgeSpool:
         self.memmaps.clear()
 
 
+# Forked workers inherit these via copy-on-write; the parent sets them before
+# creating the pool so the heavy plan/candidate index need not be pickled.
+_PARALLEL_CTX: dict = {}
+
+
+def _thread_limit():
+    """Cap native (BLAS/OpenMP) threads per worker to avoid oversubscription."""
+    try:
+        from threadpoolctl import threadpool_limits
+
+        return threadpool_limits(limits=1)
+    except Exception:  # threadpoolctl is optional; fall back to a no-op.
+        return contextlib.nullcontext()
+
+
+def _compile_chunk(task):
+    """Score one contiguous target-entity chunk into its own spool shard.
+
+    Runs inside a forked worker. Counters are reset per chunk so the returned
+    values are deltas the parent can sum. Only raw edge ``.bin`` files are
+    produced; the parent concatenates shards in chunk order and builds the CSR.
+    """
+    idx, start, stop = task
+    plan = _PARALLEL_CTX["plan"]
+    prepared = _PARALLEL_CTX["prepared"]
+    period_types = _PARALLEL_CTX["period_types"]
+    state_layout = _PARALLEL_CTX["state_layout"]
+    spool_root = _PARALLEL_CTX["spool_root"]
+    plan.compiled_pair_count = 0
+    plan.pruned_pair_count = 0
+    plan.prescreen_dropped_pair_count = 0
+    shard_dir = os.path.join(spool_root, f"shard-{idx:05d}")
+    os.makedirs(shard_dir, exist_ok=True)
+    spool = _BinaryEdgeSpool(shard_dir, period_types, state_layout)
+    chunk_prepared = dict(prepared)
+    chunk_prepared["period_types"] = period_types[start:stop]
+    with _thread_limit():
+        type_pair_count = plan._precompile_target_only_batches(
+            chunk_prepared, None, spool.append_batch
+        )
+    spool.flush()
+    for stream in spool.streams.values():
+        stream.close()
+    return {
+        "idx": idx,
+        "paths": dict(spool.paths),
+        "count": spool.count,
+        "type_pair_count": type_pair_count,
+        "target_count": stop - start,
+        "compiled_pair_count": plan.compiled_pair_count,
+        "pruned_pair_count": plan.pruned_pair_count,
+        "prescreen_dropped_pair_count": plan.prescreen_dropped_pair_count,
+    }
+
+
+def _entity_aligned_chunks(period_types, workers):
+    """Split globally sorted period types into contiguous entity-aligned chunks.
+
+    Chunks never straddle a target entity (so each entity's shared prescreen
+    tables are built once), and oversampling relative to ``workers`` lets the
+    pool load-balance skewed candidate-set sizes dynamically.
+    """
+    boundaries = [0]
+    for i in range(1, len(period_types)):
+        if period_types[i].entity != period_types[i - 1].entity:
+            boundaries.append(i)
+    boundaries.append(len(period_types))
+    n_groups = len(boundaries) - 1
+    if n_groups == 0:
+        return []
+    n_chunks = min(n_groups, max(workers * 4, workers))
+    tasks = []
+    for c in range(n_chunks):
+        g0 = c * n_groups // n_chunks
+        g1 = (c + 1) * n_groups // n_chunks
+        if g0 >= g1:
+            continue
+        tasks.append((len(tasks), boundaries[g0], boundaries[g1]))
+    return tasks
+
+
+def _merge_shards(spool_dir, ordered_results, period_types, state_layout):
+    """Concatenate shard edge files in chunk order into one merged spool.
+
+    Chunks are ascending contiguous target-signature ranges, so byte-appending
+    them in order yields a single target-sorted archive that ``arrays()`` can
+    turn into the compact CSR — identical to the single-process spool.
+    """
+    merged = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
+    for stream in merged.streams.values():
+        stream.close()
+    for name in merged.paths:
+        with open(merged.paths[name], "wb") as out:
+            for res in ordered_results:
+                with open(res["paths"][name], "rb") as src:
+                    shutil.copyfileobj(src, out, 8 * 1024 * 1024)
+    merged.count = sum(res["count"] for res in ordered_results)
+    return merged
+
+
+def _run_parallel_compile(
+    plan, prepared, period_types, state_layout, spool_dir, workers, progress_cb
+):
+    """Fork-parallel target-dynamic compile; returns (type_pair_count, spool)."""
+    global _PARALLEL_CTX
+    tasks = _entity_aligned_chunks(period_types, workers)
+    # Warm the target-independent static table before forking so every worker
+    # inherits it copy-on-write instead of rebuilding it once per chunk.
+    if prepared.get("adaptive") and prepared.get("entities"):
+        plan.adaptive_static_table(prepared["entities"])
+    _PARALLEL_CTX = {
+        "plan": plan,
+        "prepared": prepared,
+        "period_types": period_types,
+        "state_layout": state_layout,
+        "spool_root": spool_dir,
+    }
+    results = {}
+    agg_pairs = agg_compiled = agg_pruned = agg_targets = 0
+    try:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=min(workers, len(tasks)) or 1) as pool:
+            for res in pool.imap_unordered(_compile_chunk, tasks):
+                results[res["idx"]] = res
+                agg_pairs += res["type_pair_count"]
+                agg_compiled += res["compiled_pair_count"]
+                agg_pruned += res["pruned_pair_count"]
+                agg_targets += res["target_count"]
+                if progress_cb is not None:
+                    progress_cb(agg_pairs, agg_compiled, agg_pruned, agg_targets)
+    finally:
+        _PARALLEL_CTX = {}
+    ordered = [results[i] for i in sorted(results)]
+    plan.compiled_pair_count = sum(r["compiled_pair_count"] for r in ordered)
+    plan.pruned_pair_count = sum(r["pruned_pair_count"] for r in ordered)
+    plan.prescreen_dropped_pair_count = sum(
+        r["prescreen_dropped_pair_count"] for r in ordered
+    )
+    type_pair_count = sum(r["type_pair_count"] for r in ordered)
+    spool = _merge_shards(spool_dir, ordered, period_types, state_layout)
+    return type_pair_count, spool
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
         description="Compile an offline sparse association cache for AlarmPeriod MHP."
@@ -266,6 +412,17 @@ def _build_parser():
         help="Refresh the progress bar after this many directed type pairs; 0 disables.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Parallel target-entity workers for the target-dynamic vectorized "
+            "compiler (fork pool). 1 keeps the single-process path. Output is "
+            "bit-identical regardless of worker count; only the target-dynamic "
+            "path is parallelized (other layouts fall back to one process)."
+        ),
+    )
+    parser.add_argument(
         "--count-only",
         action="store_true",
         help="Build the candidate index, print total_type_pairs, then exit without scoring/writing.",
@@ -277,6 +434,8 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
     try:
         relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
     except ValueError as exc:
@@ -376,16 +535,30 @@ def main():
         else "cpu-scalar"
     )
     candidate_t0 = time.monotonic()
-    prepared_candidates = plan.prepare_candidate_period_types(period_types)
+    # The exact directed-pair total requires enumerating every target's
+    # candidate set. That enumeration is the same work the compile pass already
+    # does, so we skip it for the normal path (progress is driven by the known
+    # target count instead) and only pay it for --count-only, whose sole job is
+    # to report the total.
+    prepared_candidates = plan.prepare_candidate_period_types(
+        period_types, count_pairs=args.count_only
+    )
     period_types = prepared_candidates["period_types"]
     total_type_pairs = prepared_candidates["total_pair_count"]
+    total_targets = len(period_types)
     if not args.quiet:
+        pairs_field = (
+            f"total_type_pairs={total_type_pairs}, "
+            f"max_state_edges={total_type_pairs * state_expansion}, "
+            if total_type_pairs is not None
+            else "total_type_pairs=counted-during-compile, "
+        )
         print(
-            f"[period-cache] total_type_pairs={total_type_pairs}, "
+            f"[period-cache] {pairs_field}"
+            f"target_types={total_targets}, "
             f"state_layout={state_layout}, "
             f"backend={compile_backend}, "
             f"states_per_type_pair={state_expansion}, "
-            f"max_state_edges={total_type_pairs * state_expansion}, "
             f"candidate_index_elapsed={time.monotonic() - candidate_t0:.1f}s, "
             "estimated_active_edges=pending, ETA=pending",
             flush=True,
@@ -397,50 +570,70 @@ def main():
 
     last_report = 0
     progress_bar = (
-        ProgressBar(total_type_pairs, "编译 AlarmPeriod 关联缓存")
+        ProgressBar(total_targets, "编译 AlarmPeriod 关联缓存")
         if not args.quiet and args.progress_every
         else None
     )
 
-    def update_progress(type_pairs, active_edges, pruned_pairs):
+    def update_progress(type_pairs, active_edges, pruned_pairs, targets_done):
         if progress_bar is None:
             return
         estimated_active_edges = (
-            round(active_edges / type_pairs * total_type_pairs) if type_pairs else 0
+            round(active_edges / targets_done * total_targets) if targets_done else 0
         )
         active_ratio = active_edges / max(active_edges + pruned_pairs, 1)
         progress_bar.extra_text = (
-            f"edges={active_edges:,} ({active_ratio:.1%}, "
+            f"pairs={type_pairs:,} edges={active_edges:,} ({active_ratio:.1%}, "
             f"est={estimated_active_edges:,})"
         )
-        progress_bar.set(type_pairs)
+        progress_bar.set(targets_done)
 
-    def report(type_pairs, active_edges, pruned_pairs):
+    def report(type_pairs, active_edges, pruned_pairs, targets_done):
         nonlocal last_report
         if args.quiet or not args.progress_every:
             return
         if type_pairs - last_report < args.progress_every:
             return
         last_report = type_pairs
-        update_progress(type_pairs, active_edges, pruned_pairs)
+        update_progress(type_pairs, active_edges, pruned_pairs, targets_done)
 
+    use_parallel = args.workers > 1 and state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+    if args.workers > 1 and not use_parallel and not args.quiet:
+        print(
+            "[period-cache] --workers>1 仅支持 target-dynamic 向量化路径；回退单进程",
+            flush=True,
+        )
     with tempfile.TemporaryDirectory(prefix="alarm-period-cache-") as spool_dir:
-        spool = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
+        spool = None if use_parallel else _BinaryEdgeSpool(
+            spool_dir, period_types, state_layout
+        )
         arrays = None
         payload = None
         try:
-            type_pair_count = plan.precompile_period_types(
-                period_types,
-                progress=report,
-                prepared_candidates=prepared_candidates,
-                edge_sink=spool.append,
-                edge_batch_sink=spool.append_batch,
-            )
+            if use_parallel:
+                type_pair_count, spool = _run_parallel_compile(
+                    plan,
+                    prepared_candidates,
+                    period_types,
+                    state_layout,
+                    spool_dir,
+                    args.workers,
+                    None if progress_bar is None else update_progress,
+                )
+            else:
+                type_pair_count = plan.precompile_period_types(
+                    period_types,
+                    progress=report,
+                    prepared_candidates=prepared_candidates,
+                    edge_sink=spool.append,
+                    edge_batch_sink=spool.append_batch,
+                )
             if progress_bar is not None:
                 update_progress(
                     type_pair_count,
                     plan.compiled_pair_count,
                     plan.pruned_pair_count,
+                    total_targets,
                 )
                 progress_bar.close()
                 progress_bar = None
@@ -492,7 +685,8 @@ def main():
             if payload is not None:
                 payload.pop("arrays", None)
             arrays = None
-            spool.release_mmaps()
+            if spool is not None:
+                spool.release_mmaps()
     elapsed = time.monotonic() - t0
     if not args.quiet:
         print(

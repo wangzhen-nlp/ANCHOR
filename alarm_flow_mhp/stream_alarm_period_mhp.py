@@ -1708,6 +1708,66 @@ class CompiledAssociationPlan:
             oov_source_indices,
         )
 
+    def adaptive_static_table(self, entities):
+        """Memoized static table over the candidate entity universe.
+
+        The table is target-independent, so it is built once and reused across
+        every entity group. Warming it in the parent before a fork pool lets
+        workers inherit it copy-on-write instead of each rebuilding it per chunk.
+        """
+        cached = getattr(self, "_adaptive_static_table_cache", None)
+        if cached is None or cached[0] is not entities:
+            cached = (entities, self.decomposed.entity_static_table(entities))
+            self._adaptive_static_table_cache = cached
+        return cached[1]
+
+    def _prescreen_state_from_table(
+        self, source_types, table, parts, z_entity_full, z_same_full
+    ):
+        """Prescreen tables for one candidate set over a static table.
+
+        The adaptive counterpart of ``_prescreen_source_state``: instead of
+        rebuilding entity-pair features per candidate with a Python loop, it
+        indexes the target entity's already-vectorized ``parts``/logits (computed
+        once per entity group over the whole universe) directly by static-table
+        row. The group's full-table ``parts``/``z_entity``/``z_same`` are passed
+        through unchanged — the prescreen scans them by global row and only the
+        surviving candidates are gathered downstream, so no per-candidate gather
+        is materialized here. Returns the same 8-tuple as the loop path with
+        ``ent_inverse`` holding global table rows; output is bit-identical
+        because ``entity_parts_from_table`` is elementwise-equal and
+        ``logits_from_parts`` is row-independent.
+        """
+        if not source_types:
+            return None
+        d = self.decomposed
+        at_to_id = self.scorer.at_to_id
+        n = len(source_types)
+        src_at_ids = np.fromiter(
+            (at_to_id.get(str(value.alarm_type), -1) for value in source_types),
+            dtype=np.int64,
+            count=n,
+        )
+        ent_rows = np.fromiter(
+            (table.row_of[value.entity] for value in source_types),
+            dtype=np.int64,
+            count=n,
+        )
+        grid_index = np.full((d.W_at_pad.shape[0], table.n), -1, dtype=np.int64)
+        grid_index[src_at_ids + 1, ent_rows] = np.arange(n, dtype=np.int64)
+        distinct_at_ids = np.unique(src_at_ids)
+        oov_source_indices = np.flatnonzero(src_at_ids == -1)
+        return (
+            src_at_ids,
+            ent_rows,
+            grid_index,
+            distinct_at_ids,
+            parts,
+            z_entity_full,
+            z_same_full,
+            oov_source_indices,
+        )
+
     def _precompile_target_only_batches(self, prepared, progress, edge_batch_sink):
         """Vectorized offline compiler for target-dynamic cache rows.
 
@@ -1724,6 +1784,7 @@ class CompiledAssociationPlan:
         bit-identical to the unpruned scan.
         """
         type_pair_count = 0
+        targets_done = 0
         d = self.decomposed
         target_terms = np.asarray(
             [d.tgt_term(_combo_state(state)) for state in range(8)],
@@ -1752,6 +1813,17 @@ class CompiledAssociationPlan:
         # prescreen tables cannot be shared across a target entity's rows the
         # way ``related``/``global`` sets can; rebuild them per target instead.
         per_target_sources = bool(prepared.get("adaptive"))
+        # Adaptive shares the ``global`` vectorized machinery: one static table
+        # over the whole entity universe replaces the per-candidate Python loop
+        # in ``entity_parts_for_target``. The target-entity feature parts (and
+        # their logits) depend only on the target entity, so they are computed
+        # once per entity group and gathered into each alarm type's candidate
+        # subset — bit-identical to the loop path.
+        adaptive_table = (
+            self.adaptive_static_table(prepared["entities"])
+            if per_target_sources
+            else None
+        )
         for entity, group in groupby(
             prepared["period_types"], key=lambda value: value.entity
         ):
@@ -1766,12 +1838,27 @@ class CompiledAssociationPlan:
                 # whose policy rules resolve to the same candidate set still
                 # reuse the prescreen tables — keyed by that resolved set.
                 state_by_sources = {}
+                group_parts = d.entity_parts_from_table(entity, adaptive_table)
+                group_z_entity = d.logits_from_parts(
+                    -1,
+                    np.full(adaptive_table.n, -1, dtype=np.int64),
+                    src_mark_idx=np.zeros(adaptive_table.n, dtype=np.int64),
+                    tgt_term=0.0,
+                    **group_parts,
+                )
+                group_z_same = group_z_entity + d.same_at_delta_from_parts(group_parts)
             for target_type in targets:
                 if per_target_sources:
                     source_types = self._candidate_sources(target_type, prepared)
                     if source_types not in state_by_sources:
-                        state_by_sources[source_types] = self._prescreen_source_state(
-                            entity, source_types, shared, static_table
+                        state_by_sources[source_types] = (
+                            self._prescreen_state_from_table(
+                                source_types,
+                                adaptive_table,
+                                group_parts,
+                                group_z_entity,
+                                group_z_same,
+                            )
                         )
                     state = state_by_sources[source_types]
                 else:
@@ -1920,9 +2007,13 @@ class CompiledAssociationPlan:
                     self.compiled_pair_count += kept_count
                     self.pruned_pair_count += source_count * 8 - kept_count
                 type_pair_count += source_count
+                targets_done += 1
                 if progress is not None:
                     progress(
-                        type_pair_count, self.compiled_pair_count, self.pruned_pair_count
+                        type_pair_count,
+                        self.compiled_pair_count,
+                        self.pruned_pair_count,
+                        targets_done,
                     )
         return type_pair_count
 
@@ -1957,7 +2048,7 @@ class CompiledAssociationPlan:
             self.precompiled_candidate_scope = self.config.candidate_scope
 
         type_pair_count = 0
-        for target_type in prepared["period_types"]:
+        for targets_done, target_type in enumerate(prepared["period_types"], start=1):
             source_types = self._candidate_sources(target_type, prepared)
             for target_state in states:
                 target = PeriodSignature(target_type, target_state)
@@ -1972,7 +2063,12 @@ class CompiledAssociationPlan:
                                 edge_sink(target, source, edge)
             type_pair_count += len(source_types)
             if progress is not None:
-                progress(type_pair_count, self.compiled_pair_count, self.pruned_pair_count)
+                progress(
+                    type_pair_count,
+                    self.compiled_pair_count,
+                    self.pruned_pair_count,
+                    targets_done,
+                )
         return type_pair_count
 
     def to_cache_payload(self, fingerprint, extra_metadata=None):
