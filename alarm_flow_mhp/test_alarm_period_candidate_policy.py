@@ -400,7 +400,8 @@ _PROFILED_ENGINE_METHODS = (
     "_close_inactive_groups",
     "_finalize_group",
     "_evict_expired_periods",
-    "_group_record",
+    "_prepare_group_symptoms",
+    "_assemble_group_record",
     "flush",
 )
 
@@ -538,7 +539,10 @@ class AlarmPeriodEvictionHeapTest(unittest.TestCase):
             period_ids={period.period_id},
             active_member_count=1,
         )
-        engine._group_record = lambda _group: {"event_count": 0, "real_event_count": 0}
+        engine._prepare_group_symptoms = lambda _group: {
+            "real_event_count": 0,
+            "real_site_ids": set(),
+        }
         engine._schedule_period_eviction(period)
 
         engine._evict_expired_periods(30.0)
@@ -568,9 +572,12 @@ class AlarmPeriodOutputFilterTest(unittest.TestCase):
 
         def finalize(real_site_list):
             engine.groups[1] = PeriodFaultGroup(group_id=1, anchor_period_id=0)
-            engine._group_record = lambda _group: {
+            engine._prepare_group_symptoms = lambda _group: {
                 "real_event_count": 2,
-                "real_site_list": real_site_list,
+                "real_site_ids": set(real_site_list),
+            }
+            engine._assemble_group_record = lambda _group, _prepared: {
+                "real_site_list": sorted(_prepared["real_site_ids"]),
             }
             engine._finalize_group(1)
 

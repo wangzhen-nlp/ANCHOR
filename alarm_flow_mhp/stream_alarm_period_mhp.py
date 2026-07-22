@@ -160,7 +160,10 @@ def _enable_period_profiling(timer, engine, output):
         ("_close_inactive_groups", "maintenance.close_inactive_groups"),
         ("_finalize_group", "maintenance.finalize_group"),
         ("_evict_expired_periods", "maintenance.evict_expired_periods"),
-        ("_group_record", "output.build_group_record"),
+        # Symptom prep runs for every finalized group (needed for the output
+        # gate); record assembly only for groups that survive the gate.
+        ("_prepare_group_symptoms", "output.prepare_symptoms"),
+        ("_assemble_group_record", "output.build_group_record"),
         ("flush", "flush.total"),
     )
     for method_name, phase_name in engine_phases:
@@ -3033,17 +3036,19 @@ class AlarmPeriodMHPAssigner:
         if group is None:
             return
         self._prune_merge_proposals_for_group(gid)
-        record = self._group_record(group)
+        # Evaluate the output gate on the cheap symptom pass first; the expensive
+        # edge list and record assembly are built only for groups that pass.
         # Gate on REAL events only: an imputed (virtual) source must not push a
         # group past min_group_events on its own. Without imputation
         # real_event_count == event_count, so this is a no-op for that path.
+        prepared = self._prepare_group_symptoms(group)
         if (
-            record["real_event_count"] >= self.config.min_group_events
-            and len(record["real_site_list"]) >= self.config.min_site_num
+            prepared["real_event_count"] >= self.config.min_group_events
+            and len(prepared["real_site_ids"]) >= self.config.min_site_num
         ):
             if self.closed_group_sink is None:
                 raise RuntimeError("incremental closed-group sink is not configured")
-            self.closed_group_sink(record)
+            self.closed_group_sink(self._assemble_group_record(group, prepared))
             self.closed_group_count += 1
 
         # Periods retained for active-group output may already be older than the
@@ -3170,6 +3175,16 @@ class AlarmPeriodMHPAssigner:
             self._finalize_group(gid)
 
     def _group_record(self, group):
+        return self._assemble_group_record(group, self._prepare_group_symptoms(group))
+
+    def _prepare_group_symptoms(self, group):
+        """First pass over a finalized group: build enriched per-event summaries
+        plus the cheap aggregations the output gate needs (``real_event_count``
+        and the distinct real-site set). The expensive edge list and the final
+        record dict are built later in ``_assemble_group_record`` only for groups
+        that clear the gate, so filtered groups (the vast majority under a
+        ``--min-site-num`` / ``--min-group-events`` cutoff) skip that work.
+        """
         periods = [self.periods[pid] for pid in group.period_ids if pid in self.periods]
         events = []
         seen = set()
@@ -3233,6 +3248,31 @@ class AlarmPeriodMHPAssigner:
                 min_ts = ts
             if ts > max_ts:
                 max_ts = ts
+        return {
+            "periods": periods,
+            "events": events,
+            "summaries": summaries,
+            "virtual_event_count": virtual_event_count,
+            "real_event_count": len(events) - virtual_event_count,
+            "real_site_ids": real_site_ids,
+            "site_set": site_set,
+            "alarm_source_set": alarm_source_set,
+            "title_counter": title_counter,
+            "type_counter": type_counter,
+            "min_ts": min_ts,
+            "max_ts": max_ts,
+        }
+
+    def _assemble_group_record(self, group, prepared):
+        """Second pass: build the edge list and final record dict from prepared
+        symptoms. Only invoked for groups that pass the output gate."""
+        periods = prepared["periods"]
+        events = prepared["events"]
+        summaries = prepared["summaries"]
+        virtual_event_count = prepared["virtual_event_count"]
+        real_site_ids = prepared["real_site_ids"]
+        min_ts = prepared["min_ts"]
+        max_ts = prepared["max_ts"]
         virtual_period_count = sum(1 for p in periods if getattr(p, "is_virtual", False))
         summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
         anchor = self.periods.get(group.anchor_period_id)
@@ -3277,12 +3317,12 @@ class AlarmPeriodMHPAssigner:
             "root_event": _summary_of(root_event),
             "anchor_period_id": group.anchor_period_id,
             "core_period_ids": list(group.core_period_ids),
-            "site_list": sorted(site_set),
+            "site_list": sorted(prepared["site_set"]),
             "real_site_list": sorted(real_site_ids),
             "real_site_count": len(real_site_ids),
-            "alarm_source_list": sorted(alarm_source_set),
-            "alarm_title_counts": dict(title_counter),
-            "alarm_type_counts": dict(type_counter),
+            "alarm_source_list": sorted(prepared["alarm_source_set"]),
+            "alarm_title_counts": dict(prepared["title_counter"]),
+            "alarm_type_counts": dict(prepared["type_counter"]),
             "symptoms": summaries,
             "edges": edges,
         }
