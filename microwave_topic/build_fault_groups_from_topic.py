@@ -402,6 +402,23 @@ def _build_root_cause_annotations(site_root_cause):
     return annotations
 
 
+def _build_auto_root_cause_summary(site_root_cause):
+    """生成 complete_group_topology.topology_completion 使用的自动根因摘要。"""
+    summary = []
+    for site_id, info in (site_root_cause or {}).items():
+        root_ne = info.get("root_ne", "")
+        if not root_ne:
+            continue
+        summary.append({
+            "site_id": site_id,
+            "ne_id": root_ne,
+            "kind": info.get("root_cause_kind", ""),
+            # complete_group_topology 对设备级根因写 JSON null，而不是空字符串。
+            "alarm_key": info.get("alarm_key") or None,
+        })
+    return summary
+
+
 def _connected_components(sites, site_links):
     """返回 {site_id: component_id}。孤立站点(无边)自成一个分量。"""
     comp_of = {}
@@ -734,6 +751,7 @@ def build_group_object(
 
     # 标注页面的标准根因协议：告警根因精确标记 alarm key；无告警根因标记整台设备。
     root_cause_annotations = _build_root_cause_annotations(root["site_root_cause"])
+    auto_root_cause_annotations = _build_auto_root_cause_summary(root["site_root_cause"])
 
     # 在根因网元的告警上打标记：根因网元上的告警算根因症状，主根因单独标一条
     for rn in root_ne_set:
@@ -822,6 +840,51 @@ def build_group_object(
         for info_site, rc in root["site_root_cause"].items()
     }
     root_cause_summary = dict(root)
+    selected_site_ids = sorted({site_id for site_id in ne_site.values() if site_id})
+    added_site_ids = sorted(set(selected_site_ids) - set(group_site_ids))
+    added_ne_ids = sorted(ne_id for ne_id in display_nes if ne_id not in set(core_nes))
+    highlight_sites = []
+    role_by_selection = {
+        "common_upstream": "common_upstream_site",
+        "farthest_upstream": "farthest_upstream_site",
+        "data_self_fallback": "no_upstream_site",
+        "isolated_offline_self": "no_upstream_site",
+    }
+    for candidate in root.get("candidate_roots", []):
+        site_id = candidate.get("site_id", "")
+        if not site_id:
+            continue
+        item = {
+            "site_id": site_id,
+            "role": role_by_selection.get(candidate.get("selection_kind"), "common_upstream_site"),
+            "source_sites": candidate.get("source_sites", []),
+        }
+        if candidate.get("router_promoted"):
+            item["router_promoted"] = True
+            item["router_ancestor_site_ids"] = [candidate.get("router_ancestor_site_id")]
+        highlight_sites.append(item)
+    topology_completion = {
+        "mode": "topic_data_boundary_bfs",
+        "original_alarm_ne_ids": sorted(core_nes),
+        "original_alarm_site_ids": root.get("all_alarm_sites", []),
+        "ancestor_source_site_ids": root.get("offline_alarm_sites", []),
+        "non_offline_alarm_site_ids": sorted(
+            set(root.get("all_alarm_sites", [])) - set(root.get("offline_alarm_sites", []))
+        ),
+        "selected_site_ids": selected_site_ids,
+        "added_site_ids": added_site_ids,
+        "added_ne_ids": added_ne_ids,
+        "common_upstream_source_site_ids": root.get("common_upstream_source_sites", []),
+        "no_upstream_sites": root.get("no_upstream_sites", []),
+        "upstream_undetermined_sites": root.get("upstream_undetermined_sites", []),
+        "nearest_data_sites_by_source": root.get("nearest_data_sites_by_source", {}),
+        "candidate_roots": root.get("candidate_roots", []),
+        "data_ancestor_promotions": root.get("data_ancestor_promotions", []),
+        "highlight_site_ids": root_sites,
+        "highlight_sites": highlight_sites,
+        "auto_root_cause_annotations": auto_root_cause_annotations,
+        "site_level_connected": bool(root_sites) or len(root.get("offline_alarm_sites", [])) <= 1,
+    }
     match_info = {
         "uuid": group_id,
         "rule": "fault_group_id_rule",
@@ -849,6 +912,7 @@ def build_group_object(
         "fault_pattern_managed_sites": managed_sites,
         "inferred_roots": inferred_roots,
         "root_cause_annotations": root_cause_annotations,
+        "topology_completion": topology_completion,
         "root_cause": root_cause_summary,
         "group_info": {
             group_id: {
