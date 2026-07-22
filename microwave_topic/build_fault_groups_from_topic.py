@@ -321,10 +321,33 @@ def _promote_to_data_site(candidate_site, allowed_data_sites, site_links):
     }
 
 
+def _stringify_like_js(value):
+    """与标注页面的字符串化规则一致：整数 float 不保留小数点。"""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _alarm_root_cause_key(alarm, index):
+    """与 ne_propagation_labeling.html 的 getAlarmRootCauseKey 保持一致。"""
+    alarm_id = alarm.get("alarm_id") or alarm.get("eid")
+    if alarm_id:
+        return "id:" + _stringify_like_js(alarm_id)
+    alarm_type = alarm.get("alarm_type") or alarm.get("title") or ""
+    ticket = alarm.get("工单号") or ""
+    ts = alarm.get("ts") or alarm.get("alarm_time") or ""
+    return (
+        "k:" + _stringify_like_js(alarm_type)
+        + "|" + _stringify_like_js(ticket)
+        + "|" + _stringify_like_js(ts)
+        + "|#" + str(index)
+    )
+
+
 def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjacency, downstream_sites):
     """逐案照搬 complete_group_topology._pick_site_root_cause：
     最早非断站告警 > 最早断站告警 > 无告警时挑“下游连接最多的 Transmission(Microwave) 设备”。
-    返回 (root_ne, kind, primary_occurrence_uuid)。"""
+    返回 (root_ne, kind, primary_occurrence_uuid, alarm_key)。"""
     non_offline = []
     offline = []
     for ne_id in site_nes:
@@ -338,8 +361,13 @@ def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjace
                 non_offline.append(record)
     for records, kind in ((non_offline, "non_offline_alarm"), (offline, "offline_alarm")):
         if records:
-            _key, ne_id, _index, alarm = min(records)
-            return ne_id, kind, alarm.get("occurrence_uuid", "")
+            _key, ne_id, index, alarm = min(records)
+            return (
+                ne_id,
+                kind,
+                alarm.get("occurrence_uuid", ""),
+                _alarm_root_cause_key(alarm, index),
+            )
 
     # 无告警：挑与下游站点连接最多的 Microwave(传输) 设备，平局取 ne_id 最小
     best = None
@@ -354,8 +382,24 @@ def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjace
         if best is None or len(connected) > best[0]:
             best = (len(connected), ne_id)
     if best is not None:
-        return best[1], "transmission_device", ""
-    return "", "", ""
+        return best[1], "transmission_device", "", ""
+    return "", "", "", ""
+
+
+def _build_root_cause_annotations(site_root_cause):
+    """把站点根因选择结果转换成标注页面识别的标准结构。"""
+    annotations = {}
+    for info in (site_root_cause or {}).values():
+        root_ne = info.get("root_ne", "")
+        if not root_ne:
+            continue
+        annotation = annotations.setdefault(root_ne, {"device": False, "alarms": {}})
+        alarm_key = info.get("alarm_key", "")
+        if alarm_key:
+            annotation["alarms"][alarm_key] = True
+        else:
+            annotation["device"] = True
+    return annotations
 
 
 def _connected_components(sites, site_links):
@@ -550,7 +594,7 @@ def find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adja
     # 每个上游根因站点挑一个根因网元
     site_root_cause = {}
     for root_site in root_sites:
-        ne_id, kind, primary_uuid = _pick_site_root_cause(
+        ne_id, kind, primary_uuid, alarm_key = _pick_site_root_cause(
             root_site, site_to_nes.get(root_site, []), ne_alarms,
             ne_role, ne_site, adjacency, downstream_by_root.get(root_site, set()),
         )
@@ -558,6 +602,7 @@ def find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adja
             "root_ne": ne_id,
             "root_cause_kind": kind,
             "primary_occurrence_uuid": primary_uuid,
+            "alarm_key": alarm_key,
         }
 
     return {
@@ -687,6 +732,9 @@ def build_group_object(
     primary_uuids = {info["primary_occurrence_uuid"] for info in root["site_root_cause"].values()
                      if info["primary_occurrence_uuid"]}
 
+    # 标注页面的标准根因协议：告警根因精确标记 alarm key；无告警根因标记整台设备。
+    root_cause_annotations = _build_root_cause_annotations(root["site_root_cause"])
+
     # 在根因网元的告警上打标记：根因网元上的告警算根因症状，主根因单独标一条
     for rn in root_ne_set:
         for na in ne_alarms.get(rn, []):
@@ -780,6 +828,7 @@ def build_group_object(
         "merged_rules": ["fault_group_id_rule"],
         "related_group_uuids": [],
         "inferred_roots": inferred_roots,
+        "root_cause_annotations": root_cause_annotations,
         "role_mapping": role_mapping,
         "symptoms": symptoms,
         "uses_missing_topology": False,
@@ -799,6 +848,7 @@ def build_group_object(
         # 根因站点在地图上标红（visualizer 读取 fault_pattern_managed_sites）
         "fault_pattern_managed_sites": managed_sites,
         "inferred_roots": inferred_roots,
+        "root_cause_annotations": root_cause_annotations,
         "root_cause": root_cause_summary,
         "group_info": {
             group_id: {

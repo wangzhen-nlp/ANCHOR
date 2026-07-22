@@ -328,28 +328,64 @@ def _merge_shards(spool_dir, ordered_results, period_types, state_layout):
     return merged
 
 
-def _run_parallel_compile(
-    plan, prepared, period_types, state_layout, spool_dir, workers, progress_cb
-):
-    """Fork-parallel target-dynamic compile; returns (type_pair_count, spool)."""
+def _parallel_init(plan, prepared, period_types, state_layout, spool_root):
+    """Worker initializer for the ``spawn`` start method (e.g. Windows).
+
+    ``spawn`` gives each worker a fresh interpreter that cannot inherit the
+    parent's memory, so the plan and candidate index are shipped once per worker
+    via pickled init args instead of copy-on-write.
+    """
     global _PARALLEL_CTX
-    tasks = _entity_aligned_chunks(period_types, workers)
-    # Warm the target-independent static table before forking so every worker
-    # inherits it copy-on-write instead of rebuilding it once per chunk.
-    if prepared.get("adaptive") and prepared.get("entities"):
-        plan.adaptive_static_table(prepared["entities"])
     _PARALLEL_CTX = {
         "plan": plan,
         "prepared": prepared,
         "period_types": period_types,
         "state_layout": state_layout,
-        "spool_root": spool_dir,
+        "spool_root": spool_root,
     }
+
+
+def _run_parallel_compile(
+    plan, prepared, period_types, state_layout, spool_dir, workers, progress_cb
+):
+    """Process-parallel target-dynamic compile; returns (type_pair_count, spool).
+
+    Uses ``fork`` (copy-on-write, no pickling) where available and falls back to
+    ``spawn`` on platforms without fork (Windows), shipping state to workers via
+    a pickled initializer.
+    """
+    global _PARALLEL_CTX
+    tasks = _entity_aligned_chunks(period_types, workers)
+    use_fork = "fork" in mp.get_all_start_methods()
+    ctx = mp.get_context("fork" if use_fork else "spawn")
+    pool_kwargs = {"processes": min(workers, len(tasks)) or 1}
+    if use_fork:
+        # Warm the target-independent static table before forking so every
+        # worker inherits it copy-on-write instead of rebuilding it per chunk.
+        if prepared.get("adaptive") and prepared.get("entities"):
+            plan.adaptive_static_table(prepared["entities"])
+        _PARALLEL_CTX = {
+            "plan": plan,
+            "prepared": prepared,
+            "period_types": period_types,
+            "state_layout": state_layout,
+            "spool_root": spool_dir,
+        }
+    else:
+        # spawn: each worker gets the (picklable) plan/index via init args and
+        # warms its own static table lazily on the first chunk.
+        pool_kwargs["initializer"] = _parallel_init
+        pool_kwargs["initargs"] = (
+            plan,
+            prepared,
+            period_types,
+            state_layout,
+            spool_dir,
+        )
     results = {}
     agg_pairs = agg_compiled = agg_pruned = agg_targets = 0
     try:
-        ctx = mp.get_context("fork")
-        with ctx.Pool(processes=min(workers, len(tasks)) or 1) as pool:
+        with ctx.Pool(**pool_kwargs) as pool:
             for res in pool.imap_unordered(_compile_chunk, tasks):
                 results[res["idx"]] = res
                 agg_pairs += res["type_pair_count"]
@@ -359,7 +395,8 @@ def _run_parallel_compile(
                 if progress_cb is not None:
                     progress_cb(agg_pairs, agg_compiled, agg_pruned, agg_targets)
     finally:
-        _PARALLEL_CTX = {}
+        if use_fork:
+            _PARALLEL_CTX = {}
     ordered = [results[i] for i in sorted(results)]
     plan.compiled_pair_count = sum(r["compiled_pair_count"] for r in ordered)
     plan.pruned_pair_count = sum(r["pruned_pair_count"] for r in ordered)
