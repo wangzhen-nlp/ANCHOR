@@ -32,6 +32,10 @@ import heapq
 import hashlib
 from itertools import groupby
 import json
+try:
+    import orjson as _orjson
+except ImportError:  # optional; falls back to stdlib json when unavailable
+    _orjson = None
 import math
 import os
 import time
@@ -3180,6 +3184,14 @@ class AlarmPeriodMHPAssigner:
         # count them; the marker rides on the synthetic alarm dict.
         virtual_event_count = 0
         real_site_ids = set()
+        # Fold the per-field list/counter aggregations into this single pass so
+        # summaries is walked once instead of once per output field.
+        site_set = set()
+        alarm_source_set = set()
+        title_counter = Counter()
+        type_counter = Counter()
+        min_ts = math.inf
+        max_ts = -math.inf
         node_field = str(self.artifact.config.topology_node_field or "alarm_source")
         for event, summary in zip(events, summaries):
             node, _domain = split_entity(event.ne) if event.ne else ("", "")
@@ -3202,6 +3214,25 @@ class AlarmPeriodMHPAssigner:
                 virtual_event_count += 1
             elif summary.get("site_id"):
                 real_site_ids.add(str(summary["site_id"]))
+            # Collected after the enrichment/virtual mutations above so the
+            # site_id/alarm_type values match the finalized summary dict.
+            site_id = summary.get("site_id")
+            if site_id:
+                site_set.add(site_id)
+            alarm_source = summary.get("alarm_source")
+            if alarm_source:
+                alarm_source_set.add(alarm_source)
+            alarm_title = summary.get("alarm_title")
+            if alarm_title:
+                title_counter[alarm_title] += 1
+            alarm_type = summary.get("alarm_type")
+            if alarm_type:
+                type_counter[alarm_type] += 1
+            ts = float(summary["ts"])
+            if ts < min_ts:
+                min_ts = ts
+            if ts > max_ts:
+                max_ts = ts
         virtual_period_count = sum(1 for p in periods if getattr(p, "is_virtual", False))
         summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
         anchor = self.periods.get(group.anchor_period_id)
@@ -3230,7 +3261,6 @@ class AlarmPeriodMHPAssigner:
                     "strength": float(rel.strength),
                 }
             )
-        timestamps = [float(s["ts"]) for s in summaries]
         gid_text = f"mhp-period-{group.group_id:06d}"
         return {
             "group_id": gid_text,
@@ -3241,24 +3271,18 @@ class AlarmPeriodMHPAssigner:
             "virtual_event_count": virtual_event_count,
             "alarm_period_count": len(periods),
             "virtual_period_count": virtual_period_count,
-            "start_ts": min(timestamps),
-            "end_ts": max(timestamps),
-            "duration_sec": max(timestamps) - min(timestamps),
+            "start_ts": min_ts,
+            "end_ts": max_ts,
+            "duration_sec": max_ts - min_ts,
             "root_event": _summary_of(root_event),
             "anchor_period_id": group.anchor_period_id,
             "core_period_ids": list(group.core_period_ids),
-            "site_list": sorted({s["site_id"] for s in summaries if s.get("site_id")}),
+            "site_list": sorted(site_set),
             "real_site_list": sorted(real_site_ids),
             "real_site_count": len(real_site_ids),
-            "alarm_source_list": sorted(
-                {s["alarm_source"] for s in summaries if s.get("alarm_source")}
-            ),
-            "alarm_title_counts": dict(
-                Counter(s["alarm_title"] for s in summaries if s.get("alarm_title"))
-            ),
-            "alarm_type_counts": dict(
-                Counter(s["alarm_type"] for s in summaries if s.get("alarm_type"))
-            ),
+            "alarm_source_list": sorted(alarm_source_set),
+            "alarm_title_counts": dict(title_counter),
+            "alarm_type_counts": dict(type_counter),
             "symptoms": summaries,
             "edges": edges,
         }
@@ -3363,6 +3387,20 @@ def _build_runtime_scorers(artifact, ne_graph_path, site_graph_path, quiet=False
     return scorer, mu_scorer, ne_graph_data
 
 
+def _encode_jsonl_record(record):
+    """Serialize one record to a UTF-8 JSONL line (bytes).
+
+    Uses orjson when available (several times faster than stdlib json on these
+    nested group dicts) and falls back to json.dumps otherwise. Both emit
+    equivalent JSON for the plain str/int/float/list/dict payloads here (orjson
+    just uses compact separators); streams are opened in binary mode so the
+    encoded bytes are written without a second UTF-8 pass.
+    """
+    if _orjson is not None:
+        return _orjson.dumps(record, option=_orjson.OPT_SERIALIZE_NUMPY) + b"\n"
+    return (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 class IncrementalPeriodOutput:
     """Durable JSONL output for finalized groups and their optional views."""
 
@@ -3386,19 +3424,21 @@ class IncrementalPeriodOutput:
         self.groups_stream = None
         self.edges_stream = None
         self.visual = None
+        # Batch flushes instead of one fsync-inducing flush per record: at ~300
+        # groups/s a per-record flush was a syscall per group. Records still land
+        # on disk within this many writes, and close() always flushes the tail.
+        self._flush_every = 200
+        self._groups_since_flush = 0
+        self._edges_since_flush = 0
         try:
             for path in (self.groups_path, self.edges_path):
                 if path:
                     parent = os.path.dirname(path)
                     if parent:
                         os.makedirs(parent, exist_ok=True)
-            self.groups_stream = open(
-                self.groups_path, "w", encoding="utf-8", buffering=1
-            )
+            self.groups_stream = open(self.groups_path, "wb", buffering=1 << 20)
             if self.edges_path:
-                self.edges_stream = open(
-                    self.edges_path, "w", encoding="utf-8", buffering=1
-                )
+                self.edges_stream = open(self.edges_path, "wb", buffering=1 << 20)
             if visual_path:
                 from alarm_flow_mhp.visual_output import AlarmMHPVisualOutputSession
 
@@ -3414,6 +3454,10 @@ class IncrementalPeriodOutput:
                     "metadata": dict(metadata),
                 }
             )
+            # Land the header immediately so tailing consumers see it up front;
+            # group records ride the batched flush afterwards.
+            self.groups_stream.flush()
+            self._groups_since_flush = 0
         except Exception:
             self.close()
             raise
@@ -3421,8 +3465,11 @@ class IncrementalPeriodOutput:
     def _write_group_record(self, record):
         if self.groups_stream is None:
             raise RuntimeError("incremental groups output is not open")
-        self.groups_stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self.groups_stream.flush()
+        self.groups_stream.write(_encode_jsonl_record(record))
+        self._groups_since_flush += 1
+        if self._groups_since_flush >= self._flush_every:
+            self.groups_stream.flush()
+            self._groups_since_flush = 0
 
     def emit_group(self, group):
         if self._closed:
@@ -3431,9 +3478,12 @@ class IncrementalPeriodOutput:
         self.group_count += 1
         if self.edges_stream is not None:
             for edge in group.get("edges", ()):
-                self.edges_stream.write(json.dumps(edge, ensure_ascii=False) + "\n")
+                self.edges_stream.write(_encode_jsonl_record(edge))
                 self.edge_count += 1
-            self.edges_stream.flush()
+            self._edges_since_flush += len(group.get("edges", ()))
+            if self._edges_since_flush >= self._flush_every:
+                self.edges_stream.flush()
+                self._edges_since_flush = 0
         if self.visual is not None:
             self.visual.emit_groups([group], finalization_reason="period_finalized")
 
