@@ -345,18 +345,24 @@ def _alarm_root_cause_key(alarm, index):
 
 
 def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjacency, downstream_sites):
-    """逐案照搬 complete_group_topology._pick_site_root_cause：
-    最早非断站告警 > 最早断站告警 > 无告警时挑“下游连接最多的 Transmission(Microwave) 设备”。
+    """在 complete_group_topology._pick_site_root_cause 基础上改断站口径：
+    最早非断站告警 > 最早“传输(Microwave)设备”断站告警 > 有传输设备但无其断站告警时挑
+    “下游连接最多的 Transmission(Microwave) 设备” > 无任何传输设备时回退到最早断站告警(任意设备)。
+    注意：非传输设备(Data/Ran/Other)的断站告警只在最后一级兜底时才参与选择。
     返回 (root_ne, kind, primary_occurrence_uuid, alarm_key)。"""
     non_offline = []
-    offline = []
+    offline = []            # 仅传输(Microwave)设备的断站告警：第②级候选
+    offline_any = []        # 所有设备的断站告警：无传输设备时的兜底(第④级)
     for ne_id in site_nes:
         for index, alarm in enumerate(ne_alarms.get(ne_id) or []):
             ts = alarm.get("ts")
             sort_key = (ts is None, ts if ts is not None else 0.0, ne_id, index)
             record = (sort_key, ne_id, index, alarm)
             if _is_offline_alarm(alarm.get("alarm_type")):
-                offline.append(record)
+                offline_any.append(record)
+                # 只有传输(Microwave)设备的断站告警才作为第②级候选
+                if ne_role.get(ne_id) == "Microwave":
+                    offline.append(record)
             else:
                 non_offline.append(record)
     for records, kind in ((non_offline, "non_offline_alarm"), (offline, "offline_alarm")):
@@ -369,7 +375,7 @@ def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjace
                 _alarm_root_cause_key(alarm, index),
             )
 
-    # 无告警：挑与下游站点连接最多的 Microwave(传输) 设备，平局取 ne_id 最小
+    # 无传输设备断站告警：挑与下游站点连接最多的 Microwave(传输) 设备，平局取 ne_id 最小
     best = None
     for ne_id in sorted(site_nes):
         if ne_role.get(ne_id) != "Microwave":
@@ -383,6 +389,16 @@ def _pick_site_root_cause(site_id, site_nes, ne_alarms, ne_role, ne_site, adjace
             best = (len(connected), ne_id)
     if best is not None:
         return best[1], "transmission_device", "", ""
+
+    # 站内没有任何传输(Microwave)设备：回退到最早的断站告警(任意设备)
+    if offline_any:
+        _key, ne_id, index, alarm = min(offline_any)
+        return (
+            ne_id,
+            "offline_alarm",
+            alarm.get("occurrence_uuid", ""),
+            _alarm_root_cause_key(alarm, index),
+        )
     return "", "", "", ""
 
 
@@ -557,6 +573,11 @@ def find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adja
         kind = "data_self_fallback" if site_id in site_has_data else "isolated_offline_self"
         _add_candidate(site_id, [site_id], kind, {site_id} if site_id in site_has_data else set(), 0)
 
+    # 判不了(无路由 + 分量内 >=2 断站且连通)：上游无法定向，按需求把这些站点也标为根因站点，
+    # 各自自身即根因站点，站内根因设备用同一套 _pick_site_root_cause 规则挑。
+    for site_id in undetermined_sites:
+        _add_candidate(site_id, [site_id], "upstream_undetermined_self", set(), 0)
+
     root_sites = sorted({item["site_id"] for item in candidate_roots if item.get("site_id")})
 
     # 每个断站源站记录一个确定性的最终候选和无向最短路径，兼容原输出结构。
@@ -630,7 +651,7 @@ def find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adja
         "offline_alarm_sites": alarm_sites,
         "common_upstream_source_sites": common_source_sites,
         "no_upstream_sites": no_upstream_sites,
-        # 无路由 + 分量内多断站且连通：上游无法判定，不产出根因
+        # 无路由 + 分量内多断站且连通：上游无法判定；这些站点仍各自标为根因站点(self)
         "upstream_undetermined_sites": sorted(undetermined_sites),
         "nearest_data_sites_by_source": {
             site_id: sorted(data_sites)
@@ -849,6 +870,7 @@ def build_group_object(
         "farthest_upstream": "farthest_upstream_site",
         "data_self_fallback": "no_upstream_site",
         "isolated_offline_self": "no_upstream_site",
+        "upstream_undetermined_self": "upstream_undetermined_site",
     }
     for candidate in root.get("candidate_roots", []):
         site_id = candidate.get("site_id", "")
