@@ -20,6 +20,7 @@ from alarm_flow_mhp.candidate_policy import (
     unrelated_pair_allowed,
     write_candidate_policy,
 )
+from alarm_flow_mhp.compile_alarm_period_cache import _first_target_entities
 from alarm_flow_mhp.feature_spec import FeatureLayout, RuntimeFeatureScorer
 from alarm_flow_mhp.period_source_imputer import PeriodImputeConfig, PeriodSourceImputer
 from alarm_flow_mhp.learn_alarm_period_candidate_policy import (
@@ -312,6 +313,52 @@ class CandidatePolicyTest(unittest.TestCase):
             self.assertFalse(
                 bool(candidate_rule_mask(target, source, base.scorer) & RELATED_MASK)
             )
+
+    def test_unrelated_batch_does_not_build_full_entity_static_table(self):
+        policy = CandidatePolicy(
+            {"X": {"X": ("same_ne_type", "same_vendor")}}, approved=True
+        )
+        plan = _plan(dynamic="target", scope="unrelated", policy=policy)
+        period_types = tuple(PeriodType(node, "X") for node in NODES)
+
+        def reject_global_table(_entities):
+            self.fail("unrelated compile must not build a full-entity static table")
+
+        plan.decomposed.entity_static_table = reject_global_table
+        pair_count = plan.precompile_period_types(
+            period_types, edge_batch_sink=lambda *_args: None
+        )
+        self.assertGreater(pair_count, 0)
+
+    def test_profile_target_entity_limit_keeps_complete_entity_groups(self):
+        period_types = tuple(
+            sorted(
+                (
+                    PeriodType(node, alarm_type)
+                    for node in NODES
+                    for alarm_type in ("X", "Y")
+                ),
+                key=lambda value: (value.entity, value.alarm_type),
+            )
+        )
+        selected, entity_count = _first_target_entities(period_types, 2)
+        self.assertEqual(entity_count, 2)
+        self.assertEqual({value.entity for value in selected}, {"A", "B"})
+        self.assertEqual(len(selected), 4)
+
+    def test_target_subset_still_scores_against_full_source_universe(self):
+        period_types = tuple(PeriodType(node, "X") for node in NODES)
+        plan = _plan(dynamic="target", scope="global")
+        prepared = plan.prepare_candidate_period_types(
+            period_types, count_pairs=False
+        )
+        pair_count = plan.precompile_period_types(
+            period_types,
+            prepared_candidates=prepared,
+            target_period_types=(period_types[0],),
+            edge_batch_sink=lambda *_args: None,
+        )
+        self.assertEqual(pair_count, len(period_types))
 
     def test_multiple_precompiled_indexes_union(self):
         # iter_edges unions every loaded cache index plus in-memory edges.

@@ -447,28 +447,10 @@ def _related_entity_set(target, prepared):
     return related
 
 
-def _related_entity_set_cached(target, prepared):
-    """``_related_entity_set`` memoized by target entity.
-
-    The related set depends only on ``target.entity`` (the related rules ignore
-    the source alarm type), so every alarm type of the same entity shares it.
-    The cache lives in ``prepared`` and is populated lazily; it is a pure
-    function of the immutable candidate indexes, so results are unchanged.
-    """
-    cache = prepared.get("_related_cache")
-    if cache is None:
-        return _related_entity_set(target, prepared)
-    related = cache.get(target.entity)
-    if related is None:
-        related = _related_entity_set(target, prepared)
-        cache[target.entity] = related
-    return related
-
-
 def adaptive_candidate_sources(target, policy, prepared, exclude_related=False):
     candidates = set()
     period_type_class = target.__class__
-    related = _related_entity_set_cached(target, prepared) if exclude_related else ()
+    related = _related_entity_set(target, prepared) if exclude_related else ()
     for source_at in prepared["alarm_types"]:
         candidate_entities = set()
         for rule in policy.rules_for(target.alarm_type, source_at):
@@ -485,7 +467,7 @@ def adaptive_candidate_sources(target, policy, prepared, exclude_related=False):
 
 def adaptive_candidate_count(target, policy, prepared, exclude_related=False):
     total = 0
-    related = _related_entity_set_cached(target, prepared) if exclude_related else ()
+    related = _related_entity_set(target, prepared) if exclude_related else ()
     for source_at in prepared["alarm_types"]:
         candidate_entities = set()
         for rule in policy.rules_for(target.alarm_type, source_at):
@@ -506,9 +488,6 @@ def prepare_adaptive_candidates(
     prepared["global"] = False
     prepared["policy"] = policy
     prepared["exclude_related"] = bool(exclude_related)
-    # Memoize the entity-level related set so every alarm type of an entity
-    # reuses it instead of recomputing the related-rule union per target.
-    prepared["_related_cache"] = {}
     total = None
     if count_pairs:
         total = sum(

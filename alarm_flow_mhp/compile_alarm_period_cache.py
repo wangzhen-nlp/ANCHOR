@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import multiprocessing as mp
 import os
-import shutil
 import tempfile
 import time
 
@@ -52,6 +50,7 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
 )
 from alarm_flow_mhp.topology_relation_prior import parse_topology_relation_prior
 from alarm_tools.progress_utils import ProgressBar
+from fault_grouping.matching.profiling import PhaseTimer
 from topology_resources import NE_GRAPH_JSON, SITE_GRAPH_JSON, resource_display
 
 
@@ -228,184 +227,113 @@ class _BinaryEdgeSpool:
         self.memmaps.clear()
 
 
-# Forked workers inherit these via copy-on-write; the parent sets them before
-# creating the pool so the heavy plan/candidate index need not be pickled.
-_PARALLEL_CTX: dict = {}
+def _profile_phase(timer, name):
+    return timer.time(name) if timer is not None else contextlib.nullcontext()
 
 
-def _thread_limit():
-    """Cap native (BLAS/OpenMP) threads per worker to avoid oversubscription."""
-    try:
-        from threadpoolctl import threadpool_limits
-
-        return threadpool_limits(limits=1)
-    except Exception:  # threadpoolctl is optional; fall back to a no-op.
-        return contextlib.nullcontext()
-
-
-def _compile_chunk(task):
-    """Score one contiguous target-entity chunk into its own spool shard.
-
-    Runs inside a forked worker. Counters are reset per chunk so the returned
-    values are deltas the parent can sum. Only raw edge ``.bin`` files are
-    produced; the parent concatenates shards in chunk order and builds the CSR.
-    """
-    idx, start, stop = task
-    plan = _PARALLEL_CTX["plan"]
-    prepared = _PARALLEL_CTX["prepared"]
-    period_types = _PARALLEL_CTX["period_types"]
-    state_layout = _PARALLEL_CTX["state_layout"]
-    spool_root = _PARALLEL_CTX["spool_root"]
-    plan.compiled_pair_count = 0
-    plan.pruned_pair_count = 0
-    plan.prescreen_dropped_pair_count = 0
-    shard_dir = os.path.join(spool_root, f"shard-{idx:05d}")
-    os.makedirs(shard_dir, exist_ok=True)
-    spool = _BinaryEdgeSpool(shard_dir, period_types, state_layout)
-    chunk_prepared = dict(prepared)
-    chunk_prepared["period_types"] = period_types[start:stop]
-    with _thread_limit():
-        type_pair_count = plan._precompile_target_only_batches(
-            chunk_prepared, None, spool.append_batch
-        )
-    spool.flush()
-    for stream in spool.streams.values():
-        stream.close()
-    return {
-        "idx": idx,
-        "paths": dict(spool.paths),
-        "count": spool.count,
-        "type_pair_count": type_pair_count,
-        "target_count": stop - start,
-        "compiled_pair_count": plan.compiled_pair_count,
-        "pruned_pair_count": plan.pruned_pair_count,
-        "prescreen_dropped_pair_count": plan.prescreen_dropped_pair_count,
-    }
+def _first_target_entities(period_types, limit):
+    """Return complete alarm-type groups for the first ``limit`` entities."""
+    selected = []
+    entity_count = 0
+    previous = None
+    for period_type in period_types:
+        if period_type.entity != previous:
+            if entity_count >= limit:
+                break
+            entity_count += 1
+            previous = period_type.entity
+        selected.append(period_type)
+    return tuple(selected), entity_count
 
 
-def _entity_aligned_chunks(period_types, workers):
-    """Split globally sorted period types into contiguous entity-aligned chunks.
-
-    Chunks never straddle a target entity (so each entity's shared prescreen
-    tables are built once), and oversampling relative to ``workers`` lets the
-    pool load-balance skewed candidate-set sizes dynamically.
-    """
-    boundaries = [0]
-    for i in range(1, len(period_types)):
-        if period_types[i].entity != period_types[i - 1].entity:
-            boundaries.append(i)
-    boundaries.append(len(period_types))
-    n_groups = len(boundaries) - 1
-    if n_groups == 0:
-        return []
-    n_chunks = min(n_groups, max(workers * 4, workers))
-    tasks = []
-    for c in range(n_chunks):
-        g0 = c * n_groups // n_chunks
-        g1 = (c + 1) * n_groups // n_chunks
-        if g0 >= g1:
-            continue
-        tasks.append((len(tasks), boundaries[g0], boundaries[g1]))
-    return tasks
+def _enable_compile_profiling(timer, plan, spool):
+    """Wrap high-value compile phases without affecting the normal path."""
+    for owner, method_name, phase_name in (
+        (plan, "_candidate_sources", "score.candidate_enumeration"),
+        (plan, "_candidate_arrays", "score.candidate_arrays"),
+        (plan, "_prescreen_source_state", "score.prescreen_prepare"),
+        (plan, "_compute_edge", "score.compute_edge"),
+        (plan.decomposed, "entity_parts_for_target", "score.entity_features"),
+        (plan.decomposed, "entity_static_table", "score.entity_static_table"),
+        (plan.decomposed, "entity_parts_from_table", "score.entity_features"),
+        (spool, "append", "score.edge_spool"),
+        (spool, "append_batch", "score.edge_spool"),
+    ):
+        timer.wrap_method(owner, method_name, phase_name)
 
 
-def _merge_shards(spool_dir, ordered_results, period_types, state_layout):
-    """Concatenate shard edge files in chunk order into one merged spool.
-
-    Chunks are ascending contiguous target-signature ranges, so byte-appending
-    them in order yields a single target-sorted archive that ``arrays()`` can
-    turn into the compact CSR — identical to the single-process spool.
-    """
-    merged = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
-    for stream in merged.streams.values():
-        stream.close()
-    for name in merged.paths:
-        with open(merged.paths[name], "wb") as out:
-            for res in ordered_results:
-                with open(res["paths"][name], "rb") as src:
-                    shutil.copyfileobj(src, out, 8 * 1024 * 1024)
-    merged.count = sum(res["count"] for res in ordered_results)
-    return merged
-
-
-def _parallel_init(plan, prepared, period_types, state_layout, spool_root):
-    """Worker initializer for the ``spawn`` start method (e.g. Windows).
-
-    ``spawn`` gives each worker a fresh interpreter that cannot inherit the
-    parent's memory, so the plan and candidate index are shipped once per worker
-    via pickled init args instead of copy-on-write.
-    """
-    global _PARALLEL_CTX
-    _PARALLEL_CTX = {
-        "plan": plan,
-        "prepared": prepared,
-        "period_types": period_types,
-        "state_layout": state_layout,
-        "spool_root": spool_root,
-    }
-
-
-def _run_parallel_compile(
-    plan, prepared, period_types, state_layout, spool_dir, workers, progress_cb
+def _print_compile_profile(
+    timer,
+    *,
+    sampled_entity_count,
+    sampled_target_count,
+    source_target_count,
+    type_pair_count,
+    active_edge_count,
 ):
-    """Process-parallel target-dynamic compile; returns (type_pair_count, spool).
+    phases = timer.snapshot()
+    wall = timer.wall_elapsed
+    if not phases and wall <= 0:
+        return
 
-    Uses ``fork`` (copy-on-write, no pickling) where available and falls back to
-    ``spawn`` on platforms without fork (Windows), shipping state to workers via
-    a pickled initializer.
-    """
-    global _PARALLEL_CTX
-    tasks = _entity_aligned_chunks(period_types, workers)
-    use_fork = "fork" in mp.get_all_start_methods()
-    ctx = mp.get_context("fork" if use_fork else "spawn")
-    pool_kwargs = {"processes": min(workers, len(tasks)) or 1}
-    if use_fork:
-        # Warm the target-independent static table before forking so every
-        # worker inherits it copy-on-write instead of rebuilding it per chunk.
-        if prepared.get("adaptive") and prepared.get("entities"):
-            plan.adaptive_static_table(prepared["entities"])
-        _PARALLEL_CTX = {
-            "plan": plan,
-            "prepared": prepared,
-            "period_types": period_types,
-            "state_layout": state_layout,
-            "spool_root": spool_dir,
-        }
-    else:
-        # spawn: each worker gets the (picklable) plan/index via init args and
-        # warms its own static table lazily on the first chunk.
-        pool_kwargs["initializer"] = _parallel_init
-        pool_kwargs["initargs"] = (
-            plan,
-            prepared,
-            period_types,
-            state_layout,
-            spool_dir,
+    def row(name, values, indent=2):
+        total = values["total_seconds"]
+        count = values["count"]
+        pct = total / wall * 100.0 if wall > 0 else 0.0
+        average_ms = total / max(count, 1) * 1000.0
+        print(
+            f"{' ' * indent}{name:<36} {total:>10.3f}s {pct:>7.1f}% "
+            f"{count:>9}次 avg={average_ms:>10.3f}ms"
         )
-    results = {}
-    agg_pairs = agg_compiled = agg_pruned = agg_targets = 0
-    try:
-        with ctx.Pool(**pool_kwargs) as pool:
-            for res in pool.imap_unordered(_compile_chunk, tasks):
-                results[res["idx"]] = res
-                agg_pairs += res["type_pair_count"]
-                agg_compiled += res["compiled_pair_count"]
-                agg_pruned += res["pruned_pair_count"]
-                agg_targets += res["target_count"]
-                if progress_cb is not None:
-                    progress_cb(agg_pairs, agg_compiled, agg_pruned, agg_targets)
-    finally:
-        if use_fork:
-            _PARALLEL_CTX = {}
-    ordered = [results[i] for i in sorted(results)]
-    plan.compiled_pair_count = sum(r["compiled_pair_count"] for r in ordered)
-    plan.pruned_pair_count = sum(r["pruned_pair_count"] for r in ordered)
-    plan.prescreen_dropped_pair_count = sum(
-        r["prescreen_dropped_pair_count"] for r in ordered
+
+    blocks = (
+        ("init.", "准备阶段"),
+        ("score.", "候选与打分"),
+        ("output.", "CSR 与输出"),
     )
-    type_pair_count = sum(r["type_pair_count"] for r in ordered)
-    spool = _merge_shards(spool_dir, ordered, period_types, state_layout)
-    return type_pair_count, spool
+    print()
+    print("=" * 100)
+    print(f"AlarmPeriod 缓存编译性能分析（wall={wall:.3f}s）")
+    print("=" * 100)
+    print(
+        f"sample_entities={sampled_entity_count:,}, "
+        f"sample_target_types={sampled_target_count:,}, "
+        f"full_source_types={source_target_count:,}, "
+        f"directed_type_pairs={type_pair_count:,}, "
+        f"active_edges={active_edge_count:,}"
+    )
+    for prefix, title in blocks:
+        names = [name for name in phases if name.startswith(prefix)]
+        if not names:
+            continue
+        print()
+        print(f"[{prefix[:-1]}] {title}")
+        for name in sorted(
+            names, key=lambda value: phases[value]["total_seconds"], reverse=True
+        ):
+            row(name, phases[name])
+
+    score_total = phases.get("score.total", {}).get("total_seconds", 0.0)
+    direct_children = sum(
+        phases.get(name, {}).get("total_seconds", 0.0)
+        for name in (
+            "score.candidate_enumeration",
+            "score.prescreen_prepare",
+            "score.compute_edge",
+            "score.edge_spool",
+        )
+    )
+    if score_total:
+        residual = max(score_total - direct_children, 0.0)
+        pct = residual / wall * 100.0 if wall > 0 else 0.0
+        print(
+            f"  {'score.residual':<36} {residual:>10.3f}s "
+            f"{pct:>7.1f}% {'—':>11}"
+        )
+    print()
+    print("说明：阶段为累计耗时，部分阶段存在嵌套，不应直接相加。")
+    print("score.residual 主要是 prescreen 过滤与精确打分，也包含未单列的共享候选准备。")
+    print("=" * 100)
 
 
 def _build_parser():
@@ -449,20 +377,23 @@ def _build_parser():
         help="Refresh the progress bar after this many directed type pairs; 0 disables.",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help=(
-            "Parallel target-entity workers for the target-dynamic vectorized "
-            "compiler (fork pool). 1 keeps the single-process path. Output is "
-            "bit-identical regardless of worker count; only the target-dynamic "
-            "path is parallelized (other layouts fall back to one process)."
-        ),
-    )
-    parser.add_argument(
         "--count-only",
         action="store_true",
         help="Build the candidate index, print total_type_pairs, then exit without scoring/writing.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Print phase timing for candidate enumeration, scoring, CSR and output.",
+    )
+    parser.add_argument(
+        "--profile-target-entities",
+        type=int,
+        default=None,
+        help=(
+            "Profile only the first N target entities against the full source "
+            "universe. Requires --profile; writes only a discarded temporary cache."
+        ),
     )
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -471,18 +402,28 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = parser.parse_args()
-    if args.workers < 1:
-        parser.error("--workers must be >= 1")
+    if args.profile_target_entities is not None:
+        if not args.profile:
+            parser.error("--profile-target-entities requires --profile")
+        if args.profile_target_entities < 1:
+            parser.error("--profile-target-entities must be >= 1")
+        if args.count_only:
+            parser.error("--profile-target-entities cannot be used with --count-only")
+    timer = PhaseTimer() if args.profile else None
+    if timer is not None:
+        timer.mark_wall_start()
     try:
         relation_prior = parse_topology_relation_prior(args.topology_relation_prior)
     except ValueError as exc:
         parser.error(str(exc))
 
     t0 = time.monotonic()
-    artifact = load_alarm_mhp_artifact(args.model)
-    scorer, mu_scorer, _ne_graph_data = _build_runtime_scorers(
-        artifact, args.ne_graph, args.site_graph, quiet=args.quiet
-    )
+    with _profile_phase(timer, "init.load_model"):
+        artifact = load_alarm_mhp_artifact(args.model)
+    with _profile_phase(timer, "init.build_runtime_scorers"):
+        scorer, mu_scorer, _ne_graph_data = _build_runtime_scorers(
+            artifact, args.ne_graph, args.site_graph, quiet=args.quiet
+        )
     history = (
         float(args.history_window_sec)
         if args.history_window_sec is not None
@@ -527,23 +468,25 @@ def main():
     candidate_policy = None
     if args.candidate_policy:
         try:
-            expected_policy_fingerprint = candidate_policy_fingerprint(
-                args.model,
-                args.ne_graph,
-                args.site_graph,
-                _association_plan_config(config),
-                artifact.config.topology_node_field,
-            )
-            candidate_policy = load_candidate_policy(
-                args.candidate_policy,
-                expected_fingerprint=expected_policy_fingerprint,
-            )
+            with _profile_phase(timer, "init.load_candidate_policy"):
+                expected_policy_fingerprint = candidate_policy_fingerprint(
+                    args.model,
+                    args.ne_graph,
+                    args.site_graph,
+                    _association_plan_config(config),
+                    artifact.config.topology_node_field,
+                )
+                candidate_policy = load_candidate_policy(
+                    args.candidate_policy,
+                    expected_fingerprint=expected_policy_fingerprint,
+                )
         except (OSError, ValueError) as exc:
             parser.error(f"cannot load --candidate-policy: {exc}")
 
-    period_types, graph_entity_count, alarm_type_count = graph_period_types(
-        artifact, scorer
-    )
+    with _profile_phase(timer, "init.build_period_universe"):
+        period_types, graph_entity_count, alarm_type_count = graph_period_types(
+            artifact, scorer
+        )
     if not period_types:
         parser.error("NE graph × model alarm-type vocabulary produced no period types")
     if not args.quiet:
@@ -577,12 +520,21 @@ def main():
     # does, so we skip it for the normal path (progress is driven by the known
     # target count instead) and only pay it for --count-only, whose sole job is
     # to report the total.
-    prepared_candidates = plan.prepare_candidate_period_types(
-        period_types, count_pairs=args.count_only
-    )
+    with _profile_phase(timer, "init.prepare_candidate_index"):
+        prepared_candidates = plan.prepare_candidate_period_types(
+            period_types, count_pairs=args.count_only
+        )
     period_types = prepared_candidates["period_types"]
     total_type_pairs = prepared_candidates["total_pair_count"]
-    total_targets = len(period_types)
+    profile_sample = args.profile_target_entities is not None
+    if profile_sample:
+        target_period_types, sampled_entity_count = _first_target_entities(
+            period_types, args.profile_target_entities
+        )
+    else:
+        target_period_types = period_types
+        sampled_entity_count = graph_entity_count
+    total_targets = len(target_period_types)
     if not args.quiet:
         pairs_field = (
             f"total_type_pairs={total_type_pairs}, "
@@ -600,7 +552,25 @@ def main():
             "estimated_active_edges=pending, ETA=pending",
             flush=True,
         )
+        if profile_sample:
+            print(
+                f"[period-cache] profile sample: target_entities="
+                f"{sampled_entity_count:,}/{graph_entity_count:,}, "
+                f"target_types={total_targets:,}/{len(period_types):,}; "
+                "source universe remains full; requested output will not be written",
+                flush=True,
+            )
     if args.count_only:
+        if timer is not None:
+            timer.mark_wall_end()
+            _print_compile_profile(
+                timer,
+                sampled_entity_count=graph_entity_count,
+                sampled_target_count=len(period_types),
+                source_target_count=len(period_types),
+                type_pair_count=total_type_pairs or 0,
+                active_edge_count=0,
+            )
         return
     if not str(args.output).lower().endswith(".npz"):
         parser.error("binary association cache output must end with .npz")
@@ -634,36 +604,27 @@ def main():
         last_report = type_pairs
         update_progress(type_pairs, active_edges, pruned_pairs, targets_done)
 
-    use_parallel = args.workers > 1 and state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
-    if args.workers > 1 and not use_parallel and not args.quiet:
-        print(
-            "[period-cache] --workers>1 仅支持 target-dynamic 向量化路径；回退单进程",
-            flush=True,
-        )
+    output_size = 0
     with tempfile.TemporaryDirectory(prefix="alarm-period-cache-") as spool_dir:
-        spool = None if use_parallel else _BinaryEdgeSpool(
-            spool_dir, period_types, state_layout
+        spool = _BinaryEdgeSpool(spool_dir, period_types, state_layout)
+        cache_output = (
+            os.path.join(spool_dir, "profile-sample.npz")
+            if profile_sample
+            else args.output
         )
+        if timer is not None:
+            _enable_compile_profiling(timer, plan, spool)
         arrays = None
         payload = None
         try:
-            if use_parallel:
-                type_pair_count, spool = _run_parallel_compile(
-                    plan,
-                    prepared_candidates,
-                    period_types,
-                    state_layout,
-                    spool_dir,
-                    args.workers,
-                    None if progress_bar is None else update_progress,
-                )
-            else:
+            with _profile_phase(timer, "score.total"):
                 type_pair_count = plan.precompile_period_types(
                     period_types,
                     progress=report,
                     prepared_candidates=prepared_candidates,
                     edge_sink=spool.append,
                     edge_batch_sink=spool.append_batch,
+                    target_period_types=target_period_types,
                 )
             if progress_bar is not None:
                 update_progress(
@@ -680,15 +641,17 @@ def main():
                     f"{spool.count:,} positive edges ...",
                     flush=True,
                 )
-            arrays = spool.arrays()
-            fingerprint = association_cache_fingerprint(
-                args.model,
-                args.ne_graph,
-                args.site_graph,
-                config,
-                artifact.config.topology_node_field,
-                candidate_policy_path=args.candidate_policy,
-            )
+            with _profile_phase(timer, "output.build_csr"):
+                arrays = spool.arrays()
+            with _profile_phase(timer, "output.fingerprint"):
+                fingerprint = association_cache_fingerprint(
+                    args.model,
+                    args.ne_graph,
+                    args.site_graph,
+                    config,
+                    artifact.config.topology_node_field,
+                    candidate_policy_path=args.candidate_policy,
+                )
             payload = {
                 "format": ASSOCIATION_CACHE_FORMAT,
                 "version": ASSOCIATION_CACHE_VERSION,
@@ -705,6 +668,11 @@ def main():
                     "graph_entity_count": graph_entity_count,
                     "model_alarm_type_count": alarm_type_count,
                     "directed_period_type_pair_count": type_pair_count,
+                    **(
+                        {"profile_sample_target_entity_count": sampled_entity_count}
+                        if profile_sample
+                        else {}
+                    ),
                     "candidate_policy_validation": (
                         dict(candidate_policy.validation or {})
                         if candidate_policy is not None
@@ -712,7 +680,9 @@ def main():
                     ),
                 },
             }
-            write_association_cache(args.output, payload)
+            with _profile_phase(timer, "output.write_cache"):
+                write_association_cache(cache_output, payload)
+            output_size = os.path.getsize(cache_output)
         finally:
             if progress_bar is not None:
                 progress_bar.close()
@@ -722,17 +692,31 @@ def main():
             if payload is not None:
                 payload.pop("arrays", None)
             arrays = None
-            if spool is not None:
-                spool.release_mmaps()
+            spool.release_mmaps()
     elapsed = time.monotonic() - t0
     if not args.quiet:
+        output_label = (
+            "<discarded temporary profile cache>"
+            if profile_sample
+            else os.path.abspath(args.output)
+        )
         print(
             f"[period-cache] done: signatures={payload['metadata']['signature_count']}, "
             f"edges={payload['metadata']['edge_count']}, pruned={plan.pruned_pair_count}, "
             f"prescreen_dropped_pairs={plan.prescreen_dropped_pair_count}, "
-            f"size={os.path.getsize(args.output) / (1024 * 1024):.1f}MiB, "
-            f"elapsed={elapsed:.2f}s; output={os.path.abspath(args.output)}",
+            f"size={output_size / (1024 * 1024):.1f}MiB, "
+            f"elapsed={elapsed:.2f}s; output={output_label}",
             flush=True,
+        )
+    if timer is not None:
+        timer.mark_wall_end()
+        _print_compile_profile(
+            timer,
+            sampled_entity_count=sampled_entity_count,
+            sampled_target_count=total_targets,
+            source_target_count=len(period_types),
+            type_pair_count=type_pair_count,
+            active_edge_count=spool.count,
         )
 
 
