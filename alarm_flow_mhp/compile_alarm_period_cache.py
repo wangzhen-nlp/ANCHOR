@@ -258,6 +258,11 @@ def _enable_compile_profiling(timer, plan, spool):
         (plan.decomposed, "entity_parts_for_target", "score.entity_features"),
         (plan.decomposed, "entity_static_table", "score.entity_static_table"),
         (plan.decomposed, "entity_parts_from_table", "score.entity_features"),
+        (
+            plan.decomposed,
+            "entity_parts_from_table_rows",
+            "score.entity_features",
+        ),
         (spool, "append", "score.edge_spool"),
         (spool, "append_batch", "score.edge_spool"),
     ):
@@ -321,6 +326,7 @@ def _print_compile_profile(
         for name in (
             "score.candidate_enumeration",
             "score.candidate_context",
+            "score.entity_static_table",
             "score.prescreen_basis",
             "score.prescreen_prepare",
             "score.compute_edge",

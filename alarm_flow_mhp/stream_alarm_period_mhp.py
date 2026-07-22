@@ -1677,14 +1677,23 @@ class CompiledAssociationPlan:
         distinct_at_ids = np.unique(src_at_ids)
         return src_at_ids, ent_inverse, unique_entities, grid_index, distinct_at_ids
 
-    def _prescreen_basis(self, entity, unique_entities, static_table=None):
+    def _prescreen_basis(
+        self,
+        entity,
+        unique_entities,
+        static_table=None,
+        static_rows=None,
+    ):
         """Build entity-pair parts and alarm-type-neutral prescreen logits."""
         d = self.decomposed
-        parts = (
-            d.entity_parts_from_table(entity, static_table)
-            if static_table is not None
-            else d.entity_parts_for_target(entity, unique_entities)
-        )
+        if static_rows is not None:
+            parts = d.entity_parts_from_table_rows(
+                entity, static_table, static_rows
+            )
+        elif static_table is not None:
+            parts = d.entity_parts_from_table(entity, static_table)
+        else:
+            parts = d.entity_parts_for_target(entity, unique_entities)
         z_entity = d.logits_from_parts(
             -1,
             np.full(len(unique_entities), -1, dtype=np.int64),
@@ -1789,9 +1798,18 @@ class CompiledAssociationPlan:
         # precompute its target-independent columns once and assemble parts per
         # group vectorized. Related scope keeps the per-group loop — its
         # candidate sets are small and differ per target entity.
-        static_table = (
-            d.entity_static_table(shared[2]) if shared is not None else None
-        )
+        static_table = None
+        if shared is not None:
+            static_table = d.entity_static_table(shared[2])
+        elif prepared.get("adaptive") and prepared.get("dense_period_grid"):
+            # Adaptive/unrelated uses a full target-independent table once, but
+            # every target gathers only its bounded candidate rows below.  This
+            # avoids both the old per-candidate Python feature loop and the old
+            # negative optimization that allocated full-universe temporaries
+            # for every target entity.
+            static_table = d.entity_static_table(
+                prepared["entities"], row_of=prepared["entity_to_id"]
+            )
         # ``adaptive`` candidate sets depend on the target alarm type, so the
         # prescreen tables cannot be shared across a target entity's rows the
         # way ``related``/``global`` sets can; rebuild them per target instead.
@@ -1846,8 +1864,23 @@ class CompiledAssociationPlan:
                     union_entities.update(value.entity for value in source_types)
                 if union_entities:
                     union_entities = tuple(sorted(union_entities))
+                    union_rows = (
+                        np.fromiter(
+                            (
+                                static_table.row_of[value]
+                                for value in union_entities
+                            ),
+                            dtype=np.int64,
+                            count=len(union_entities),
+                        )
+                        if static_table is not None
+                        else None
+                    )
                     union_parts, union_z_entity, union_z_same = self._prescreen_basis(
-                        entity, union_entities
+                        entity,
+                        union_entities,
+                        static_table=static_table,
+                        static_rows=union_rows,
                     )
                     shared_basis = (
                         {value: i for i, value in enumerate(union_entities)},

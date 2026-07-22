@@ -1379,28 +1379,43 @@ class RuntimeFeatureScorer:
         key = (site_a, site_b) if site_a < site_b else (site_b, site_a)
         hit = self._site_pair_cache.get(key)
         if hit is None:
-            link = self.site_stats.link_feat(site_a, site_b) if self.site_stats is not None else 0.0
-            link_ratio = (
-                self.link_stats.site_link_ratio(site_a, site_b)
-                if self.link_stats is not None else 0.0
-            )
-            link_density = (
-                self.link_stats.site_link_density(site_a, site_b)
-                if self.link_stats is not None else 0.0
-            )
-            size_balance = (
-                self.link_stats.site_size_balance(site_a, site_b)
-                if self.link_stats is not None else 0.0
-            )
-            domain_cosine = (
-                self.link_stats.site_domain_cosine(site_a, site_b)
-                if self.link_stats is not None else 0.0
-            )
-            proximity, missing = self.geo_stats.pair_features(site_a, site_b)
-            hit = (link, link_ratio, link_density, size_balance,
-                   domain_cosine, proximity, missing)
+            hit = self._site_pair_features_uncached(site_a, site_b)
             self._site_pair_cache[key] = hit
         return hit
+
+    def _site_pair_features_uncached(self, site_a, site_b) -> tuple[float, ...]:
+        """Structural/domain/geographic site features without cache growth."""
+        link = (
+            self.site_stats.link_feat(site_a, site_b)
+            if self.site_stats is not None
+            else 0.0
+        )
+        link_ratio = (
+            self.link_stats.site_link_ratio(site_a, site_b)
+            if self.link_stats is not None else 0.0
+        )
+        link_density = (
+            self.link_stats.site_link_density(site_a, site_b)
+            if self.link_stats is not None else 0.0
+        )
+        size_balance = (
+            self.link_stats.site_size_balance(site_a, site_b)
+            if self.link_stats is not None else 0.0
+        )
+        domain_cosine = (
+            self.link_stats.site_domain_cosine(site_a, site_b)
+            if self.link_stats is not None else 0.0
+        )
+        proximity, missing = self.geo_stats.pair_features(site_a, site_b)
+        return (
+            link,
+            link_ratio,
+            link_density,
+            size_balance,
+            domain_cosine,
+            proximity,
+            missing,
+        )
 
     def _device_link_ratio(self, node_a, node_b) -> float:
         if self.site_stats is None:
@@ -1612,6 +1627,16 @@ class EntityStaticTable:
     ``entity_parts_from_table``; also caches per-target-site site-pair feature
     rows across targets. Attributes are assigned by the builder.
     """
+
+    @staticmethod
+    def rows(mapping, key):
+        """Return one compact row-map value through a uniform iterable view."""
+        value = mapping.get(key)
+        if value is None:
+            return ()
+        if isinstance(value, (int, np.integer)):
+            return (int(value),)
+        return value
 
 
 class DecomposedFeatureScorer:
@@ -1920,7 +1945,7 @@ class DecomposedFeatureScorer:
                 delta += w_k * float(np.float32(value))
         return delta
 
-    def entity_static_table(self, entities):
+    def entity_static_table(self, entities, row_of=None):
         """Precompute target-independent entity columns for the offline compiler.
 
         One pass over the entity universe captures attribute codes, structural
@@ -1935,8 +1960,14 @@ class DecomposedFeatureScorer:
         n = len(entities)
         table = EntityStaticTable()
         table.n = n
-        table.entities = list(entities)
-        table.row_of = {entity: i for i, entity in enumerate(table.entities)}
+        table.entities = (
+            entities if isinstance(entities, (list, tuple)) else tuple(entities)
+        )
+        table.row_of = (
+            row_of
+            if row_of is not None
+            else {entity: i for i, entity in enumerate(table.entities)}
+        )
         table.nodes = []
         table.site_code_of = {}
         table.vendor_code_of = {}
@@ -1948,8 +1979,27 @@ class DecomposedFeatureScorer:
         table.src_site_size = np.empty(n, dtype=np.float64)
         table.src_degree = np.empty(n, dtype=np.float64)
         table.src_external = np.empty(n, dtype=np.float64)
-        node_rows = defaultdict(list)
-        norm_rows = defaultdict(list)
+        node_rows = {}
+        nodes_are_normalized = True
+
+        def _add_row(mapping, key, row):
+            previous = mapping.get(key)
+            if previous is None:
+                mapping[key] = row
+            elif isinstance(previous, list):
+                previous.append(row)
+            else:
+                mapping[key] = [previous, row]
+
+        def _finalize_rows(mapping):
+            return {
+                key: (
+                    np.asarray(value, dtype=np.int64)
+                    if isinstance(value, list)
+                    else value
+                )
+                for key, value in mapping.items()
+            }
 
         def _code(mapping, value, values=None):
             code = mapping.get(value)
@@ -1962,8 +2012,10 @@ class DecomposedFeatureScorer:
         for i, entity in enumerate(table.entities):
             node = topo_node_of(entity)
             table.nodes.append(node)
-            node_rows[node].append(i)
-            norm_rows[_normalize_ne_id(node)].append(i)
+            _add_row(node_rows, node, i)
+            nodes_are_normalized = (
+                nodes_are_normalized and _normalize_ne_id(node) == node
+            )
             site, vendor, netype = s._attr(entity)
             table.site_codes[i] = _code(table.site_code_of, site, table.site_list)
             table.vendor_codes[i] = _code(table.vendor_code_of, vendor)
@@ -1971,8 +2023,14 @@ class DecomposedFeatureScorer:
             table.src_site_size[i] = s._site_size(site)
             table.src_degree[i] = s._device_degree(node)
             table.src_external[i] = s._site_external_neighbor_count(site)
-        table.node_rows = {key: np.asarray(value, dtype=np.int64) for key, value in node_rows.items()}
-        table.norm_rows = {key: np.asarray(value, dtype=np.int64) for key, value in norm_rows.items()}
+        table.node_rows = _finalize_rows(node_rows)
+        if nodes_are_normalized:
+            table.norm_rows = table.node_rows
+        else:
+            norm_rows = {}
+            for row, node in enumerate(table.nodes):
+                _add_row(norm_rows, _normalize_ne_id(node), row)
+            table.norm_rows = _finalize_rows(norm_rows)
         table.src_dom_ids = (
             self.layout.domain_ids([phi_domain_of(x, s.node_infos) for x in table.entities])
             if self.n_dom
@@ -2020,7 +2078,7 @@ class DecomposedFeatureScorer:
             candidate_norms = {t_norm}
             candidate_norms.update(table.topo_sources.get(t_norm, ()))
             for source_norm in candidate_norms:
-                for row in table.norm_rows.get(source_norm, ()):
+                for row in table.rows(table.norm_rows, source_norm):
                     topo[row] = _topo_score(
                         table.nodes[row], t_node, s.topology_index, s._topo_cache
                     )
@@ -2054,8 +2112,8 @@ class DecomposedFeatureScorer:
         device_link_ratio = np.zeros(n, dtype=np.float64)
         if s.site_stats is not None and t_node:
             for neighbor in table.link_neighbors.get(t_node, ()):
-                rows = table.node_rows.get(neighbor)
-                if rows is not None:
+                rows = table.rows(table.node_rows, neighbor)
+                if len(rows):
                     device_link_ratio[rows] = s._device_link_ratio(neighbor, t_node)
 
         tgt_dom_id = (
@@ -2079,6 +2137,137 @@ class DecomposedFeatureScorer:
             "geo_missing": pair_cols[:, 6],
             "tgt_site_external_neighbor_count": s._site_external_neighbor_count(t_site),
             "src_site_external_neighbor_count": table.src_external,
+        }
+
+    def entity_parts_from_table_rows(self, target_ne, table, rows):
+        """Build entity parts only for sorted candidate rows of a static table.
+
+        Unlike ``entity_parts_from_table``, every dense temporary has exactly
+        ``len(rows)`` entries. Sparse topology/device-link columns intersect
+        their full-table adjacency rows with the candidate rows, and site-pair
+        features are computed once for the unique sites present in this target's
+        candidates without populating an unbounded cross-target cache.
+        """
+        from alarm_flow_isahp.ne_topology import _normalize_ne_id
+
+        s = self.scorer
+        rows = np.asarray(rows, dtype=np.int64)
+        n = len(rows)
+        invalid_rows = n and (
+            np.any(rows[1:] <= rows[:-1])
+            or rows[0] < 0
+            or rows[-1] >= table.n
+        )
+        if invalid_rows:
+            raise ValueError("candidate table rows must be sorted, unique, and in range")
+
+        t_node = topo_node_of(target_ne)
+        t_site, t_vendor, t_netype = s._attr(target_ne)
+
+        def _candidate_positions(full_rows):
+            full_rows = np.atleast_1d(np.asarray(full_rows, dtype=np.int64))
+            if not n or not len(full_rows):
+                return np.zeros(0, dtype=np.int64)
+            positions = np.searchsorted(rows, full_rows)
+            valid = positions < n
+            if not np.any(valid):
+                return np.zeros(0, dtype=np.int64)
+            positions = positions[valid]
+            full_rows = full_rows[valid]
+            return positions[rows[positions] == full_rows]
+
+        topo = np.zeros(n, dtype=np.float64)
+        if s.topology_index is not None and t_node:
+            t_norm = _normalize_ne_id(t_node)
+            candidate_norms = {t_norm}
+            candidate_norms.update(table.topo_sources.get(t_norm, ()))
+            for source_norm in candidate_norms:
+                full_rows = table.rows(table.norm_rows, source_norm)
+                local_rows = _candidate_positions(full_rows)
+                for local_row in local_rows:
+                    table_row = rows[local_row]
+                    topo[local_row] = _topo_score(
+                        table.nodes[table_row],
+                        t_node,
+                        s.topology_index,
+                        s._topo_cache,
+                    )
+
+        is_same_ne = np.zeros(n, dtype=np.float64)
+        own_row = table.row_of.get(target_ne)
+        if own_row is not None and n:
+            own_position = int(np.searchsorted(rows, own_row))
+            if own_position < n and rows[own_position] == own_row:
+                is_same_ne[own_position] = 1.0
+
+        site_codes = table.site_codes[rows]
+        vendor_codes = table.vendor_codes[rows]
+        netype_codes = table.netype_codes[rows]
+
+        def _same(codes, code_of, value):
+            if not value:
+                return np.zeros(n, dtype=np.float64)
+            code = code_of.get(value)
+            if code is None:
+                return np.zeros(n, dtype=np.float64)
+            return (codes == code).astype(np.float64)
+
+        same_site = _same(site_codes, table.site_code_of, t_site)
+        same_vendor = _same(vendor_codes, table.vendor_code_of, t_vendor)
+        same_netype = _same(netype_codes, table.netype_code_of, t_netype)
+
+        unique_site_codes, site_inverse = np.unique(
+            site_codes, return_inverse=True
+        )
+        pair_rows = np.asarray(
+            [
+                s._site_pair_features_uncached(
+                    table.site_list[int(site_code)], t_site
+                )
+                for site_code in unique_site_codes
+            ],
+            dtype=np.float64,
+        ).reshape((-1, 7))
+        pair_cols = pair_rows[site_inverse]
+
+        device_link_ratio = np.zeros(n, dtype=np.float64)
+        if s.site_stats is not None and t_node:
+            for neighbor in table.link_neighbors.get(t_node, ()):
+                local_rows = _candidate_positions(
+                    table.rows(table.node_rows, neighbor)
+                )
+                if len(local_rows):
+                    device_link_ratio[local_rows] = s._device_link_ratio(
+                        neighbor, t_node
+                    )
+
+        tgt_dom_id = (
+            self.layout.dom_id(phi_domain_of(target_ne, s.node_infos))
+            if self.n_dom
+            else -1
+        )
+        return {
+            "topo": topo,
+            "is_same_ne": is_same_ne,
+            "same_site": same_site,
+            "same_vendor": same_vendor,
+            "same_netype": same_netype,
+            "tgt_dom_id": tgt_dom_id,
+            "src_dom_ids": table.src_dom_ids[rows],
+            "tgt_site_size": s._site_size(t_site),
+            "src_site_size": table.src_site_size[rows],
+            "site_link": pair_cols[:, 0],
+            "site_link_ratio": pair_cols[:, 1],
+            "site_link_density": pair_cols[:, 2],
+            "site_size_balance": pair_cols[:, 3],
+            "site_domain_cosine": pair_cols[:, 4],
+            "tgt_undirected_degree": s._device_degree(t_node),
+            "src_undirected_degree": table.src_degree[rows],
+            "device_link_ratio": device_link_ratio,
+            "geo_proximity": pair_cols[:, 5],
+            "geo_missing": pair_cols[:, 6],
+            "tgt_site_external_neighbor_count": s._site_external_neighbor_count(t_site),
+            "src_site_external_neighbor_count": table.src_external[rows],
         }
 
     def logits_for_target(self, target_at, target_ne, src_ats, src_nes, src_marks=None):

@@ -394,21 +394,35 @@ class CandidatePolicyTest(unittest.TestCase):
                 bool(candidate_rule_mask(target, source, base.scorer) & RELATED_MASK)
             )
 
-    def test_unrelated_batch_does_not_build_full_entity_static_table(self):
+    def test_unrelated_batch_only_builds_candidate_sized_feature_rows(self):
         policy = CandidatePolicy(
             {"X": {"X": ("same_ne_type", "same_vendor")}}, approved=True
         )
         plan = _plan(dynamic="target", scope="unrelated", policy=policy)
         period_types = tuple(PeriodType(node, "X") for node in NODES)
+        original = plan.decomposed.entity_parts_from_table_rows
+        row_counts = []
 
-        def reject_global_table(_entities):
-            self.fail("unrelated compile must not build a full-entity static table")
+        def reject_full_target_arrays(_target, _table):
+            self.fail("unrelated compile must not build full-universe target arrays")
 
-        plan.decomposed.entity_static_table = reject_global_table
+        def counted(target, table, rows):
+            row_counts.append((len(rows), table.n))
+            return original(target, table, rows)
+
+        plan.decomposed.entity_parts_from_table = reject_full_target_arrays
+        plan.decomposed.entity_parts_from_table_rows = counted
         pair_count = plan.precompile_period_types(
             period_types, edge_batch_sink=lambda *_args: None
         )
         self.assertGreater(pair_count, 0)
+        self.assertTrue(row_counts)
+        self.assertTrue(
+            all(
+                row_count <= table_count
+                for row_count, table_count in row_counts
+            )
+        )
 
     def test_unrelated_batch_builds_entity_features_once_per_target_entity(self):
         alarm_types = ("a", "b")
@@ -433,14 +447,14 @@ class CandidatePolicyTest(unittest.TestCase):
             for node in NODES
             for alarm_type in alarm_types
         )
-        original = plan.decomposed.entity_parts_for_target
+        original = plan.decomposed.entity_parts_from_table_rows
         calls = []
 
-        def counted(target_entity, source_entities):
-            calls.append((target_entity, tuple(source_entities)))
-            return original(target_entity, source_entities)
+        def counted(target_entity, table, rows):
+            calls.append((target_entity, tuple(rows)))
+            return original(target_entity, table, rows)
 
-        plan.decomposed.entity_parts_for_target = counted
+        plan.decomposed.entity_parts_from_table_rows = counted
         plan.precompile_period_types(
             period_types, edge_batch_sink=lambda *_args: None
         )
