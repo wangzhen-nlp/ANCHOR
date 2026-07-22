@@ -8,9 +8,9 @@
   - resourceRelations: 网元-网元拓扑连边（srcVid/dstVid、linkLayer）
   - happenRelations:   告警顶点 -> owner 网元/站点
 
-因此本脚本默认只依赖 test.json。若需要补充 test.json 里没有的经纬度等信息，
-可以再传入 anchor_grouping_online/tools/build_resource_buffer.py 产出的 resource_buffer.jsonl
-（--resource-buffer），按 NE 名 / 站点名做best-effort 富化，缺失时不影响展示。
+因此本脚本只依赖 test.json，无需任何外部文件。test.json 里没有经纬度，页面又用真实
+地图布局，所以脚本按 site_id 确定性哈希给每个站点合成一个聚拢的经纬度（同站点的所有
+设备坐标完全一致），可用 --base-lat/--base-lon/--spread 调整中心与散布范围。
 
 输出：每个 faultGroupId 一个「原始格式」故障组对象（含 ne_info / group_info / symptoms /
 match_info），可被 ne_propagation_visualizer.html 的 loadOriginalFormat 直接加载。
@@ -19,11 +19,17 @@ match_info），可被 ne_propagation_visualizer.html 的 loadOriginalFormat 直
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
+
+# 合成经纬度的默认中心与散布（度）。spread≈0.06° 约 6~7km，保证站点聚拢不散。
+DEFAULT_BASE_LAT = 39.90
+DEFAULT_BASE_LON = 116.40
+DEFAULT_SPREAD = 0.06
 
 
 def _text(value):
@@ -56,51 +62,40 @@ def _append_unique(values, value):
 
 
 # --------------------------------------------------------------------------- #
-# 可选的 resource_buffer.jsonl 富化（仅补经纬度等 test.json 缺失字段）
+# 站点经纬度合成（test.json 无经纬度；页面用真实地图布局，需要合法 WGS84 坐标）
 # --------------------------------------------------------------------------- #
-def load_resource_buffer_enrichment(path):
-    """返回 (ne_geo_by_name, site_geo_by_name)。找不到文件时返回空映射，不报错。"""
-    ne_geo_by_name = {}
-    site_geo_by_name = {}
-    if not path:
-        return ne_geo_by_name, site_geo_by_name
-    p = Path(path)
-    if not p.exists():
-        print(f"⚠️ resource_buffer 不存在，跳过富化: {path}", file=sys.stderr)
-        return ne_geo_by_name, site_geo_by_name
+class SiteCoordGenerator:
+    """按 site_id 确定性哈希生成聚拢的经纬度。
 
-    with open(p, "r", encoding="utf-8") as fr:
-        for line in fr:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rtype = record.get("resource_type")
-            data = record.get("data") or {}
-            if not isinstance(data, dict):
-                continue
-            if rtype == "ne_graph":
-                for _vid, info in data.items():
-                    if not isinstance(info, dict):
-                        continue
-                    name = _text(info.get("name"))
-                    lon = _text(info.get("longitude"))
-                    lat = _text(info.get("latitude"))
-                    if name and (lon or lat):
-                        ne_geo_by_name.setdefault(name, {"longitude": lon, "latitude": lat})
-            elif rtype == "site_graph":
-                for _sid, info in data.items():
-                    if not isinstance(info, dict):
-                        continue
-                    name = _text(info.get("site_name"))
-                    lon = _text(info.get("longitude"))
-                    lat = _text(info.get("latitude"))
-                    if name and (lon or lat):
-                        site_geo_by_name.setdefault(name, {"longitude": lon, "latitude": lat})
-    return ne_geo_by_name, site_geo_by_name
+    - 同一个 site_id 永远返回相同坐标（同站点所有设备坐标一致）。
+    - 所有站点落在以 (base_lat, base_lon) 为中心、±spread 度的方框内，保证不散。
+    """
+
+    def __init__(self, base_lat=DEFAULT_BASE_LAT, base_lon=DEFAULT_BASE_LON, spread=DEFAULT_SPREAD):
+        self.base_lat = base_lat
+        self.base_lon = base_lon
+        self.spread = spread
+        self._cache = {}
+
+    @staticmethod
+    def _unit(seed):
+        """由字符串确定性得到 [0,1) 的浮点。"""
+        digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+        return int(digest[:12], 16) / float(1 << 48)
+
+    def coords(self, site_id):
+        key = _text(site_id)
+        if not key:
+            return "", ""
+        if key not in self._cache:
+            # 纬度随 |纬度| 增大会拉伸经度间距，这里散布很小可忽略，直接线性铺开即可。
+            lat_off = (self._unit(key + "#lat") * 2 - 1) * self.spread
+            lon_off = (self._unit(key + "#lon") * 2 - 1) * self.spread
+            lat = round(self.base_lat + lat_off, 6)
+            lon = round(self.base_lon + lon_off, 6)
+            self._cache[key] = (lat, lon)
+        lat, lon = self._cache[key]
+        return lat, lon
 
 
 # --------------------------------------------------------------------------- #
@@ -164,8 +159,7 @@ def build_group_object(
     alarms,
     resource_by_nename,
     adjacency,
-    ne_geo_by_name,
-    site_geo_by_name,
+    coord_gen,
     include_neighbors=True,
 ):
     # 1) 收集本组所有告警对应的核心网元（有告警的 NE）及其告警
@@ -276,7 +270,7 @@ def build_group_object(
         vendor = _text(res.get("vendor")) or (_text(fallback.get("vendor")) if fallback else "")
         domain = _text(res.get("domain")) or (_text(fallback.get("domain")) if fallback else "")
 
-        geo = ne_geo_by_name.get(nename) or site_geo_by_name.get(site_name) or {}
+        lat, lon = coord_gen.coords(site_id)
 
         ne_info[nename] = {
             "link": links,
@@ -291,8 +285,8 @@ def build_group_object(
             "running_status": "",
             "domain": domain.upper(),
             "region_id": "",
-            "longitude": geo.get("longitude", ""),
-            "latitude": geo.get("latitude", ""),
+            "longitude": lon,
+            "latitude": lat,
             "alarm": alarms_here,
             # 邻居节点（本身无告警）标记为拓扑补充节点
             "supplemental_fault_pattern_context": nename not in ne_alarms,
@@ -339,7 +333,7 @@ def build_group_object(
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
-def build_groups(topic, ne_geo_by_name, site_geo_by_name, include_neighbors=True):
+def build_groups(topic, coord_gen, include_neighbors=True):
     _, _, resource_by_nename, adjacency = build_indexes(topic)
 
     grouped = OrderedDict()
@@ -357,7 +351,7 @@ def build_groups(topic, ne_geo_by_name, site_geo_by_name, include_neighbors=True
     for group_id, alarms in grouped.items():
         groups.append(build_group_object(
             group_id, alarms, resource_by_nename, adjacency,
-            ne_geo_by_name, site_geo_by_name, include_neighbors=include_neighbors,
+            coord_gen, include_neighbors=include_neighbors,
         ))
     return groups, skipped_no_group
 
@@ -394,9 +388,22 @@ def main():
         help="输出路径，默认 microwave_topic/test_fault_groups.jsonl（单故障组时另出同名 .json）",
     )
     parser.add_argument(
-        "--resource-buffer",
-        default=None,
-        help="可选：build_resource_buffer.py 产出的 resource_buffer.jsonl，用于补经纬度等 test.json 缺失字段",
+        "--base-lat",
+        type=float,
+        default=DEFAULT_BASE_LAT,
+        help=f"合成站点经纬度的中心纬度，默认 {DEFAULT_BASE_LAT}",
+    )
+    parser.add_argument(
+        "--base-lon",
+        type=float,
+        default=DEFAULT_BASE_LON,
+        help=f"合成站点经纬度的中心经度，默认 {DEFAULT_BASE_LON}",
+    )
+    parser.add_argument(
+        "--spread",
+        type=float,
+        default=DEFAULT_SPREAD,
+        help=f"站点相对中心的最大散布（度），越小越聚拢，默认 {DEFAULT_SPREAD}（约6~7km）",
     )
     parser.add_argument(
         "--no-neighbors",
@@ -414,10 +421,12 @@ def main():
     if not isinstance(topic, dict):
         parser.error("输入顶层必须是对象（含 alarms/resources/resourceRelations）")
 
-    ne_geo_by_name, site_geo_by_name = load_resource_buffer_enrichment(args.resource_buffer)
+    coord_gen = SiteCoordGenerator(
+        base_lat=args.base_lat, base_lon=args.base_lon, spread=args.spread
+    )
 
     groups, skipped_no_group = build_groups(
-        topic, ne_geo_by_name, site_geo_by_name, include_neighbors=not args.no_neighbors
+        topic, coord_gen, include_neighbors=not args.no_neighbors
     )
 
     if not groups:
@@ -431,8 +440,9 @@ def main():
         "skipped_alarms_without_group": skipped_no_group,
         "jsonl_output": str(jsonl_path),
         "single_json_output": str(single_path) if single_path else None,
-        "resource_buffer_enriched_ne": len(ne_geo_by_name),
-        "resource_buffer_enriched_site": len(site_geo_by_name),
+        "synthesized_site_coords": len(coord_gen._cache),
+        "coord_center": [args.base_lat, args.base_lon],
+        "coord_spread_deg": args.spread,
         "groups": [
             {
                 "faultGroupId": g["uuid"],
