@@ -1817,14 +1817,32 @@ class CompiledAssociationPlan:
                 # union and gathered by each compact candidate state.
                 adaptive_context = self._adaptive_entity_context(targets, prepared)
                 sources_by_target = {}
+                source_key_by_target = {}
+                sources_by_key = {}
                 union_entities = set()
                 for target_type in targets:
-                    source_types = self._candidate_sources(
-                        target_type,
-                        prepared,
-                        adaptive_entity_context=adaptive_context,
+                    # Candidate membership depends on the policy's ordered rule
+                    # tuple for each source alarm type.  Multiple target alarm
+                    # types often share that exact plan; enumerate it once per
+                    # entity instead of rebuilding and sorting the same large
+                    # candidate tuple, then hashing that tuple to discover the
+                    # duplication afterwards.
+                    source_key = tuple(
+                        prepared["policy"].rules_for(
+                            target_type.alarm_type, source_alarm_type
+                        )
+                        for source_alarm_type in prepared["alarm_types"]
                     )
+                    source_types = sources_by_key.get(source_key)
+                    if source_types is None:
+                        source_types = self._candidate_sources(
+                            target_type,
+                            prepared,
+                            adaptive_entity_context=adaptive_context,
+                        )
+                        sources_by_key[source_key] = source_types
                     sources_by_target[target_type] = source_types
+                    source_key_by_target[target_type] = source_key
                     union_entities.update(value.entity for value in source_types)
                 if union_entities:
                     union_entities = tuple(sorted(union_entities))
@@ -1839,19 +1857,20 @@ class CompiledAssociationPlan:
                     )
                 else:
                     shared_basis = None
-                state_by_sources = {}
+                state_by_source_key = {}
             for target_type in targets:
                 if per_target_sources:
                     source_types = sources_by_target[target_type]
-                    if source_types not in state_by_sources:
-                        state_by_sources[source_types] = self._prescreen_source_state(
+                    source_key = source_key_by_target[target_type]
+                    if source_key not in state_by_source_key:
+                        state_by_source_key[source_key] = self._prescreen_source_state(
                             entity,
                             source_types,
                             shared,
                             static_table,
                             shared_basis=shared_basis,
                         )
-                    state = state_by_sources[source_types]
+                    state = state_by_source_key[source_key]
                 else:
                     source_types = group_source_types
                     state = group_state

@@ -355,6 +355,29 @@ def build_candidate_indices(
         entities = tuple(entity_values)
     else:
         entities = tuple(dict.fromkeys(str(value) for value in entities))
+    entity_to_id = {entity: index for index, entity in enumerate(entities)}
+    alarm_type_to_id = {
+        alarm_type: index for index, alarm_type in enumerate(alarm_types)
+    }
+    # The cache compiler's production universe is the complete, sorted
+    # entity x alarm-type grid.  In that layout a PeriodType's existing tuple
+    # position is also a compact integer id, so candidate enumeration can sort
+    # integers and reuse the original objects instead of allocating/hashing a
+    # fresh PeriodType for every candidate.  Keep detecting the layout rather
+    # than assuming it: policy learning passes no period types and callers may
+    # legitimately provide a sparse custom universe.
+    alarm_type_count = len(alarm_types)
+    dense_period_grid = bool(period_types) and len(period_types) == (
+        len(entities) * alarm_type_count
+    )
+    if dense_period_grid:
+        for position, value in enumerate(period_types):
+            if (
+                value.entity != entities[position // alarm_type_count]
+                or value.alarm_type != alarm_types[position % alarm_type_count]
+            ):
+                dense_period_grid = False
+                break
     for entity in entities:
         attr = _entity_attributes(entity, scorer)
         attrs[entity] = attr
@@ -392,6 +415,9 @@ def build_candidate_indices(
         "period_types": period_types,
         "alarm_types": alarm_types,
         "entities": entities,
+        "entity_to_id": entity_to_id,
+        "alarm_type_to_id": alarm_type_to_id,
+        "dense_period_grid": dense_period_grid,
         "indexes": indexes,
         "geo_cells": geo_cells,
         "node_entities": node_entities,
@@ -471,14 +497,85 @@ def prepare_adaptive_entity_context(
         rule: rule_candidates(target, None, rule, prepared)
         for rule in selected_rules
     }
+    entity_to_id = prepared.get("entity_to_id")
+    candidate_ids_by_rule = None
+    if prepared.get("dense_period_grid") and entity_to_id is not None:
+        candidate_ids_by_rule = {
+            rule: tuple(entity_to_id[value] for value in values)
+            for rule, values in candidates_by_rule.items()
+        }
     related = set()
     if exclude_related:
         for rule in RELATED_RULES:
             related.update(candidates_by_rule.get(rule, ()))
+    related_ids = None
+    if candidate_ids_by_rule is not None and exclude_related:
+        related_ids = set()
+        for rule in RELATED_RULES:
+            related_ids.update(candidate_ids_by_rule.get(rule, ()))
     return {
         "candidates_by_rule": candidates_by_rule,
+        "candidate_ids_by_rule": candidate_ids_by_rule,
         "related": related,
+        "related_ids": related_ids,
     }
+
+
+def _adaptive_candidate_sources_by_id(
+    target,
+    policy,
+    prepared,
+    *,
+    exclude_related=False,
+    entity_context=None,
+):
+    """Enumerate a dense PeriodType universe through compact integer ids."""
+    entity_to_id = prepared["entity_to_id"]
+    alarm_type_to_id = prepared["alarm_type_to_id"]
+    alarm_type_count = len(prepared["alarm_types"])
+    period_types = prepared["period_types"]
+    context_ids = (
+        entity_context.get("candidate_ids_by_rule")
+        if entity_context is not None
+        else None
+    )
+    if context_ids is not None:
+        related_ids = (
+            entity_context.get("related_ids") or ()
+            if exclude_related
+            else ()
+        )
+    elif exclude_related:
+        related_ids = {
+            entity_to_id[value] for value in _related_entity_set(target, prepared)
+        }
+    else:
+        related_ids = ()
+
+    candidate_positions = []
+    for source_at in prepared["alarm_types"]:
+        candidate_entity_ids = set()
+        for rule in policy.rules_for(target.alarm_type, source_at):
+            if context_ids is not None:
+                values = context_ids.get(rule, ())
+            else:
+                values = (
+                    entity_to_id[value]
+                    for value in rule_candidates(
+                        target, source_at, rule, prepared
+                    )
+                )
+            candidate_entity_ids.update(values)
+        if exclude_related:
+            candidate_entity_ids.difference_update(related_ids)
+        source_at_id = alarm_type_to_id[source_at]
+        candidate_positions.extend(
+            entity_id * alarm_type_count + source_at_id
+            for entity_id in candidate_entity_ids
+        )
+
+    candidate_positions.sort()
+    return tuple(period_types[position] for position in candidate_positions)
 
 
 def adaptive_candidate_sources(
@@ -488,6 +585,14 @@ def adaptive_candidate_sources(
     exclude_related=False,
     entity_context=None,
 ):
+    if prepared.get("dense_period_grid"):
+        return _adaptive_candidate_sources_by_id(
+            target,
+            policy,
+            prepared,
+            exclude_related=exclude_related,
+            entity_context=entity_context,
+        )
     candidates = set()
     period_type_class = target.__class__
     related = (

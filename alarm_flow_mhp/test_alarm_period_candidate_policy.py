@@ -222,6 +222,84 @@ class CandidatePolicyTest(unittest.TestCase):
                     bool(candidate_rule_mask(target, source, base.scorer) & RELATED_MASK)
                 )
 
+    def test_dense_unrelated_enumeration_reuses_sorted_period_types(self):
+        base = _plan(at_vocab=("a", "b"))
+        period_types = tuple(
+            PeriodType(node, alarm_type)
+            for node in NODES
+            for alarm_type in ("a", "b")
+        )
+        policy = CandidatePolicy(
+            {
+                "a": {
+                    "a": ("same_ne_type",),
+                    "b": ("same_vendor",),
+                },
+                "b": {
+                    "a": ("same_vendor",),
+                    "b": ("same_ne_type",),
+                },
+            },
+            approved=True,
+        )
+        prepared = prepare_adaptive_candidates(
+            period_types,
+            base.scorer,
+            policy,
+            count_pairs=False,
+            exclude_related=True,
+        )
+        self.assertTrue(prepared["dense_period_grid"])
+
+        target = PeriodType("A", "a")
+        actual = adaptive_candidate_sources(
+            target, policy, prepared, exclude_related=True
+        )
+        expected = tuple(
+            sorted(
+                (
+                    source
+                    for source in period_types
+                    if unrelated_pair_allowed(policy, target, source, base.scorer)
+                ),
+                key=lambda value: (value.entity, value.alarm_type),
+            )
+        )
+        self.assertEqual(actual, expected)
+        original_by_value = {value: value for value in prepared["period_types"]}
+        for value in actual:
+            self.assertIs(value, original_by_value[value])
+
+    def test_sparse_unrelated_universe_keeps_compatibility_path(self):
+        base = _plan(at_vocab=("a", "b"))
+        period_types = (
+            PeriodType("A", "a"),
+            PeriodType("B", "b"),
+            PeriodType("C", "a"),
+        )
+        policy = CandidatePolicy(
+            {"a": {"a": ("same_ne_type",), "b": ("same_vendor",)}},
+            approved=True,
+        )
+        prepared = prepare_adaptive_candidates(
+            period_types,
+            base.scorer,
+            policy,
+            count_pairs=False,
+            exclude_related=True,
+        )
+        self.assertFalse(prepared["dense_period_grid"])
+        actual = adaptive_candidate_sources(
+            PeriodType("A", "a"),
+            policy,
+            prepared,
+            exclude_related=True,
+        )
+        self.assertEqual(
+            actual,
+            tuple(sorted(actual, key=lambda value: (value.entity, value.alarm_type))),
+        )
+
     def test_unrelated_scalar_compile_matches_global_filtered(self):
         global_plan = _plan(mu=0.01)
         period_types = tuple(PeriodType(n, "X") for n in NODES)
@@ -419,6 +497,46 @@ class CandidatePolicyTest(unittest.TestCase):
                 for rule in selected_rules
             },
         )
+
+    def test_unrelated_batch_enumerates_shared_policy_signature_once_per_entity(self):
+        alarm_types = ("a", "b", "c")
+        rules = {
+            source: ("same_ne_type", "same_vendor")
+            for source in alarm_types
+        }
+        policy = CandidatePolicy(
+            {target: dict(rules) for target in alarm_types},
+            approved=True,
+        )
+        plan = _plan(
+            dynamic="target",
+            at_vocab=alarm_types,
+            scope="unrelated",
+            policy=policy,
+        )
+        period_types = tuple(
+            PeriodType(node, alarm_type)
+            for node in NODES
+            for alarm_type in alarm_types
+        )
+        prepared = plan.prepare_candidate_period_types(
+            period_types, count_pairs=False
+        )
+        original = plan._candidate_sources
+        calls = []
+
+        def counted(target, candidate_index, adaptive_entity_context=None):
+            calls.append(target)
+            return original(target, candidate_index, adaptive_entity_context)
+
+        plan._candidate_sources = counted
+        plan.precompile_period_types(
+            period_types,
+            prepared_candidates=prepared,
+            edge_batch_sink=lambda *_args: None,
+        )
+        self.assertEqual(len(calls), len(NODES))
+        self.assertEqual({target.entity for target in calls}, set(NODES))
 
     def test_profile_target_entity_limit_keeps_complete_entity_groups(self):
         period_types = tuple(
