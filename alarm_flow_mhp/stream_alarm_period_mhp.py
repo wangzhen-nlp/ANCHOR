@@ -320,6 +320,11 @@ class PeriodStreamConfig:
     merge_min_evidence: int = 2
     candidate_scope: str = "related"
     topology_relation_prior: dict = field(default_factory=dict)
+    # Output-only filter: when set, emit (groups JSONL + visualization) only
+    # fault groups that contain at least one unrelated-scope association edge.
+    # Purely a sink-side gate; it never affects candidate enumeration/scoring or
+    # the association fingerprint.
+    only_unrelated: bool = False
 
     def validate(self):
         if self.aggregation_wait_sec < 0:
@@ -2376,6 +2381,7 @@ class AlarmPeriodMHPAssigner:
         self.merge_proposal_pruned_count = 0
         self.closed_group_sink = closed_group_sink
         self.closed_group_count = 0
+        self.unrelated_filtered_group_count = 0
         self._next_event_index = 0
         self._next_period_id = 0
         self._next_group_id = 0
@@ -3238,8 +3244,18 @@ class AlarmPeriodMHPAssigner:
         ):
             if self.closed_group_sink is None:
                 raise RuntimeError("incremental closed-group sink is not configured")
-            self.closed_group_sink(self._assemble_group_record(group, prepared))
-            self.closed_group_count += 1
+            record = self._assemble_group_record(group, prepared)
+            # Output-only unrelated filter: drop groups with no unrelated edge
+            # before they reach the sink, so both the groups JSONL and the visual
+            # stream skip them together.
+            if not (
+                self.config.only_unrelated
+                and int(record.get("unrelated_edge_count", 0)) == 0
+            ):
+                self.closed_group_sink(record)
+                self.closed_group_count += 1
+            else:
+                self.unrelated_filtered_group_count += 1
 
         # Periods retained for active-group output may already be older than the
         # matching horizon. Re-arm their original expiry deadline now that the
@@ -3467,12 +3483,30 @@ class AlarmPeriodMHPAssigner:
         summary_by_index = {event.index: summary for event, summary in zip(events, summaries)}
         anchor = self.periods.get(group.anchor_period_id)
         root_event = anchor.events[0] if anchor is not None and anchor.events else events[0]
+        # Only the ``global``/``unrelated`` scopes can attach across the related
+        # predicate; under ``related`` there is no unrelated edge to tag, so skip
+        # the per-edge predicate entirely.
+        tag_unrelated = self.config.candidate_scope in ("global", "unrelated")
         edges = []
+        unrelated_edge_count = 0
         for rel in sorted(group.evidence_by_pair.values(), key=lambda x: (-x.score, x.period_pair)):
             if rel.target_period_id not in group.period_ids or rel.source_period_id not in group.period_ids:
                 continue
             src = summary_by_index.get(rel.source_event.index, {})
             tgt = summary_by_index.get(rel.target_event.index, {})
+            is_unrelated = False
+            if tag_unrelated:
+                src_period = self.periods.get(rel.source_period_id)
+                tgt_period = self.periods.get(rel.target_period_id)
+                is_unrelated = bool(
+                    src_period is not None
+                    and tgt_period is not None
+                    and not self.plan._is_related_period_type_pair(
+                        src_period.period_type, tgt_period.period_type
+                    )
+                )
+                if is_unrelated:
+                    unrelated_edge_count += 1
             edges.append(
                 {
                     "source_period_id": rel.source_period_id,
@@ -3487,6 +3521,9 @@ class AlarmPeriodMHPAssigner:
                     "target_type": rel.target_event.alarm_type,
                     "source_virtual": bool(src.get("virtual")),
                     "target_virtual": bool(tgt.get("virtual")),
+                    # Provenance: the pair was associated across the unrelated
+                    # candidate scope (no entity/site/topology relation).
+                    "unrelated": is_unrelated,
                     "score": float(rel.score),
                     "strength": float(rel.strength),
                 }
@@ -3501,6 +3538,7 @@ class AlarmPeriodMHPAssigner:
             "virtual_event_count": virtual_event_count,
             "alarm_period_count": len(periods),
             "virtual_period_count": virtual_period_count,
+            "unrelated_edge_count": unrelated_edge_count,
             "start_ts": min_ts,
             "end_ts": max_ts,
             "duration_sec": max_ts - min_ts,
@@ -3567,6 +3605,7 @@ class AlarmPeriodMHPAssigner:
             ),
             "active_group_count": len(self.groups),
             "closed_group_count": self.closed_group_count,
+            "unrelated_filtered_group_count": self.unrelated_filtered_group_count,
             **impute_stats,
         }
 
@@ -4002,6 +4041,16 @@ def _build_parser():
         help="Comma-separated relation multipliers, same format as stream_alarm_mhp.py.",
     )
     parser.add_argument(
+        "--only-unrelated",
+        action="store_true",
+        help=(
+            "Output-only filter: emit (groups JSONL + visualization) only fault "
+            "groups that contain at least one unrelated-scope association edge. "
+            "Does not change candidate scoring; typically paired with "
+            "--candidate-scope global/unrelated."
+        ),
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=1,
@@ -4195,6 +4244,7 @@ def main():
         merge_min_evidence=args.merge_min_evidence,
         candidate_scope=args.candidate_scope,
         topology_relation_prior=relation_prior,
+        only_unrelated=bool(args.only_unrelated),
     )
     try:
         config.validate()
@@ -4205,6 +4255,13 @@ def main():
         parser.error("--candidate-policy is required for --candidate-scope unrelated")
     if args.candidate_policy and config.candidate_scope != "unrelated":
         parser.error("--candidate-policy requires --candidate-scope unrelated")
+    if config.only_unrelated and config.candidate_scope == "related" and not args.quiet:
+        print(
+            "[period] warning: --only-unrelated with --candidate-scope related "
+            "never tags unrelated edges; output will be empty. Use "
+            "--candidate-scope global or unrelated.",
+            flush=True,
+        )
     candidate_policy = None
     if args.candidate_policy:
         with _profile_phase(timer, "init.load_candidate_policy"):

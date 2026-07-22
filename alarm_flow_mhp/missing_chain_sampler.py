@@ -75,6 +75,10 @@ TypeKey = object
 # consumers can treat MHP-imputed groups the same way as BRUNCH ones.
 MHP_RULE = "alarm_flow_mhp"
 MHP_VIRTUAL_RULE = "alarm_flow_mhp_virtual_event"
+# Edges associated across the "unrelated" candidate scope (no entity/site/
+# topology relation between the two period types). Surfaced as a distinct
+# dashed/virtual edge and as its own overview filter rule.
+MHP_UNRELATED_RULE = "alarm_flow_mhp_unrelated"
 
 
 # --------------------------------------------------------------------------

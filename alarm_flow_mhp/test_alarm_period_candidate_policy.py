@@ -47,7 +47,11 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
     build_compact_csr_arrays,
 )
 from alarm_flow_mhp.stream_alarm_mhp import OnlineEvent
-from alarm_flow_mhp.visual_output import _symptom_to_visual_record_mhp
+from alarm_flow_mhp.visual_output import (
+    MHP_UNRELATED_RULE,
+    _symptom_to_visual_record_mhp,
+    group_to_visual_match_mhp,
+)
 from fault_grouping.matching.profiling import PhaseTimer
 from fault_grouping.tools.analyze_visual_group_clear_metrics import (
     ClearedAlarm,
@@ -1154,6 +1158,10 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
         engine.artifact = SimpleNamespace(
             config=SimpleNamespace(topology_node_field=node_field)
         )
+        engine.config = SimpleNamespace(candidate_scope="related")
+        engine.plan = SimpleNamespace(
+            _is_related_period_type_pair=lambda _a, _b: True
+        )
         engine.feature_scorer = SimpleNamespace(
             node_infos={
                 "A": SimpleNamespace(site_id="S1"),
@@ -1258,6 +1266,150 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
         self.assertTrue(visual["virtual"])
         self.assertEqual(record["edges"][0]["source_virtual"], True)
         self.assertEqual(record["edges"][0]["target_virtual"], False)
+        # Default (related) scope never tags an edge as unrelated.
+        self.assertFalse(record["edges"][0]["unrelated"])
+        self.assertEqual(record["unrelated_edge_count"], 0)
+
+    @staticmethod
+    def _real_period(period_id, entity, alarm_type, ts):
+        period = AlarmPeriod(
+            period_id=period_id,
+            period_type=PeriodType(entity, alarm_type),
+            initial_state=(0, 0, 0),
+            initial_state_combo=0,
+            first_ts=ts,
+            last_raise_ts=ts,
+        )
+        period.append(
+            OnlineEvent(
+                index=period_id,
+                ts=ts,
+                type_id=-1,
+                type_label=alarm_type,
+                alarm={
+                    "eid": f"real-{period_id}",
+                    "occurrence_uuid": f"00000000-0000-0000-0000-0000000000{period_id:02d}",
+                    "ts": ts,
+                    "alarm_source": entity,
+                    "alarm_title": "",
+                    "alarm": {},
+                },
+                alarm_type=alarm_type,
+                ne=entity,
+            )
+        )
+        return period
+
+    def test_unrelated_scope_edge_is_tagged(self):
+        engine = self._virtual_engine()
+        # Global scope can attach across the related predicate; force the plan
+        # predicate to report the pair as unrelated so the edge is tagged.
+        engine.config = SimpleNamespace(candidate_scope="global")
+        engine.plan = SimpleNamespace(
+            _is_related_period_type_pair=lambda _a, _b: False
+        )
+        source = self._real_period(20, "A", "link", 40.0)
+        target = self._real_period(21, "B", "power", 50.0)
+        engine.periods[source.period_id] = source
+        engine.periods[target.period_id] = target
+        group = PeriodFaultGroup(
+            group_id=4,
+            anchor_period_id=target.period_id,
+            period_ids={source.period_id, target.period_id},
+        )
+        group.evidence_by_pair[(source.period_id, target.period_id)] = RelationEvidence(
+            target_period_id=target.period_id,
+            source_period_id=source.period_id,
+            target_event=target.events[0],
+            source_event=source.events[0],
+            score=10.0,
+            strength=10.0,
+            edge=CompiledEdge(10.0, 1.0, 60.0, 0.0),
+        )
+
+        record = engine._group_record(group)
+        self.assertTrue(record["edges"][0]["unrelated"])
+        self.assertEqual(record["unrelated_edge_count"], 1)
+
+        # The visual layer turns the flag into a dashed virtual edge plus an
+        # overview filter rule.
+        ne_graph = {"A": {"alarm_source": "A"}, "B": {"alarm_source": "B"}}
+        match = group_to_visual_match_mhp(record, ne_graph_data=ne_graph)
+        self.assertIn(MHP_UNRELATED_RULE, match["merged_rules"])
+        prop = match["missing_topology_edges"]
+        self.assertTrue(prop)
+        self.assertEqual(prop[0]["relation"], "mhp_unrelated")
+        self.assertEqual(prop[0]["edge_source"], MHP_UNRELATED_RULE)
+        self.assertTrue(prop[0]["virtual_edge"])
+
+    def _finalize_engine(self, *, only_unrelated, related_pair):
+        engine = self._virtual_engine()
+        engine.config = SimpleNamespace(
+            candidate_scope="global",
+            min_group_events=1,
+            min_site_num=1,
+            only_unrelated=only_unrelated,
+        )
+        engine.plan = SimpleNamespace(
+            _is_related_period_type_pair=lambda _a, _b: related_pair
+        )
+        engine.groups = {}
+        engine.closed_group_count = 0
+        engine.unrelated_filtered_group_count = 0
+        engine._prune_merge_proposals_for_group = lambda _gid: None
+        engine._schedule_period_eviction = lambda _period: None
+        emitted = []
+        engine.closed_group_sink = emitted.append
+        return engine, emitted
+
+    def _two_period_group(self, engine, gid):
+        source = self._real_period(20, "A", "link", 40.0)
+        target = self._real_period(21, "B", "power", 50.0)
+        engine.periods[source.period_id] = source
+        engine.periods[target.period_id] = target
+        group = PeriodFaultGroup(
+            group_id=gid,
+            anchor_period_id=target.period_id,
+            period_ids={source.period_id, target.period_id},
+        )
+        group.evidence_by_pair[(source.period_id, target.period_id)] = RelationEvidence(
+            target_period_id=target.period_id,
+            source_period_id=source.period_id,
+            target_event=target.events[0],
+            source_event=source.events[0],
+            score=10.0,
+            strength=10.0,
+            edge=CompiledEdge(10.0, 1.0, 60.0, 0.0),
+        )
+        engine.groups[gid] = group
+        return group
+
+    def test_only_unrelated_filter_drops_groups_without_unrelated_edge(self):
+        # Group whose single edge is related -> filtered out under --only-unrelated.
+        engine, emitted = self._finalize_engine(only_unrelated=True, related_pair=True)
+        self._two_period_group(engine, gid=5)
+        engine._finalize_group(5)
+        self.assertEqual(emitted, [])
+        self.assertEqual(engine.closed_group_count, 0)
+        self.assertEqual(engine.unrelated_filtered_group_count, 1)
+
+    def test_only_unrelated_filter_keeps_groups_with_unrelated_edge(self):
+        engine, emitted = self._finalize_engine(only_unrelated=True, related_pair=False)
+        self._two_period_group(engine, gid=6)
+        engine._finalize_group(6)
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0]["unrelated_edge_count"], 1)
+        self.assertEqual(engine.closed_group_count, 1)
+        self.assertEqual(engine.unrelated_filtered_group_count, 0)
+
+    def test_related_group_still_emitted_without_only_unrelated(self):
+        # Without the filter, a related-only group is emitted as usual.
+        engine, emitted = self._finalize_engine(only_unrelated=False, related_pair=True)
+        self._two_period_group(engine, gid=7)
+        engine._finalize_group(7)
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(engine.closed_group_count, 1)
+        self.assertEqual(engine.unrelated_filtered_group_count, 0)
 
     def test_min_score_ratio_is_a_pre_kappa_guard(self):
         edge = CompiledEdge(

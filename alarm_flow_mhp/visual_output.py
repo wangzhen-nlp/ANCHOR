@@ -28,7 +28,11 @@ from alarm_flow_brunch.visual_output import (
     _symptom_site_id,
     load_json_object,
 )
-from alarm_flow_mhp.missing_chain_sampler import MHP_RULE, MHP_VIRTUAL_RULE
+from alarm_flow_mhp.missing_chain_sampler import (
+    MHP_RULE,
+    MHP_UNRELATED_RULE,
+    MHP_VIRTUAL_RULE,
+)
 
 
 def _classify_mhp_edge(ne_graph_data, source_symptom, target_symptom):
@@ -84,7 +88,14 @@ def _mhp_propagation_edges(group, ne_graph_data):
             continue
         if _has_direct_ne_link(ne_graph_data, src_ne, tgt_ne):
             continue
-        relation, hops = _classify_mhp_edge(ne_graph_data, src, tgt)
+        # An "unrelated"-scope association has no entity/site/topology basis; it
+        # overrides the topology relation with its own tag so the browser can
+        # render it as a dashed virtual edge and filter it by the unrelated rule.
+        is_unrelated = bool(edge.get("unrelated"))
+        if is_unrelated:
+            relation, hops = "mhp_unrelated", None
+        else:
+            relation, hops = _classify_mhp_edge(ne_graph_data, src, tgt)
         key = (
             str(src_index),
             str(tgt_index),
@@ -128,8 +139,16 @@ def _mhp_propagation_edges(group, ne_graph_data):
             # provenance: which side of the edge is an imputed (missing) node
             "source_virtual": bool(edge.get("source_virtual")),
             "target_virtual": bool(edge.get("target_virtual")),
-            "edge_source": MHP_RULE,
-            "description": "MHP imputed parent-child propagation edge (may pass through an unobserved/missing event)",
+            # An unrelated-scope edge is itself a virtual/dashed link (no topology
+            # basis), independent of whether either endpoint is an imputed node.
+            "unrelated": is_unrelated,
+            "virtual_edge": is_unrelated,
+            "edge_source": MHP_UNRELATED_RULE if is_unrelated else MHP_RULE,
+            "description": (
+                "MHP unrelated-scope association edge (no entity/site/topology relation)"
+                if is_unrelated
+                else "MHP imputed parent-child propagation edge (may pass through an unobserved/missing event)"
+            ),
         })
     return edges
 
@@ -170,6 +189,16 @@ def group_to_visual_match_mhp(group, ne_graph_data=None):
     merged_rules = list(group.get("merged_rules") or [])
     if not merged_rules and int(group.get("virtual_event_count", 0) or 0) > 0:
         merged_rules = [MHP_RULE, MHP_VIRTUAL_RULE]
+    # Advertise the unrelated rule on the overview so groups that used an
+    # unrelated-scope association can be filtered. Derived from the raw edge
+    # provenance (not prop_edges) so it holds even without an NE graph.
+    has_unrelated = int(group.get("unrelated_edge_count", 0) or 0) > 0 or any(
+        edge.get("unrelated") for edge in group.get("edges") or []
+    )
+    if has_unrelated and MHP_UNRELATED_RULE not in merged_rules:
+        if MHP_RULE not in merged_rules:
+            merged_rules.append(MHP_RULE)
+        merged_rules.append(MHP_UNRELATED_RULE)
     return {
         "uuid": group.get("group_id", ""),
         "rule": group.get("rule") or MHP_RULE,
