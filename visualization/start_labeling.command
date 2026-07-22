@@ -22,7 +22,9 @@ if [ -d data ]; then
             first=1
             for f in "${files[@]}"; do
                 while IFS= read -r line || [ -n "$line" ]; do
-                    [ -z "${line//[[:space:]]/}" ] && continue
+                    # 跳过纯空白行。注意：不能用 ${line//[[:space:]]/}，macOS 自带 bash 3.2
+                    # 对长字符串的全局替换有 O(n²) 性能塌陷，单行大 JSON 会卡死。
+                    case $line in *[![:space:]]*) : ;; *) continue ;; esac
                     if [ $first -eq 1 ]; then first=0; else printf ','; fi
                     printf '%s' "$line"
                 done < "$f"
