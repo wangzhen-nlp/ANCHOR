@@ -325,6 +325,10 @@ class PeriodStreamConfig:
     # Purely a sink-side gate; it never affects candidate enumeration/scoring or
     # the association fingerprint.
     only_unrelated: bool = False
+    # Output-only filter (analogous to only_unrelated): when set, emit only fault
+    # groups that contain at least one imputed (virtual) event. Requires --impute
+    # to have births; also a sink-side gate with no effect on scoring.
+    only_impute: bool = False
 
     def validate(self):
         if self.aggregation_wait_sec < 0:
@@ -2393,6 +2397,7 @@ class AlarmPeriodMHPAssigner:
         self.closed_group_sink = closed_group_sink
         self.closed_group_count = 0
         self.unrelated_filtered_group_count = 0
+        self.impute_filtered_group_count = 0
         self._next_event_index = 0
         self._next_period_id = 0
         self._next_group_id = 0
@@ -3274,17 +3279,26 @@ class AlarmPeriodMHPAssigner:
             if self.closed_group_sink is None:
                 raise RuntimeError("incremental closed-group sink is not configured")
             record = self._assemble_group_record(group, prepared)
-            # Output-only unrelated filter: drop groups with no unrelated edge
+            # Output-only filters: drop groups that fail an enabled sink-side gate
             # before they reach the sink, so both the groups JSONL and the visual
-            # stream skip them together.
-            if not (
+            # stream skip them together. Filters are independent and conjunctive —
+            # a group must satisfy every enabled one to be emitted.
+            dropped_unrelated = (
                 self.config.only_unrelated
                 and int(record.get("unrelated_edge_count", 0)) == 0
-            ):
+            )
+            dropped_impute = (
+                self.config.only_impute
+                and int(record.get("virtual_event_count", 0)) == 0
+            )
+            if dropped_unrelated or dropped_impute:
+                if dropped_unrelated:
+                    self.unrelated_filtered_group_count += 1
+                if dropped_impute:
+                    self.impute_filtered_group_count += 1
+            else:
                 self.closed_group_sink(record)
                 self.closed_group_count += 1
-            else:
-                self.unrelated_filtered_group_count += 1
 
         # Periods retained for active-group output may already be older than the
         # matching horizon. Re-arm their original expiry deadline now that the
@@ -3637,6 +3651,7 @@ class AlarmPeriodMHPAssigner:
             "active_group_count": len(self.groups),
             "closed_group_count": self.closed_group_count,
             "unrelated_filtered_group_count": self.unrelated_filtered_group_count,
+            "impute_filtered_group_count": self.impute_filtered_group_count,
             **impute_stats,
         }
 
@@ -4082,6 +4097,15 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--only-impute",
+        action="store_true",
+        help=(
+            "Output-only filter: emit (groups JSONL + visualization) only fault "
+            "groups that contain at least one imputed (virtual) event. Requires "
+            "--impute; does not change candidate scoring."
+        ),
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=1,
@@ -4276,6 +4300,7 @@ def main():
         candidate_scope=args.candidate_scope,
         topology_relation_prior=relation_prior,
         only_unrelated=bool(args.only_unrelated),
+        only_impute=bool(args.only_impute),
     )
     try:
         config.validate()
@@ -4291,6 +4316,12 @@ def main():
             "[period] warning: --only-unrelated with --candidate-scope related "
             "never tags unrelated edges; output will be empty. Use "
             "--candidate-scope global or unrelated.",
+            flush=True,
+        )
+    if config.only_impute and not getattr(args, "impute", False) and not args.quiet:
+        print(
+            "[period] warning: --only-impute without --impute produces no virtual "
+            "events; output will be empty. Add --impute to enable imputation.",
             flush=True,
         )
     candidate_policy = None
