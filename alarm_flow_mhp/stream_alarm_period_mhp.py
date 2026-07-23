@@ -4155,7 +4155,9 @@ def _build_parser():
         default=0.0,
         help=(
             "Seconds to place the virtual source before the target's first "
-            "occurrence. 0 ⇒ fall back to --time-slack-sec (MAP placement)."
+            "occurrence. 0 (default) ⇒ MAP placement dt→0 (highest score). Does "
+            "not fall back to --time-slack-sec, whose future-window slack would "
+            "decay the score and filter out all candidate edges."
         ),
     )
     parser.add_argument(

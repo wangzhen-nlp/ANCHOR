@@ -48,8 +48,9 @@ class PeriodImputeConfig:
     (more negative ⇒ fewer / stricter births), aligned with
     ``--impute-kappa`` in the
     occurrence engine.  ``lag_sec`` places the virtual source that many seconds
-    before the target's first occurrence; ``0`` falls back to the engine's
-    ``time_slack_sec`` (the exp kernel's MAP placement is "as close as allowed").
+    before the target's first occurrence; ``0`` (the default) means the exp
+    kernel's MAP placement, dt -> 0 (as close to the target as possible, the
+    highest-scoring position). It does not fall back to ``time_slack_sec``.
     """
 
     enabled: bool = False
@@ -213,10 +214,20 @@ class PeriodSourceImputer:
         return best
 
     def _source_offset_sec(self) -> float:
-        cfg = self.config
-        if cfg.lag_sec > 0:
-            return float(cfg.lag_sec)
-        return float(self.engine.config.time_slack_sec)
+        # MAP placement for the backward exp-excitation kernel is dt -> 0: the
+        # closer the hypothesised source sits to the target, the higher its
+        # score. So the default offset is 0. An explicit --impute-lag-sec pushes
+        # the source further back if desired.
+        #
+        # This deliberately does NOT fall back to the engine's time_slack_sec.
+        # time_slack_sec is a *future*-window slack (a source may appear that
+        # many seconds *after* the target and still match); using it as a
+        # *backward* offset both needlessly decays the score by
+        # exp(-beta*slack/scale) and, because the same offset is passed as the
+        # top_edges min_past_window floor, filters out every candidate edge whose
+        # reachable past window is shorter than the slack. With a large slack
+        # (e.g. 300s) that silently zeroes out all imputation candidates.
+        return float(self.config.lag_sec)
 
     def _source_signature(self, source_key):
         """Coerce a plan candidate key into a concrete source PeriodSignature.
