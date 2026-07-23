@@ -63,6 +63,11 @@ def _text(value):
     return str(value if value is not None else "").strip()
 
 
+def _as_list(value):
+    """把输入字段归一成 list：非 list（标量/None/dict 等畸形输入）一律当空，避免迭代报错。"""
+    return value if isinstance(value, list) else []
+
+
 def _ms_to_ts(value):
     """毫秒时间戳 -> 秒（float）。空/非法返回 None。"""
     if value in (None, "", 0, "0"):
@@ -82,7 +87,7 @@ def _ms_to_ts(value):
 def _dedup_resources_by_vid(resources):
     """以 resourceVid 为准去重（resources 可能有重复行）。"""
     vid_to_resource = OrderedDict()
-    for res in resources:
+    for res in _as_list(resources):
         if not isinstance(res, dict):
             continue
         vid = _text(res.get("resourceVid"))
@@ -108,7 +113,7 @@ def _resource_name_maps(vid_to_resource):
 def _build_adjacency(res_rels, vid_to_nename):
     """网元-网元无向邻接（以 neName 为节点）；resourceRelations 的 src/dst 不作为方向。"""
     adjacency = defaultdict(dict)  # ne -> {peer_ne: {layers:set}}
-    for rel in res_rels or []:
+    for rel in _as_list(res_rels):
         if not isinstance(rel, dict):
             continue
         src = vid_to_nename.get(_text(rel.get("srcVid")))
@@ -410,12 +415,12 @@ def find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adja
 
 
 # --------------------------------------------------------------------------- #
-# 单个故障组 -> 根因设备
+# 告警定位（neName）与诊断入口
 # --------------------------------------------------------------------------- #
 def _alarm_vid_to_ne(happen_rels, vid_to_nename):
     """告警顶点 vid -> neName：经 happenRelations(srcVid->dstVid) 再查 resourceVid->neName。"""
     mapping = {}
-    for h in happen_rels or []:
+    for h in _as_list(happen_rels):
         if not isinstance(h, dict):
             continue
         src = _text(h.get("srcVid"))
@@ -436,7 +441,7 @@ def _collect_ne_alarms(alarms, alarm_vid_to_ne):
     返回 (ne_alarms: neName->[{alarm_type,ts}], ne_alarm_fallback: neName->一条原始告警)。"""
     ne_alarms = OrderedDict()
     ne_alarm_fallback = {}
-    for alarm in alarms or []:
+    for alarm in _as_list(alarms):
         if not isinstance(alarm, dict):
             continue
         nename = _resolve_nename(alarm, alarm_vid_to_ne)
@@ -454,7 +459,7 @@ def _collect_ne_alarms(alarms, alarm_vid_to_ne):
 def _collect_ne_to_alarm_objs(alarms, alarm_vid_to_ne):
     """按定位到的 neName 归拢原始告警对象（丢弃非 dict / 无法定位 neName 的告警）。"""
     ne_to_alarm_objs = OrderedDict()
-    for alarm in alarms or []:
+    for alarm in _as_list(alarms):
         if not isinstance(alarm, dict):
             continue
         nename = _resolve_nename(alarm, alarm_vid_to_ne)
@@ -510,8 +515,6 @@ def _diagnose_root_nes(alarms, resource_by_nename, adjacency, all_ne_names, alar
     display_nes = _dedup_extend(core_nes, all_ne_names)
     ne_site, ne_role = _ne_site_and_role(display_nes, resource_by_nename, ne_alarm_fallback)
     root = find_upstream_roots(core_nes, ne_alarms, display_nes, ne_site, ne_role, adjacency)
-
-    # 只在唯一定位到一个根因站点时才产出；0 个或多个视为无法定位，返回空。
     if len(root["root_sites"]) != 1:
         return []
     return _root_cause_nes(root)
@@ -526,9 +529,10 @@ def diagnose_root_cause_devices(input_json):
         - root_cause_resources: [{"resourceName": neName, "confidence": 0.9}, ...]，
           去重、保序；0 个或多个根因站点视为无法定位，返回空列表。
         - ne_to_alarm_objs: {neName: [原始告警对象, ...]}，按定位到的 neName 归拢全部告警。
+    输入格式不正确（非 dict、字段非 list 等）不抛异常，返回 ([], {})。
     """
     if not isinstance(input_json, dict):
-        raise TypeError("input_json 必须是 dict（含 alarms/resources/resourceRelations）")
+        return [], {}
 
     _, vid_to_nename, resource_by_nename, adjacency = build_indexes(input_json)
     all_ne_names = sorted(resource_by_nename.keys())
