@@ -124,8 +124,8 @@ def _mhp_propagation_edges(group, ne_graph_data):
             "target_index": tgt_index,
             "source_occurrence_uuid": src_occurrence_uuid,
             "target_occurrence_uuid": tgt_occurrence_uuid,
-            "source_alarm": src.get("alarm_title", ""),
-            "target_alarm": tgt.get("alarm_title", ""),
+            "source_alarm": src.get("alarm_title") or src.get("alarm_type", ""),
+            "target_alarm": tgt.get("alarm_title") or tgt.get("alarm_type", ""),
             "source_type": edge.get("source_type", ""),
             "target_type": edge.get("target_type", ""),
             "relation": relation,
@@ -158,11 +158,18 @@ def _symptom_to_visual_record_mhp(symptom):
     marks imputed nodes with the missing rule so node-level filtering works."""
     is_virtual = bool(symptom.get("virtual", False))
     eid, occurrence_uuid = require_alarm_identity(symptom)
+    alarm_title = str(symptom.get("alarm_title", "") or "")
+    alarm_type = str(symptom.get("alarm_type", "") or "")
+    display_alarm = alarm_title or alarm_type
     record = {
         "node": symptom.get("site_id", ""),
         "alarm_source": symptom.get("alarm_source", ""),
-        "alarm": symptom.get("alarm_title", ""),
-        "alarm_type": symptom.get("alarm_type", ""),
+        # The shared visualization builder maps ``alarm`` into the per-NE
+        # ``alarm_type`` displayed by ne_propagation_visualizer.html. Imputed
+        # periods intentionally have no raw alarm title, so fall back to their
+        # model category (link/power/offline) instead of emitting an empty type.
+        "alarm": display_alarm,
+        "alarm_type": alarm_type or alarm_title,
         "ts": symptom.get("ts"),
         "eid": eid,
         "occurrence_uuid": occurrence_uuid,
@@ -170,7 +177,10 @@ def _symptom_to_visual_record_mhp(symptom):
         "virtual": is_virtual,
         "latent": bool(symptom.get("latent", False)),
         "confidence": symptom.get("confidence", 1.0),
-        "virtual_source": symptom.get("virtual_source", ""),
+        "virtual_source": (
+            symptom.get("virtual_source", "")
+            or (alarm_type if is_virtual else "")
+        ),
         "matched_rule": MHP_VIRTUAL_RULE if is_virtual else MHP_RULE,
         "matched_role": "cascade",
         "matched_role_key": "cascade",

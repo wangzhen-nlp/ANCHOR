@@ -1193,6 +1193,10 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
         self.assertEqual(symptom["alarm_title"], "")
         self.assertEqual(symptom["alarm_source"], "A")
         self.assertEqual(symptom["site_id"], "S1")
+        visual = _symptom_to_visual_record_mhp(symptom)
+        self.assertEqual(visual["alarm"], "link")
+        self.assertEqual(visual["alarm_type"], "link")
+        self.assertEqual(visual["virtual_source"], "link")
 
         site_engine = self._virtual_engine(node_field="site_id")
         site_period = site_engine.create_virtual_source_period(
