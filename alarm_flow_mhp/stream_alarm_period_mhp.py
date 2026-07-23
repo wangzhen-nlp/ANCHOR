@@ -1411,6 +1411,23 @@ class CompiledAssociationPlan:
         if signature in self.signatures:
             return
         covered_type = signature.period_type in self.covered_period_types
+        if not covered_type and os.environ.get("PERIOD_DEBUG_COVERAGE"):
+            pt = signature.period_type
+            covered = self.covered_period_types
+            entity_hit = any(c.entity == pt.entity for c in covered)
+            at_hit = any(c.alarm_type == pt.alarm_type for c in covered)
+            sample = [
+                (c.entity, c.alarm_type)
+                for c in list(covered)[:5]
+            ]
+            raise SystemExit(
+                "[coverage-miss] runtime period_type=("
+                f"entity={pt.entity!r}, alarm_type={pt.alarm_type!r}); "
+                f"universe_size={len(covered)}; "
+                f"entity_in_universe={entity_hit}; "
+                f"alarm_type_in_universe={at_hit}; "
+                f"universe_sample={sample}"
+            )
         partial_related_base = (
             covered_type
             and self.precompiled_candidate_scope == "related"
