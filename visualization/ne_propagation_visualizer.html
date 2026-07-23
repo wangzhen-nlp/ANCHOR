@@ -4140,6 +4140,35 @@
             return parts[parts.length - 1] || fullId;
         }
 
+        // Region 取值：与后端 topology_tools.region_utils.get_region 同一套 REGION_KEYS
+        // 优先级。node 白名单组装通常不带 region，故回退到已加载的 neGraphData 原始节点。
+        function getNodeRegion(nodeOrId) {
+            const REGION_KEYS = ['region_id', 'regionId', 'regionId1', 'region', 'area_id', 'area', '区域', '地市'];
+            function pick(info) {
+                if (!info || typeof info !== 'object') return '';
+                for (let i = 0; i < REGION_KEYS.length; i++) {
+                    const value = info[REGION_KEYS[i]];
+                    if (value !== undefined && value !== null && String(value).trim() !== '') {
+                        return String(value).trim();
+                    }
+                }
+                return '';
+            }
+            // 1) node 自身若已带 region 字段（如 Object.assign 展开的路径）
+            if (nodeOrId && typeof nodeOrId === 'object') {
+                const direct = pick(nodeOrId);
+                if (direct) return direct;
+            }
+            // 2) 用 NE id 回查 ne_graph 原始节点
+            if (typeof neGraphData === 'object' && neGraphData) {
+                const fullId = typeof nodeOrId === 'string' ? nodeOrId : ((nodeOrId && nodeOrId.id) || '');
+                const info = neGraphData[fullId] || neGraphData[getRawNodeId(nodeOrId)] || null;
+                const fromGraph = pick(info);
+                if (fromGraph) return fromGraph;
+            }
+            return '';
+        }
+
         function formatTimestampSeconds(ts) {
             if (ts === null || ts === undefined || ts === '') return '';
             const numberTs = Number(ts);
@@ -4723,7 +4752,8 @@
                     '<div class="popup-row">类型: ' + (node.network_type || node.type || '-') + '</div>' +
                     '<div class="popup-row">Domain: <span style="color:' + style.color + '; font-weight:bold;">' + style.label + '</span></div>' +
                     '<div class="popup-row">厂商: ' + (node.manufacturer || '-') + '</div>' +
-                    '<div class="popup-row">坐标: ' + lat.toFixed(6) + ', ' + lng.toFixed(6) + '</div>';
+                    '<div class="popup-row">坐标: ' + lat.toFixed(6) + ', ' + lng.toFixed(6) + '</div>' +
+                    '<div class="popup-row">区域: ' + (escapeHtml(getNodeRegion(node)) || '-') + '</div>';
 
                 if (node.alarm && node.alarm.length > 0) {
                     const alarmGroups = getNodeAlarmGroupIds(node);
