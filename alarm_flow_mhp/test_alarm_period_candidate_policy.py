@@ -1628,6 +1628,31 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
         self.assertEqual(seen_dt, [0.0])
         self.assertEqual(imputer._source_offset_sec(), 0.0)
 
+    def test_source_signature_accepts_direct_script_class_identity(self):
+        class DirectPeriodType:
+            def __init__(self, entity, alarm_type):
+                self.entity = entity
+                self.alarm_type = alarm_type
+
+        class DirectPeriodSignature:
+            def __init__(self, period_type, initial_state):
+                self.period_type = period_type
+                self.initial_state = initial_state
+
+        target = DirectPeriodSignature(DirectPeriodType("A", "X"), 3)
+        source_type = DirectPeriodType("B", "Y")
+        source_signature = DirectPeriodSignature(source_type, 5)
+
+        coerced_type = PeriodSourceImputer._source_signature(source_type, target)
+        coerced_signature = PeriodSourceImputer._source_signature(
+            source_signature, target
+        )
+
+        self.assertIs(type(coerced_type), DirectPeriodSignature)
+        self.assertIs(coerced_type.period_type, source_type)
+        self.assertEqual(coerced_type.initial_state, 0)
+        self.assertIs(coerced_signature, source_signature)
+
     def test_config_rejects_non_finite_and_rewarding_values(self):
         invalid = (
             {"kappa": 0.1},

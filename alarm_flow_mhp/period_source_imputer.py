@@ -198,7 +198,7 @@ class PeriodSourceImputer:
         examined = 0
         scored_any = False
         for source_key, edge in incoming:
-            src_sig = self._source_signature(source_key)
+            src_sig = self._source_signature(source_key, sig)
             if src_sig is None:
                 continue
             # Skip a same-type self-source: a period explaining "itself" is a
@@ -384,21 +384,40 @@ class PeriodSourceImputer:
         # (e.g. 300s) that silently zeroes out all imputation candidates.
         return float(self.config.lag_sec)
 
-    def _source_signature(self, source_key):
+    @staticmethod
+    def _source_signature(source_key, target_signature):
         """Coerce a plan candidate key into a concrete source PeriodSignature.
 
         The compact index yields a bare ``PeriodType`` under the target-only
         state layout; the full layout already yields a ``PeriodSignature``.  A
         virtual source has no observed frozen state, so it defaults to the
         all-clear combo (0), the neutral choice.
-        """
-        from alarm_flow_mhp.stream_alarm_period_mhp import PeriodSignature, PeriodType
 
-        if isinstance(source_key, PeriodSignature):
+        Derive the classes from the live target instead of importing them back
+        from ``stream_alarm_period_mhp``.  When that file is executed by path,
+        its classes belong to ``__main__``; importing the canonical module again
+        would create lookalike classes for which ``isinstance`` is false.
+        """
+        signature_type = type(target_signature)
+        period_type = type(target_signature.period_type)
+        if isinstance(source_key, signature_type):
             return source_key
-        if isinstance(source_key, PeriodType):
-            return PeriodSignature(source_key, 0)
-        return None
+        if isinstance(source_key, period_type):
+            return signature_type(source_key, 0)
+
+        # Be tolerant of a key produced by another import identity.  This can
+        # happen in embedding/runpy environments even when the CLI alias above
+        # is not installed.
+        source_period_type = getattr(source_key, "period_type", None)
+        initial_state = getattr(source_key, "initial_state", 0)
+        if source_period_type is None:
+            source_period_type = source_key
+        entity = getattr(source_period_type, "entity", None)
+        alarm_type = getattr(source_period_type, "alarm_type", None)
+        if entity is None or alarm_type is None:
+            return None
+        normalized_type = period_type(str(entity), str(alarm_type))
+        return signature_type(normalized_type, int(initial_state))
 
     # ---- birth -----------------------------------------------------------
 

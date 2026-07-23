@@ -38,6 +38,7 @@ except ImportError:  # optional; falls back to stdlib json when unavailable
     _orjson = None
 import math
 import os
+import sys
 import time
 from typing import Optional
 
@@ -45,6 +46,13 @@ if __package__ in (None, ""):
     from _script_env import ensure_repo_root
 
     ensure_repo_root(1)
+
+# Direct execution gives this file the module name ``__main__``.  The period
+# imputer imports a few engine record types lazily through the canonical package
+# name; without this alias Python loads this file a second time and creates
+# incompatible duplicate PeriodType/PeriodSignature classes.
+if __name__ == "__main__":
+    sys.modules["alarm_flow_mhp.stream_alarm_period_mhp"] = sys.modules[__name__]
 
 import numpy as np
 
