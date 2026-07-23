@@ -4141,30 +4141,38 @@
         }
 
         // Region 取值：与后端 topology_tools.region_utils.get_region 同一套 REGION_KEYS
-        // 优先级。node 白名单组装通常不带 region，故回退到已加载的 neGraphData 原始节点。
-        function getNodeRegion(nodeOrId) {
-            const REGION_KEYS = ['region_id', 'regionId', 'regionId1', 'region', 'area_id', 'area', '区域', '地市'];
-            function pick(info) {
-                if (!info || typeof info !== 'object') return '';
-                for (let i = 0; i < REGION_KEYS.length; i++) {
-                    const value = info[REGION_KEYS[i]];
-                    if (value !== undefined && value !== null && String(value).trim() !== '') {
-                        return String(value).trim();
-                    }
+        // 优先级（region_id 优先）。
+        const REGION_KEYS = ['region_id', 'regionId', 'regionId1', 'region', 'area_id', 'area', '区域', '地市'];
+        function pickRegionField(info) {
+            if (!info || typeof info !== 'object') return '';
+            for (let i = 0; i < REGION_KEYS.length; i++) {
+                const value = info[REGION_KEYS[i]];
+                if (value !== undefined && value !== null && String(value).trim() !== '') {
+                    return String(value).trim();
                 }
-                return '';
             }
-            // 1) node 自身若已带 region 字段（如 Object.assign 展开的路径）
+            return '';
+        }
+        // 覆盖三个来源，任一命中即返回：节点自身字段 → 已加载的 ne_graph 原始节点 → 该节点的告警记录。
+        function getNodeRegion(nodeOrId) {
+            // 1) node 自身（节点组装已尽量把 region 带出来）
             if (nodeOrId && typeof nodeOrId === 'object') {
-                const direct = pick(nodeOrId);
+                const direct = pickRegionField(nodeOrId);
                 if (direct) return direct;
             }
             // 2) 用 NE id 回查 ne_graph 原始节点
             if (typeof neGraphData === 'object' && neGraphData) {
                 const fullId = typeof nodeOrId === 'string' ? nodeOrId : ((nodeOrId && nodeOrId.id) || '');
                 const info = neGraphData[fullId] || neGraphData[getRawNodeId(nodeOrId)] || null;
-                const fromGraph = pick(info);
+                const fromGraph = pickRegionField(info);
                 if (fromGraph) return fromGraph;
+            }
+            // 3) 回退到该节点的告警记录（部分数据 region 只挂在告警上）
+            if (nodeOrId && typeof nodeOrId === 'object' && Array.isArray(nodeOrId.alarm)) {
+                for (let i = 0; i < nodeOrId.alarm.length; i++) {
+                    const fromAlarm = pickRegionField(nodeOrId.alarm[i]);
+                    if (fromAlarm) return fromAlarm;
+                }
             }
             return '';
         }
@@ -5952,6 +5960,7 @@
                     name: neInfo.name || neId,
                     alarm: nodeAlarms,
                     supplemental_fault_pattern_context: !!neInfo.supplemental_fault_pattern_context,
+                    region_id: pickRegionField(neInfo),
                     latitude: neInfo.latitude !== undefined ? neInfo.latitude : (neInfo.lat !== undefined ? neInfo.lat : undefined),
                     longitude: neInfo.longitude !== undefined ? neInfo.longitude : (neInfo.lon !== undefined ? neInfo.lon : (neInfo.lng !== undefined ? neInfo.lng : undefined))
                 });
