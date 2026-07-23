@@ -106,6 +106,12 @@ class PeriodSourceImputer:
         self.candidates_seen = 0
         self.orphans_with_candidates = 0
         self.max_score_ratio = 0.0
+        # Coverage breakdown for orphans that scored no candidate (see
+        # _diagnose_no_candidate). Exactly one is incremented per such orphan.
+        self.orphan_type_absent = 0
+        self.orphan_no_incoming = 0
+        self.orphan_state_gap = 0
+        self.orphan_incoming_present = 0
 
     # ---- orchestration ---------------------------------------------------
 
@@ -211,7 +217,60 @@ class PeriodSourceImputer:
                 best = (score, src_sig, edge)
         if scored_any:
             self.orphans_with_candidates += 1
+        else:
+            self._diagnose_no_candidate(sig)
         return best
+
+    def _diagnose_no_candidate(self, sig) -> None:
+        """Classify why an orphan scored no candidate (one-run coverage probe).
+
+        Distinguishes the three causes of an empty candidate set so a single run
+        pins the fault without a guess:
+
+        * ``type_absent``   — the target period-type is not in any loaded cache.
+        * ``no_incoming``   — type present but zero incoming edges in any state
+                              (a root/immigrant-only type; imputation cannot and
+                              should not fabricate an upstream cause).
+        * ``state_gap``     — the type has incoming edges under some frozen state,
+                              but none under this orphan's exact state.
+        * ``present``       — incoming edges exist for this exact signature yet
+                              none were scored: a genuine lookup/filter bug.
+        """
+        from alarm_flow_mhp.stream_alarm_period_mhp import PeriodSignature
+
+        plan = self.engine.plan
+        indexes = list(getattr(plan, "precompiled_indexes", None) or [])
+        dynamic = getattr(plan, "edges_by_target", {}) or {}
+
+        type_present = False
+        exact_incoming = 0
+        type_incoming = 0
+        for index in indexes:
+            if index.type_to_id.get(sig.period_type) is None:
+                continue
+            type_present = True
+            exact_incoming += index.target_edge_count(sig)
+            for state in range(8):
+                type_incoming += index.target_edge_count(
+                    PeriodSignature(sig.period_type, state)
+                )
+        for target_sig, row in dynamic.items():
+            if target_sig.period_type != sig.period_type:
+                continue
+            type_present = True
+            count = len(row)
+            type_incoming += count
+            if target_sig == sig:
+                exact_incoming += count
+
+        if not type_present:
+            self.orphan_type_absent += 1
+        elif exact_incoming > 0:
+            self.orphan_incoming_present += 1
+        elif type_incoming > 0:
+            self.orphan_state_gap += 1
+        else:
+            self.orphan_no_incoming += 1
 
     def _source_offset_sec(self) -> float:
         # MAP placement for the backward exp-excitation kernel is dt -> 0: the
@@ -289,4 +348,8 @@ class PeriodSourceImputer:
             "impute_candidates_seen": self.candidates_seen,
             "impute_max_score_ratio": float(self.max_score_ratio),
             "impute_kappa_for_any_birth": kappa_for_any_birth,
+            "impute_orphan_type_absent": self.orphan_type_absent,
+            "impute_orphan_no_incoming": self.orphan_no_incoming,
+            "impute_orphan_state_gap": self.orphan_state_gap,
+            "impute_orphan_incoming_present": self.orphan_incoming_present,
         }
