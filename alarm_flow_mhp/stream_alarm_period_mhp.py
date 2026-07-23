@@ -2355,8 +2355,11 @@ class AlarmPeriodMHPAssigner:
         # recompile (catastrophic under ``global``); such alarms are dropped at
         # ingest as if they never occurred. Entity form matches ``covered_type``:
         # ``graph_period_universe`` and ``runtime_ne_at`` fold domain identically.
-        _universe_entities, _ = graph_period_universe(artifact, feature_scorer)
+        _universe_entities, _universe_alarm_types = graph_period_universe(
+            artifact, feature_scorer
+        )
         self._known_entities = frozenset(_universe_entities)
+        self._known_alarm_types = frozenset(_universe_alarm_types)
         self.state_tracker = DeviceStateTracker()
         self.periods: dict[int, AlarmPeriod] = {}
         self.open_period_by_type: dict[PeriodType, int] = {}
@@ -2400,6 +2403,7 @@ class AlarmPeriodMHPAssigner:
         self.total_clear_events = 0
         self.dropped_no_type = 0
         self.dropped_out_of_graph = 0
+        self.dropped_out_of_vocab = 0
         self.created_periods = 0
         self.idle_closed_periods = 0
         self.clear_closed_periods = 0
@@ -2459,6 +2463,15 @@ class AlarmPeriodMHPAssigner:
 
         if not alarm_type:
             self.dropped_no_type += 1
+            self._advance_watermark(ts)
+            return None
+
+        # alarm_type outside the model vocabulary (at_vocab) has no compiled
+        # coverage either: (entity, alarm_type) is not in the universe, so
+        # associating it would force the same full-universe online recompile.
+        # Drop it as non-existent, matching the out-of-graph NE guard above.
+        if str(alarm_type) not in self._known_alarm_types:
+            self.dropped_out_of_vocab += 1
             self._advance_watermark(ts)
             return None
 
@@ -3580,6 +3593,7 @@ class AlarmPeriodMHPAssigner:
             "total_clear_events": self.total_clear_events,
             "dropped_no_type": self.dropped_no_type,
             "dropped_out_of_graph": self.dropped_out_of_graph,
+            "dropped_out_of_vocab": self.dropped_out_of_vocab,
             "created_periods": self.created_periods,
             "open_periods": open_periods,
             "idle_closed_periods": self.idle_closed_periods,
@@ -4471,6 +4485,7 @@ def main():
             f"[period] done: groups={stats['closed_group_count']}, "
             f"periods={stats['created_periods']}, harvests={stats['harvest_count']}, "
             f"dropped_out_of_graph={stats['dropped_out_of_graph']}, "
+            f"dropped_out_of_vocab={stats['dropped_out_of_vocab']}, "
             f"preloaded_edges={stats['preloaded_edge_count']}, "
             f"incremental_edges={stats['compiled_pair_count']}, elapsed={elapsed:.2f}s; "
             f"groups_output={args.groups_output}, visual_output={args.visual_output}",
