@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+import numpy as np
+
 EPS = 1e-12
 
 
@@ -111,7 +113,8 @@ class PeriodSourceImputer:
         self.orphan_type_absent = 0
         self.orphan_no_incoming = 0
         self.orphan_state_gap = 0
-        self.orphan_incoming_present = 0
+        self.orphan_selfloop_only = 0
+        self.orphan_crosstype_bug = 0
 
     # ---- orchestration ---------------------------------------------------
 
@@ -224,17 +227,22 @@ class PeriodSourceImputer:
     def _diagnose_no_candidate(self, sig) -> None:
         """Classify why an orphan scored no candidate (one-run coverage probe).
 
-        Distinguishes the three causes of an empty candidate set so a single run
-        pins the fault without a guess:
+        The candidate path excludes same-period-type (self-loop) sources, so raw
+        incoming-edge presence is not enough — this separates the *imputable*
+        cross-type edges from self-loops. Exactly one counter is bumped:
 
-        * ``type_absent``   — the target period-type is not in any loaded cache.
-        * ``no_incoming``   — type present but zero incoming edges in any state
-                              (a root/immigrant-only type; imputation cannot and
-                              should not fabricate an upstream cause).
-        * ``state_gap``     — the type has incoming edges under some frozen state,
-                              but none under this orphan's exact state.
-        * ``present``       — incoming edges exist for this exact signature yet
-                              none were scored: a genuine lookup/filter bug.
+        * ``type_absent``     — target period-type is in no loaded cache.
+        * ``no_incoming``     — type present but zero incoming edges in any state
+                                (a root/immigrant-only type; nothing to impute).
+        * ``state_gap``       — the type has incoming edges under some frozen
+                                state, but none under this orphan's exact state.
+        * ``selfloop_only``   — the exact signature has incoming edges but every
+                                one is a self-loop (same entity+alarm type), which
+                                imputation excludes by design (a repeat, not an
+                                upstream cause). Expected, not a bug.
+        * ``crosstype_bug``   — the exact signature has a *cross-type* incoming
+                                edge that should have scored yet didn't: a genuine
+                                lookup/filter bug.
         """
         from alarm_flow_mhp.stream_alarm_period_mhp import PeriodSignature
 
@@ -244,12 +252,15 @@ class PeriodSourceImputer:
 
         type_present = False
         exact_incoming = 0
+        exact_crosstype = 0
         type_incoming = 0
         for index in indexes:
-            if index.type_to_id.get(sig.period_type) is None:
+            type_id = index.type_to_id.get(sig.period_type)
+            if type_id is None:
                 continue
             type_present = True
             exact_incoming += index.target_edge_count(sig)
+            exact_crosstype += self._index_crosstype_incoming(index, sig, type_id)
             for state in range(8):
                 type_incoming += index.target_edge_count(
                     PeriodSignature(sig.period_type, state)
@@ -262,15 +273,45 @@ class PeriodSourceImputer:
             type_incoming += count
             if target_sig == sig:
                 exact_incoming += count
+                exact_crosstype += sum(
+                    1
+                    for source_key in row
+                    if getattr(source_key, "period_type", source_key)
+                    != sig.period_type
+                )
 
         if not type_present:
             self.orphan_type_absent += 1
+        elif exact_crosstype > 0:
+            self.orphan_crosstype_bug += 1
         elif exact_incoming > 0:
-            self.orphan_incoming_present += 1
+            self.orphan_selfloop_only += 1
         elif type_incoming > 0:
             self.orphan_state_gap += 1
         else:
             self.orphan_no_incoming += 1
+
+    @staticmethod
+    def _index_crosstype_incoming(index, sig, target_type_id) -> int:
+        """Count incoming edges for ``sig`` whose source period-type differs."""
+        from alarm_flow_mhp.stream_alarm_period_mhp import (
+            CACHE_STATE_LAYOUT_TARGET_ONLY,
+        )
+
+        signature_id = index._target_signature_id(sig)
+        if signature_id is None:
+            return 0
+        start = int(index.target_offsets[signature_id])
+        end = int(index.target_offsets[signature_id + 1])
+        if start >= end:
+            return 0
+        source_ids = index.source_signature_ids[start:end]
+        source_type_ids = (
+            source_ids
+            if index.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
+            else source_ids // 8
+        )
+        return int(np.count_nonzero(source_type_ids != int(target_type_id)))
 
     def _source_offset_sec(self) -> float:
         # MAP placement for the backward exp-excitation kernel is dt -> 0: the
@@ -351,5 +392,6 @@ class PeriodSourceImputer:
             "impute_orphan_type_absent": self.orphan_type_absent,
             "impute_orphan_no_incoming": self.orphan_no_incoming,
             "impute_orphan_state_gap": self.orphan_state_gap,
-            "impute_orphan_incoming_present": self.orphan_incoming_present,
+            "impute_orphan_selfloop_only": self.orphan_selfloop_only,
+            "impute_orphan_crosstype_bug": self.orphan_crosstype_bug,
         }
