@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """微波拓扑根因诊断：diagnose_root_cause_devices(input_json) 返回 (root_cause_resources,
-ne_to_alarm_objs)，输出形状对齐 anchor_resource.py 的 predict（resourceName=neName）。
+ne_to_alarm_objs)，root_cause_resources 每项形如 {"resourceName": neName, "confidence": 0.9}。
 
-input_json 字段（与 anchor_resource.py 同 schema，看到的告警口径一致）：
+input_json 字段：
   - alarms:            告警（neName、alarmVertexVid、alarmName、发生时间等）
   - resources:         网元资源（resourceVid、neName、domain、siteId 等）
   - resourceRelations: 网元-网元拓扑连边（srcVid/dstVid、linkLayer）
@@ -19,8 +19,7 @@ input_json 字段（与 anchor_resource.py 同 schema，看到的告警口径一
 import re
 from collections import OrderedDict, defaultdict, deque
 
-# 断站告警集合（_pick_site_root_cause 用它区分“非断站/断站”）。
-# 内联自 alarm_tools/alarm_types.py 的 OFFLINE_ALARMS，使本文件自包含、不依赖其它文件。
+# 断站告警名称集合：判定一条告警是否“断站/掉线”，_pick_site_root_cause 据此区分断站/非断站。
 OFFLINE_ALARMS = {
     "BASE STATION FAULTY",
     "BCF FAULTY",
@@ -97,8 +96,7 @@ def _dedup_resources_by_vid(resources):
 
 
 def _resource_name_maps(vid_to_resource):
-    """resourceVid -> neName、neName -> 代表资源。
-    仅认 neName（与 anchor_resource._extract_vid_to_ne 一致，无 name 兜底）。"""
+    """resourceVid -> neName、neName -> 代表资源。仅认 neName（无 name 兜底）。"""
     vid_to_nename = {}
     resource_by_nename = {}
     for vid, res in vid_to_resource.items():
@@ -151,10 +149,8 @@ def _site_of(nename, resource_by_nename, alarm_fallback=None):
 # 多源优先最低公共上游，无公共上游时逐站取最远上游。
 # --------------------------------------------------------------------------- #
 def _text_has_token(text, token):
-    # 逐字来自 complete_group_topology._text_has_token
-    if len(token) <= 2:
-        return re.search(rf"(?<![A-Z0-9]){token}(?![A-Z0-9])", text) is not None
-    return token in text
+    # 按词边界匹配（token 前后不紧挨字母/数字），避免 RAN 误命中 TRANSMISSION/BRANCH 等子串
+    return re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", text) is not None
 
 
 # 设备角色识别：按顺序匹配 domain 里的关键词（只看 domain）。
@@ -431,8 +427,8 @@ def _alarm_vid_to_ne(happen_rels, vid_to_nename):
 
 
 def _resolve_nename(alarm, alarm_vid_to_ne):
-    """告警定位到 neName：优先经 happenRelations(alarmVertexVid->neName)，再退回自带 neName。
-    口径与 anchor_resource._collect_alarm_texts 一致（不用 neVid 兜底）。"""
+    """告警定位到 neName：优先经 happenRelations(alarmVertexVid->neName)，再退回自带 neName
+    （不用 neVid 兜底）。"""
     return alarm_vid_to_ne.get(_text(alarm.get("alarmVertexVid"))) or _text(alarm.get("neName"))
 
 
@@ -521,9 +517,7 @@ def _diagnose_root_nes(alarms, resource_by_nename, adjacency, all_ne_names, alar
 
 
 def diagnose_root_cause_devices(input_json):
-    """根因诊断入口（输出对齐 anchor_resource.py 的 predict）。
-
-    整个 input_json 当作一张图诊断（不按 faultGroupId 切分）。
+    """根因诊断入口。整个 input_json 当作一张图诊断（不按 faultGroupId 切分）。
     输入 input_json: 含 alarms / resources / resourceRelations / happenRelations 的 dict。
     输出: (root_cause_resources, ne_to_alarm_objs)
         - root_cause_resources: [{"resourceName": neName, "confidence": 0.9}, ...]，
