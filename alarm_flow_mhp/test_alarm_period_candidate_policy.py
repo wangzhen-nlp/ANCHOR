@@ -42,6 +42,7 @@ from alarm_flow_mhp.stream_alarm_period_mhp import (
     RelatedPeriodKeyIndex,
     RelationEvidence,
     _enable_period_profiling,
+    _build_parser,
     _iter_profiled_events,
     _print_period_profile,
     build_compact_csr_arrays,
@@ -1571,7 +1572,13 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
             def __init__(self, rows):
                 self.rows = rows
 
-            def top_target(self, _signature, _limit, _min_past_window):
+            def top_target(
+                self,
+                _signature,
+                _limit,
+                _min_past_window,
+                _allowed_alarm_types=(),
+            ):
                 return list(self.rows)
 
         plan = object.__new__(CompiledAssociationPlan)
@@ -1601,6 +1608,55 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
 
         self.assertIsNotNone(best)
         self.assertEqual(best[1], accepted_source)
+
+    def test_allowed_impute_type_is_filtered_before_candidate_cap(self):
+        period_types = [
+            PeriodType("TARGET", "X"),
+            PeriodType("HIGH", "power"),
+            PeriodType("LOW", "link"),
+        ]
+        arrays = build_compact_csr_arrays(
+            target_signature_ids=np.zeros(2, dtype=np.int64),
+            source_signature_ids=np.asarray([1, 2], dtype=np.int64),
+            base_scores=np.asarray([100.0, 10.0], dtype=np.float64),
+            thresholds=np.ones(2, dtype=np.float64),
+            past_windows=np.full(2, 60.0, dtype=np.float64),
+            future_windows=np.zeros(2, dtype=np.float64),
+            signature_count=len(period_types) * 8,
+            source_key_count=len(period_types),
+        )
+        index = CompactAssociationIndex(
+            period_types,
+            arrays,
+            state_layout=CACHE_STATE_LAYOUT_TARGET_ONLY,
+        )
+        plan = object.__new__(CompiledAssociationPlan)
+        plan.precompiled_indexes = [index]
+        plan.edges_by_target = {}
+        plan._target_edge_versions = {}
+        plan._top_edges_by_target_cache = {}
+        target = _closed_period(period_id=1, group_id=1)
+        target.period_type = period_types[0]
+        engine = SimpleNamespace(
+            config=SimpleNamespace(time_slack_sec=300.0),
+            plan=plan,
+            _past_score=lambda edge, _dt: edge.base_score,
+        )
+        imputer = PeriodSourceImputer(
+            engine,
+            PeriodImputeConfig(
+                enabled=True,
+                kappa=-2.0,
+                max_candidates=1,
+                allowed_alarm_types=("link",),
+            ),
+        )
+
+        best = imputer._best_candidate(target)
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best[1].period_type, PeriodType("LOW", "link"))
+        self.assertEqual(imputer.candidates_seen, 1)
 
     def test_zero_lag_uses_zero_map_offset(self):
         edge = CompiledEdge(
@@ -1679,6 +1735,7 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
             max_candidates=7,
             lag_sec=2.5,
             min_score_ratio=1.5,
+            allowed_alarm_types=("link", "offline"),
         )
         self.assertEqual(
             config.to_dict(),
@@ -1688,8 +1745,26 @@ class PeriodSourceImputationRegressionTest(unittest.TestCase):
                 "max_candidates": 7,
                 "lag_sec": 2.5,
                 "min_score_ratio": 1.5,
+                "allowed_alarm_types": ["link", "offline"],
             },
         )
+
+    def test_impute_type_cli_option_is_repeatable(self):
+        args = _build_parser().parse_args(
+            [
+                "model.json",
+                "alarms.jsonl",
+                "--groups-output",
+                "groups.jsonl",
+                "--impute",
+                "--impute-type",
+                "link",
+                "--impute-type",
+                "offline",
+            ]
+        )
+
+        self.assertEqual(args.impute_type, ["link", "offline"])
 
 
 class ClearMetricNullSamplingTest(unittest.TestCase):

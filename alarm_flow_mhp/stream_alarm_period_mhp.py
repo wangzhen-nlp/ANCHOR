@@ -880,6 +880,7 @@ class CompactAssociationIndex:
         self.target_offsets = np.asarray(arrays["target_offsets"])
         self.source_offsets = np.asarray(arrays["source_offsets"])
         self.source_order = np.asarray(arrays["source_order"])
+        self._allowed_source_type_masks = {}
         self.memory_bytes = sum(
             array.nbytes
             for array in (
@@ -1052,7 +1053,13 @@ class CompactAssociationIndex:
         for source_key, index in self.iter_target_ids(target):
             yield source_key, self._edge(index)
 
-    def top_target(self, target, limit, min_past_window=0.0):
+    def top_target(
+        self,
+        target,
+        limit,
+        min_past_window=0.0,
+        allowed_alarm_types=(),
+    ):
         """Return at most ``limit`` strongest eligible incoming cache edges.
 
         Cache rows are source-id ordered, so use the numeric score arrays to
@@ -1073,10 +1080,26 @@ class CompactAssociationIndex:
             if self.state_layout == CACHE_STATE_LAYOUT_TARGET_ONLY
             else source_ids // 8
         )
-        eligible = np.flatnonzero(
+        eligible_mask = (
             (self.past_windows[start:end] + EPS >= float(min_past_window))
             & (source_type_ids != target_type_id)
         )
+        allowed_key = tuple(sorted(set(allowed_alarm_types or ())))
+        if allowed_key:
+            allowed_type_mask = self._allowed_source_type_masks.get(allowed_key)
+            if allowed_type_mask is None:
+                allowed = frozenset(allowed_key)
+                allowed_type_mask = np.fromiter(
+                    (
+                        str(period_type.alarm_type) in allowed
+                        for period_type in self.period_types
+                    ),
+                    dtype=np.bool_,
+                    count=len(self.period_types),
+                )
+                self._allowed_source_type_masks[allowed_key] = allowed_type_mask
+            eligible_mask &= allowed_type_mask[source_type_ids]
+        eligible = np.flatnonzero(eligible_mask)
         if eligible.size == 0:
             return []
         limit = min(int(limit), int(eligible.size))
@@ -1264,7 +1287,13 @@ class CompiledAssociationPlan:
             yield from index.iter_target(signature)
         yield from self.edges_by_target.get(signature, {}).items()
 
-    def top_edges_by_target(self, signature, limit, min_past_window=0.0):
+    def top_edges_by_target(
+        self,
+        signature,
+        limit,
+        min_past_window=0.0,
+        allowed_alarm_types=(),
+    ):
         """Return the strongest eligible incoming edges with precise caching.
 
         Precompiled indexes select Top-K through NumPy; dynamic rows are rescanned
@@ -1274,10 +1303,12 @@ class CompiledAssociationPlan:
         limit = int(limit)
         if limit < 1:
             return ()
+        allowed_key = tuple(sorted(set(allowed_alarm_types or ())))
         cache_key = (
             signature,
             limit,
             float(min_past_window),
+            allowed_key,
             len(self.precompiled_indexes),
         )
         version = self._target_edge_versions.get(signature, 0)
@@ -1288,7 +1319,12 @@ class CompiledAssociationPlan:
         candidates = []
         for index in self.precompiled_indexes:
             candidates.extend(
-                index.top_target(signature, limit, min_past_window)
+                index.top_target(
+                    signature,
+                    limit,
+                    min_past_window,
+                    allowed_key,
+                )
             )
         dynamic = self.edges_by_target.get(signature, {})
         if dynamic:
@@ -1297,6 +1333,10 @@ class CompiledAssociationPlan:
                 for source_key, edge in dynamic.items()
                 if edge.past_window_sec + EPS >= float(min_past_window)
                 and source_key.period_type != signature.period_type
+                and (
+                    not allowed_key
+                    or str(source_key.period_type.alarm_type) in allowed_key
+                )
             )
             candidates.extend(
                 heapq.nsmallest(
@@ -4158,6 +4198,19 @@ def _build_parser():
         ),
     )
     parser.add_argument(
+        "--impute-type",
+        action="append",
+        choices=("link", "power", "offline"),
+        default=[],
+        metavar="TYPE",
+        help=(
+            "Allowed alarm type for imputed virtual source periods. Repeat for "
+            "multiple values, e.g. --impute-type link --impute-type power. "
+            "Choices: link, power, offline. Default: unrestricted (preserves "
+            "existing behavior)."
+        ),
+    )
+    parser.add_argument(
         "--impute-lag-sec",
         type=float,
         default=0.0,
@@ -4400,6 +4453,7 @@ def main():
             max_candidates=int(args.impute_max_candidates),
             lag_sec=float(args.impute_lag_sec),
             min_score_ratio=float(args.impute_min_score_ratio),
+            allowed_alarm_types=tuple(args.impute_type or ()),
         )
         try:
             impute_config.validate()

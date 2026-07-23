@@ -60,6 +60,7 @@ class PeriodImputeConfig:
     max_candidates: int = 16
     lag_sec: float = 0.0
     min_score_ratio: float = 1.0
+    allowed_alarm_types: tuple[str, ...] = ()
 
     def validate(self):
         if self.max_candidates < 1:
@@ -70,6 +71,23 @@ class PeriodImputeConfig:
             raise ValueError("lag_sec must be finite and >= 0")
         if not math.isfinite(self.min_score_ratio) or self.min_score_ratio <= 0:
             raise ValueError("min_score_ratio must be finite and > 0")
+        raw_types = (
+            (self.allowed_alarm_types,)
+            if isinstance(self.allowed_alarm_types, str)
+            else tuple(self.allowed_alarm_types or ())
+        )
+        normalized_types = tuple(
+            dict.fromkeys(str(value).strip().lower() for value in raw_types)
+        )
+        invalid_types = sorted(
+            set(normalized_types) - {"link", "power", "offline"}
+        )
+        if invalid_types:
+            raise ValueError(
+                "allowed_alarm_types contains unsupported values: "
+                + ", ".join(invalid_types)
+            )
+        self.allowed_alarm_types = normalized_types
 
     def to_dict(self) -> dict:
         return {
@@ -78,6 +96,7 @@ class PeriodImputeConfig:
             "max_candidates": int(self.max_candidates),
             "lag_sec": float(self.lag_sec),
             "min_score_ratio": float(self.min_score_ratio),
+            "allowed_alarm_types": list(self.allowed_alarm_types),
         }
 
 
@@ -186,13 +205,19 @@ class PeriodSourceImputer:
         # dt=0 fix is not the code path running (stale .pyc / partial sync).
         self.source_offset_sec = dt
         accept_factor = math.exp(cfg.kappa)
+        allowed_alarm_types = frozenset(cfg.allowed_alarm_types)
 
         top_edges = getattr(engine.plan, "top_edges_by_target", None)
         if top_edges is None:
             # Lightweight compatibility path for policy-only test doubles.
             incoming = engine.plan.iter_edges_by_target(sig)
         else:
-            incoming = top_edges(sig, cfg.max_candidates, dt)
+            incoming = top_edges(
+                sig,
+                cfg.max_candidates,
+                dt,
+                allowed_alarm_types,
+            )
 
         best = None
         examined = 0
@@ -204,6 +229,11 @@ class PeriodSourceImputer:
             # Skip a same-type self-source: a period explaining "itself" is a
             # repeat, not an imputed upstream cause.
             if src_sig.period_type == sig.period_type:
+                continue
+            if (
+                allowed_alarm_types
+                and str(src_sig.period_type.alarm_type) not in allowed_alarm_types
+            ):
                 continue
             if dt > edge.past_window_sec + EPS:
                 continue
