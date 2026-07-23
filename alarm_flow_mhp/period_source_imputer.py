@@ -115,6 +115,10 @@ class PeriodSourceImputer:
         self.orphan_state_gap = 0
         self.orphan_selfloop_only = 0
         self.orphan_crosstype_bug = 0
+        # Orthogonal to the above: 0-candidate orphans that DO have a cross-type
+        # outgoing edge (orphan as source). A high count means the relationships
+        # exist but in the reverse direction imputation never reads.
+        self.orphan_has_crosstype_outgoing = 0
 
     # ---- orchestration ---------------------------------------------------
 
@@ -291,6 +295,32 @@ class PeriodSourceImputer:
         else:
             self.orphan_no_incoming += 1
 
+        # Orthogonal probe (independent of the incoming classification above):
+        # does this orphan participate in a cross-type relationship as a SOURCE,
+        # i.e. an outgoing edge orphan->target? Imputation only reads incoming
+        # edges, so if training/time-slack stored the relation in the reverse
+        # direction, it lives here and imputation never sees it.
+        outgoing_crosstype = 0
+        for index in indexes:
+            source_type_id = index.type_to_id.get(sig.period_type)
+            if source_type_id is None:
+                continue
+            outgoing_crosstype += self._index_crosstype_outgoing(
+                index, sig, source_type_id
+            )
+        outgoing = getattr(plan, "edges_by_source", {}) or {}
+        for source_sig, row in outgoing.items():
+            if getattr(source_sig, "period_type", source_sig) != sig.period_type:
+                continue
+            outgoing_crosstype += sum(
+                1
+                for target_key in row
+                if getattr(target_key, "period_type", target_key)
+                != sig.period_type
+            )
+        if outgoing_crosstype > 0:
+            self.orphan_has_crosstype_outgoing += 1
+
     @staticmethod
     def _index_crosstype_incoming(index, sig, target_type_id) -> int:
         """Count incoming edges for ``sig`` whose source period-type differs."""
@@ -312,6 +342,24 @@ class PeriodSourceImputer:
             else source_ids // 8
         )
         return int(np.count_nonzero(source_type_ids != int(target_type_id)))
+
+    @staticmethod
+    def _index_crosstype_outgoing(index, sig, source_type_id) -> int:
+        """Count outgoing edges (``sig`` as source) whose target type differs.
+
+        Targets in the cache always carry full state (type_id*8 + state), so the
+        target type id is the row value // 8 regardless of state layout.
+        """
+        source_key_id = index._source_key_id(sig)
+        if source_key_id is None:
+            return 0
+        start = int(index.source_offsets[source_key_id])
+        end = int(index.source_offsets[source_key_id + 1])
+        if start >= end:
+            return 0
+        order = index.source_order[start:end]
+        target_type_ids = index.target_signature_ids[order] // 8
+        return int(np.count_nonzero(target_type_ids != int(source_type_id)))
 
     def _source_offset_sec(self) -> float:
         # MAP placement for the backward exp-excitation kernel is dt -> 0: the
@@ -394,4 +442,5 @@ class PeriodSourceImputer:
             "impute_orphan_state_gap": self.orphan_state_gap,
             "impute_orphan_selfloop_only": self.orphan_selfloop_only,
             "impute_orphan_crosstype_bug": self.orphan_crosstype_bug,
+            "impute_orphan_has_crosstype_outgoing": self.orphan_has_crosstype_outgoing,
         }
