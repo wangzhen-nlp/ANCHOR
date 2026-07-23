@@ -1411,23 +1411,6 @@ class CompiledAssociationPlan:
         if signature in self.signatures:
             return
         covered_type = signature.period_type in self.covered_period_types
-        if not covered_type and os.environ.get("PERIOD_DEBUG_COVERAGE"):
-            pt = signature.period_type
-            covered = self.covered_period_types
-            entity_hit = any(c.entity == pt.entity for c in covered)
-            at_hit = any(c.alarm_type == pt.alarm_type for c in covered)
-            sample = [
-                (c.entity, c.alarm_type)
-                for c in list(covered)[:5]
-            ]
-            raise SystemExit(
-                "[coverage-miss] runtime period_type=("
-                f"entity={pt.entity!r}, alarm_type={pt.alarm_type!r}); "
-                f"universe_size={len(covered)}; "
-                f"entity_in_universe={entity_hit}; "
-                f"alarm_type_in_universe={at_hit}; "
-                f"universe_sample={sample}"
-            )
         partial_related_base = (
             covered_type
             and self.precompiled_candidate_scope == "related"
@@ -2366,6 +2349,14 @@ class AlarmPeriodMHPAssigner:
             )
             for payload in payloads:
                 self.plan.load_cache_payload(payload)
+        # Mode-agnostic ingest guard: the graph universe of entities the model /
+        # caches were built on. Any runtime NE outside this set has no compiled
+        # coverage, so associating it would trigger a full-universe online
+        # recompile (catastrophic under ``global``); such alarms are dropped at
+        # ingest as if they never occurred. Entity form matches ``covered_type``:
+        # ``graph_period_universe`` and ``runtime_ne_at`` fold domain identically.
+        _universe_entities, _ = graph_period_universe(artifact, feature_scorer)
+        self._known_entities = frozenset(_universe_entities)
         self.state_tracker = DeviceStateTracker()
         self.periods: dict[int, AlarmPeriod] = {}
         self.open_period_by_type: dict[PeriodType, int] = {}
@@ -2408,6 +2399,7 @@ class AlarmPeriodMHPAssigner:
         self.total_raise_events = 0
         self.total_clear_events = 0
         self.dropped_no_type = 0
+        self.dropped_out_of_graph = 0
         self.created_periods = 0
         self.idle_closed_periods = 0
         self.clear_closed_periods = 0
@@ -2452,6 +2444,13 @@ class AlarmPeriodMHPAssigner:
             self.artifact.config.type_fields,
             self.artifact.config.topology_node_field,
         )
+        # NE not in the graph universe: no compiled coverage, so treat the alarm
+        # as non-existent instead of forcing a full-universe online recompile.
+        # Dropped before state tracking/association; watermark still advances.
+        if str(entity) not in self._known_entities:
+            self.dropped_out_of_graph += 1
+            self._advance_watermark(ts)
+            return None
         fallback_at = alarm_type_label(alarm_event)
         alarm_type = parsed_at or fallback_at
         state_at = alarm_type_from_title(alarm_event.get("alarm_title", ""))
@@ -3580,6 +3579,7 @@ class AlarmPeriodMHPAssigner:
             "total_raise_events": self.total_raise_events,
             "total_clear_events": self.total_clear_events,
             "dropped_no_type": self.dropped_no_type,
+            "dropped_out_of_graph": self.dropped_out_of_graph,
             "created_periods": self.created_periods,
             "open_periods": open_periods,
             "idle_closed_periods": self.idle_closed_periods,
@@ -4470,6 +4470,7 @@ def main():
         print(
             f"[period] done: groups={stats['closed_group_count']}, "
             f"periods={stats['created_periods']}, harvests={stats['harvest_count']}, "
+            f"dropped_out_of_graph={stats['dropped_out_of_graph']}, "
             f"preloaded_edges={stats['preloaded_edge_count']}, "
             f"incremental_edges={stats['compiled_pair_count']}, elapsed={elapsed:.2f}s; "
             f"groups_output={args.groups_output}, visual_output={args.visual_output}",
