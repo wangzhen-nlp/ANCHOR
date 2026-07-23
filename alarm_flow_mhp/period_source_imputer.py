@@ -108,6 +108,9 @@ class PeriodSourceImputer:
         self.candidates_seen = 0
         self.orphans_with_candidates = 0
         self.max_score_ratio = 0.0
+        # Actual dt (placement/window offset) used; set on first _best_candidate.
+        # Proves whether the dt=0 fix is the running code path.
+        self.source_offset_sec = None
         # Coverage breakdown for orphans that scored no candidate (see
         # _diagnose_no_candidate). Exactly one is incremented per such orphan.
         self.orphan_type_absent = 0
@@ -178,6 +181,10 @@ class PeriodSourceImputer:
         sig = period.signature
         offset = self._source_offset_sec()
         dt = float(offset)
+        # Surface the actual placement/window offset so a run can prove whether
+        # dt==0 (MAP placement) is in effect. If this reports ~time_slack_sec, the
+        # dt=0 fix is not the code path running (stale .pyc / partial sync).
+        self.source_offset_sec = dt
         accept_factor = math.exp(cfg.kappa)
 
         top_edges = getattr(engine.plan, "top_edges_by_target", None)
@@ -443,4 +450,5 @@ class PeriodSourceImputer:
             "impute_orphan_selfloop_only": self.orphan_selfloop_only,
             "impute_orphan_crosstype_bug": self.orphan_crosstype_bug,
             "impute_orphan_has_crosstype_outgoing": self.orphan_has_crosstype_outgoing,
+            "impute_source_offset_sec": self.source_offset_sec,
         }
