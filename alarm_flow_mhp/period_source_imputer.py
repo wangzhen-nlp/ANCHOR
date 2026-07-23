@@ -95,6 +95,16 @@ class PeriodSourceImputer:
         self.births = 0
         self.rejected = 0
         self.orphans_seen = 0
+        # Diagnostics for tuning kappa when births stay at 0. ``candidates_seen``
+        # counts window-eligible incoming edges scored across all orphans;
+        # ``max_score_ratio`` is the largest decayed score / mu (== edge.threshold)
+        # observed. A birth needs score/mu > exp(-kappa), so max_score_ratio tells
+        # you the loosest kappa that could ever fire: kappa > -ln(max_score_ratio).
+        # orphans_with_candidates separates "no candidate edge at all" (a coverage
+        # problem) from "candidates exist but all too weak" (a kappa problem).
+        self.candidates_seen = 0
+        self.orphans_with_candidates = 0
+        self.max_score_ratio = 0.0
 
     # ---- orchestration ---------------------------------------------------
 
@@ -165,6 +175,7 @@ class PeriodSourceImputer:
 
         best = None
         examined = 0
+        scored_any = False
         for source_key, edge in incoming:
             src_sig = self._source_signature(source_key)
             if src_sig is None:
@@ -179,6 +190,14 @@ class PeriodSourceImputer:
                 break
             examined += 1
             score = engine._past_score(edge, dt)
+            # Tuning telemetry: record the raw score/mu ratio of every scored
+            # candidate before any acceptance guard, so a run whose births stay
+            # at 0 still reveals how far kappa is from firing.
+            self.candidates_seen += 1
+            scored_any = True
+            ratio = score / max(edge.threshold, EPS)
+            if ratio > self.max_score_ratio:
+                self.max_score_ratio = ratio
             # Apply the optional raw-score guard before the independent
             # κ-penalised birth-vs-background test.  Keeping these separate
             # matches the CLI contract and avoids multiplying the ratio by
@@ -189,6 +208,8 @@ class PeriodSourceImputer:
                 continue
             if best is None or score > best[0]:
                 best = (score, src_sig, edge)
+        if scored_any:
+            self.orphans_with_candidates += 1
         return best
 
     def _source_offset_sec(self) -> float:
@@ -241,8 +262,20 @@ class PeriodSourceImputer:
     # ---- reporting -------------------------------------------------------
 
     def stats(self) -> dict:
+        # Loosest kappa that could produce any birth given what was observed:
+        # a candidate fires when score/mu > exp(-kappa), so any birth needs
+        # kappa > -ln(max_score_ratio). None when no candidate was ever scored.
+        kappa_for_any_birth = (
+            -math.log(self.max_score_ratio)
+            if self.max_score_ratio > 0.0
+            else None
+        )
         return {
             "impute_births": self.births,
             "impute_rejected": self.rejected,
             "impute_orphans_seen": self.orphans_seen,
+            "impute_orphans_with_candidates": self.orphans_with_candidates,
+            "impute_candidates_seen": self.candidates_seen,
+            "impute_max_score_ratio": float(self.max_score_ratio),
+            "impute_kappa_for_any_birth": kappa_for_any_birth,
         }
